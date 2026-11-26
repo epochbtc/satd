@@ -28,7 +28,14 @@ const NO_TOR: &str = "Outbound connections restricted to Tor (-onlynet=onion) bu
 #[test]
 fn without_onlynet_every_network_satd_can_reach_is_reachable() {
     let c = load("", &[]).unwrap();
-    assert_eq!(c.reachable, ReachableNets { onion: false, ..ReachableNets::default() }, "no Tor proxy, no onion");
+    assert_eq!(
+        c.reachable,
+        ReachableNets {
+            onion: false,
+            ..ReachableNets::default()
+        },
+        "no Tor proxy, no onion"
+    );
     assert!(c.dnsseed);
     let c = load("proxy=127.0.0.1:9050\n", &[]).unwrap();
     assert!(c.reachable.ipv4 && c.reachable.ipv6 && c.reachable.onion);
@@ -48,9 +55,14 @@ fn onlynet_restricts_to_the_networks_it_names() {
 #[test]
 fn onlynet_onion_without_a_tor_proxy_is_refused() {
     assert_eq!(load("onlynet=onion\n", &[]).err().as_deref(), Some(NO_TOR));
-    assert!(load("onlynet=onion\nproxy=0\n", &[]).is_err(), "-proxy=0 is no proxy");
+    assert!(
+        load("onlynet=onion\nproxy=0\n", &[]).is_err(),
+        "-proxy=0 is no proxy"
+    );
     assert_eq!(
-        load("onlynet=onion\nproxy=127.0.0.1:9050\nonion=0\n", &[]).err().as_deref(),
+        load("onlynet=onion\nproxy=127.0.0.1:9050\nonion=0\n", &[])
+            .err()
+            .as_deref(),
         Some(
             "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network \
              is explicitly forbidden: -onion=0"
@@ -64,7 +76,10 @@ fn onlynet_onion_without_a_tor_proxy_is_refused() {
     // with no outbound transport. Perturbation: drop that check and this
     // loads.
     let err = load("onlynet=onion\nlistenonion=1\n", &[]).expect_err("no outbound transport");
-    assert!(err.contains("satd does not take the proxy from the Tor control port"), "{err}");
+    assert!(
+        err.contains("satd does not take the proxy from the Tor control port"),
+        "{err}"
+    );
 }
 
 /// `-onion=0` keeps `.onion` out of reach even with `-proxy` (Core has no
@@ -85,10 +100,18 @@ fn onlynet_without_clearnet_turns_dns_seeding_off_and_refuses_it_explicitly() {
     assert!(!c.dnsseed, "soft-set off");
     assert!(c.reachable.onion && !c.reachable.clearnet());
     assert_eq!(
-        load("onlynet=onion\nproxy=127.0.0.1:9050\ndnsseed=1\n", &[]).err().as_deref(),
-        Some("Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")
+        load("onlynet=onion\nproxy=127.0.0.1:9050\ndnsseed=1\n", &[])
+            .err()
+            .as_deref(),
+        Some(
+            "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6"
+        )
     );
-    assert!(!load("onlynet=onion\nproxy=127.0.0.1:9050\ndnsseed=0\n", &[]).unwrap().dnsseed);
+    assert!(
+        !load("onlynet=onion\nproxy=127.0.0.1:9050\ndnsseed=0\n", &[])
+            .unwrap()
+            .dnsseed
+    );
 }
 
 #[test]
@@ -103,7 +126,9 @@ fn networks_satd_cannot_use_are_refused_as_core_refuses_them() {
     );
     assert_eq!(
         load("onlynet=cjdns\n", &[]).err().as_deref(),
-        Some("Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided")
+        Some(
+            "Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided"
+        )
     );
     let c = load("onlynet=cjdns\nonlynet=ipv6\ncjdnsreachable=1\n", &[]).unwrap();
     assert!(c.reachable.cjdns && c.reachable.ipv6 && c.reachable.cjdns_flip);
@@ -117,12 +142,33 @@ fn a_proxy_turns_listening_off_by_default() {
     assert!(load("", &[]).unwrap().listen);
     let c = load("proxy=127.0.0.1:9050\n", &[]).unwrap();
     assert!(!c.listen);
-    assert!(load("proxy=127.0.0.1:9050\nlisten=1\n", &[]).unwrap().listen);
-    assert!(load("proxy=127.0.0.1:9050\nbind=127.0.0.1:18444\n", &[]).unwrap().listen);
-    assert!(load("proxy=0\n", &[]).unwrap().listen, "-proxy=0 is no proxy");
+    assert!(
+        load("proxy=127.0.0.1:9050\nlisten=1\n", &[])
+            .unwrap()
+            .listen
+    );
+    assert!(
+        load("proxy=127.0.0.1:9050\nbind=127.0.0.1:18444\n", &[])
+            .unwrap()
+            .listen
+    );
+    assert!(
+        load("proxy=0\n", &[]).unwrap().listen,
+        "-proxy=0 is no proxy"
+    );
     assert_eq!(load("proxy=0\n", &[]).unwrap().proxy, None);
     let c = load("proxy=127.0.0.1:9050\ntorcontrol=127.0.0.1:9051\n", &[]).unwrap();
-    assert!(!c.listen && !c.listenonion, "-listen=0 soft-sets -listenonion=0");
-    let c = load("proxy=127.0.0.1:9050\ntorcontrol=127.0.0.1:9051\nlistenonion=1\n", &[]).unwrap();
-    assert!(!c.listen && c.listenonion, "an explicit -listenonion stands");
+    assert!(
+        !c.listen && !c.listenonion,
+        "-listen=0 soft-sets -listenonion=0"
+    );
+    let c = load(
+        "proxy=127.0.0.1:9050\ntorcontrol=127.0.0.1:9051\nlistenonion=1\n",
+        &[],
+    )
+    .unwrap();
+    assert!(
+        !c.listen && c.listenonion,
+        "an explicit -listenonion stands"
+    );
 }

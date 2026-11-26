@@ -7,12 +7,13 @@
 
 use super::*;
 use bitcoin::hashes::Hash;
-use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_RETURN};
 use bitcoin::opcodes::OP_0;
+use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_RETURN};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness};
 
 const HEIGHT: u32 = 1_000;
-const EVAL_FALSE: &str = "Script evaluated without error but finished with a false/empty top stack element";
+const EVAL_FALSE: &str =
+    "Script evaluated without error but finished with a false/empty top stack element";
 const OP_RETURN_HIT: &str = "OP_RETURN was encountered";
 
 /// A P2WSH input per witness script, each revealing its script.
@@ -31,13 +32,19 @@ fn p2wsh_spend(scripts: &[ScriptBuf]) -> (Transaction, Vec<TxOut>) {
             .iter()
             .enumerate()
             .map(|(i, ws)| TxIn {
-                previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([i as u8 + 1; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([i as u8 + 1; 32]),
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::from_slice(&[ws.as_bytes()]),
             })
             .collect(),
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::new_op_return([]) }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new_op_return([]),
+        }],
     };
     (tx, prevs)
 }
@@ -54,7 +61,10 @@ fn script(op: u8) -> ScriptBuf {
 fn naming_runs_only_the_failing_input() {
     let (tx, prevs) = p2wsh_spend(&[script(OP_0.to_u8()), script(OP_RETURN.to_u8())]);
     let cpp = ConsensusVerifier::new(Network::Regtest);
-    let coarse = ScriptError::VerifyFailed { input: 1, reason: "ERR_SCRIPT".into() };
+    let coarse = ScriptError::VerifyFailed {
+        input: 1,
+        reason: "ERR_SCRIPT".into(),
+    };
     let named = cpp.name_failure(&tx, &prevs, ScriptContext::unmined(HEIGHT), coarse);
     assert_eq!(named.input(), 1);
     assert_eq!(named.reason(), OP_RETURN_HIT);
@@ -96,16 +106,32 @@ fn the_unnamed_verify_leaves_the_name_for_later() {
         16,
         1,
     );
-    let verifiers: [(&str, &dyn ScriptVerifier); 2] =
-        [("cpp", &ConsensusVerifier::new(Network::Regtest)), ("rust-shadow", &shadow)];
+    let verifiers: [(&str, &dyn ScriptVerifier); 2] = [
+        ("cpp", &ConsensusVerifier::new(Network::Regtest)),
+        ("rust-shadow", &shadow),
+    ];
     for (name, v) in verifiers {
-        let err = v.verify_transaction_unnamed(&tx, &prevs, ScriptContext::unmined(HEIGHT)).expect_err("input 1 fails");
+        let err = v
+            .verify_transaction_unnamed(&tx, &prevs, ScriptContext::unmined(HEIGHT))
+            .expect_err("input 1 fails");
         assert_eq!(err.input(), 1, "{name}");
-        assert_eq!(err.reason(), "ERR_SCRIPT", "{name}: named under the caller's lock");
+        assert_eq!(
+            err.reason(),
+            "ERR_SCRIPT",
+            "{name}: named under the caller's lock"
+        );
         let named = v.name_failure(&tx, &prevs, ScriptContext::unmined(HEIGHT), err);
-        assert_eq!((named.input(), named.reason()), (1, OP_RETURN_HIT), "{name}");
+        assert_eq!(
+            (named.input(), named.reason()),
+            (1, OP_RETURN_HIT),
+            "{name}"
+        );
 
-        v.verify_transaction_unnamed(&p2wsh_spend(&[script(OP_PUSHNUM_1.to_u8())]).0, &prevs[..1], ScriptContext::unmined(HEIGHT))
-            .expect("a true script passes");
+        v.verify_transaction_unnamed(
+            &p2wsh_spend(&[script(OP_PUSHNUM_1.to_u8())]).0,
+            &prevs[..1],
+            ScriptContext::unmined(HEIGHT),
+        )
+        .expect("a true script passes");
     }
 }

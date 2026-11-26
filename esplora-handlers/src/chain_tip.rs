@@ -51,8 +51,8 @@ pub const CHAIN_TIP_HEADER: HeaderName = HeaderName::from_static("x-bitcoin-chai
 pub const CHAIN_TIP_HEIGHT_HEADER: HeaderName =
     HeaderName::from_static("x-bitcoin-chain-tip-height");
 
-pub use node::chain::pin::{CHAIN_VIEW_MOVED, Pin, VIEW_ATTEMPTS, VIEW_WAIT};
 use node::chain::pin::asof_pin;
+pub use node::chain::pin::{CHAIN_VIEW_MOVED, Pin, VIEW_ATTEMPTS, VIEW_WAIT};
 
 /// Whether a pinned route takes `?asof=`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,7 +211,10 @@ mod tests {
     use crate::test_support::{extend_tip, regtest_state};
 
     /// A router whose one route runs `handler` behind [`stamp_chain_tip`].
-    fn stamped(state: EsploraState, handler: impl Fn(&ChainState) + Clone + Send + Sync + 'static) -> Router {
+    fn stamped(
+        state: EsploraState,
+        handler: impl Fn(&ChainState) + Clone + Send + Sync + 'static,
+    ) -> Router {
         let chain = state.chain.clone();
         Router::new()
             .route(
@@ -257,7 +260,10 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(tip.to_string().as_str()));
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(tip.to_string().as_str())
+        );
         assert_eq!(header(&resp, &CHAIN_TIP_HEIGHT_HEADER), Some("1"));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
@@ -279,9 +285,16 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "an extension does not rerun");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "an extension does not rerun"
+        );
         assert_eq!(state.chain.tip_height(), 3);
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(start.to_string().as_str()));
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(start.to_string().as_str())
+        );
         assert_eq!(header(&resp, &CHAIN_TIP_HEIGHT_HEADER), Some("1"));
     }
 
@@ -303,8 +316,15 @@ mod tests {
         .await;
 
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(runs.load(Ordering::SeqCst), 2, "the first run was discarded");
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(one.to_string().as_str()));
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "the first run was discarded"
+        );
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(one.to_string().as_str())
+        );
         assert_eq!(header(&resp, &CHAIN_TIP_HEIGHT_HEADER), Some("1"));
     }
 
@@ -333,7 +353,10 @@ mod tests {
                 stamp_chain_tip,
             ));
         let resp = call(router).await;
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(tip.to_string().as_str()));
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(tip.to_string().as_str())
+        );
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], format!("{tip} 1").as_bytes());
     }
@@ -394,21 +417,35 @@ mod tests {
 
         let resp = get_path(&pins, &format!("/probe?asof={one}")).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(one.to_string().as_str()));
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(one.to_string().as_str())
+        );
         assert_eq!(header(&resp, &CHAIN_TIP_HEIGHT_HEADER), Some("1"));
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], format!("{one} 1 false").as_bytes());
 
         // The key is decoded as a form decodes it.
         let resp = get_path(&pins, &format!("/probe?%61sof={one}")).await;
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(one.to_string().as_str()));
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(one.to_string().as_str())
+        );
 
         let resp = get_path(&pins, "/probe?other=1").await;
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(&body[..], format!("{two} 2 true").as_bytes(), "no asof: the live tip");
+        assert_eq!(
+            &body[..],
+            format!("{two} 2 true").as_bytes(),
+            "no asof: the live tip"
+        );
 
         // A side block at height 1, not on the best chain.
-        let side = crate::test_support::regtest_block(state.chain.get_block_hash_by_height(0).unwrap(), 1, 7);
+        let side = crate::test_support::regtest_block(
+            state.chain.get_block_hash_by_height(0).unwrap(),
+            1,
+            7,
+        );
         let _ = state.chain.accept_block(&side);
         let zero = BlockHash::all_zeros();
         for query in [
@@ -426,10 +463,22 @@ mod tests {
         // Through the real router: a pinned route that does not take asof,
         // and an unpinned one, are 404.
         let router = crate::build_router(state).unwrap();
-        for path in [format!("/tx/{zero}?asof={one}"), format!("/mempool?asof={one}")] {
-            assert_eq!(get_path(&router, &path).await.status(), StatusCode::NOT_FOUND, "{path}");
+        for path in [
+            format!("/tx/{zero}?asof={one}"),
+            format!("/mempool?asof={one}"),
+        ] {
+            assert_eq!(
+                get_path(&router, &path).await.status(),
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
         }
-        assert_eq!(get_path(&router, &format!("/blocks/tip/hash?asof={one}")).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get_path(&router, &format!("/blocks/tip/hash?asof={one}"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(get_path(&router, "/mempool").await.status(), StatusCode::OK);
     }
 
@@ -480,11 +529,18 @@ mod tests {
 
         let resp = router
             .clone()
-            .oneshot(Request::get("/blocks/tip/hash").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/blocks/tip/hash")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(tip.to_string().as_str()));
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(tip.to_string().as_str())
+        );
         assert_eq!(header(&resp, &CHAIN_TIP_HEIGHT_HEADER), Some("1"));
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], tip.to_string().as_bytes());
@@ -493,11 +549,18 @@ mod tests {
         let missing = "00".repeat(32);
         let resp = router
             .clone()
-            .oneshot(Request::get(format!("/tx/{missing}/status")).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(format!("/tx/{missing}/status"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert_eq!(header(&resp, &CHAIN_TIP_HEADER), Some(tip.to_string().as_str()));
+        assert_eq!(
+            header(&resp, &CHAIN_TIP_HEADER),
+            Some(tip.to_string().as_str())
+        );
 
         for path in ["/mempool", "/fee-estimates"] {
             let resp = router
@@ -506,7 +569,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{path}");
-            assert!(header(&resp, &CHAIN_TIP_HEADER).is_none(), "{path} is not a chain read");
+            assert!(
+                header(&resp, &CHAIN_TIP_HEADER).is_none(),
+                "{path} is not a chain read"
+            );
         }
     }
 }

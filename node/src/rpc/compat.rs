@@ -644,8 +644,7 @@ where
             // non-root path with 404 Not Found (there is no REST surface on
             // the RPC port). jsonrpsee returns 405 Method Not Allowed for
             // non-POST requests, which breaks `interface_http.py`.
-            let uri_len =
-                parts.uri.path().len() + parts.uri.query().map_or(0, |q| q.len() + 1);
+            let uri_len = parts.uri.path().len() + parts.uri.query().map_or(0, |q| q.len() + 1);
             if uri_len > MAX_URI_LENGTH {
                 return Ok(bad_request());
             }
@@ -781,7 +780,8 @@ where
             let collected = match with_optional_timeout(body_timeout, collect).await {
                 Some(Ok(buf)) => buf.to_bytes(),
                 Some(Err(e))
-                    if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() =>
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some() =>
                 {
                     return Ok(payload_too_large());
                 }
@@ -877,9 +877,7 @@ where
             // an error object, and parsing it here would be the DOM parse the
             // cap exists to avoid.
             let oversized = too_large_to_normalise(resp_bytes.len());
-            if !oversized
-                && let Some(status) = core_http_status(&resp_bytes, client_spoke_2_0)
-            {
+            if !oversized && let Some(status) = core_http_status(&resp_bytes, client_spoke_2_0) {
                 head.status = status;
             }
 
@@ -932,8 +930,7 @@ fn no_content() -> HttpResponse<HttpBody> {
 ///
 /// Only a batch reaches this: a lone notification is answered 204 before it.
 fn drop_notification_replies(body: &[u8], notification_ids: &[String]) -> Vec<u8> {
-    let Ok(serde_json::Value::Array(items)) =
-        serde_json::from_slice::<serde_json::Value>(body)
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_slice::<serde_json::Value>(body)
     else {
         return body.to_vec();
     };
@@ -1133,7 +1130,11 @@ mod tests {
                 hyper::header::HeaderValue::from_str(start).unwrap(),
             );
             super::normalize_response_content_type(&mut headers);
-            assert_eq!(headers[hyper::header::CONTENT_TYPE], "application/json", "from {start}");
+            assert_eq!(
+                headers[hyper::header::CONTENT_TYPE],
+                "application/json",
+                "from {start}"
+            );
         }
     }
 
@@ -1147,7 +1148,10 @@ mod tests {
             hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
         );
         super::normalize_response_content_type(&mut headers);
-        assert_eq!(headers[hyper::header::CONTENT_TYPE], "text/plain; charset=utf-8");
+        assert_eq!(
+            headers[hyper::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
 
         // A response with no Content-Type at all must not gain one.
         let mut empty = hyper::HeaderMap::new();
@@ -1254,8 +1258,10 @@ mod tests {
     #[test]
     fn batch_already_2_0_untouched() {
         assert!(
-            norm(r#"[{"jsonrpc":"2.0","id":1,"method":"a"},{"jsonrpc":"2.0","id":2,"method":"b"}]"#)
-                .is_none()
+            norm(
+                r#"[{"jsonrpc":"2.0","id":1,"method":"a"},{"jsonrpc":"2.0","id":2,"method":"b"}]"#
+            )
+            .is_none()
         );
     }
 
@@ -1275,10 +1281,9 @@ mod tests {
 
     #[test]
     fn preserves_string_id_and_params() {
-        let out = norm(
-            r#"{"jsonrpc":"1.0","id":"abc","method":"getblock","params":["deadbeef",2]}"#,
-        )
-        .expect("should rewrite");
+        let out =
+            norm(r#"{"jsonrpc":"1.0","id":"abc","method":"getblock","params":["deadbeef",2]}"#)
+                .expect("should rewrite");
         assert_eq!(out["id"], "abc");
         assert_eq!(out["params"][0], "deadbeef");
         assert_eq!(out["params"][1], 2);
@@ -1293,7 +1298,9 @@ mod tests {
         let out = norm(r#"{"method": "getbestblockhash"}"#).expect("should rewrite");
         assert_eq!(out["jsonrpc"], "2.0");
         assert!(
-            out["id"].as_str().is_some_and(|s| s.starts_with(ABSENT_ID_PREFIX)),
+            out["id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with(ABSENT_ID_PREFIX)),
             "{out}"
         );
         assert_eq!(out["method"], "getbestblockhash");
@@ -1448,9 +1455,15 @@ mod tests {
         }
         // A success keeps 200, and so does a batch.
         assert_eq!(core_http_status(br#"{"result":1,"id":1}"#, false), None);
-        assert_eq!(core_http_status(br#"{"result":1,"error":null,"id":1}"#, false), None);
         assert_eq!(
-            core_http_status(br#"[{"error":{"code":-32601,"message":"x"},"id":1}]"#, false),
+            core_http_status(br#"{"result":1,"error":null,"id":1}"#, false),
+            None
+        );
+        assert_eq!(
+            core_http_status(
+                br#"[{"error":{"code":-32601,"message":"x"},"id":1}]"#,
+                false
+            ),
             None
         );
     }
@@ -1501,7 +1514,10 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","jsonrpc":"1.0","method":"getblockcount","id":1}"#;
         let out = super::normalize_jsonrpc_version(body).expect("must rewrite");
         let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains(r#""1.0""#), "the 1.0 must not survive: {text}");
+        assert!(
+            !text.contains(r#""1.0""#),
+            "the 1.0 must not survive: {text}"
+        );
         assert_eq!(text.matches(r#""jsonrpc":"2.0""#).count(), 2, "{text}");
     }
 
@@ -1515,7 +1531,10 @@ mod tests {
         let out = super::normalize_jsonrpc_version(body).expect("must rewrite");
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#""jsonrpc":"2.0""#), "{text}");
-        assert!(text.ends_with(",5]"), "the junk element is copied through: {text}");
+        assert!(
+            text.ends_with(",5]"),
+            "the junk element is copied through: {text}"
+        );
     }
 
     /// The whole point of the raw-member rewrite: `params` reaches jsonrpsee
@@ -1527,7 +1546,6 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains(r#"{"a":1,"a":2}"#), "{text}");
     }
-
 
     /// The forward-instead-of-normalise branch, which was dead code until the
     /// caps were split — the engine refused anything that could reach it.
@@ -1551,7 +1569,10 @@ mod tests {
     #[test]
     fn whitelist_refuses_a_method_outside_the_list() {
         let s = only(&["getblockcount"]);
-        assert_eq!(whitelist_refusal(&s, br#"{"method":"getblockcount"}"#), None);
+        assert_eq!(
+            whitelist_refusal(&s, br#"{"method":"getblockcount"}"#),
+            None
+        );
         assert_eq!(
             whitelist_refusal(&s, br#"{"method":"getnetworkinfo"}"#).as_deref(),
             Some("getnetworkinfo")
@@ -1564,14 +1585,24 @@ mod tests {
     fn whitelist_refuses_the_whole_batch_for_one_member() {
         let s = only(&["getblockcount"]);
         assert_eq!(
-            whitelist_refusal(&s, br#"[{"method":"getblockcount"},{"method":"getblockcount"}]"#),
+            whitelist_refusal(
+                &s,
+                br#"[{"method":"getblockcount"},{"method":"getblockcount"}]"#
+            ),
             None
         );
         assert!(
-            whitelist_refusal(&s, br#"[{"method":"getblockcount"},{"method":"getnetworkinfo"}]"#)
-                .is_some()
+            whitelist_refusal(
+                &s,
+                br#"[{"method":"getblockcount"},{"method":"getnetworkinfo"}]"#
+            )
+            .is_some()
         );
-        assert_eq!(whitelist_refusal(&s, b"[]"), None, "an empty batch runs nothing");
+        assert_eq!(
+            whitelist_refusal(&s, b"[]"),
+            None,
+            "an empty batch runs nothing"
+        );
     }
 
     #[test]
@@ -1580,14 +1611,13 @@ mod tests {
         // An escaped key or value names the same method.
         assert!(whitelist_refusal(&s, br#"{"m\u0065thod":"stop"}"#).is_some());
         assert!(whitelist_refusal(&s, br#"{"method":"st\u006fp"}"#).is_some());
-        assert_eq!(whitelist_refusal(&s, br#"{"method":"getblock\u0063ount"}"#), None);
+        assert_eq!(
+            whitelist_refusal(&s, br#"{"method":"getblock\u0063ount"}"#),
+            None
+        );
         // Two `method` members are refused, whichever one is allowed.
-        assert!(
-            whitelist_refusal(&s, br#"{"method":"getblockcount","method":"stop"}"#).is_some()
-        );
-        assert!(
-            whitelist_refusal(&s, br#"{"method":"stop","method":"getblockcount"}"#).is_some()
-        );
+        assert!(whitelist_refusal(&s, br#"{"method":"getblockcount","method":"stop"}"#).is_some());
+        assert!(whitelist_refusal(&s, br#"{"method":"stop","method":"getblockcount"}"#).is_some());
     }
 
     #[test]
@@ -1599,7 +1629,10 @@ mod tests {
         // No method, or one that is not a string: rejected by the engine.
         assert_eq!(whitelist_refusal(&s, br#"{"id":1}"#), None);
         assert_eq!(whitelist_refusal(&s, br#"{"method":5}"#), None);
-        assert_eq!(whitelist_refusal(&s, br#"[5,{"method":"getblockcount"}]"#), None);
+        assert_eq!(
+            whitelist_refusal(&s, br#"[5,{"method":"getblockcount"}]"#),
+            None
+        );
     }
 
     #[test]

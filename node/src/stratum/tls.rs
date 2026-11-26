@@ -3,9 +3,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tls_config::{ClientAllowList, TlsAcceptor};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
-use tls_config::{ClientAllowList, TlsAcceptor};
 
 /// How long a client gets to finish the TLS handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

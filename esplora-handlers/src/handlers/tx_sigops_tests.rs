@@ -47,12 +47,18 @@ fn multisig(m: i64, n: i64) -> ScriptBuf {
     for _ in 0..n {
         script = script.push_slice(KEY);
     }
-    script.push_int(n).push_opcode(opcodes::all::OP_CHECKMULTISIG).into_script()
+    script
+        .push_int(n)
+        .push_opcode(opcodes::all::OP_CHECKMULTISIG)
+        .into_script()
 }
 
 fn input(script_sig: ScriptBuf, witness: &[&[u8]]) -> TxIn {
     TxIn {
-        previous_output: OutPoint { txid: Txid::from_byte_array([0x77; 32]), vout: 0 },
+        previous_output: OutPoint {
+            txid: Txid::from_byte_array([0x77; 32]),
+            vout: 0,
+        },
         script_sig,
         sequence: Sequence::MAX,
         witness: Witness::from_slice(witness),
@@ -66,13 +72,19 @@ fn tx(input: Vec<TxIn>, outputs: Vec<ScriptBuf>) -> Transaction {
         input,
         output: outputs
             .into_iter()
-            .map(|script_pubkey| TxOut { value: Amount::from_sat(1_000), script_pubkey })
+            .map(|script_pubkey| TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey,
+            })
             .collect(),
     }
 }
 
 fn spending(script_pubkey: ScriptBuf) -> Vec<Option<TxOut>> {
-    vec![Some(TxOut { value: Amount::from_sat(5_000), script_pubkey })]
+    vec![Some(TxOut {
+        value: Amount::from_sat(5_000),
+        script_pubkey,
+    })]
 }
 
 #[test]
@@ -118,7 +130,9 @@ fn a_p2wpkh_spend_costs_one() {
 #[test]
 fn a_p2sh_wrapped_p2wpkh_spend_costs_one() {
     let program = p2wpkh();
-    let script_sig = Builder::new().push_slice(push(program.as_bytes())).into_script();
+    let script_sig = Builder::new()
+        .push_slice(push(program.as_bytes()))
+        .into_script();
     let spent = ScriptBuf::new_p2sh(&ScriptHash::hash(program.as_bytes()));
     let t = tx(vec![input(script_sig, &[&SIG, &KEY])], vec![p2wpkh()]);
     assert_eq!(sigop_cost(&t, &spending(spent)), 1);
@@ -129,7 +143,10 @@ fn a_p2wsh_multisig_spend_costs_one_per_key_of_the_witness_script() {
     let witness_script = multisig(2, 3);
     let spent = ScriptBuf::new_p2wsh(&WScriptHash::hash(witness_script.as_bytes()));
     let t = tx(
-        vec![input(ScriptBuf::new(), &[&[], &SIG, &SIG, witness_script.as_bytes()])],
+        vec![input(
+            ScriptBuf::new(),
+            &[&[], &SIG, &SIG, witness_script.as_bytes()],
+        )],
         vec![p2wpkh()],
     );
     assert_eq!(sigop_cost(&t, &spending(spent)), 3);
@@ -151,11 +168,17 @@ fn inputs_and_outputs_add_up() {
         .push_slice(push(redeem.as_bytes()))
         .into_script();
     let t = tx(
-        vec![input(ScriptBuf::new(), &[&SIG, &KEY]), input(script_sig, &[])],
+        vec![
+            input(ScriptBuf::new(), &[&SIG, &KEY]),
+            input(script_sig, &[]),
+        ],
         vec![p2pkh(), p2tr()],
     );
     let spent = vec![
-        Some(TxOut { value: Amount::from_sat(1), script_pubkey: p2wpkh() }),
+        Some(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: p2wpkh(),
+        }),
         Some(TxOut {
             value: Amount::from_sat(1),
             script_pubkey: ScriptBuf::new_p2sh(&ScriptHash::hash(redeem.as_bytes())),
@@ -173,11 +196,20 @@ fn an_input_whose_spent_output_is_unknown_adds_nothing() {
         .push_slice(push(redeem.as_bytes()))
         .into_script();
     let t = tx(
-        vec![input(ScriptBuf::new(), &[&SIG, &KEY]), input(script_sig, &[])],
+        vec![
+            input(ScriptBuf::new(), &[&SIG, &KEY]),
+            input(script_sig, &[]),
+        ],
         vec![p2pkh()],
     );
     // The P2WPKH output is known, the P2SH one is not: 1 + the output's 4.
-    let spent = vec![Some(TxOut { value: Amount::from_sat(1), script_pubkey: p2wpkh() }), None];
+    let spent = vec![
+        Some(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: p2wpkh(),
+        }),
+        None,
+    ];
     assert_eq!(sigop_cost(&t, &spent), 5);
     // Neither: the legacy count alone.
     assert_eq!(sigop_cost(&t, &[None, None]), 4);
@@ -187,15 +219,24 @@ fn coinbase(outputs: Vec<ScriptBuf>) -> Transaction {
     let mut cb = regtest_block(BlockHash::all_zeros(), 1, 0).txdata.remove(0);
     cb.output = outputs
         .into_iter()
-        .map(|script_pubkey| TxOut { value: Amount::from_sat(1_000), script_pubkey })
+        .map(|script_pubkey| TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey,
+        })
         .collect();
     cb
 }
 
 #[test]
 fn a_coinbase_costs_its_legacy_sigops() {
-    let p2pk = Builder::new().push_slice(KEY).push_opcode(opcodes::all::OP_CHECKSIG).into_script();
-    assert_eq!(sigop_cost(&coinbase(vec![p2pk.clone(), p2wpkh()]), &[None]), 4);
+    let p2pk = Builder::new()
+        .push_slice(KEY)
+        .push_opcode(opcodes::all::OP_CHECKSIG)
+        .into_script();
+    assert_eq!(
+        sigop_cost(&coinbase(vec![p2pk.clone(), p2wpkh()]), &[None]),
+        4
+    );
     assert_eq!(sigop_cost(&coinbase(vec![p2wpkh()]), &[None]), 0);
     // An OP_CHECKSIG in the coinbase's scriptSig counts too.
     let mut cb = coinbase(vec![p2pk]);
@@ -210,18 +251,22 @@ fn a_coinbase_costs_its_legacy_sigops() {
 fn connect_coinbase_paying(state: &EsploraState, outputs: Vec<ScriptBuf>) -> Transaction {
     let (tip, height) = state.chain.tip_snapshot();
     let mut block = regtest_block(tip, height + 1, 0);
-    block.txdata[0].output.extend(
-        outputs
-            .into_iter()
-            .map(|script_pubkey| TxOut { value: Amount::from_sat(5_000), script_pubkey }),
-    );
+    block.txdata[0]
+        .output
+        .extend(outputs.into_iter().map(|script_pubkey| TxOut {
+            value: Amount::from_sat(5_000),
+            script_pubkey,
+        }));
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     block.header.nonce = 0;
     let target = block.header.target();
     while !target.is_met_by(block.block_hash()) {
         block.header.nonce += 1;
     }
-    state.chain.accept_block(&block).expect("connect test block");
+    state
+        .chain
+        .accept_block(&block)
+        .expect("connect test block");
     assert_eq!(state.chain.tip_snapshot().0, block.block_hash());
     block.txdata.remove(0)
 }
@@ -233,13 +278,19 @@ fn the_tx_json_counts_with_the_prevouts_it_resolved() {
     let (state, _dir) = regtest_state();
     let funding = connect_coinbase_paying(&state, vec![p2wpkh()]);
     let mut spend = tx(vec![input(ScriptBuf::new(), &[&SIG, &KEY])], vec![p2pkh()]);
-    spend.input[0].previous_output = OutPoint { txid: funding.compute_txid(), vout: 1 };
+    spend.input[0].previous_output = OutPoint {
+        txid: funding.compute_txid(),
+        vout: 1,
+    };
 
     let json = build_mempool_tx_json(&state, &spend).unwrap();
     assert_eq!(json.fee, Some(4_000), "the prevout was resolved");
     // 1 for the P2WPKH input, 4 for the P2PKH output.
     assert_eq!(json.sigops, 5);
-    assert_eq!(serde_json::to_value(&json).unwrap()["sigops"], serde_json::json!(5));
+    assert_eq!(
+        serde_json::to_value(&json).unwrap()["sigops"],
+        serde_json::json!(5)
+    );
 
     // The same spend of an output nobody holds: the legacy count, no fee.
     spend.input[0].previous_output.vout = 9;
@@ -251,18 +302,27 @@ fn the_tx_json_counts_with_the_prevouts_it_resolved() {
 #[tokio::test]
 async fn tx_route_serves_sigops_for_a_coinbase() {
     let (state, _dir) = regtest_state();
-    let p2pk = Builder::new().push_slice(KEY).push_opcode(opcodes::all::OP_CHECKSIG).into_script();
+    let p2pk = Builder::new()
+        .push_slice(KEY)
+        .push_opcode(opcodes::all::OP_CHECKSIG)
+        .into_script();
     let with_sigop = connect_coinbase_paying(&state, vec![p2pk]).compute_txid();
     let without = connect_coinbase_paying(&state, vec![p2wpkh()]).compute_txid();
     let router = crate::build_router(state).unwrap();
     for (txid, sigops) in [(with_sigop, 4), (without, 0)] {
         let resp = router
             .clone()
-            .oneshot(Request::get(format!("/tx/{txid}")).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get(format!("/tx/{txid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["vin"][0]["is_coinbase"], true, "{json}");
         // A number even when it is 0, not a missing key.
@@ -276,13 +336,21 @@ async fn tx_route_serves_sigops_for_a_coinbase() {
 #[test]
 fn a_stripped_transaction_keeps_its_sigops() {
     let (state, _dir) = regtest_state();
-    let t = tx(vec![input(ScriptBuf::new(), &[])], vec![p2pkh(), ScriptBuf::new_op_return([])]);
+    let t = tx(
+        vec![input(ScriptBuf::new(), &[])],
+        vec![p2pkh(), ScriptBuf::new_op_return([])],
+    );
     let stripped = [(1u32, 40u64)];
-    let view = TxView { tx: &t, txid: t.compute_txid(), stripped: Some(&stripped) };
+    let view = TxView {
+        tx: &t,
+        txid: t.compute_txid(),
+        stripped: Some(&stripped),
+    };
     let json = serde_json::to_value(build_tx_json(&state, &view, None).unwrap()).unwrap();
     assert_eq!(json["opreturn_stripped"], true);
     assert_eq!(json["sigops"], 4, "{json}");
 
-    let json = serde_json::to_value(build_tx_json(&state, &TxView::intact(&t), None).unwrap()).unwrap();
+    let json =
+        serde_json::to_value(build_tx_json(&state, &TxView::intact(&t), None).unwrap()).unwrap();
     assert_eq!(json["sigops"], 4, "{json}");
 }

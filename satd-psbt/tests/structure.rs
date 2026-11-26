@@ -94,7 +94,10 @@ fn a_share_without_a_proof_is_refused() {
 
     let v = common::bip375_valid()
         .into_iter()
-        .find(|v| v.description.starts_with("can finalize: two inputs single-signer using global"))
+        .find(|v| {
+            v.description
+                .starts_with("can finalize: two inputs single-signer using global")
+        })
         .expect("the vector is in the file");
     let mut raw = RawPsbt::parse(&v.psbt).expect("parses");
     validate_structure(&raw).expect("the untouched vector is structurally sound");

@@ -5,10 +5,10 @@
 //!
 //! Run: `cargo bench --bench legacy`
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 mod common;
-use common::{filter_category, load_script_tests, make_criterion, run_suite, Category};
+use common::{Category, filter_category, load_script_tests, make_criterion, run_suite};
 
 fn legacy_suite(c: &mut Criterion) {
     let workload = filter_category(load_script_tests(), Category::Legacy);

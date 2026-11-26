@@ -11,9 +11,7 @@ use tokio::sync::broadcast;
 
 use crate::keys::Scripthash;
 use crate::subscribe::SubscribeError;
-use crate::types::{
-    HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo,
-};
+use crate::types::{HistoryEntry, IndexError, MempoolHistoryEntry, StatusUpdate, Utxo};
 
 pub trait AddressIndex: Send + Sync {
     /// All confirmed funding + spending rows for `sh`, ordered by
@@ -122,7 +120,9 @@ pub trait AddressIndex: Send + Sync {
                 None => return Ok(None),
             },
         };
-        Ok(Some(newest_first.into_iter().skip(start).take(limit).collect()))
+        Ok(Some(
+            newest_first.into_iter().skip(start).take(limit).collect(),
+        ))
     }
 
     /// Refuse a history above `cap`: `Err(IndexError::HistoryTooLarge {

@@ -9,10 +9,10 @@ use crate::checker::NoopChecker;
 /// does not share a range expression with the code under test.
 const CORE_OP_SUCCESS: [u8; 87] = [
     80, 98, 126, 127, 128, 129, 131, 132, 133, 134, 137, 138, 141, 142, 149, 150, 151, 152, 153,
-    187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204,
-    205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222,
-    223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240,
-    241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254,
+    187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205,
+    206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224,
+    225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243,
+    244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254,
 ];
 
 #[test]
@@ -33,7 +33,11 @@ fn op_success_prescan_finds_left_right_and_bitwise_opcodes() {
     for op in [0x80u8, 0x81, 0x83, 0x84, 0x85, 0x86] {
         // Anywhere in the leaf, including after an unexecuted IF.
         for leaf in [vec![op], vec![0x00, 0x63, op, 0x68, 0x51]] {
-            assert_eq!(scan_for_op_success(&leaf, 0), Some(Ok(())), "leaf {leaf:02x?}");
+            assert_eq!(
+                scan_for_op_success(&leaf, 0),
+                Some(Ok(())),
+                "leaf {leaf:02x?}"
+            );
             assert_eq!(
                 scan_for_op_success(&leaf, flags::VERIFY_DISCOURAGE_OP_SUCCESS),
                 Some(Err(ScriptError::DiscourageOpSuccess)),
@@ -60,7 +64,11 @@ fn op_success_prescan_skips_push_data() {
         leaf.extend([0x50; 3]);
         assert_eq!(scan_for_op_success(&leaf, 0), None, "push {push:02x?}");
         leaf.push(0x50);
-        assert_eq!(scan_for_op_success(&leaf, 0), Some(Ok(())), "push {push:02x?} then OP_SUCCESS80");
+        assert_eq!(
+            scan_for_op_success(&leaf, 0),
+            Some(Ok(())),
+            "push {push:02x?} then OP_SUCCESS80"
+        );
     }
 }
 
@@ -82,7 +90,11 @@ fn op_success_prescan_reports_an_unreadable_push_as_bad_opcode() {
         &[0x6a, 0x4e, 0x61, 0x61, 0x61, 0x61, 0x61],
     ];
     for leaf in truncated {
-        assert_eq!(scan_for_op_success(leaf, 0), Some(Err(ScriptError::BadOpcode)), "leaf {leaf:02x?}");
+        assert_eq!(
+            scan_for_op_success(leaf, 0),
+            Some(Err(ScriptError::BadOpcode)),
+            "leaf {leaf:02x?}"
+        );
     }
     // An OP_SUCCESSx ahead of the unreadable push ends the scan first.
     assert_eq!(scan_for_op_success(&[0x50, 0x4c], 0), Some(Ok(())));
@@ -102,10 +114,18 @@ fn pay_to_anchor_is_not_discouraged() {
     // true ahead of the DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM branch
     // (src/script/interpreter.cpp:1990), whatever the witness holds.
     for witness in [vec![], vec![vec![0x01]]] {
-        let r = verify_witness_program(&witness, 1, &P2A_PROGRAM, discourage(), &NoopChecker, false);
+        let r =
+            verify_witness_program(&witness, 1, &P2A_PROGRAM, discourage(), &NoopChecker, false);
         assert_eq!(r, Ok(()), "witness {witness:?}");
     }
-    let r = verify_witness_program(&[], 1, &P2A_PROGRAM, flags::VERIFY_P2SH | flags::VERIFY_WITNESS, &NoopChecker, false);
+    let r = verify_witness_program(
+        &[],
+        1,
+        &P2A_PROGRAM,
+        flags::VERIFY_P2SH | flags::VERIFY_WITNESS,
+        &NoopChecker,
+        false,
+    );
     assert_eq!(r, Ok(()));
 }
 

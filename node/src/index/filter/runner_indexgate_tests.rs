@@ -15,7 +15,9 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::{Block, Network};
 
 use node_filter_index::cursor::BackfillState;
-use node_filter_index::{FILTER_TYPE_BASIC, FilterHeaderRow, FilterIndexConfig, FilterKey, FilterRow};
+use node_filter_index::{
+    FILTER_TYPE_BASIC, FilterHeaderRow, FilterIndexConfig, FilterKey, FilterRow,
+};
 
 use crate::chain::state::tests::build_test_block;
 use crate::chain::state::{AssumeValid, ChainState};
@@ -46,14 +48,24 @@ fn chain(dir: &std::path::Path, live_filters: bool) -> ChainState {
         16,
         2,
         Default::default(),
-        if live_filters { enabled() } else { Default::default() },
+        if live_filters {
+            enabled()
+        } else {
+            Default::default()
+        },
         Default::default(),
     )
     .unwrap()
 }
 
 /// Build and connect a branch of `n` blocks on `parent` at `parent_height`.
-fn extend(cs: &ChainState, parent: bitcoin::BlockHash, parent_height: u32, n: u32, salt: u32) -> Vec<Block> {
+fn extend(
+    cs: &ChainState,
+    parent: bitcoin::BlockHash,
+    parent_height: u32,
+    n: u32,
+    salt: u32,
+) -> Vec<Block> {
     let mut parent = parent;
     (1..=n)
         .map(|i| {
@@ -70,7 +82,11 @@ fn header(cs: &ChainState, height: u32) -> Option<[u8; 32]> {
     cs.store_ref().get_filter_header(FILTER_TYPE_BASIC, height)
 }
 
-fn running_cursor(snapshot_height: u32, cursor_height: u32, anchor: bitcoin::BlockHash) -> BackfillCursor {
+fn running_cursor(
+    snapshot_height: u32,
+    cursor_height: u32,
+    anchor: bitcoin::BlockHash,
+) -> BackfillCursor {
     BackfillCursor {
         state: BackfillState::Running,
         cursor_height,
@@ -99,7 +115,10 @@ fn reorg_cleanup_keeps_the_rows_the_live_path_wrote() {
     assert_eq!(cs.tip_hash(), b[2].block_hash(), "the B branch is active");
     cs.store_ref().flush().unwrap();
     let live: Vec<Option<[u8; 32]>> = (0..=4).map(|h| header(&cs, h)).collect();
-    assert!(live.iter().all(|h| h.is_some()), "live rows at 0..=4: {live:?}");
+    assert!(
+        live.iter().all(|h| h.is_some()),
+        "live rows at 0..=4: {live:?}"
+    );
 
     BackfillRunner::cleanup_stale_rows_after_reorg(&cs, &handle).expect("cleanup runs");
 
@@ -122,7 +141,8 @@ fn reorg_cleanup_removes_a_row_above_the_live_tip() {
     let a = extend(&cs, genesis, 0, 3, 0);
     let handle = BackfillHandle::new(running_cursor(3, 3, a[2].block_hash()));
 
-    cs.invalidate_block(a[2].block_hash()).expect("invalidate A3");
+    cs.invalidate_block(a[2].block_hash())
+        .expect("invalidate A3");
     assert_eq!(cs.tip_height(), 2);
     // A row for A3 that a backfill write left behind.
     let key = FilterKey {
@@ -130,8 +150,14 @@ fn reorg_cleanup_removes_a_row_above_the_live_tip() {
         height: 3,
     };
     let mut stale = StoreBatch::default();
-    stale.filter_puts.push(FilterRow { key, filter: vec![1] });
-    stale.filter_header_puts.push(FilterHeaderRow { key, header: [3u8; 32] });
+    stale.filter_puts.push(FilterRow {
+        key,
+        filter: vec![1],
+    });
+    stale.filter_header_puts.push(FilterHeaderRow {
+        key,
+        header: [3u8; 32],
+    });
     cs.store_ref().write_batch(stale).unwrap();
     cs.store_ref().flush().unwrap();
     let kept = header(&cs, 2);
@@ -139,7 +165,11 @@ fn reorg_cleanup_removes_a_row_above_the_live_tip() {
 
     BackfillRunner::cleanup_stale_rows_after_reorg(&cs, &handle).expect("cleanup runs");
 
-    assert_eq!(header(&cs, 3), None, "the row above the live tip is removed");
+    assert_eq!(
+        header(&cs, 3),
+        None,
+        "the row above the live tip is removed"
+    );
     assert_eq!(header(&cs, 2), kept, "the live row below it is kept");
 }
 
@@ -153,9 +183,17 @@ fn the_backfill_writes_rows_only_under_accept_lock() {
     let cs = Arc::new(chain(dir.path(), false));
     let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
     let blocks = extend(&cs, genesis, 0, 5, 0);
-    assert_eq!(header(&cs, 0), None, "the live path writes no filter rows here");
+    assert_eq!(
+        header(&cs, 0),
+        None,
+        "the live path writes no filter rows here"
+    );
 
-    let handle = Arc::new(BackfillHandle::new(running_cursor(5, 0, blocks[4].block_hash())));
+    let handle = Arc::new(BackfillHandle::new(running_cursor(
+        5,
+        0,
+        blocks[4].block_hash(),
+    )));
     let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let runner = BackfillRunner {
         handle: handle.clone(),
@@ -175,6 +213,9 @@ fn the_backfill_writes_rows_only_under_accept_lock() {
         written_while_held.is_empty(),
         "rows written while accept_lock was held: {written_while_held:?}"
     );
-    assert!((0..=5).all(|h| header(&cs, h).is_some()), "every row written afterwards");
+    assert!(
+        (0..=5).all(|h| header(&cs, h).is_some()),
+        "every row written afterwards"
+    );
     assert_eq!(handle.cursor().state, BackfillState::Completed);
 }

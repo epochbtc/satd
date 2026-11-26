@@ -2,7 +2,7 @@ use crate::chain::state::ChainState;
 use crate::net::manager::PeerManager;
 use crate::net::peer::PeerId;
 use bitcoin::BlockHash;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Bitcoin Core's `RPC_MISC_ERROR`, the code Core's own `getblockfrompeer`
 /// uses for every one of its rejections.
@@ -85,10 +85,7 @@ pub fn get_block_from_peer(
             ));
         }
         crate::storage::blockindex::BlockStatus::Invalid => {
-            return Err((
-                RPC_MISC_ERROR,
-                "Block is marked invalid".to_string(),
-            ));
+            return Err((RPC_MISC_ERROR, "Block is marked invalid".to_string()));
         }
         _ => {}
     }
@@ -115,7 +112,6 @@ pub fn get_block_from_peer(
     Ok(json!({}))
 }
 
-
 /// Build the `getnetworkinfo` response with live connection data.
 pub fn get_network_info(
     peer_manager: &PeerManager,
@@ -129,8 +125,14 @@ pub fn get_network_info(
         (bitcoin::p2p::ServiceFlags::NETWORK, "NETWORK"),
         (bitcoin::p2p::ServiceFlags::BLOOM, "BLOOM"),
         (bitcoin::p2p::ServiceFlags::WITNESS, "WITNESS"),
-        (bitcoin::p2p::ServiceFlags::COMPACT_FILTERS, "COMPACT_FILTERS"),
-        (bitcoin::p2p::ServiceFlags::NETWORK_LIMITED, "NETWORK_LIMITED"),
+        (
+            bitcoin::p2p::ServiceFlags::COMPACT_FILTERS,
+            "COMPACT_FILTERS",
+        ),
+        (
+            bitcoin::p2p::ServiceFlags::NETWORK_LIMITED,
+            "NETWORK_LIMITED",
+        ),
         (bitcoin::p2p::ServiceFlags::P2P_V2, "P2P_V2"),
         (crate::net::peer::node_intact_blocks(), "INTACT_BLOCKS"),
         (crate::nap::p2p::node_nap(), "NAP"),
@@ -159,8 +161,18 @@ pub fn get_network_info(
     let networks: Vec<Value> = {
         use crate::net::reachable::Network;
         [
-            ("ipv4", Network::Ipv4, clearnet_proxy.clone(), clearnet_randomize),
-            ("ipv6", Network::Ipv6, clearnet_proxy.clone(), clearnet_randomize),
+            (
+                "ipv4",
+                Network::Ipv4,
+                clearnet_proxy.clone(),
+                clearnet_randomize,
+            ),
+            (
+                "ipv6",
+                Network::Ipv6,
+                clearnet_proxy.clone(),
+                clearnet_randomize,
+            ),
             ("onion", Network::Onion, onion_proxy, onion_randomize),
             ("i2p", Network::I2p, String::new(), false),
             ("cjdns", Network::Cjdns, clearnet_proxy, clearnet_randomize),
@@ -181,9 +193,7 @@ pub fn get_network_info(
     let local_addresses: Vec<Value> = peer_manager
         .local_addresses()
         .into_iter()
-        .map(|(address, port, score)| {
-            json!({ "address": address, "port": port, "score": score })
-        })
+        .map(|(address, port, score)| json!({ "address": address, "port": port, "score": score }))
         .collect();
 
     let unit = crate::rpc::amounts::default_unit();
@@ -259,7 +269,14 @@ mod tests {
     /// wired to it. No peers are connected, which is what the tests below
     /// want: every assertion here is about the checks that run *before* a
     /// peer is chosen.
-    fn fixture(n: u32) -> (Arc<ChainState>, Arc<PeerManager>, Vec<bitcoin::Block>, std::path::PathBuf) {
+    fn fixture(
+        n: u32,
+    ) -> (
+        Arc<ChainState>,
+        Arc<PeerManager>,
+        Vec<bitcoin::Block>,
+        std::path::PathBuf,
+    ) {
         let (cs, dir) = make_chain_state();
         let cs = Arc::new(cs);
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
@@ -379,8 +396,7 @@ mod tests {
             .unwrap();
         cs.resync_block_append_pos().unwrap();
 
-        let (code, msg) =
-            get_block_from_peer(&cs, &pm, &hash.to_string(), Some(4242)).unwrap_err();
+        let (code, msg) = get_block_from_peer(&cs, &pm, &hash.to_string(), Some(4242)).unwrap_err();
         assert_eq!(code, RPC_MISC_ERROR);
         // Core's exact wording, so a Core-derived client's assertion holds.
         assert_eq!(msg, "Peer does not exist");

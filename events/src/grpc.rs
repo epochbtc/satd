@@ -16,9 +16,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use node::events::{EventSink, NodeEvent, NodeEventBody};
@@ -86,11 +86,9 @@ impl Default for GrpcLimits {
 }
 
 use crate::proto::v1 as pb;
-use crate::watchset::{bounded_txid_depth_pairs, WatchSet};
+use crate::proto::v1::node_event_stream_server::{NodeEventStream, NodeEventStreamServer};
+use crate::watchset::{WatchSet, bounded_txid_depth_pairs};
 use zeroize::Zeroize;
-use crate::proto::v1::node_event_stream_server::{
-    NodeEventStream, NodeEventStreamServer,
-};
 
 /// gRPC adapter errors surfaced at sink construction time.
 #[derive(Debug, thiserror::Error)]
@@ -275,7 +273,9 @@ impl GrpcEventSink {
                         .mtls_client_ca
                         .as_ref()
                         .ok_or(GrpcEventSinkError::MtlsWithoutCa)?;
-                    tls_config::ClientAuthPolicy::Required { ca_path: ca.clone() }
+                    tls_config::ClientAuthPolicy::Required {
+                        ca_path: ca.clone(),
+                    }
                 } else {
                     tls_config::ClientAuthPolicy::Disabled
                 };
@@ -379,7 +379,9 @@ impl EventSink for GrpcEventSink {
         // owned permit released when the connection (and thus the wrapping
         // `PermittedTcp`) is dropped. `0` disables the cap.
         let conn_sem = if self.limits.max_conns > 0 {
-            Some(Arc::new(Semaphore::new(node::http_serve::clamp_cap(self.limits.max_conns))))
+            Some(Arc::new(Semaphore::new(node::http_serve::clamp_cap(
+                self.limits.max_conns,
+            ))))
         } else {
             None
         };
@@ -439,7 +441,10 @@ impl EventSink for GrpcEventSink {
                                 Ok(p) => Some(p),
                                 Err(_) => {
                                     static AT_CAPACITY: node::warn_budget::WarnBudget =
-                                        node::warn_budget::WarnBudget::new(5, Duration::from_secs(60));
+                                        node::warn_budget::WarnBudget::new(
+                                            5,
+                                            Duration::from_secs(60),
+                                        );
                                     if let Some(suppressed) = AT_CAPACITY.tick() {
                                         warn!(
                                             target: "events::grpc",
@@ -475,7 +480,10 @@ impl EventSink for GrpcEventSink {
                                 }
                                 Err(_) => {
                                     static TIMEOUTS: node::warn_budget::WarnBudget =
-                                        node::warn_budget::WarnBudget::new(5, Duration::from_secs(60));
+                                        node::warn_budget::WarnBudget::new(
+                                            5,
+                                            Duration::from_secs(60),
+                                        );
                                     if let Some(suppressed) = TIMEOUTS.tick() {
                                         warn!(
                                             target: "events::grpc",
@@ -582,7 +590,10 @@ impl EventSink for GrpcEventSink {
             Server::builder()
                 .http2_keepalive_interval(Some(GRPC_KEEPALIVE_INTERVAL))
                 .http2_keepalive_timeout(Some(GRPC_KEEPALIVE_TIMEOUT))
-                .add_service(NodeEventStreamServer::with_interceptor(svc_impl, interceptor))
+                .add_service(NodeEventStreamServer::with_interceptor(
+                    svc_impl,
+                    interceptor,
+                ))
                 .serve_with_incoming_shutdown(incoming, shutdown_signal)
                 .await
         } else {
@@ -669,17 +680,11 @@ impl AsyncWrite for PermittedTcp {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 
@@ -887,7 +892,10 @@ fn head_cursor(
 /// response, when there is one.
 fn stamp_head<T>(mut resp: Response<T>, head: Option<node::events::Cursor>) -> Response<T> {
     if let Some(c) = head {
-        let v = format!("{}:{}:{}:{}", c.height, c.tx_index, c.mempool_seq, c.instance_id);
+        let v = format!(
+            "{}:{}:{}:{}",
+            c.height, c.tx_index, c.mempool_seq, c.instance_id
+        );
         if let Ok(v) = tonic::metadata::MetadataValue::try_from(v.as_str()) {
             resp.metadata_mut().insert(HEAD_CURSOR_METADATA_KEY, v);
         }
@@ -913,8 +921,7 @@ fn stamp_version<T>(mut resp: Response<T>) -> Response<T> {
 impl NodeEventStream for NodeEventStreamSvc {
     type SubscribeStream =
         Pin<Box<dyn Stream<Item = Result<pb::NodeEvent, Status>> + Send + 'static>>;
-    type WatchStream =
-        Pin<Box<dyn Stream<Item = Result<pb::NodeEvent, Status>> + Send + 'static>>;
+    type WatchStream = Pin<Box<dyn Stream<Item = Result<pb::NodeEvent, Status>> + Send + 'static>>;
 
     async fn subscribe(
         &self,
@@ -2157,9 +2164,13 @@ fn apply_control(
     match ctrl.msg {
         Some(Msg::AddOutpoints(a)) => {
             return watch_set
-                .add_outpoints(principal, a.outpoints.iter().filter_map(parse_outpoint), |ops| {
-                    handle.add_outpoints(ops);
-                })
+                .add_outpoints(
+                    principal,
+                    a.outpoints.iter().filter_map(parse_outpoint),
+                    |ops| {
+                        handle.add_outpoints(ops);
+                    },
+                )
                 .err();
         }
         Some(Msg::AddScripts(a)) => {
@@ -2177,7 +2188,10 @@ fn apply_control(
                 return Some(AddRejected {
                     reason: AddRejectReason::Malformed,
                     items: RejectedItems::Scripts(
-                        a.scripthashes.iter().filter_map(|b| parse_scripthash(b)).collect(),
+                        a.scripthashes
+                            .iter()
+                            .filter_map(|b| parse_scripthash(b))
+                            .collect(),
                     ),
                 });
             } else {
@@ -2187,7 +2201,8 @@ fn apply_control(
                     .iter()
                     .enumerate()
                     .filter_map(|(i, b)| {
-                        parse_scripthash(b).map(|sh| (sh, a.min_values.get(i).copied().unwrap_or(0)))
+                        parse_scripthash(b)
+                            .map(|sh| (sh, a.min_values.get(i).copied().unwrap_or(0)))
                     })
                     .collect();
                 // Apply the parsed floors to a set of scripthashes. Used for
@@ -2533,8 +2548,9 @@ fn desired_from_proto(
     }
     let mut prefixes = Vec::with_capacity(s.prefixes.len());
     for p in &s.prefixes {
-        let parsed = crate::watchset::parse_prefix(&p.prefix, p.bits, prefix_min_bits, prefix_max_bits)
-            .ok_or("prefix")?;
+        let parsed =
+            crate::watchset::parse_prefix(&p.prefix, p.bits, prefix_min_bits, prefix_max_bits)
+                .ok_or("prefix")?;
         prefixes.push(parsed);
     }
     let mut sp_targets = Vec::with_capacity(s.silent_payments.len());
@@ -2561,13 +2577,15 @@ fn watch_set_result_to_proto(
 ) -> pb::NodeEvent {
     use crate::watchset::ReplaceOutcome;
     let outcome = match outcome {
-        ReplaceOutcome::Accepted { added, removed, unchanged } => {
-            pb::watch_set_result::Outcome::Accepted(pb::WatchSetAccepted {
-                added: *added,
-                removed: *removed,
-                unchanged: *unchanged,
-            })
-        }
+        ReplaceOutcome::Accepted {
+            added,
+            removed,
+            unchanged,
+        } => pb::watch_set_result::Outcome::Accepted(pb::WatchSetAccepted {
+            added: *added,
+            removed: *removed,
+            unchanged: *unchanged,
+        }),
         ReplaceOutcome::Rejected { required, quota } => {
             pb::watch_set_result::Outcome::Rejected(pb::WatchSetRejected {
                 reason: pb::watch_set_rejected::Reason::QuotaExceeded as i32,
@@ -2594,9 +2612,11 @@ fn watch_set_result_to_proto(
         schema_version: node::events::SCHEMA_VERSION,
         stamp: Some(replay_stamp(edge)),
         cursor: None,
-        body: Some(pb::node_event::Body::SetWatchSetResult(pb::WatchSetResult {
-            outcome: Some(outcome),
-        })),
+        body: Some(pb::node_event::Body::SetWatchSetResult(
+            pb::WatchSetResult {
+                outcome: Some(outcome),
+            },
+        )),
     }
 }
 
@@ -2612,7 +2632,11 @@ fn watch_add_rejected_to_proto(
     use pb::watch_add_rejected::{Kind, Reason};
     let mut r = pb::WatchAddRejected::default();
     match rejected.reason {
-        AddRejectReason::QuotaExceeded { required, held, quota } => {
+        AddRejectReason::QuotaExceeded {
+            required,
+            held,
+            quota,
+        } => {
             r.reason = Reason::QuotaExceeded as i32;
             r.required = required;
             r.held = held;
@@ -2639,7 +2663,10 @@ fn watch_add_rejected_to_proto(
             r.kind = Kind::Outpoints as i32;
             r.outpoints = ops
                 .iter()
-                .map(|op| pb::Outpoint { txid: op.txid.to_byte_array().to_vec(), vout: op.vout })
+                .map(|op| pb::Outpoint {
+                    txid: op.txid.to_byte_array().to_vec(),
+                    vout: op.vout,
+                })
                 .collect();
         }
         RejectedItems::Transactions(txids) => {
@@ -2650,10 +2677,18 @@ fn watch_add_rejected_to_proto(
             r.kind = Kind::DepthAlarms as i32;
             r.depth_alarms = pairs
                 .iter()
-                .map(|(t, depth)| pb::WatchDepthAlarm { txid: t.to_byte_array().to_vec(), depth: *depth })
+                .map(|(t, depth)| pb::WatchDepthAlarm {
+                    txid: t.to_byte_array().to_vec(),
+                    depth: *depth,
+                })
                 .collect();
         }
-        RejectedItems::Descriptor { descriptor, gap_limit, start, kept } => {
+        RejectedItems::Descriptor {
+            descriptor,
+            gap_limit,
+            start,
+            kept,
+        } => {
             r.kind = Kind::Descriptor as i32;
             r.descriptor = descriptor.clone();
             r.gap_limit = *gap_limit;
@@ -2763,8 +2798,7 @@ fn parse_outpoint(op: &pb::Outpoint) -> Option<bitcoin::OutPoint> {
     }
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&op.txid);
-    let txid =
-        bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes));
+    let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes));
     Some(bitcoin::OutPoint {
         txid,
         vout: op.vout,
@@ -3223,10 +3257,7 @@ fn off_reactor<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-fn refine_block_tweaks(
-    env: &NodeEvent,
-    opts: &TweakServeOpts,
-) -> Option<(NodeEvent, bool)> {
+fn refine_block_tweaks(env: &NodeEvent, opts: &TweakServeOpts) -> Option<(NodeEvent, bool)> {
     if !opts.reads_block() {
         return None;
     }
@@ -3280,9 +3311,7 @@ fn refine_block_tweaks(
             // owns. A transaction with nothing left unspent has no coin at any
             // k, so dropping it whole is safe; trimming a survivor is not.
             let outs = match by_txid.get(&e.txid) {
-                Some(outs)
-                    if may_cut && !node::sp_serve::any_unspent(e.txid, outs, &unspent) =>
-                {
+                Some(outs) if may_cut && !node::sp_serve::any_unspent(e.txid, outs, &unspent) => {
                     cut = true;
                     continue;
                 }
@@ -3445,9 +3474,7 @@ fn region_to_string(region: Option<&[u8; 8]>) -> String {
         None => String::new(),
         Some(raw) => {
             let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-            std::str::from_utf8(&raw[..end])
-                .unwrap_or("")
-                .to_string()
+            std::str::from_utf8(&raw[..end]).unwrap_or("").to_string()
         }
     }
 }
@@ -3518,7 +3545,11 @@ fn status_event_to_proto(ev: &node::events::StatusEvent) -> pb::StatusEvent {
         // the HMAC-signed webhook body); proto maps are unordered, so the
         // ordering guarantee simply does not carry here — no consumer of the
         // proto surface depends on it.
-        details: ev.details.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        details: ev
+            .details
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
 }
 
@@ -3589,7 +3620,11 @@ fn mempool_event_to_proto(ev: &node::mempool::events::MempoolEvent) -> pb::Mempo
             block_hash: block_hash.as_raw_hash().to_byte_array().to_vec(),
             height: *height,
         }),
-        Mp::LeaveEvicted { txid, reason, mempool_sequence: _ } => MpBody::LeaveEvicted(pb::MempoolLeaveEvicted {
+        Mp::LeaveEvicted {
+            txid,
+            reason,
+            mempool_sequence: _,
+        } => MpBody::LeaveEvicted(pb::MempoolLeaveEvicted {
             txid: txid.as_raw_hash().to_byte_array().to_vec(),
             reason: match reason {
                 RustReason::FullPool => pb::EvictReason::FullPool as i32,
@@ -3663,16 +3698,16 @@ mod tests {
 
     fn sample_block_tweaks() -> node::events::BlockTweaks {
         node::events::BlockTweaks {
-            block_hash: BlockHash::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([9u8; 32]),
-            ),
+            block_hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [9u8; 32],
+            )),
             height: 100,
             entries: vec![
                 node::events::SpTweakEntry {
                     tweak: test_pubkey(1),
-                    txid: Txid::from_raw_hash(
-                        bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32]),
-                    ),
+                    txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                        [1u8; 32],
+                    )),
                     max_value: 1_000,
                     // Populated as a `tweak_outputs`-enriched entry would be, to
                     // exercise the proto passthrough.
@@ -3684,9 +3719,9 @@ mod tests {
                 },
                 node::events::SpTweakEntry {
                     tweak: test_pubkey(2),
-                    txid: Txid::from_raw_hash(
-                        bitcoin::hashes::sha256d::Hash::from_byte_array([2u8; 32]),
-                    ),
+                    txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                        [2u8; 32],
+                    )),
                     max_value: 50_000,
                     taproot_outputs: Vec::new(),
                 },
@@ -3727,8 +3762,14 @@ mod tests {
         assert_eq!(pb.state, pb::StatusState::Raised as i32);
         assert_eq!(pb.severity, pb::StatusSeverity::Critical as i32);
         assert_eq!(pb.message, "no block for 3612s");
-        assert_eq!(pb.details.get("seconds_since_block").map(String::as_str), Some("3612"));
-        assert_eq!(pb.details.get("threshold_seconds").map(String::as_str), Some("3600"));
+        assert_eq!(
+            pb.details.get("seconds_since_block").map(String::as_str),
+            Some("3612")
+        );
+        assert_eq!(
+            pb.details.get("threshold_seconds").map(String::as_str),
+            Some("3600")
+        );
 
         // Every kind and state has a distinct, non-UNSPECIFIED mapping — a
         // zero-valued enum on the wire would be indistinguishable from a field
@@ -3895,8 +3936,11 @@ mod tests {
 
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(42u32, block);
-        let scan: Arc<dyn node::events::BlockScanSource> =
-            Arc::new(MockScanBlocks { tip: 42, blocks, spent });
+        let scan: Arc<dyn node::events::BlockScanSource> = Arc::new(MockScanBlocks {
+            tip: 42,
+            blocks,
+            spent,
+        });
         (env, scan, txid)
     }
 
@@ -4002,11 +4046,18 @@ mod tests {
         let (env2, scan2, _) = enrichment_fixture(spent);
         let _ = (env, scan);
 
-        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(scan2)) };
+        let opts = TweakServeOpts {
+            unspent_only: true,
+            ..outputs_opts(Some(scan2))
+        };
         let (refined, cut) = refine_block_tweaks(&env2, &opts).expect("refined");
         assert!(!cut, "no entry was dropped, so the block is not `filtered`");
         let outs = &entries_of(&refined)[0].taproot_outputs;
-        assert_eq!(outs.len(), 2, "a surviving entry carries its full candidate set");
+        assert_eq!(
+            outs.len(),
+            2,
+            "a surviving entry carries its full candidate set"
+        );
         assert_eq!(
             (outs[0].vout, outs[1].vout),
             (0, 2),
@@ -4027,15 +4078,24 @@ mod tests {
         let (env2, scan2, _) = enrichment_fixture(spent);
         let _ = env;
 
-        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(scan2)) };
+        let opts = TweakServeOpts {
+            unspent_only: true,
+            ..outputs_opts(Some(scan2))
+        };
         let (refined, cut) = refine_block_tweaks(&env2, &opts).expect("refined");
-        assert!(entries_of(&refined).is_empty(), "nothing left to scan in this block");
+        assert!(
+            entries_of(&refined).is_empty(),
+            "nothing left to scan in this block"
+        );
         assert!(cut, "a dropped entry must set the block's `filtered` flag");
 
         // And the flag survives the proto mapping, which is where a client reads
         // it: an empty `entries` with `filtered` means "some were removed", not
         // "this block had none".
-        let opts_proto = TweakServeOpts { unspent_only: true, ..opts };
+        let opts_proto = TweakServeOpts {
+            unspent_only: true,
+            ..opts
+        };
         let ev = envelope_to_proto_sp(&refined, &opts_proto, cut);
         let Some(pb::node_event::Body::BlockTweaks(bt)) = ev.body else {
             panic!("expected BlockTweaks")
@@ -4075,14 +4135,19 @@ mod tests {
             ) -> Option<node::storage::opreturn_strip::StoredBlock> {
                 self.inner.block_body(hash)
             }
-            fn block_undo(&self, hash: &bitcoin::BlockHash) -> Option<node::storage::undo::UndoData> {
+            fn block_undo(
+                &self,
+                hash: &bitcoin::BlockHash,
+            ) -> Option<node::storage::undo::UndoData> {
                 self.inner.block_undo(hash)
             }
             fn is_unspent(&self, _outpoint: &bitcoin::OutPoint) -> bool {
                 false
             }
             fn chain_snapshot(&self) -> Option<(bitcoin::BlockHash, u32)> {
-                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let n = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Some((bitcoin::BlockHash::from_byte_array([n as u8; 32]), n))
             }
         }
@@ -4094,14 +4159,20 @@ mod tests {
                 calls: std::sync::atomic::AtomicU32::new(0),
             });
 
-        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(moving)) };
+        let opts = TweakServeOpts {
+            unspent_only: true,
+            ..outputs_opts(Some(moving))
+        };
         let (refined, cut) = refine_block_tweaks(&env, &opts).expect("refined");
         assert!(
             !entries_of(&refined).is_empty(),
             "the chain moved under the reads, so the entry must be served uncut \
              rather than dropped on a decision no single chain state supports",
         );
-        assert!(!cut, "nothing was cut, so the block must not claim it was filtered");
+        assert!(
+            !cut,
+            "nothing was cut, so the block must not claim it was filtered"
+        );
     }
 
     #[test]
@@ -4126,7 +4197,10 @@ mod tests {
             ) -> Option<node::storage::opreturn_strip::StoredBlock> {
                 self.0.block_body(hash)
             }
-            fn block_undo(&self, hash: &bitcoin::BlockHash) -> Option<node::storage::undo::UndoData> {
+            fn block_undo(
+                &self,
+                hash: &bitcoin::BlockHash,
+            ) -> Option<node::storage::undo::UndoData> {
                 self.0.block_undo(hash)
             }
             fn is_unspent(&self, _outpoint: &bitcoin::OutPoint) -> bool {
@@ -4138,9 +4212,15 @@ mod tests {
         let (env, scan, _txid) = enrichment_fixture(Default::default());
         let opaque: std::sync::Arc<dyn node::events::BlockScanSource> =
             std::sync::Arc::new(NoSnapshot(scan));
-        let opts = TweakServeOpts { unspent_only: true, ..outputs_opts(Some(opaque)) };
+        let opts = TweakServeOpts {
+            unspent_only: true,
+            ..outputs_opts(Some(opaque))
+        };
         let (refined, cut) = refine_block_tweaks(&env, &opts).expect("refined");
-        assert!(!entries_of(&refined).is_empty(), "no guarantee means no cutting");
+        assert!(
+            !entries_of(&refined).is_empty(),
+            "no guarantee means no cutting"
+        );
         assert!(!cut);
     }
 
@@ -4269,18 +4349,29 @@ mod tests {
         }
         let want = format!("5:0:3:{}", publisher.instance_id());
         let head = |md: &tonic::metadata::MetadataMap| {
-            md.get(HEAD_CURSOR_METADATA_KEY).and_then(|v| v.to_str().ok()).map(str::to_owned)
+            md.get(HEAD_CURSOR_METADATA_KEY)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
         };
 
-        let resp = client.subscribe(pb::SubscribeRequest::default()).await.expect("subscribe");
+        let resp = client
+            .subscribe(pb::SubscribeRequest::default())
+            .await
+            .expect("subscribe");
         assert_eq!(head(resp.metadata()), Some(want.clone()), "Subscribe");
         let (_ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(1);
-        let resp = client.watch(ReceiverStream::new(ctrl_rx)).await.expect("watch");
+        let resp = client
+            .watch(ReceiverStream::new(ctrl_rx))
+            .await
+            .expect("watch");
         assert_eq!(head(resp.metadata()), Some(want), "Watch");
         let _ = shutdown_tx.send(true);
 
         let (mut client, shutdown_tx) = version_metadata_fixture().await;
-        let resp = client.subscribe(pb::SubscribeRequest::default()).await.expect("subscribe");
+        let resp = client
+            .subscribe(pb::SubscribeRequest::default())
+            .await
+            .expect("subscribe");
         assert_eq!(head(resp.metadata()), None, "no block source, no head");
         let _ = shutdown_tx.send(true);
     }
@@ -4359,8 +4450,10 @@ mod tests {
         // needs block access to re-derive outputs; with no block source it is
         // refused rather than silently returning empty outputs.
         let publisher = EventPublisher::new(edge(), 16);
-        let sp: Arc<dyn node::index::silent_payments::SpIndex> =
-            Arc::new(MockSp { tip: 5, complete: true });
+        let sp: Arc<dyn node::index::silent_payments::SpIndex> = Arc::new(MockSp {
+            tip: 5,
+            complete: true,
+        });
         let svc = NodeEventStreamSvc {
             publisher,
             active_subs: Arc::new(AtomicUsize::new(0)),
@@ -4423,8 +4516,10 @@ mod tests {
         // block source the filter would silently do nothing, and a client that
         // asked to skip spent coins would quietly scan all of them instead.
         let publisher = EventPublisher::new(edge(), 16);
-        let sp: Arc<dyn node::index::silent_payments::SpIndex> =
-            Arc::new(MockSp { tip: 5, complete: true });
+        let sp: Arc<dyn node::index::silent_payments::SpIndex> = Arc::new(MockSp {
+            tip: 5,
+            complete: true,
+        });
         let svc = NodeEventStreamSvc {
             publisher,
             active_subs: Arc::new(AtomicUsize::new(0)),
@@ -4468,21 +4563,36 @@ mod tests {
             scripthashes: vec![vec![0x11; 32], vec![0x22; 31]],
             ..Default::default()
         };
-        assert!(desired_from_proto(&bad_sh, (8, 32)).is_err(), "bad scripthash rejects snapshot");
+        assert!(
+            desired_from_proto(&bad_sh, (8, 32)).is_err(),
+            "bad scripthash rejects snapshot"
+        );
 
         // A malformed outpoint (bad txid length) fails too.
         let bad_op = pb::SetWatchSet {
-            outpoints: vec![pb::Outpoint { txid: vec![0u8; 31], vout: 0 }],
+            outpoints: vec![pb::Outpoint {
+                txid: vec![0u8; 31],
+                vout: 0,
+            }],
             ..Default::default()
         };
-        assert!(desired_from_proto(&bad_op, (8, 32)).is_err(), "bad outpoint rejects snapshot");
+        assert!(
+            desired_from_proto(&bad_op, (8, 32)).is_err(),
+            "bad outpoint rejects snapshot"
+        );
 
         // A depth alarm with depth 0 is invalid.
         let bad_depth = pb::SetWatchSet {
-            depth_alarms: vec![pb::WatchDepthAlarm { txid: vec![0x33; 32], depth: 0 }],
+            depth_alarms: vec![pb::WatchDepthAlarm {
+                txid: vec![0x33; 32],
+                depth: 0,
+            }],
             ..Default::default()
         };
-        assert!(desired_from_proto(&bad_depth, (8, 32)).is_err(), "depth 0 rejects snapshot");
+        assert!(
+            desired_from_proto(&bad_depth, (8, 32)).is_err(),
+            "depth 0 rejects snapshot"
+        );
 
         // Non-empty min_values must be exactly parallel to scripthashes: too few
         // (would silently clear floors) and too many (silently ignored) are both
@@ -4492,13 +4602,19 @@ mod tests {
             min_values: vec![5],
             ..Default::default()
         };
-        assert!(desired_from_proto(&too_few, (8, 32)).is_err(), "too few floors rejects snapshot");
+        assert!(
+            desired_from_proto(&too_few, (8, 32)).is_err(),
+            "too few floors rejects snapshot"
+        );
         let too_many = pb::SetWatchSet {
             scripthashes: vec![vec![0x11; 32]],
             min_values: vec![5, 6],
             ..Default::default()
         };
-        assert!(desired_from_proto(&too_many, (8, 32)).is_err(), "too many floors rejects snapshot");
+        assert!(
+            desired_from_proto(&too_many, (8, 32)).is_err(),
+            "too many floors rejects snapshot"
+        );
         let parallel = pb::SetWatchSet {
             scripthashes: vec![vec![0x11; 32], vec![0x22; 32]],
             min_values: vec![5, 6],
@@ -4527,10 +4643,12 @@ mod tests {
         use bitcoin::hashes::Hash;
         use node::events::WatchMatch;
         let e = edge();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
-        let rep =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x22; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x11; 32],
+        ));
+        let rep = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x22; 32],
+        ));
 
         let ev = watch_match_to_proto(
             &e,
@@ -4580,7 +4698,11 @@ mod tests {
             }
             other => panic!("wrong body: {other:?}"),
         }
-        assert_eq!(ev.cursor.unwrap().height, 100, "depth match carries a cursor");
+        assert_eq!(
+            ev.cursor.unwrap().height,
+            100,
+            "depth match carries a cursor"
+        );
 
         let ev = watch_match_to_proto(
             &e,
@@ -4603,8 +4725,9 @@ mod tests {
         use bitcoin::hashes::Hash;
         use node::events::WatchMatch;
         let e = edge();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x11; 32],
+        ));
         let ev = watch_match_to_proto(
             &e,
             &WatchMatch::ScriptMatched {
@@ -4646,8 +4769,9 @@ mod tests {
         use bitcoin::hashes::Hash;
         use node::events::WatchMatch;
         let e = edge();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x11; 32],
+        ));
         let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(vec![0xde, 0xad, 0xbe, 0xef]);
         let m = WatchMatch::ScriptMatched {
             scripthash: [0xaa; 32],
@@ -4665,7 +4789,10 @@ mod tests {
             other => panic!("wrong body: {other:?}"),
         };
         // Opted in AND the match carries it → bytes on the wire.
-        assert_eq!(raw_of(watch_match_to_proto(&e, &m, Vec::new(), true)), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            raw_of(watch_match_to_proto(&e, &m, Vec::new(), true)),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         // Not opted in → dropped even though the match carries it.
         assert!(raw_of(watch_match_to_proto(&e, &m, Vec::new(), false)).is_empty());
         // Opted in but the match has no raw_tx (nobody triggered serialization)
@@ -4692,8 +4819,9 @@ mod tests {
         use bitcoin::hashes::Hash;
         use node::events::WatchMatch;
         let e = edge();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0x11; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x11; 32],
+        ));
         let m = WatchMatch::ScriptMatched {
             scripthash: [0xaa; 32],
             txid,
@@ -4705,14 +4833,20 @@ mod tests {
             raw_tx: None,
             raw_tx_stripped: true,
         };
-        let script = |include| match watch_match_to_proto(&e, &m, Vec::new(), include).body.unwrap() {
+        let script = |include| match watch_match_to_proto(&e, &m, Vec::new(), include)
+            .body
+            .unwrap()
+        {
             pb::node_event::Body::ScriptMatched(s) => s,
             other => panic!("wrong body: {other:?}"),
         };
         let on = script(true);
         assert!(on.raw_tx.is_empty() && on.raw_tx_stripped);
         let off = script(false);
-        assert!(off.raw_tx.is_empty() && !off.raw_tx_stripped, "not opted in: no flag");
+        assert!(
+            off.raw_tx.is_empty() && !off.raw_tx_stripped,
+            "not opted in: no flag"
+        );
 
         let pm = WatchMatch::PrefixMatched(Box::new(node::events::PrefixMatch {
             prefix: (0xabcd_0000, 16),
@@ -4723,7 +4857,10 @@ mod tests {
             height: Some(5),
             matched_prevouts: vec![],
         }));
-        match watch_match_to_proto(&e, &pm, Vec::new(), false).body.unwrap() {
+        match watch_match_to_proto(&e, &pm, Vec::new(), false)
+            .body
+            .unwrap()
+        {
             pb::node_event::Body::PrefixMatched(p) => {
                 assert!(p.raw_tx.is_empty() && p.raw_tx_stripped);
                 assert_eq!(p.txid, txid.as_raw_hash().to_byte_array().to_vec());
@@ -4762,7 +4899,8 @@ mod tests {
     fn req_with_auth(value: Option<&str>) -> Request<()> {
         let mut req = Request::new(());
         if let Some(v) = value {
-            req.metadata_mut().insert("authorization", v.parse().unwrap());
+            req.metadata_mut()
+                .insert("authorization", v.parse().unwrap());
         }
         req
     }
@@ -4787,7 +4925,9 @@ mod tests {
     fn grpc_auth_rejects_missing_and_unknown() {
         let store = auth_store();
         assert_eq!(
-            authenticate(&req_with_auth(None), &store).unwrap_err().code(),
+            authenticate(&req_with_auth(None), &store)
+                .unwrap_err()
+                .code(),
             tonic::Code::Unauthenticated
         );
         assert_eq!(
@@ -4807,9 +4947,7 @@ mod tests {
 
     fn enter(byte: u8) -> MempoolEvent {
         MempoolEvent::Enter {
-            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-                [byte; 32],
-            )),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32])),
             fee: 100,
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
@@ -4844,9 +4982,9 @@ mod tests {
             (EvictReason::Reorg, pb::EvictReason::Reorg),
         ] {
             let ev = MempoolEvent::LeaveEvicted {
-                txid: Txid::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32]),
-                ),
+                txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    [1u8; 32],
+                )),
                 reason: rust,
                 mempool_sequence: 1,
             };
@@ -4863,9 +5001,9 @@ mod tests {
     #[test]
     fn convert_block_connected_includes_hash_and_height() {
         let ev = ChainEvent::BlockConnected {
-            hash: BlockHash::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]),
-            ),
+            hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xaa; 32],
+            )),
             height: 42,
         };
         let pb_ev = chain_event_to_proto(&ev);
@@ -4882,7 +5020,20 @@ mod tests {
     #[tokio::test]
     async fn bind_rejects_remote_address_by_default() {
         let publisher = EventPublisher::new(edge(), 16);
-        match GrpcEventSink::bind("0.0.0.0:0", false, publisher, GrpcLimits::default(), None, None, None, None, None, None).await {
+        match GrpcEventSink::bind(
+            "0.0.0.0:0",
+            false,
+            publisher,
+            GrpcLimits::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
             Err(GrpcEventSinkError::RemoteBindRejected(_)) => {}
             Ok(_) => panic!("non-loopback bind without allow_remote should fail"),
             Err(e) => panic!("expected RemoteBindRejected, got {e}"),
@@ -4892,9 +5043,20 @@ mod tests {
     #[tokio::test]
     async fn bind_allows_loopback_without_override() {
         let publisher = EventPublisher::new(edge(), 16);
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher, GrpcLimits::default(), None, None, None, None, None, None)
-            .await
-            .expect("loopback bind should succeed");
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher,
+            GrpcLimits::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("loopback bind should succeed");
         let addr = sink.local_addr().expect("local_addr");
         assert!(addr.ip().is_loopback());
     }
@@ -4905,9 +5067,20 @@ mod tests {
         // 0.0.0.0:0 with allow_remote = true: must succeed (the actual
         // port the OS picks is irrelevant; the test asserts only that
         // the loopback gate is bypassed when the caller opts in).
-        let sink = GrpcEventSink::bind("0.0.0.0:0", true, publisher, GrpcLimits::default(), None, None, None, None, None, None)
-            .await
-            .expect("explicit remote bind should be allowed");
+        let sink = GrpcEventSink::bind(
+            "0.0.0.0:0",
+            true,
+            publisher,
+            GrpcLimits::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("explicit remote bind should be allowed");
         let addr = sink.local_addr().unwrap();
         assert!(!addr.ip().is_loopback());
     }
@@ -4970,7 +5143,9 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
-        let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("tcp connect");
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let handshake = connector.connect(name, tcp).await;
         assert!(
@@ -5031,7 +5206,9 @@ mod tests {
         // Exactly what tonic offers.
         client_cfg.alpn_protocols = vec![b"h2".to_vec()];
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
-        let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("tcp connect");
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let tls = connector.connect(name, tcp).await.expect("TLS handshake");
 
@@ -5169,7 +5346,10 @@ mod tests {
 
         let publisher = EventPublisher::new(edge(), 16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let limits = GrpcLimits { max_conns: 1, ..GrpcLimits::default() };
+        let limits = GrpcLimits {
+            max_conns: 1,
+            ..GrpcLimits::default()
+        };
         let sink = GrpcEventSink::bind(
             "127.0.0.1:0",
             false,
@@ -5199,8 +5379,12 @@ mod tests {
         // rejects the ClientHello, the handshake task returns, and its permit
         // must release.
         {
-            let mut bad = tokio::net::TcpStream::connect(addr).await.expect("tcp connect");
-            let _ = bad.write_all(b"this is not a tls clienthello\r\n\r\n").await;
+            let mut bad = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("tcp connect");
+            let _ = bad
+                .write_all(b"this is not a tls clienthello\r\n\r\n")
+                .await;
             let _ = bad.shutdown().await;
         }
 
@@ -5265,22 +5449,32 @@ mod tests {
 
         // 2. Bind directly (the new API picks the actual ephemeral port
         // from the OS, no TOCTOU window).
-        let sink = GrpcEventSink::bind("127.0.0.1:0", false, publisher.clone(), GrpcLimits::default(), None, None, None, None, None, None)
-            .await
-            .expect("bind");
+        let sink = GrpcEventSink::bind(
+            "127.0.0.1:0",
+            false,
+            publisher.clone(),
+            GrpcLimits::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("bind");
         let actual = sink.local_addr().unwrap();
         let sinks: Vec<Box<dyn EventSink>> = vec![Box::new(sink)];
         publisher.attach_sinks(sinks, shutdown_rx.clone());
 
         // 3. Wait briefly for the server to come up, then connect.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
-                "http://{}",
-                actual
-            ))
-            .await
-            .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{}",
+            actual
+        ))
+        .await
+        .expect("connect");
 
         // 4. Subscribe to all categories.
         let mut stream = client
@@ -5303,9 +5497,9 @@ mod tests {
         mp_tx.send(enter(1)).unwrap();
         ch_tx
             .send(ChainEvent::BlockConnected {
-                hash: BlockHash::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array([2u8; 32]),
-                ),
+                hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    [2u8; 32],
+                )),
                 height: 1,
             })
             .unwrap();
@@ -5445,9 +5639,9 @@ mod tests {
                 .map(|h| {
                     (
                         h,
-                        BlockHash::from_raw_hash(
-                            bitcoin::hashes::sha256d::Hash::from_byte_array([h as u8; 32]),
-                        ),
+                        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                            [h as u8; 32],
+                        )),
                     )
                 })
                 .collect()
@@ -5523,9 +5717,9 @@ mod tests {
                 .map(|h| {
                     (
                         h,
-                        BlockHash::from_raw_hash(
-                            bitcoin::hashes::sha256d::Hash::from_byte_array([h as u8; 32]),
-                        ),
+                        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                            [h as u8; 32],
+                        )),
                     )
                 })
                 .collect()
@@ -5838,8 +6032,10 @@ mod tests {
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let sp: Arc<dyn node::index::silent_payments::SpIndex> =
-            Arc::new(MockSp { tip: 100, complete: true });
+        let sp: Arc<dyn node::index::silent_payments::SpIndex> = Arc::new(MockSp {
+            tip: 100,
+            complete: true,
+        });
         publisher.spawn_bridges_with_sp(
             mp_tx.subscribe(),
             ch_tx.subscribe(),
@@ -5910,7 +6106,11 @@ mod tests {
             .expect("tweaks ready")
             .unwrap()
             .unwrap();
-        assert_eq!(tweaks_height(&ev), Some(7), "categories=8 receives BlockTweaks");
+        assert_eq!(
+            tweaks_height(&ev),
+            Some(7),
+            "categories=8 receives BlockTweaks"
+        );
 
         // Subscriber A: receives the chain event but NOT the tweak event. Its
         // next delivered item must be the next block's chain event, never the
@@ -6212,7 +6412,10 @@ mod tests {
         let mut stream = resp.into_inner();
         // No replay, no live events → next() times out (stream is pending).
         let pending = tokio::time::timeout(Duration::from_millis(150), stream.next()).await;
-        assert!(pending.is_err(), "forward-only stream should have no replay items");
+        assert!(
+            pending.is_err(),
+            "forward-only stream should have no replay items"
+        );
     }
 
     /// When the subscriber falls behind the broadcast, the server emits an
@@ -6281,7 +6484,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_lagged, "expected an in-band Lagged notice after overflow");
+        assert!(
+            saw_lagged,
+            "expected an in-band Lagged notice after overflow"
+        );
         let _ = shutdown_tx.send(true);
     }
 
@@ -6311,7 +6517,8 @@ mod tests {
             },
             &handle,
             None,
-            &mask, &AtomicBool::new(false),
+            &mask,
+            &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -6339,7 +6546,8 @@ mod tests {
             },
             &handle,
             Some(&principal),
-            &mask, &AtomicBool::new(false),
+            &mask,
+            &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -6391,7 +6599,8 @@ mod tests {
                 },
                 &handle,
                 Some(&principal),
-                &mask, &AtomicBool::new(false),
+                &mask,
+                &AtomicBool::new(false),
                 &mut guard,
                 (8, 32),
             );
@@ -6445,7 +6654,8 @@ mod tests {
             },
             &handle,
             Some(&principal),
-            &mask, &AtomicBool::new(false),
+            &mask,
+            &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -6487,7 +6697,8 @@ mod tests {
             add(vec![op_proto(1, 0), op_proto(2, 0), op_proto(3, 0)]),
             &handle,
             Some(&principal),
-            &mask, &AtomicBool::new(false),
+            &mask,
+            &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -6499,22 +6710,30 @@ mod tests {
             add(vec![op_proto(1, 0), op_proto(4, 0)]),
             &handle,
             Some(&principal),
-            &mask, &AtomicBool::new(false),
+            &mask,
+            &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
-        assert_eq!(q.current("tenant"), 4, "re-asserted op(1) not double-charged");
+        assert_eq!(
+            q.current("tenant"),
+            4,
+            "re-asserted op(1) not double-charged"
+        );
 
         // Remove op(2) → exactly one unit released (per-remove release).
         apply_control(
             pb::SubscribeControl {
-                msg: Some(pb::subscribe_control::Msg::RemoveOutpoints(pb::RemoveOutpoints {
-                    outpoints: vec![op_proto(2, 0)],
-                })),
+                msg: Some(pb::subscribe_control::Msg::RemoveOutpoints(
+                    pb::RemoveOutpoints {
+                        outpoints: vec![op_proto(2, 0)],
+                    },
+                )),
             },
             &handle,
             Some(&principal),
-            &mask, &AtomicBool::new(false),
+            &mask,
+            &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
@@ -6543,7 +6762,10 @@ mod tests {
             &mut leases,
             (8, 32),
         );
-        assert!(reg.has_watchers(), "descriptor expansion should register a watch-set");
+        assert!(
+            reg.has_watchers(),
+            "descriptor expansion should register a watch-set"
+        );
     }
 
     /// `apply_control(RemoveDescriptor)` drops the window a prior AddDescriptor
@@ -6558,15 +6780,18 @@ mod tests {
         let add = |leases: &mut WatchSet| {
             apply_control(
                 pb::SubscribeControl {
-                    msg: Some(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {
-                        descriptor: DESC.into(),
-                        gap_limit: 4,
-                        start: 0,
-                    })),
+                    msg: Some(pb::subscribe_control::Msg::AddDescriptor(
+                        pb::AddDescriptor {
+                            descriptor: DESC.into(),
+                            gap_limit: 4,
+                            start: 0,
+                        },
+                    )),
                 },
                 &handle,
                 None,
-                &mask, &AtomicBool::new(false),
+                &mask,
+                &AtomicBool::new(false),
                 leases,
                 (8, 32),
             );
@@ -6577,18 +6802,28 @@ mod tests {
 
         apply_control(
             pb::SubscribeControl {
-                msg: Some(pb::subscribe_control::Msg::RemoveDescriptor(pb::RemoveDescriptor {
-                    descriptor: DESC.into(),
-                })),
+                msg: Some(pb::subscribe_control::Msg::RemoveDescriptor(
+                    pb::RemoveDescriptor {
+                        descriptor: DESC.into(),
+                    },
+                )),
             },
             &handle,
             None,
-            &mask, &AtomicBool::new(false),
+            &mask,
+            &AtomicBool::new(false),
             &mut leases,
             (8, 32),
         );
-        assert_eq!(leases.len(), 0, "removing the descriptor drops its whole window");
-        assert!(!reg.has_watchers(), "no watchers remain after RemoveDescriptor");
+        assert_eq!(
+            leases.len(),
+            0,
+            "removing the descriptor drops its whole window"
+        );
+        assert!(
+            !reg.has_watchers(),
+            "no watchers remain after RemoveDescriptor"
+        );
     }
 
     /// End-to-end bidi `Watch`: a client adds an outpoint to its watch-set
@@ -6618,12 +6853,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
-                "http://{actual}"
-            ))
-            .await
-            .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
 
         let op = bitcoin::OutPoint {
             txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xcd; 32])),
@@ -6715,12 +6949,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
-                "http://{actual}"
-            ))
-            .await
-            .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
 
         let op = bitcoin::OutPoint {
             txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xcd; 32])),
@@ -6835,7 +7068,9 @@ mod tests {
             if *c <= self.allow_first {
                 satd_auth::RateDecision::Allow
             } else {
-                satd_auth::RateDecision::Throttle { retry_after_secs: 1 }
+                satd_auth::RateDecision::Throttle {
+                    retry_after_secs: 1,
+                }
             }
         }
     }
@@ -6896,8 +7131,11 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let store =
-            Arc::new(satd_auth::TokenStore::load(&path).unwrap().with_accounting(acct));
+        let store = Arc::new(
+            satd_auth::TokenStore::load(&path)
+                .unwrap()
+                .with_accounting(acct),
+        );
 
         let publisher = EventPublisher::new(edge(), 64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -6920,12 +7158,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
-                "http://{actual}"
-            ))
-            .await
-            .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
 
         let op = bitcoin::OutPoint {
             txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xcd; 32])),
@@ -6953,7 +7190,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(registry.has_watchers(), "watch registered (establishment + add allowed)");
+        assert!(
+            registry.has_watchers(),
+            "watch registered (establishment + add allowed)"
+        );
 
         // SetCursor: rate check #3 → throttled → rejected (no replay). Were it
         // served it would replay confirmed blocks 3, 4, 5.
@@ -7001,7 +7241,10 @@ mod tests {
             .expect("transport")
             .expect("stream ended");
         let Some(pb::node_event::Body::SetCursorResult(r)) = ev.body else {
-            panic!("expected a CursorRejected, not a replayed block (got {:?})", ev.body);
+            panic!(
+                "expected a CursorRejected, not a replayed block (got {:?})",
+                ev.body
+            );
         };
         let Some(pb::set_cursor_result::Outcome::Rejected(rj)) = r.outcome else {
             panic!("expected CursorRejected, got {:?}", r.outcome);
@@ -7087,12 +7330,11 @@ mod tests {
         let actual = sink.local_addr().unwrap();
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
-                "http://{actual}"
-            ))
-            .await
-            .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
 
         let add = |shs: &[u8]| pb::SubscribeControl {
             msg: Some(pb::subscribe_control::Msg::AddScripts(pb::AddScripts {
@@ -7119,7 +7361,10 @@ mod tests {
             .expect("stream ended");
         let r = next_rejection(ev);
         assert_eq!(r.kind, pb::watch_add_rejected::Kind::Scripts as i32);
-        assert_eq!(r.reason, pb::watch_add_rejected::Reason::QuotaExceeded as i32);
+        assert_eq!(
+            r.reason,
+            pb::watch_add_rejected::Reason::QuotaExceeded as i32
+        );
         assert_eq!((r.required, r.held, r.quota), (2, 0, 1));
         assert_eq!(r.scripthashes, vec![vec![0x01; 32], vec![0x02; 32]]);
         assert!(!registry.has_watchers(), "a refused add registers nothing");
@@ -7133,7 +7378,11 @@ mod tests {
             .expect("transport")
             .expect("stream ended");
         let r = next_rejection(ev);
-        assert_eq!((r.required, r.held, r.quota), (1, 1, 1), "the accepted add holds the unit");
+        assert_eq!(
+            (r.required, r.held, r.quota),
+            (1, 1, 1),
+            "the accepted add holds the unit"
+        );
         assert_eq!(r.scripthashes, vec![vec![0x04; 32]]);
         assert!(registry.has_watchers(), "the add that fit is watched");
 
@@ -7162,42 +7411,103 @@ mod tests {
         };
 
         let r = render(
-            AddRejectReason::RateLimited { retry_after_secs: 7 },
+            AddRejectReason::RateLimited {
+                retry_after_secs: 7,
+            },
             RejectedItems::Outpoints(vec![bitcoin::OutPoint { txid, vout: 3 }]),
         );
-        assert_eq!((r.kind, r.reason), (Kind::Outpoints as i32, Reason::RateLimited as i32));
+        assert_eq!(
+            (r.kind, r.reason),
+            (Kind::Outpoints as i32, Reason::RateLimited as i32)
+        );
         assert_eq!(r.retry_after_secs, 7);
-        assert_eq!(r.outpoints, vec![pb::Outpoint { txid: vec![0xab; 32], vout: 3 }]);
+        assert_eq!(
+            r.outpoints,
+            vec![pb::Outpoint {
+                txid: vec![0xab; 32],
+                vout: 3
+            }]
+        );
 
-        let r = render(AddRejectReason::PermissionDenied, RejectedItems::Transactions(vec![txid]));
-        assert_eq!((r.kind, r.reason), (Kind::Transactions as i32, Reason::PermissionDenied as i32));
+        let r = render(
+            AddRejectReason::PermissionDenied,
+            RejectedItems::Transactions(vec![txid]),
+        );
+        assert_eq!(
+            (r.kind, r.reason),
+            (Kind::Transactions as i32, Reason::PermissionDenied as i32)
+        );
         assert_eq!(r.txids, vec![vec![0xab; 32]]);
 
         let r = render(
-            AddRejectReason::QuotaExceeded { required: 2, held: 5, quota: 6 },
+            AddRejectReason::QuotaExceeded {
+                required: 2,
+                held: 5,
+                quota: 6,
+            },
             RejectedItems::DepthAlarms(vec![(txid, 6)]),
         );
-        assert_eq!((r.kind, r.required, r.held, r.quota), (Kind::DepthAlarms as i32, 2, 5, 6));
-        assert_eq!(r.depth_alarms, vec![pb::WatchDepthAlarm { txid: vec![0xab; 32], depth: 6 }]);
+        assert_eq!(
+            (r.kind, r.required, r.held, r.quota),
+            (Kind::DepthAlarms as i32, 2, 5, 6)
+        );
+        assert_eq!(
+            r.depth_alarms,
+            vec![pb::WatchDepthAlarm {
+                txid: vec![0xab; 32],
+                depth: 6
+            }]
+        );
 
         let r = render(
             AddRejectReason::Malformed,
-            RejectedItems::Descriptor { descriptor: "wpkh(x)".into(), gap_limit: 20, start: 40, kept: true },
+            RejectedItems::Descriptor {
+                descriptor: "wpkh(x)".into(),
+                gap_limit: 20,
+                start: 40,
+                kept: true,
+            },
         );
-        assert_eq!((r.kind, r.reason), (Kind::Descriptor as i32, Reason::Malformed as i32));
-        assert_eq!((r.descriptor.as_str(), r.gap_limit, r.start, r.descriptor_kept), ("wpkh(x)", 20, 40, true));
+        assert_eq!(
+            (r.kind, r.reason),
+            (Kind::Descriptor as i32, Reason::Malformed as i32)
+        );
+        assert_eq!(
+            (
+                r.descriptor.as_str(),
+                r.gap_limit,
+                r.start,
+                r.descriptor_kept
+            ),
+            ("wpkh(x)", 20, 40, true)
+        );
 
         // 12 bits → 2 bytes, low 4 bits of the second byte masked off.
         let (key, _) = crate::watchset::parse_prefix(&[0xab, 0xcd], 12, 8, 32).unwrap();
         let r = render(
-            AddRejectReason::CapExceeded { requested: 3, limit: 2 },
+            AddRejectReason::CapExceeded {
+                requested: 3,
+                limit: 2,
+            },
             RejectedItems::Prefixes(vec![key]),
         );
-        assert_eq!((r.kind, r.required, r.quota), (Kind::ScriptPrefixes as i32, 3, 2));
-        assert_eq!(r.prefixes, vec![pb::ScriptPrefix { prefix: vec![0xab, 0xc0], bits: 12 }]);
+        assert_eq!(
+            (r.kind, r.required, r.quota),
+            (Kind::ScriptPrefixes as i32, 3, 2)
+        );
+        assert_eq!(
+            r.prefixes,
+            vec![pb::ScriptPrefix {
+                prefix: vec![0xab, 0xc0],
+                bits: 12
+            }]
+        );
 
         let r = render(
-            AddRejectReason::CapExceeded { requested: 17, limit: 16 },
+            AddRejectReason::CapExceeded {
+                requested: 17,
+                limit: 16,
+            },
             RejectedItems::SilentPayments(vec![[0x02; 33]]),
         );
         assert_eq!(r.kind, Kind::SilentPayments as i32);
@@ -7242,10 +7552,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
-                .await
-                .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
         let mut stream = client
             .watch(ReceiverStream::new(ctrl_rx))
@@ -7349,10 +7660,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
-                .await
-                .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
         let mut stream = client
             .watch(ReceiverStream::new(ctrl_rx))
@@ -7450,12 +7762,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
-                "http://{actual}"
-            ))
-            .await
-            .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
         ctrl_tx
             .send(pb::SubscribeControl {
@@ -7522,11 +7833,11 @@ mod tests {
                 svc.subscribe(Request::new(pb::SubscribeRequest {
                     categories: 0,
                     since_seq: None,
-                tweak_dust_limit: None,
-                tweaks_only: None,
-                mempool_tweaks: None,
-                tweak_outputs: None,
-                tweak_unspent_only: None,
+                    tweak_dust_limit: None,
+                    tweaks_only: None,
+                    mempool_tweaks: None,
+                    tweak_outputs: None,
+                    tweak_unspent_only: None,
                     from_cursor: None,
                 }))
                 .await
@@ -7560,7 +7871,10 @@ mod tests {
     }
 
     impl node::events::BlockScanSource for MockScanBlocks {
-        fn block_body(&self, hash: &BlockHash) -> Option<node::storage::opreturn_strip::StoredBlock> {
+        fn block_body(
+            &self,
+            hash: &BlockHash,
+        ) -> Option<node::storage::opreturn_strip::StoredBlock> {
             self.blocks
                 .values()
                 .find(|b| b.block_hash() == *hash)
@@ -7622,8 +7936,11 @@ mod tests {
         };
         let mut blocks = std::collections::HashMap::new();
         blocks.insert(3u32, block3);
-        let scan_source: Arc<dyn node::events::BlockScanSource> =
-            Arc::new(MockScanBlocks { tip: 5, blocks, spent: Default::default() });
+        let scan_source: Arc<dyn node::events::BlockScanSource> = Arc::new(MockScanBlocks {
+            tip: 5,
+            blocks,
+            spent: Default::default(),
+        });
 
         let sink = GrpcEventSink::bind(
             "127.0.0.1:0",
@@ -7643,10 +7960,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
-                .await
-                .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
 
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
         ctrl_tx
@@ -7752,10 +8070,11 @@ mod tests {
         publisher.attach_sinks(vec![Box::new(sink)], shutdown_rx.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut client =
-            pb::node_event_stream_client::NodeEventStreamClient::connect(format!("http://{actual}"))
-                .await
-                .expect("connect");
+        let mut client = pb::node_event_stream_client::NodeEventStreamClient::connect(format!(
+            "http://{actual}"
+        ))
+        .await
+        .expect("connect");
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<pb::SubscribeControl>(4);
         // Watch something so the rescan isn't rejected EMPTY_WATCH_SET first.
         ctrl_tx
@@ -7926,7 +8245,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(desired_from_proto(&bad, (8, 32)).is_err(), "bad scan secret rejects snapshot");
+        assert!(
+            desired_from_proto(&bad, (8, 32)).is_err(),
+            "bad scan secret rejects snapshot"
+        );
     }
 
     #[test]

@@ -304,19 +304,39 @@ impl Session {
             wire::SET_CUSTOM_MINING_JOB => self.set_custom_job(payload).await,
             wire::OPEN_STANDARD_MINING_CHANNEL => {
                 let req = self.decode(wire::decode_open_standard_mining_channel(payload))?;
-                self.open_channel(req.request_id, &req.user_identity, req.max_target, None, work_rx)
-                    .await
+                self.open_channel(
+                    req.request_id,
+                    &req.user_identity,
+                    req.max_target,
+                    None,
+                    work_rx,
+                )
+                .await
             }
             wire::OPEN_EXTENDED_MINING_CHANNEL => {
                 let req = self.decode(wire::decode_open_extended_mining_channel(payload))?;
                 let size = usize::from(req.min_extranonce_size);
-                self.open_channel(req.request_id, &req.user_identity, req.max_target, Some(size), work_rx)
-                    .await
+                self.open_channel(
+                    req.request_id,
+                    &req.user_identity,
+                    req.max_target,
+                    Some(size),
+                    work_rx,
+                )
+                .await
             }
             wire::SUBMIT_SHARES_STANDARD => {
                 let s = self.decode(wire::decode_submit_shares_standard(payload))?;
-                self.submit(s.channel_id, s.sequence_number, s.job_id, s.nonce, s.ntime, s.version, None)
-                    .await
+                self.submit(
+                    s.channel_id,
+                    s.sequence_number,
+                    s.job_id,
+                    s.nonce,
+                    s.ntime,
+                    s.version,
+                    None,
+                )
+                .await
             }
             wire::SUBMIT_SHARES_EXTENDED => {
                 let s = self.decode(wire::decode_submit_shares_extended(payload))?;
@@ -352,7 +372,9 @@ impl Session {
             || (req.protocol == wire::PROTOCOL_JOB_DECLARATION && jd))
         {
             Some((0, "unsupported-protocol"))
-        } else if req.min_version > wire::PROTOCOL_VERSION || req.max_version < wire::PROTOCOL_VERSION {
+        } else if req.min_version > wire::PROTOCOL_VERSION
+            || req.max_version < wire::PROTOCOL_VERSION
+        {
             Some((0, "protocol-version-mismatch"))
         } else if req.protocol == wire::PROTOCOL_MINING
             && req.flags & wire::REQUIRES_WORK_SELECTION != 0
@@ -371,10 +393,17 @@ impl Session {
                 code,
                 "Stratum V2 SetupConnection refused"
             );
-            self.send(wire::SETUP_CONNECTION_ERROR, &wire::setup_connection_error(flags, code)).await?;
+            self.send(
+                wire::SETUP_CONNECTION_ERROR,
+                &wire::setup_connection_error(flags, code),
+            )
+            .await?;
             return Err(Close("SetupConnection refused"));
         }
-        self.device = miner::label(&format!("{} {} {}", req.vendor, req.hardware_version, req.firmware));
+        self.device = miner::label(&format!(
+            "{} {} {}",
+            req.vendor, req.hardware_version, req.firmware
+        ));
         tracing::debug!(
             target: "node::stratum",
             peer = %self.peer,
@@ -390,8 +419,11 @@ impl Session {
             req.protocol == wire::PROTOCOL_MINING && req.flags & wire::REQUIRES_WORK_SELECTION != 0;
         // No REQUIRES_FIXED_VERSION: miners may roll the version bits. Job
         // Declaration flags ask nothing of the server that it must refuse.
-        self.send(wire::SETUP_CONNECTION_SUCCESS, &wire::setup_connection_success(wire::PROTOCOL_VERSION, 0))
-            .await
+        self.send(
+            wire::SETUP_CONNECTION_SUCCESS,
+            &wire::setup_connection_success(wire::PROTOCOL_VERSION, 0),
+        )
+        .await
     }
 
     /// This connection, as the owner of the job tokens it is issued.
@@ -404,9 +436,15 @@ impl Session {
     /// request that names no usable address closes the connection.
     async fn allocate_token(&mut self, payload: &[u8]) -> Result<(), Close> {
         let req = self.decode(wire::decode_allocate_mining_job_token(payload))?;
-        let Some(jd) = self.jd.clone() else { return Err(Close("protocol violation")) };
+        let Some(jd) = self.jd.clone() else {
+            return Err(Close("protocol violation"));
+        };
         let config = self.shared.config.clone();
-        let payout = match resolve_payout(&req.user_identifier, config.network, config.fallback_address.as_ref()) {
+        let payout = match resolve_payout(
+            &req.user_identifier,
+            config.network,
+            config.fallback_address.as_ref(),
+        ) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -438,11 +476,17 @@ impl Session {
     /// mempool and the current work.
     async fn declare_job(&mut self, payload: &[u8]) -> Result<(), Close> {
         let req = self.decode(wire::decode_declare_mining_job(payload))?;
-        let Some(jd) = self.jd.clone() else { return Err(Close("protocol violation")) };
+        let Some(jd) = self.jd.clone() else {
+            return Err(Close("protocol violation"));
+        };
         let request_id = req.request_id;
         let Some(payout) = jd.tokens.take_allocated(&req.mining_job_token) else {
             return self
-                .declare_error(request_id, "invalid-mining-job-token", "the token is unknown, expired or already used")
+                .declare_error(
+                    request_id,
+                    "invalid-mining-job-token",
+                    "the token is unknown, expired or already used",
+                )
                 .await;
         };
         let Some(work) = self.shared.work.borrow().clone() else {
@@ -458,7 +502,8 @@ impl Session {
         let network = self.shared.config.network;
         let shared_jd = jd.clone();
         let checked = tokio::task::spawn_blocking(move || {
-            let view = jd::MempoolView::for_declaration(&mempool, &shared_jd.wtxids, &req.wtxid_list);
+            let view =
+                jd::MempoolView::for_declaration(&mempool, &shared_jd.wtxids, &req.wtxid_list);
             let subsidy = crate::chain::connect::block_subsidy(network, work.height);
             jd::check_declaration(&req, payout, &work, subsidy, &view)
         })
@@ -487,10 +532,16 @@ impl Session {
                     self.declared.pop_front();
                 }
                 self.declared.push_back(job);
-                self.send(wire::DECLARE_MINING_JOB_SUCCESS, &wire::declare_mining_job_success(request_id, &token))
+                self.send(
+                    wire::DECLARE_MINING_JOB_SUCCESS,
+                    &wire::declare_mining_job_success(request_id, &token),
+                )
+                .await
+            }
+            Ok(Err(refusal)) => {
+                self.declare_error(request_id, refusal.code, &refusal.details)
                     .await
             }
-            Ok(Err(refusal)) => self.declare_error(request_id, refusal.code, &refusal.details).await,
             Err(e) => {
                 tracing::error!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum V2 declaration check panicked");
                 Err(Close("internal error"))
@@ -498,21 +549,39 @@ impl Session {
         }
     }
 
-    async fn declare_error(&mut self, request_id: u32, code: &str, details: &str) -> Result<(), Close> {
+    async fn declare_error(
+        &mut self,
+        request_id: u32,
+        code: &str,
+        details: &str,
+    ) -> Result<(), Close> {
         tracing::warn!(target: "node::stratum", peer = %self.peer, code, details, "Stratum V2 mining job declaration refused");
-        self.send(wire::DECLARE_MINING_JOB_ERROR, &wire::declare_mining_job_error(request_id, code, details))
-            .await
+        self.send(
+            wire::DECLARE_MINING_JOB_ERROR,
+            &wire::declare_mining_job_error(request_id, code, details),
+        )
+        .await
     }
 
     /// `PushSolution`: a block found on a job this connection declared.
     async fn push_solution(&mut self, payload: &[u8]) -> Result<(), Close> {
         let msg = self.decode(wire::decode_push_solution(payload))?;
         let found = self.declared.iter().rev().find_map(|job| {
-            let block = jd::solution_block(job, &msg.extranonce, &msg.prev_hash, msg.ntime, msg.nonce, msg.nbits, msg.version)?;
+            let block = jd::solution_block(
+                job,
+                &msg.extranonce,
+                &msg.prev_hash,
+                msg.ntime,
+                msg.nonce,
+                msg.nbits,
+                msg.version,
+            )?;
             Some((block, job.height, job.payout.clone()))
         });
         match found {
-            Some((block, height, payout)) => submit_found_block(&self.shared, block, height, &payout, self.peer).await,
+            Some((block, height, payout)) => {
+                submit_found_block(&self.shared, block, height, &payout, self.peer).await
+            }
             None => tracing::warn!(
                 target: "node::stratum",
                 peer = %self.peer,
@@ -556,20 +625,28 @@ impl Session {
     }
 
     fn check_custom_job(&mut self, msg: &wire::SetCustomMiningJob) -> Result<u32, jd::Refusal> {
-        let refuse = |code: &'static str, details: &str| jd::Refusal { code, details: details.to_string() };
-        let Some(jd) = self.jd.clone().filter(|_| self.work_selection) else {
-            return Err(refuse("invalid-mining-job-token", "this connection did not negotiate work selection"));
+        let refuse = |code: &'static str, details: &str| jd::Refusal {
+            code,
+            details: details.to_string(),
         };
-        let job = jd
-            .tokens
-            .declared(&msg.token)
-            .ok_or_else(|| refuse("invalid-mining-job-token", "the token names no declared job"))?;
-        let work = self
-            .shared
-            .work
-            .borrow()
-            .clone()
-            .ok_or_else(|| refuse("invalid-job-param-value-prev_hash", "the node is not issuing work"))?;
+        let Some(jd) = self.jd.clone().filter(|_| self.work_selection) else {
+            return Err(refuse(
+                "invalid-mining-job-token",
+                "this connection did not negotiate work selection",
+            ));
+        };
+        let job = jd.tokens.declared(&msg.token).ok_or_else(|| {
+            refuse(
+                "invalid-mining-job-token",
+                "the token names no declared job",
+            )
+        })?;
+        let work = self.shared.work.borrow().clone().ok_or_else(|| {
+            refuse(
+                "invalid-job-param-value-prev_hash",
+                "the node is not issuing work",
+            )
+        })?;
         let ch = self
             .channels
             .get_mut(&msg.channel_id)
@@ -611,8 +688,12 @@ impl Session {
         };
         let payout = match refusal {
             Some(code) => Err(code),
-            None => resolve_payout(user_identity, config.network, config.fallback_address.as_ref())
-                .map_err(|_| "unknown-user"),
+            None => resolve_payout(
+                user_identity,
+                config.network,
+                config.fallback_address.as_ref(),
+            )
+            .map_err(|_| "unknown-user"),
         };
         let payout = match payout {
             Ok(p) => p,
@@ -625,7 +706,10 @@ impl Session {
                     "Stratum V2 channel refused"
                 );
                 return self
-                    .send(wire::OPEN_MINING_CHANNEL_ERROR, &wire::open_mining_channel_error(request_id, code))
+                    .send(
+                        wire::OPEN_MINING_CHANNEL_ERROR,
+                        &wire::open_mining_channel_error(request_id, code),
+                    )
                     .await;
             }
         };
@@ -638,7 +722,8 @@ impl Session {
         let mut max_target = max_target_le;
         max_target.reverse();
         let miner = {
-            let mut record = MinerRecord::new("v2", self.peer, Some(id), config.initial_difficulty.max(1));
+            let mut record =
+                MinerRecord::new("v2", self.peer, Some(id), config.initial_difficulty.max(1));
             record.address = payout.address.clone();
             record.worker = payout.worker.clone();
             record.device = (!self.device.is_empty()).then(|| self.device.clone());
@@ -648,7 +733,11 @@ impl Session {
             id,
             extended,
             prefix,
-            vardiff: Vardiff::new(config.vardiff.clone(), config.initial_difficulty, std::time::Instant::now()),
+            vardiff: Vardiff::new(
+                config.vardiff.clone(),
+                config.initial_difficulty,
+                std::time::Instant::now(),
+            ),
             payout,
             max_target,
             jobs: JobManager::new(),
@@ -681,7 +770,14 @@ impl Session {
             ),
             Some(size) => (
                 wire::OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
-                wire::open_extended_mining_channel_success(request_id, id, &target_le, size as u16, &prefix, 0),
+                wire::open_extended_mining_channel_success(
+                    request_id,
+                    id,
+                    &target_le,
+                    size as u16,
+                    &prefix,
+                    0,
+                ),
             ),
         };
         self.channels.insert(id, channel);
@@ -705,7 +801,9 @@ impl Session {
     /// when the previous block changed (or the channel has none yet), a job
     /// active at once otherwise.
     async fn issue_job(&mut self, id: u32, work: &Arc<Work>) -> Result<(), Close> {
-        let Some(ch) = self.channels.get_mut(&id) else { return Ok(()) };
+        let Some(ch) = self.channels.get_mut(&id) else {
+            return Ok(());
+        };
         let activate = ch.prev_hash != Some(work.prev_hash);
         if activate {
             ch.jobs.mark_all_stale();
@@ -713,7 +811,12 @@ impl Session {
             ch.prev_hash = Some(work.prev_hash);
         }
         let job_id = ch.jobs.next_job_id();
-        let template = match ActiveTemplate::build(work.clone(), job_id, ch.payout.script.clone(), ch.hole_len()) {
+        let template = match ActiveTemplate::build(
+            work.clone(),
+            job_id,
+            ch.payout.script.clone(),
+            ch.hole_len(),
+        ) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(target: "node::stratum", peer = %self.peer, error = %e, "Stratum V2 job build failed");
@@ -762,7 +865,8 @@ impl Session {
         self.send(job_msg.0, &job_msg.1).await?;
         if activate {
             let prev = work.prev_hash.to_byte_array();
-            let msg = wire::set_new_prev_hash(id, job_id, &prev, work.cur_time, work.bits.to_consensus());
+            let msg =
+                wire::set_new_prev_hash(id, job_id, &prev, work.cur_time, work.bits.to_consensus());
             self.send(wire::SET_NEW_PREV_HASH, &msg).await?;
         }
         Ok(())
@@ -772,7 +876,9 @@ impl Session {
         let now = std::time::Instant::now();
         let mut changes = Vec::new();
         for ch in self.channels.values_mut() {
-            let Some(latest) = ch.jobs.latest() else { continue };
+            let Some(latest) = ch.jobs.latest() else {
+                continue;
+            };
             let block_target = latest.template.work.block_target;
             if let Some(d) = ch.vardiff.retarget(now, network_difficulty(&block_target)) {
                 let target = ch.target(&block_target);
@@ -785,7 +891,8 @@ impl Session {
         }
         for (id, difficulty, target_le) in changes {
             tracing::debug!(target: "node::stratum", peer = %self.peer, channel_id = id, difficulty, "Stratum V2 vardiff retarget");
-            self.send(wire::SET_TARGET, &wire::set_target(id, &target_le)).await?;
+            self.send(wire::SET_TARGET, &wire::set_target(id, &target_le))
+                .await?;
         }
         Ok(())
     }
@@ -804,7 +911,10 @@ impl Session {
         let judged = self.judge(channel_id, job_id, nonce, ntime, version, miner_extranonce);
         let outcome = match &judged {
             Judged::Accepted { .. } => ShareOutcome::Accepted,
-            Judged::Rejected { code: "stale-share", .. } => ShareOutcome::Stale,
+            Judged::Rejected {
+                code: "stale-share",
+                ..
+            } => ShareOutcome::Stale,
             Judged::Rejected { .. } => ShareOutcome::Rejected,
         };
         self.shared.stats.share(outcome);
@@ -819,7 +929,11 @@ impl Session {
                 )
                 .await
             }
-            Judged::Rejected { code, difficulty, hash_difficulty } => {
+            Judged::Rejected {
+                code,
+                difficulty,
+                hash_difficulty,
+            } => {
                 // Every refusal is logged here, including one for a channel
                 // that does not exist, which has no tally to count it in.
                 let worker = match self.channels.get_mut(&channel_id) {
@@ -864,7 +978,9 @@ impl Session {
         let mut extranonce = ch.prefix.to_vec();
         match (ch.extended, miner_extranonce) {
             (None, None) => {}
-            (Some(size), Some(miner)) if miner.len() == size => extranonce.extend_from_slice(&miner),
+            (Some(size), Some(miner)) if miner.len() == size => {
+                extranonce.extend_from_slice(&miner)
+            }
             _ => return Judged::refused("invalid-share", None),
         }
         let Some(job) = ch.jobs.get(job_id).cloned() else {
@@ -872,12 +988,26 @@ impl Session {
         };
         let base = job.template.work.version as u32;
         let version = ((base & !VERSION_ROLLING_MASK) | (version & VERSION_ROLLING_MASK)) as i32;
-        let key = (job_id, nonce, ntime, version, extranonce[EXTRANONCE_PREFIX_LEN..].to_vec());
+        let key = (
+            job_id,
+            nonce,
+            ntime,
+            version,
+            extranonce[EXTRANONCE_PREFIX_LEN..].to_vec(),
+        );
         if ch.seen.contains(&key) {
             return Judged::refused("duplicate-share", Some(&job));
         }
         let now = crate::time::now_secs();
-        let result = match validate_share(&job.template, &extranonce, ntime, nonce, version, &job.share_target, now) {
+        let result = match validate_share(
+            &job.template,
+            &extranonce,
+            ntime,
+            nonce,
+            version,
+            &job.share_target,
+            now,
+        ) {
             Ok(r) => r,
             Err(_) => return Judged::refused("invalid-share", Some(&job)),
         };
@@ -887,7 +1017,11 @@ impl Session {
             }
             ch.seen.insert(key);
             ch.vardiff.record_share(job.difficulty);
-            ch.miner.lock().tally.accept(std::time::Instant::now(), job.difficulty, hash_difficulty);
+            ch.miner.lock().tally.accept(
+                std::time::Instant::now(),
+                job.difficulty,
+                hash_difficulty,
+            );
         };
         match result {
             ShareResult::Block(block) => {
@@ -909,7 +1043,10 @@ impl Session {
                     share_difficulty = %format_difficulty(hash_difficulty),
                     "Stratum share accepted"
                 );
-                Judged::Accepted { difficulty: job.difficulty, block: None }
+                Judged::Accepted {
+                    difficulty: job.difficulty,
+                    block: None,
+                }
             }
             ShareResult::LowDifficulty { hash_difficulty } => Judged::Rejected {
                 code: "difficulty-too-low",
@@ -942,7 +1079,9 @@ impl Session {
     fn log_status(&mut self) {
         let now = std::time::Instant::now();
         for ch in self.channels.values_mut() {
-            let Some(report) = ch.miner.lock().tally.status_due(now) else { continue };
+            let Some(report) = ch.miner.lock().tally.status_due(now) else {
+                continue;
+            };
             tracing::debug!(
                 target: "node::stratum",
                 peer = %self.peer,
@@ -970,11 +1109,18 @@ impl Session {
         let mut ids: Vec<u32> = self.channels.keys().copied().collect();
         ids.sort_unstable();
         for id in ids {
-            let Some(ch) = self.channels.get_mut(&id) else { continue };
+            let Some(ch) = self.channels.get_mut(&id) else {
+                continue;
+            };
             let (hashrate, total, connected_secs, best_share) = {
                 let mut record = ch.miner.lock();
                 let tally = &mut record.tally;
-                (format_hashrate(tally.hashrate(now)), tally.total(), tally.connected_secs(now), tally.best_share())
+                (
+                    format_hashrate(tally.hashrate(now)),
+                    tally.total(),
+                    tally.connected_secs(now),
+                    tally.best_share(),
+                )
             };
             tracing::info!(
                 target: "node::stratum",
@@ -996,7 +1142,10 @@ impl Session {
 }
 
 enum Judged {
-    Accepted { difficulty: u64, block: Option<(bitcoin::Block, u32, Payout)> },
+    Accepted {
+        difficulty: u64,
+        block: Option<(bitcoin::Block, u32, Payout)>,
+    },
     Rejected {
         code: &'static str,
         /// The difficulty the job was issued at, once the job is known.
@@ -1008,6 +1157,10 @@ enum Judged {
 
 impl Judged {
     fn refused(code: &'static str, job: Option<&Job>) -> Self {
-        Judged::Rejected { code, difficulty: job.map(|j| j.difficulty), hash_difficulty: None }
+        Judged::Rejected {
+            code,
+            difficulty: job.map(|j| j.difficulty),
+            hash_difficulty: None,
+        }
     }
 }

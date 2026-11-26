@@ -25,15 +25,25 @@ fn floor_env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
 }
 
 fn submit(mp: &Mempool, cs: &ChainState, txs: &[&Transaction]) -> PackageResult {
-    mp.accept_package_with(txs.iter().map(|t| (*t).clone()).collect(), cs, &NoopVerifier, None)
+    mp.accept_package_with(
+        txs.iter().map(|t| (*t).clone()).collect(),
+        cs,
+        &NoopVerifier,
+        None,
+    )
 }
 
 fn result<'a>(r: &'a PackageResult, tx: &Transaction) -> &'a serde_json::Value {
-    r.tx_results.get(&tx.compute_wtxid().to_string()).expect("every member has a result")
+    r.tx_results
+        .get(&tx.compute_wtxid().to_string())
+        .expect("every member has a result")
 }
 
 fn error(r: &PackageResult, tx: &Transaction) -> String {
-    result(r, tx)["error"].as_str().unwrap_or("<accepted>").to_string()
+    result(r, tx)["error"]
+        .as_str()
+        .unwrap_or("<accepted>")
+        .to_string()
 }
 
 /// The fee the relay floor asks of `txs` together, as Core's `CheckFeeRate`
@@ -74,15 +84,27 @@ fn a_child_pays_for_a_parent_below_the_relay_floor() {
     let r = submit(&mp, &cs, &[&parent, &child]);
 
     assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
-    assert_eq!(pool(&mp), HashSet::from([parent.compute_txid(), child.compute_txid()]));
-    let both = serde_json::json!([parent.compute_wtxid().to_string(), child.compute_wtxid().to_string()]);
+    assert_eq!(
+        pool(&mp),
+        HashSet::from([parent.compute_txid(), child.compute_txid()])
+    );
+    let both = serde_json::json!([
+        parent.compute_wtxid().to_string(),
+        child.compute_wtxid().to_string()
+    ]);
     for tx in [&parent, &child] {
         let fees = &result(&r, tx)["fees"];
         assert_eq!(fees["effective-includes"], both, "{:?}", r.tx_results);
-        assert_eq!(fees["effective-feerate"], result(&r, &child)["fees"]["effective-feerate"]);
+        assert_eq!(
+            fees["effective-feerate"],
+            result(&r, &child)["fees"]["effective-feerate"]
+        );
     }
     // The parent is announced, and before the child that spends it.
-    assert_eq!(entered(&mut rx), vec![parent.compute_txid(), child.compute_txid()]);
+    assert_eq!(
+        entered(&mut rx),
+        vec![parent.compute_txid(), child.compute_txid()]
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -96,7 +118,13 @@ fn a_child_pays_for_a_parent_below_the_rolling_minimum() {
     assert!(mp.min_fee() >= 20_000, "the fixture needs a raised floor");
     // 10 sat/vB: above the static floor, below the raised one.
     let parent = spend(&[prev(1)], COIN_VALUE, 820, 1, 1);
-    let child = spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 820, 6_000, 1, 2);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        COIN_VALUE - 820,
+        6_000,
+        1,
+        2,
+    );
     assert!(
         matches!(
             mp.accept_transaction(parent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false),
@@ -108,7 +136,10 @@ fn a_child_pays_for_a_parent_below_the_rolling_minimum() {
     let r = submit(&mp, &cs, &[&parent, &child]);
 
     assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
-    assert_eq!(pool(&mp), HashSet::from([parent.compute_txid(), child.compute_txid()]));
+    assert_eq!(
+        pool(&mp),
+        HashSet::from([parent.compute_txid(), child.compute_txid()])
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -126,10 +157,16 @@ fn a_child_that_cannot_pay_for_both_is_refused_by_the_package_feerate() {
     let r = submit(&mp, &cs, &[&parent, &child]);
 
     assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
-    assert_eq!(error(&r, &parent), format!("min relay fee not met, 0 < {}", floor_fee(&[&parent])));
+    assert_eq!(
+        error(&r, &parent),
+        format!("min relay fee not met, 0 < {}", floor_fee(&[&parent]))
+    );
     assert_eq!(
         error(&r, &child),
-        format!("min relay fee not met, 100 < {}", floor_fee(&[&parent, &child]))
+        format!(
+            "min relay fee not met, 100 < {}",
+            floor_fee(&[&parent, &child])
+        )
     );
     assert!(pool(&mp).is_empty(), "{:?}", r.tx_results);
 
@@ -153,13 +190,25 @@ fn an_unpaid_parent_leaves_with_its_child() {
 
     assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
     assert_eq!(error(&r, &child), "non-BIP68-final");
-    assert_eq!(error(&r, &parent), format!("min relay fee not met, 0 < {}", floor_fee(&[&parent])));
-    assert!(pool(&mp).is_empty(), "the unpaid parent was left in the pool");
+    assert_eq!(
+        error(&r, &parent),
+        format!("min relay fee not met, 0 < {}", floor_fee(&[&parent]))
+    );
+    assert!(
+        pool(&mp).is_empty(),
+        "the unpaid parent was left in the pool"
+    );
     let inner = mp.inner.read();
-    assert!(inner.spends.is_empty(), "the parent's input is still marked spent");
+    assert!(
+        inner.spends.is_empty(),
+        "the parent's input is still marked spent"
+    );
     assert_eq!(inner.total_bytes, 0, "the parent's bytes were not released");
     drop(inner);
-    assert!(entered(&mut rx).is_empty(), "a transaction that never stayed was announced");
+    assert!(
+        entered(&mut rx).is_empty(),
+        "a transaction that never stayed was announced"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -175,7 +224,13 @@ fn a_parent_below_the_floor_replaces_on_its_childs_fee() {
     // Outbids the resident, so the replacement rules pass; below the raised
     // floor, so only a package could let it in.
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let child = spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_000, 10_000, 1, 2);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        COIN_VALUE - 1_000,
+        10_000,
+        1,
+        2,
+    );
     assert!(matches!(
         mp.test_accept(&parent, &cs, &NoopVerifier),
         Err(MempoolError::MempoolMinFeeNotMet(..))
@@ -185,9 +240,16 @@ fn a_parent_below_the_floor_replaces_on_its_childs_fee() {
     let r = submit(&mp, &cs, &[&parent, &child]);
 
     assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
-    assert_eq!(pool(&mp), HashSet::from([parent.compute_txid(), child.compute_txid()]));
+    assert_eq!(
+        pool(&mp),
+        HashSet::from([parent.compute_txid(), child.compute_txid()])
+    );
     assert_eq!(r.replaced, vec![resident]);
-    assert_eq!(entered(&mut rx), vec![parent.compute_txid(), child.compute_txid()], "parent first, with its child");
+    assert_eq!(
+        entered(&mut rx),
+        vec![parent.compute_txid(), child.compute_txid()],
+        "parent first, with its child"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -199,8 +261,10 @@ fn a_parent_below_the_floor_replaces_on_its_childs_fee() {
 #[test]
 fn a_package_trims_the_pool_once_it_is_all_in() {
     let (cs, mp, dir) = env(&[1, 2, 3, 4, 5, 6]);
-    let residents: Vec<Txid> =
-        [3, 4, 5, 6].iter().map(|t| admit(&mp, &cs, spend(&[prev(*t)], COIN_VALUE, 500, 1, *t))).collect();
+    let residents: Vec<Txid> = [3, 4, 5, 6]
+        .iter()
+        .map(|t| admit(&mp, &cs, spend(&[prev(*t)], COIN_VALUE, 500, 1, *t)))
+        .collect();
     let first = spend(&[prev(1)], COIN_VALUE, 100, 1, 1);
     let second = spend(&[prev(2)], COIN_VALUE, 100, 1, 2);
     let first_size = bitcoin::consensus::serialize(&first).len();
@@ -221,10 +285,21 @@ fn a_package_trims_the_pool_once_it_is_all_in() {
     for tx in [&first, &second, &child] {
         assert!(now.contains(&tx.compute_txid()), "{:?}", r.tx_results);
         // Each was accepted on its own feerate.
-        assert_eq!(result(&r, tx)["fees"]["effective-includes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            result(&r, tx)["fees"]["effective-includes"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
     }
-    assert!(residents.iter().any(|t| !now.contains(t)), "nothing was trimmed");
-    assert!(mp.acting_bytes() <= mp.config.read().max_size_bytes, "the pool was left over its limit");
+    assert!(
+        residents.iter().any(|t| !now.contains(t)),
+        "nothing was trimmed"
+    );
+    assert!(
+        mp.acting_bytes() <= mp.config.read().max_size_bytes,
+        "the pool was left over its limit"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -257,8 +332,14 @@ fn a_child_pays_for_a_below_floor_parent_into_a_full_pool() {
     for tx in [&first, &second, &child] {
         assert!(now.contains(&tx.compute_txid()), "{:?}", r.tx_results);
     }
-    assert!(residents.iter().any(|t| !now.contains(t)), "nothing was trimmed");
-    assert!(mp.acting_bytes() <= mp.config.read().max_size_bytes, "the pool was left over its limit");
+    assert!(
+        residents.iter().any(|t| !now.contains(t)),
+        "nothing was trimmed"
+    );
+    assert!(
+        mp.acting_bytes() <= mp.config.read().max_size_bytes,
+        "the pool was left over its limit"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -282,9 +363,17 @@ fn a_subpackage_lists_only_its_own_wtxids() {
     let r = submit(&mp, &cs, &[&paid, &unpaid, &child]);
 
     assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
-    let together = serde_json::json!([unpaid.compute_wtxid().to_string(), child.compute_wtxid().to_string()]);
+    let together = serde_json::json!([
+        unpaid.compute_wtxid().to_string(),
+        child.compute_wtxid().to_string()
+    ]);
     for tx in [&unpaid, &child] {
-        assert_eq!(result(&r, tx)["fees"]["effective-includes"], together, "{:?}", r.tx_results);
+        assert_eq!(
+            result(&r, tx)["fees"]["effective-includes"],
+            together,
+            "{:?}",
+            r.tx_results
+        );
     }
     assert_eq!(
         result(&r, &paid)["fees"]["effective-includes"],
@@ -301,12 +390,20 @@ fn a_subpackage_lists_only_its_own_wtxids() {
 #[test]
 fn a_package_that_ranks_last_is_trimmed_and_reported_mempool_full() {
     let (cs, mp, dir) = env(&[1, 2, 3]);
-    let residents: HashSet<Txid> =
-        [2, 3].iter().map(|t| admit(&mp, &cs, spend(&[prev(*t)], COIN_VALUE, 5_000, 1, *t))).collect();
+    let residents: HashSet<Txid> = [2, 3]
+        .iter()
+        .map(|t| admit(&mp, &cs, spend(&[prev(*t)], COIN_VALUE, 5_000, 1, *t)))
+        .collect();
     set_max(&mp, mp.acting_bytes());
     let mut rx = events(&mp);
     let parent = spend(&[prev(1)], COIN_VALUE, 100, 1, 1);
-    let child = spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 100, 200, 1, 4);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        COIN_VALUE - 100,
+        200,
+        1,
+        4,
+    );
 
     let r = submit(&mp, &cs, &[&parent, &child]);
 
@@ -334,8 +431,10 @@ fn a_parent_ranks_with_the_child_that_pays_for_it() {
     let other = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 2_000, 1, 3));
 
     let mut inner = mp.inner.write();
-    let gone: Vec<Txid> =
-        Mempool::evict_lowest_fee_entries(&mut inner, 1, false, 0).into_iter().map(|(t, _)| t).collect();
+    let gone: Vec<Txid> = Mempool::evict_lowest_fee_entries(&mut inner, 1, false, 0)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
     drop(inner);
 
     assert_eq!(gone, vec![other]);
@@ -355,16 +454,21 @@ fn an_eviction_reranks_the_parent_it_leaves_behind() {
     // zero-fee child. `other` pays 40.
     let parent = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 113, 2, 1));
     let per = (COIN_VALUE - 113) / 2;
-    let rich = admit(&mp, &cs, spend(&[out(parent, 0)], COIN_VALUE - 113 - per, 8_200, 1, 2));
+    let rich = admit(
+        &mp,
+        &cs,
+        spend(&[out(parent, 0)], COIN_VALUE - 113 - per, 8_200, 1, 2),
+    );
     let poor = admit(&mp, &cs, spend(&[out(parent, 1)], per, 0, 1, 3));
     let other = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 3_280, 1, 4));
     let poor_size = bitcoin::consensus::serialize(&mp.get(&poor).unwrap().tx).len();
 
     let mut inner = mp.inner.write();
-    let mut gone: Vec<Txid> = Mempool::evict_lowest_fee_entries(&mut inner, poor_size + 1, false, 0)
-        .into_iter()
-        .map(|(t, _)| t)
-        .collect();
+    let mut gone: Vec<Txid> =
+        Mempool::evict_lowest_fee_entries(&mut inner, poor_size + 1, false, 0)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
     drop(inner);
 
     gone.sort();
@@ -388,20 +492,35 @@ fn a_family_too_large_to_walk_ranks_by_the_parent_alone() {
     let parent = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 0, children, 1));
     let per = COIN_VALUE / children;
     for vout in 0..children as u32 {
-        let value = if vout == 0 { COIN_VALUE - per * (children - 1) } else { per };
+        let value = if vout == 0 {
+            COIN_VALUE - per * (children - 1)
+        } else {
+            per
+        };
         admit(&mp, &cs, spend(&[out(parent, vout)], value, 500, 1, 2));
     }
     let inner = mp.inner.read();
-    assert_eq!(Mempool::descendant_score(&inner, &parent, &HashSet::new()), Some(0));
+    assert_eq!(
+        Mempool::descendant_score(&inner, &parent, &HashSet::new()),
+        Some(0)
+    );
     drop(inner);
 
     // One child fewer, and the family is walked: the parent ranks with it.
     let (cs2, mp2, dir2) = env(&[1]);
     mp2.config.write().max_cluster_count = 1_000;
-    let parent2 = admit(&mp2, &cs2, spend(&[prev(1)], COIN_VALUE, 0, children - 1, 1));
+    let parent2 = admit(
+        &mp2,
+        &cs2,
+        spend(&[prev(1)], COIN_VALUE, 0, children - 1, 1),
+    );
     let per = COIN_VALUE / (children - 1);
     for vout in 0..(children - 1) as u32 {
-        let value = if vout == 0 { COIN_VALUE - per * (children - 2) } else { per };
+        let value = if vout == 0 {
+            COIN_VALUE - per * (children - 2)
+        } else {
+            per
+        };
         admit(&mp2, &cs2, spend(&[out(parent2, vout)], value, 500, 1, 2));
     }
     let inner = mp2.inner.read();
@@ -422,16 +541,25 @@ fn evicting_a_shared_child_reranks_its_other_parent_down() {
     let (cs, mp, dir) = env(&[1, 2, 4]);
     let a = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 820, 1, 1));
     let b = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 0, 1, 2));
-    let c = admit(&mp, &cs, spend(&[out(a, 0), out(b, 0)], 2 * COIN_VALUE - 820, 12_300, 1, 3));
+    let c = admit(
+        &mp,
+        &cs,
+        spend(&[out(a, 0), out(b, 0)], 2 * COIN_VALUE - 820, 12_300, 1, 3),
+    );
     let d = admit(&mp, &cs, spend(&[prev(4)], COIN_VALUE, 5_084, 1, 4));
     let size = |t: &Txid| bitcoin::consensus::serialize(&mp.get(t).unwrap().tx).len();
     let need = size(&b) + size(&c) + 1;
 
     let mut inner = mp.inner.write();
     let score = |t: &Txid| Mempool::descendant_score(&inner, t, &HashSet::new()).unwrap();
-    assert!(score(&b) < score(&d) && score(&d) < score(&a), "the fixture needs B < D < A");
-    let mut gone: Vec<Txid> =
-        Mempool::evict_lowest_fee_entries(&mut inner, need, false, 0).into_iter().map(|(t, _)| t).collect();
+    assert!(
+        score(&b) < score(&d) && score(&d) < score(&a),
+        "the fixture needs B < D < A"
+    );
+    let mut gone: Vec<Txid> = Mempool::evict_lowest_fee_entries(&mut inner, need, false, 0)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
     drop(inner);
 
     gone.sort();
@@ -462,7 +590,10 @@ impl ScriptVerifier for RacesThenFails {
         }
         let _ = self.go.lock().unwrap().send(());
         std::thread::sleep(std::time::Duration::from_millis(300));
-        Err(crate::validation::script::ScriptError::VerifyFailed { input: 0, reason: "forged".into() })
+        Err(crate::validation::script::ScriptError::VerifyFailed {
+            input: 0,
+            reason: "forged".into(),
+        })
     }
 
     fn verify_policy(
@@ -484,9 +615,18 @@ fn an_admission_waits_for_a_package_that_may_take_its_parent_back() {
     let parent = spend(&[prev(1)], COIN_VALUE, 0, 2, 1);
     let per = COIN_VALUE / 2;
     let child = spend(&[out(parent.compute_txid(), 0)], per, 1_000, 1, 2);
-    let racer = spend(&[out(parent.compute_txid(), 1)], COIN_VALUE - per, 5_000, 1, 3);
+    let racer = spend(
+        &[out(parent.compute_txid(), 1)],
+        COIN_VALUE - per,
+        5_000,
+        1,
+        3,
+    );
     let (go, ready) = std::sync::mpsc::channel();
-    let verifier = RacesThenFails { fail: child.compute_txid(), go: std::sync::Mutex::new(go) };
+    let verifier = RacesThenFails {
+        fail: child.compute_txid(),
+        go: std::sync::Mutex::new(go),
+    };
 
     let (r, raced) = std::thread::scope(|s| {
         let (mp, cs, racer) = (&mp, &cs, &racer);
@@ -501,8 +641,14 @@ fn an_admission_waits_for_a_package_that_may_take_its_parent_back() {
     });
 
     assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
-    assert!(matches!(raced, Err(MempoolError::MissingInputs)), "{raced:?}");
-    assert!(pool(&mp).is_empty(), "a transaction was left spending a parent that left");
+    assert!(
+        matches!(raced, Err(MempoolError::MissingInputs)),
+        "{raced:?}"
+    );
+    assert!(
+        pool(&mp).is_empty(),
+        "a transaction was left spending a parent that left"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

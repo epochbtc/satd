@@ -30,7 +30,11 @@ pub struct BlockSources {
 
 impl BlockSources {
     pub fn new(capacity: usize) -> Self {
-        Self { by_hash: HashMap::new(), order: VecDeque::new(), capacity: capacity.max(1) }
+        Self {
+            by_hash: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
     }
 
     /// Record that `peer` sent `hash`. A block already recorded keeps its
@@ -40,7 +44,9 @@ impl BlockSources {
             return;
         }
         while self.by_hash.len() >= self.capacity {
-            let Some(old) = self.order.pop_front() else { break };
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
             self.by_hash.remove(&old);
         }
         self.by_hash.insert(hash, peer);
@@ -109,7 +115,11 @@ mod tests {
             s.record(h(i), u64::from(i));
             assert_eq!(s.take(&h(i)), Some(u64::from(i)));
         }
-        assert!(s.order.len() <= 2 * 4 + 1, "order queue is {}", s.order.len());
+        assert!(
+            s.order.len() <= 2 * 4 + 1,
+            "order queue is {}",
+            s.order.len()
+        );
         assert_eq!(s.len(), 0);
     }
 }

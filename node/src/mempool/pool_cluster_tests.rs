@@ -54,11 +54,24 @@ fn the_cluster_reaches_other_parents_through_a_shared_child() {
     let b_tx = spend(&[prev(2)], COIN_VALUE, 1_000, 2, 2);
     let b = accept(&mp, &cs, &b_tx).expect("b");
     let share = b_tx.output[1].value.to_sat();
-    accept(&mp, &cs, &spend(&[out(a, 0), out(b, 1)], COIN_VALUE - 1_000 + share, 1_000, 1, 3))
-        .expect("c joins a and b: three");
+    accept(
+        &mp,
+        &cs,
+        &spend(
+            &[out(a, 0), out(b, 1)],
+            COIN_VALUE - 1_000 + share,
+            1_000,
+            1,
+            3,
+        ),
+    )
+    .expect("c joins a and b: three");
 
     let d = spend(&[out(b, 0)], b_tx.output[0].value.to_sat(), 1_000, 1, 4);
-    assert!(too_large(accept(&mp, &cs, &d)), "d would make four, a included");
+    assert!(
+        too_large(accept(&mp, &cs, &d)),
+        "d would make four, a included"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -125,7 +138,8 @@ fn a_replacement_is_counted_without_what_it_evicts() {
     let child = accept(&mp, &cs, &spend(&[out(p, 0)], value, 1_000, 1, 2)).expect("child");
 
     let replacement = spend(&[out(p, 0)], value, 5_000, 1, 3);
-    mp.test_accept(&replacement, &cs, &NoopVerifier).expect("testmempoolaccept agrees");
+    mp.test_accept(&replacement, &cs, &NoopVerifier)
+        .expect("testmempoolaccept agrees");
     let r = accept(&mp, &cs, &replacement).expect("the child it evicts does not count");
     assert_eq!(pool(&mp), HashSet::from([p, r]));
     assert!(!pool(&mp).contains(&child));
@@ -146,7 +160,11 @@ fn a_reorg_returns_a_transaction_only_within_the_cluster_limits() {
     accept(&mp, &cs, &spend(&[out(p, 1)], share, 1_000, 1, 2)).expect("child");
 
     let second = spend(&[out(p, 0)], parent.output[0].value.to_sat(), 1_000, 1, 3);
-    assert!(too_large(mp.accept_reorged_transaction(second, &cs, &NoopVerifier)));
+    assert!(too_large(mp.accept_reorged_transaction(
+        second,
+        &cs,
+        &NoopVerifier
+    )));
     assert_eq!(pool(&mp).len(), 2);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -230,7 +248,13 @@ fn the_mining_order_does_not_depend_on_arrival() {
     let (cs, mp, dir) = env(&[1, 2, 3]);
     let (cs2, mp2, dir2) = env(&[1, 2, 3]);
     let cheap_parent = spend(&[prev(1)], COIN_VALUE, 500, 1, 1);
-    let rich_child = spend(&[out(cheap_parent.compute_txid(), 0)], cheap_parent.output[0].value.to_sat(), 20_000, 1, 2);
+    let rich_child = spend(
+        &[out(cheap_parent.compute_txid(), 0)],
+        cheap_parent.output[0].value.to_sat(),
+        20_000,
+        1,
+        2,
+    );
     let middling = spend(&[prev(2)], COIN_VALUE, 5_000, 1, 3);
     let poor = spend(&[prev(3)], COIN_VALUE, 300, 1, 4);
     for tx in [&cheap_parent, &rich_child, &middling, &poor] {
@@ -243,9 +267,22 @@ fn the_mining_order_does_not_depend_on_arrival() {
     assert_eq!(order, mp2.acting_txids_in_mining_order());
     // The child pays for its parent, so they come first, together.
     let txid = |t: &Transaction| t.compute_txid();
-    assert_eq!(order, vec![txid(&cheap_parent), txid(&rich_child), txid(&middling), txid(&poor)]);
+    assert_eq!(
+        order,
+        vec![
+            txid(&cheap_parent),
+            txid(&rich_child),
+            txid(&middling),
+            txid(&poor)
+        ]
+    );
     let listed = crate::rpc::rawtx::get_raw_mempool(&mp, false);
-    let listed: Vec<Txid> = listed.as_array().expect("a list").iter().map(|v| v.as_str().unwrap().parse().unwrap()).collect();
+    let listed: Vec<Txid> = listed
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|v| v.as_str().unwrap().parse().unwrap())
+        .collect();
     assert_eq!(listed, order);
     assert_eq!(mp.acting_txids_with_sequence().0, order);
 
@@ -267,14 +304,25 @@ fn a_returned_child_is_checked_without_its_parents_mempool_spenders() {
     let r = accept(&mp, &cs, &parent).expect("the returned parent");
     let a_tx = spend(&[out(r, 1)], share, 1_000, 1, 2);
     let a = accept(&mp, &cs, &a_tx).expect("a mempool spender");
-    let b = accept(&mp, &cs, &spend(&[out(a, 0)], a_tx.output[0].value.to_sat(), 1_000, 1, 3)).expect("its child");
+    let b = accept(
+        &mp,
+        &cs,
+        &spend(&[out(a, 0)], a_tx.output[0].value.to_sat(), 1_000, 1, 3),
+    )
+    .expect("its child");
     let child = spend(&[out(r, 0)], parent.output[0].value.to_sat(), 20_000, 1, 4);
 
     // Without the reorg's returned set, the walk counts a and b.
-    assert!(too_large(mp.accept_reorged_transaction(child.clone(), &cs, &NoopVerifier)));
+    assert!(too_large(mp.accept_reorged_transaction(
+        child.clone(),
+        &cs,
+        &NoopVerifier
+    )));
 
     let mut returned = HashSet::from([r]);
-    let s = mp.accept_reorged_with(child, &cs, &NoopVerifier, &mut returned).expect("checked as Core checks it");
+    let s = mp
+        .accept_reorged_with(child, &cs, &NoopVerifier, &mut returned)
+        .expect("checked as Core checks it");
     assert_eq!(returned, HashSet::from([r, s]));
 
     mp.trim_reorged_clusters(&[r, s]);
@@ -332,7 +380,9 @@ mod core_v32_1_clusters {
 
     /// The mempool of Core's run.
     fn core_mempool() -> (ChainState, Mempool, std::path::PathBuf) {
-        let op_true = bitcoin::ScriptBuf::new_p2wsh(&bitcoin::ScriptBuf::from_bytes(vec![0x51]).wscript_hash());
+        let op_true = bitcoin::ScriptBuf::new_p2wsh(
+            &bitcoin::ScriptBuf::from_bytes(vec![0x51]).wscript_hash(),
+        );
         let coins: Vec<(OutPoint, Coin)> = [CPFP_PARENT, NEG_PARENT, LONE]
             .iter()
             .map(|h| {
@@ -350,7 +400,8 @@ mod core_v32_1_clusters {
         for h in [CPFP_PARENT, CPFP_CHILD, NEG_PARENT] {
             accept(&mp, &cs, &tx(h)).expect("admitted");
         }
-        mp.prioritise_transaction(&txid(NEG_PARENT), -200_000).unwrap();
+        mp.prioritise_transaction(&txid(NEG_PARENT), -200_000)
+            .unwrap();
         for h in [NEG_CHILD, LONE] {
             accept(&mp, &cs, &tx(h)).expect("admitted");
         }
@@ -371,7 +422,10 @@ mod core_v32_1_clusters {
         assert_eq!(mp.mempool_cluster(&txid(CPFP_CHILD)), Some(cpfp));
         let neg = vec![(vec![txid(NEG_PARENT), txid(NEG_CHILD)], ff(-140_000, 762))];
         assert_eq!(mp.mempool_cluster(&txid(NEG_CHILD)), Some(neg));
-        assert_eq!(mp.mempool_cluster(&txid(LONE)), Some(vec![(vec![txid(LONE)], ff(20_000, 381))]));
+        assert_eq!(
+            mp.mempool_cluster(&txid(LONE)),
+            Some(vec![(vec![txid(LONE)], ff(20_000, 381))])
+        );
         assert_eq!(mp.mempool_cluster(&Txid::from_byte_array([7; 32])), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -382,7 +436,12 @@ mod core_v32_1_clusters {
         let (_cs, mp, dir) = core_mempool();
         assert_eq!(
             mp.feerate_diagram(),
-            vec![ff(0, 0), ff(101_000, 762), ff(121_000, 1143), ff(-19_000, 1905)]
+            vec![
+                ff(0, 0),
+                ff(101_000, 762),
+                ff(121_000, 1143),
+                ff(-19_000, 1905)
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -391,7 +450,8 @@ mod core_v32_1_clusters {
     #[test]
     fn the_rpcs_answer_in_cores_shape() {
         let (_cs, mp, dir) = core_mempool();
-        let got = crate::rpc::blockchain::get_mempool_cluster(&mp, &txid(NEG_PARENT).to_string()).unwrap();
+        let got = crate::rpc::blockchain::get_mempool_cluster(&mp, &txid(NEG_PARENT).to_string())
+            .unwrap();
         let want = serde_json::json!({
             "clusterweight": 762,
             "txcount": 2,
@@ -410,11 +470,15 @@ mod core_v32_1_clusters {
             .iter()
             .map(|p| (p["weight"].as_i64().unwrap(), p["fee"].to_string()))
             .collect();
-        let want: Vec<(i64, String)> =
-            [(0, "0.00000000"), (762, "0.00101000"), (1143, "0.00121000"), (1905, "-0.00019000")]
-                .iter()
-                .map(|(w, f)| (*w, f.to_string()))
-                .collect();
+        let want: Vec<(i64, String)> = [
+            (0, "0.00000000"),
+            (762, "0.00101000"),
+            (1143, "0.00121000"),
+            (1905, "-0.00019000"),
+        ]
+        .iter()
+        .map(|(w, f)| (*w, f.to_string()))
+        .collect();
         assert_eq!(points, want);
         assert_eq!(
             crate::rpc::blockchain::get_mempool_cluster(&mp, &"00".repeat(32)),
@@ -422,7 +486,10 @@ mod core_v32_1_clusters {
         );
         assert_eq!(
             crate::rpc::blockchain::get_mempool_cluster(&mp, "zz"),
-            Err((-8, "txid must be of length 64 (not 2, for 'zz')".to_string()))
+            Err((
+                -8,
+                "txid must be of length 64 (not 2, for 'zz')".to_string()
+            ))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

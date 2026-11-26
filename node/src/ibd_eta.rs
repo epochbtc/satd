@@ -223,7 +223,11 @@ fn weight_between(a: u32, b: u32, mainnet: bool) -> f64 {
     for i in (a / INTERVAL)..=((b - 1) / INTERVAL) {
         let lo = (i * INTERVAL).max(a);
         let hi = ((i + 1) * INTERVAL).min(b);
-        let w = if mainnet { f64::from(mainnet_weight(i as usize)) } else { 1.0 };
+        let w = if mainnet {
+            f64::from(mainnet_weight(i as usize))
+        } else {
+            1.0
+        };
         sum += w * f64::from(hi - lo) / f64::from(INTERVAL);
     }
     sum
@@ -253,9 +257,9 @@ mod tests {
     #[test]
     fn weight_table_monotonic_trend() {
         // Weights should generally increase across Bitcoin history
-        let early = mainnet_weight(50);   // height 50k
-        let mid = mainnet_weight(350);    // height 350k
-        let late = mainnet_weight(800);   // height 800k
+        let early = mainnet_weight(50); // height 50k
+        let mid = mainnet_weight(350); // height 350k
+        let late = mainnet_weight(800); // height 800k
         assert!(early < mid, "early={early} should be < mid={mid}");
         assert!(mid < late, "mid={mid} should be < late={late}");
     }
@@ -265,8 +269,11 @@ mod tests {
         // Modern blocks should be at least 30x heavier than genesis-era
         let genesis = mainnet_weight(10);
         let modern = mainnet_weight(820);
-        assert!(modern / genesis >= 30.0,
-            "modern/genesis ratio = {}, expected >= 30", modern / genesis);
+        assert!(
+            modern / genesis >= 30.0,
+            "modern/genesis ratio = {}, expected >= 30",
+            modern / genesis
+        );
     }
 
     #[test]
@@ -282,11 +289,13 @@ mod tests {
     #[test]
     fn cumulative_weight_range() {
         let est = IbdEtaEstimator::new(0, 900_000, true);
-        let early = est.cumulative_weight(0, 100);   // 0-100k
-        let late = est.cumulative_weight(700, 800);   // 700k-800k
+        let early = est.cumulative_weight(0, 100); // 0-100k
+        let late = est.cumulative_weight(700, 800); // 700k-800k
         // Late range should be much heavier
-        assert!(late > early * 10.0,
-            "late={late}, early={early}, expected late > 10 * early");
+        assert!(
+            late > early * 10.0,
+            "late={late}, early={early}, expected late > 10 * early"
+        );
     }
 
     #[test]

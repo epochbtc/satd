@@ -95,7 +95,11 @@ impl ArrivalTracker {
         // The clock stepped back past the newest entry: restart the residence
         // of everything waiting from now, rather than holding the queue until
         // the clock catches up with entries stamped in its future.
-        if self.pending.back().is_some_and(|&(_, entered)| entered > now) {
+        if self
+            .pending
+            .back()
+            .is_some_and(|&(_, entered)| entered > now)
+        {
             for p in &mut self.pending {
                 p.1 = p.1.min(now);
             }
@@ -146,7 +150,12 @@ impl ArrivalTracker {
         let warm = self.counted >= WARM_AFTER_ARRIVALS
             && self.started.is_some_and(|s| now >= s + WARM_AFTER_SECS);
         ArrivalRates {
-            bands: self.bands.iter().copied().zip(self.level.iter().copied()).collect(),
+            bands: self
+                .bands
+                .iter()
+                .copied()
+                .zip(self.level.iter().copied())
+                .collect(),
             warm,
         }
     }
@@ -180,7 +189,10 @@ mod tests {
         t.promote(1_000 + MIN_RESIDENCE_SECS - 1, |_| Some((20_000, 4_000)));
         assert!(t.rates(1_009).bands.iter().all(|(_, r)| *r == 0.0));
         t.promote(1_000 + MIN_RESIDENCE_SECS, |_| Some((20_000, 4_000)));
-        assert!(t.rates(1_010).bands[1].1 > 0.0, "counted once resident for 10 s");
+        assert!(
+            t.rates(1_010).bands[1].1 > 0.0,
+            "counted once resident for 10 s"
+        );
     }
 
     #[test]
@@ -204,7 +216,10 @@ mod tests {
         let r = t.rates(1_800);
         assert!(r.warm);
         let level = r.bands[1].1;
-        assert!((level - 400.0).abs() < 25.0, "settles near 400 WU/s, got {level}");
+        assert!(
+            (level - 400.0).abs() < 25.0,
+            "settles near 400 WU/s, got {level}"
+        );
         assert_eq!(r.bands[0].1, 0.0);
         assert_eq!(r.bands[2].1, 0.0);
     }
@@ -220,7 +235,10 @@ mod tests {
         t.promote(6_400, |_| Some((20_000, 400)));
         assert_eq!(t.pending.len(), 2, "neither resident yet on the new clock");
         t.promote(6_400 + MIN_RESIDENCE_SECS, |_| Some((20_000, 400)));
-        assert!(t.pending.is_empty(), "both counted after ten seconds of the new clock");
+        assert!(
+            t.pending.is_empty(),
+            "both counted after ten seconds of the new clock"
+        );
         assert!(t.rates(6_400 + MIN_RESIDENCE_SECS).bands[1].1 > 0.0);
     }
 
@@ -246,11 +264,17 @@ mod tests {
             t.note(txid(i), 0);
         }
         t.promote(MIN_RESIDENCE_SECS, |_| Some((20_000, 400)));
-        assert!(!t.rates(MIN_RESIDENCE_SECS).warm, "count reached, not the time");
+        assert!(
+            !t.rates(MIN_RESIDENCE_SECS).warm,
+            "count reached, not the time"
+        );
         assert!(t.rates(WARM_AFTER_SECS).warm);
         let mut few = tracker();
         few.note(txid(1), 0);
         few.promote(MIN_RESIDENCE_SECS, |_| Some((20_000, 400)));
-        assert!(!few.rates(10 * WARM_AFTER_SECS).warm, "time reached, not the count");
+        assert!(
+            !few.rates(10 * WARM_AFTER_SECS).warm,
+            "time reached, not the count"
+        );
     }
 }

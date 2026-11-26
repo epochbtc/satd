@@ -123,7 +123,9 @@ impl RestoreDownloader {
     pub fn may_start_pass(&self, now: Instant, peers: &[PeerId]) -> bool {
         self.fruitless_at.as_ref().is_none_or(|(at, then)| {
             now.duration_since(*at) >= FRUITLESS_PASS_WAIT
-                || then.as_ref().is_some_and(|then| peers.iter().any(|p| !then.contains(p)))
+                || then
+                    .as_ref()
+                    .is_some_and(|then| peers.iter().any(|p| !then.contains(p)))
         })
     }
 
@@ -185,8 +187,10 @@ impl RestoreDownloader {
         if peers.is_empty() {
             return Vec::new();
         }
-        let mut room: Vec<usize> =
-            peers.iter().map(|p| self.cap(*p).saturating_sub(self.outstanding(*p))).collect();
+        let mut room: Vec<usize> = peers
+            .iter()
+            .map(|p| self.cap(*p).saturating_sub(self.outstanding(*p)))
+            .collect();
         let mut out: Vec<Vec<BlockHash>> = vec![Vec::new(); peers.len()];
         let mut next = self.next_start % peers.len();
         self.next_start = self.next_start.wrapping_add(1);
@@ -220,7 +224,12 @@ impl RestoreDownloader {
             self.skipped += 1;
         }
         self.end_pass_if_idle(now, Some(peers));
-        peers.iter().copied().zip(out).filter(|(_, hashes)| !hashes.is_empty()).collect()
+        peers
+            .iter()
+            .copied()
+            .zip(out)
+            .filter(|(_, hashes)| !hashes.is_empty())
+            .collect()
     }
 
     fn drop_from_window(&mut self, hash: &BlockHash) -> Option<RestoreItem> {
@@ -344,8 +353,14 @@ impl RestoreDownloader {
 
     /// Blocks restored per second since the first pass started.
     pub fn rate(&self, now: Instant) -> f64 {
-        let secs = self.started.map_or(0.0, |s| now.duration_since(s).as_secs_f64());
-        if secs > 0.0 { self.restored_blocks as f64 / secs } else { 0.0 }
+        let secs = self
+            .started
+            .map_or(0.0, |s| now.duration_since(s).as_secs_f64());
+        if secs > 0.0 {
+            self.restored_blocks as f64 / secs
+        } else {
+            0.0
+        }
     }
 
     /// The counts for `getopreturnpruneinfo`.
@@ -360,7 +375,8 @@ impl RestoreDownloader {
             remaining_bytes: self.remaining_bytes,
             in_flight: self.in_flight.len() as u64,
             peers: self.peers as u64,
-            estimated_remaining_seconds: (rate > 0.0).then(|| (remaining_blocks as f64 / rate) as u64),
+            estimated_remaining_seconds: (rate > 0.0)
+                .then(|| (remaining_blocks as f64 / rate) as u64),
         }
     }
 }
@@ -388,7 +404,10 @@ mod tests {
     }
 
     fn asked(out: &[(PeerId, Vec<BlockHash>)], peer: PeerId) -> usize {
-        out.iter().filter(|(p, _)| *p == peer).map(|(_, h)| h.len()).sum()
+        out.iter()
+            .filter(|(p, _)| *p == peer)
+            .map(|(_, h)| h.len())
+            .sum()
     }
 
     #[test]
@@ -399,10 +418,17 @@ mod tests {
         for peer in [1, 2, 3] {
             assert_eq!(asked(&out, peer), PER_PEER);
         }
-        assert!(dl.assign(&[1, 2, 3], Instant::now()).is_empty(), "no room until a block arrives");
+        assert!(
+            dl.assign(&[1, 2, 3], Instant::now()).is_empty(),
+            "no room until a block arrives"
+        );
         let first = out[0].1[0];
         assert!(dl.note_restored(&first, out[0].0, 1000));
-        assert_eq!(asked(&dl.assign(&[1, 2, 3], Instant::now()), out[0].0), 1, "a delivery frees a slot");
+        assert_eq!(
+            asked(&dl.assign(&[1, 2, 3], Instant::now()), out[0].0),
+            1,
+            "a delivery frees a slot"
+        );
     }
 
     #[test]
@@ -411,15 +437,30 @@ mod tests {
         let t0 = Instant::now();
         let out = dl.assign(&[1], t0);
         assert_eq!(asked(&out, 1), PER_PEER);
-        assert_eq!(dl.release_stale(t0 + STALL - Duration::from_millis(1)), 0, "not yet stale");
+        assert_eq!(
+            dl.release_stale(t0 + STALL - Duration::from_millis(1)),
+            0,
+            "not yet stale"
+        );
         assert_eq!(dl.release_stale(t0 + STALL), 1);
         assert_eq!(dl.in_flight_len(), 0);
         let out = dl.assign(&[1, 2], t0 + STALL);
-        assert_eq!(asked(&out, 1), PER_PEER / 2, "the slow peer's slots are halved");
+        assert_eq!(
+            asked(&out, 1),
+            PER_PEER / 2,
+            "the slow peer's slots are halved"
+        );
         assert_eq!(asked(&out, 2), PER_PEER);
         let stalled: HashSet<_> = (0..PER_PEER as u32).map(|n| item(n).hash).collect();
-        let to_one: HashSet<_> = out.iter().filter(|(p, _)| *p == 1).flat_map(|(_, h)| h.iter().copied()).collect();
-        assert!(stalled.is_disjoint(&to_one), "a stalled block goes to the other peer");
+        let to_one: HashSet<_> = out
+            .iter()
+            .filter(|(p, _)| *p == 1)
+            .flat_map(|(_, h)| h.iter().copied())
+            .collect();
+        assert!(
+            stalled.is_disjoint(&to_one),
+            "a stalled block goes to the other peer"
+        );
         // A delivery earns a slot back.
         dl.note_restored(&out[0].1[0], 1, 1);
         assert_eq!(dl.cap(1), PER_PEER / 2 + 1);
@@ -438,14 +479,31 @@ mod tests {
         assert_eq!(out, vec![(other, vec![hash])], "the other peer is asked");
         assert!(dl.note_not_found(&hash, other));
         assert!(dl.assign(&[1, 2], Instant::now()).is_empty());
-        assert!(dl.is_idle(), "refused by every peer: left for the next pass");
-        assert_eq!(dl.progress().remaining_blocks, 1, "still counted as remaining");
-        assert!(!dl.may_start_pass(Instant::now(), &[1, 2]), "a pass that restored nothing waits");
+        assert!(
+            dl.is_idle(),
+            "refused by every peer: left for the next pass"
+        );
+        assert_eq!(
+            dl.progress().remaining_blocks,
+            1,
+            "still counted as remaining"
+        );
+        assert!(
+            !dl.may_start_pass(Instant::now(), &[1, 2]),
+            "a pass that restored nothing waits"
+        );
         assert!(dl.may_start_pass(Instant::now() + FRUITLESS_PASS_WAIT, &[1, 2]));
-        assert!(dl.may_start_pass(Instant::now(), &[1, 2, 3]), "unless a new peer has connected");
+        assert!(
+            dl.may_start_pass(Instant::now(), &[1, 2, 3]),
+            "unless a new peer has connected"
+        );
         dl.start_pass(vec![item(0)], Instant::now());
         dl.next_window();
-        assert_eq!(dl.assign(&[1, 2], Instant::now()).len(), 1, "a new pass asks the same peers again");
+        assert_eq!(
+            dl.assign(&[1, 2], Instant::now()).len(),
+            1,
+            "a new pass asks the same peers again"
+        );
     }
 
     #[test]
@@ -472,7 +530,10 @@ mod tests {
         assert_eq!(dl.progress().remaining_blocks, 2, "still remaining");
         assert!(dl.skip(&b, Instant::now()));
         assert!(dl.is_idle());
-        assert!(!dl.may_start_pass(Instant::now(), &[1, 2]), "a new peer does not cut the wait short");
+        assert!(
+            !dl.may_start_pass(Instant::now(), &[1, 2]),
+            "a new peer does not cut the wait short"
+        );
         let mut dl = started(1);
         dl.hold_off(Instant::now());
         assert!(!dl.may_start_pass(Instant::now(), &[9]));
@@ -499,17 +560,37 @@ mod tests {
         }
         assert!(!dl.note_restored(&out[0].1[0], 7, 1200), "counted once");
         let p = dl.progress();
-        assert_eq!((p.total_blocks, p.remaining_blocks, p.restored_blocks), (3, 0, 3));
-        assert_eq!((p.bytes_downloaded, p.remaining_bytes, p.in_flight), (3600, 0, 0));
-        assert_eq!(p.estimated_remaining_seconds, Some(0), "nothing left, at any rate");
+        assert_eq!(
+            (p.total_blocks, p.remaining_blocks, p.restored_blocks),
+            (3, 0, 3)
+        );
+        assert_eq!(
+            (p.bytes_downloaded, p.remaining_bytes, p.in_flight),
+            (3600, 0, 0)
+        );
+        assert_eq!(
+            p.estimated_remaining_seconds,
+            Some(0),
+            "nothing left, at any rate"
+        );
         assert!(dl.is_idle());
-        assert!(dl.may_start_pass(Instant::now(), &[7]), "a pass that restored something does not wait");
+        assert!(
+            dl.may_start_pass(Instant::now(), &[7]),
+            "a pass that restored something does not wait"
+        );
         dl.start_pass(Vec::new(), Instant::now());
-        assert!(!dl.may_start_pass(Instant::now(), &[7]), "an empty pass waits too");
+        assert!(
+            !dl.may_start_pass(Instant::now(), &[7]),
+            "an empty pass waits too"
+        );
         // The records are gone before the strip worker's finish step sees
         // it: the report still describes the pass that restored them.
         let p = dl.progress();
-        assert_eq!((p.total_blocks, p.remaining_blocks, p.restored_blocks), (3, 0, 3), "{p:?}");
+        assert_eq!(
+            (p.total_blocks, p.remaining_blocks, p.restored_blocks),
+            (3, 0, 3),
+            "{p:?}"
+        );
         assert_eq!(p.estimated_remaining_seconds, Some(0));
     }
 }

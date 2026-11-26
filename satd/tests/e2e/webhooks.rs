@@ -68,8 +68,7 @@ impl Received {
             self.body.as_bytes(),
         );
         let got = self.header("x-satd-signature");
-        got.len() == expected.len()
-            && got.as_bytes().ct_eq(expected.as_bytes()).into()
+        got.len() == expected.len() && got.as_bytes().ct_eq(expected.as_bytes()).into()
     }
 }
 
@@ -208,11 +207,7 @@ impl MockReceiver {
     }
 
     /// Wait for a delivery matching `pred`, up to `secs`.
-    async fn wait_for(
-        &self,
-        secs: u64,
-        pred: impl Fn(&Received) -> bool,
-    ) -> Received {
+    async fn wait_for(&self, secs: u64, pred: impl Fn(&Received) -> bool) -> Received {
         let deadline = std::time::Instant::now() + Duration::from_secs(secs);
         loop {
             if let Some(r) = self
@@ -373,7 +368,11 @@ fn write_alertfile(
     categories: &str,
     nudge: bool,
 ) {
-    let extra = if nudge { "allow_insecure_http = true\n" } else { "" };
+    let extra = if nudge {
+        "allow_insecure_http = true\n"
+    } else {
+        ""
+    };
     write_alertfile_keys(dir, receiver, id, categories, extra);
 }
 
@@ -426,11 +425,8 @@ fn write_two_hook_alertfile(
             r.url()
         )
     };
-    std::fs::write(
-        &path,
-        format!("version = 1\n{}{}", stanza(a), stanza(b)),
-    )
-    .expect("write alertfile");
+    std::fs::write(&path, format!("version = 1\n{}{}", stanza(a), stanza(b)))
+        .expect("write alertfile");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
@@ -538,15 +534,19 @@ async fn webhook_delivers_a_signed_status_event() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    assert!(now.abs_diff(ts) < 300, "timestamp should be recent, got {ts} vs {now}");
+    assert!(
+        now.abs_diff(ts) < 300,
+        "timestamp should be recent, got {ts} vs {now}"
+    );
     // Tampering with any signed field must invalidate the signature. The
     // delivery id is the one that matters most: the contract tells receivers to
     // deduplicate on it, so if it were unsigned an attacker holding one valid
     // delivery could pre-poison a receiver's dedup cache against future alerts.
     let mut forged = got.clone();
-    forged
-        .headers
-        .insert("x-satd-delivery".into(), format!("{}-forged", got.header("x-satd-delivery")));
+    forged.headers.insert(
+        "x-satd-delivery".into(),
+        format!("{}-forged", got.header("x-satd-delivery")),
+    );
     assert!(
         !forged.signature_valid(SECRET),
         "the delivery id must be covered by the signature",
@@ -578,7 +578,10 @@ async fn webhook_retries_until_the_receiver_recovers() {
     // The attempt counter proves this was a retry rather than a fresh event —
     // and it is what lets a receiver tell the two apart without keeping state.
     let attempt: u32 = got.header("x-satd-attempt").parse().unwrap_or(0);
-    assert!(attempt >= 3, "expected the 3rd attempt to succeed, got {attempt}");
+    assert!(
+        attempt >= 3,
+        "expected the 3rd attempt to succeed, got {attempt}"
+    );
     assert!(receiver.attempts().await >= 3);
 
     // One event is signed exactly once, and every attempt carries that same
@@ -595,7 +598,11 @@ async fn webhook_retries_until_the_receiver_recovers() {
         .iter()
         .filter(|r| r.json()["body"]["category"] == "chain")
         .collect();
-    assert!(chain.len() >= 3, "expected 3 attempts at one event, got {}", chain.len());
+    assert!(
+        chain.len() >= 3,
+        "expected 3 attempts at one event, got {}",
+        chain.len()
+    );
     let first = chain[0];
     for (i, r) in chain.iter().enumerate() {
         assert_eq!(
@@ -604,12 +611,18 @@ async fn webhook_retries_until_the_receiver_recovers() {
             "attempt {} re-stamped the timestamp; the event must be signed once",
             i + 1
         );
-        assert_eq!(r.header("x-satd-signature"), first.header("x-satd-signature"));
+        assert_eq!(
+            r.header("x-satd-signature"),
+            first.header("x-satd-signature")
+        );
         assert_eq!(r.header("x-satd-delivery"), first.header("x-satd-delivery"));
         assert_eq!(r.body, first.body);
     }
     // ...and the attempt counter is the one thing that does move.
-    assert_ne!(chain[0].header("x-satd-attempt"), chain[2].header("x-satd-attempt"));
+    assert_ne!(
+        chain[0].header("x-satd-attempt"),
+        chain[2].header("x-satd-attempt")
+    );
 }
 
 /// A SIGHUP that did not touch the alertfile must not destroy a queued status
@@ -660,11 +673,8 @@ async fn an_unrelated_sighup_does_not_destroy_a_queued_status_event() {
     // alertfile is untouched; only a daemon key changes. The threshold is
     // carried over so the condition stays raised — a cleared-and-re-raised
     // alert would produce a *new* event and mask the loss of the old one.
-    crate::streaming::sighup_with_conf(
-        &sn,
-        "alertdiskfreemb=17592186044416\nmaxconnections=42\n",
-    )
-    .await;
+    crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\nmaxconnections=42\n")
+        .await;
 
     // The original event must still land.
     let got = receiver
@@ -809,8 +819,16 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let missed = |r: &Received| (2..=5).contains(&r.json()["body"]["height"].as_u64().unwrap_or(0));
-    let before = receiver.all_attempts().await.iter().filter(|r| missed(r)).count();
-    assert!(before > 0, "the outage span should have been attempted at least once");
+    let before = receiver
+        .all_attempts()
+        .await
+        .iter()
+        .filter(|r| missed(r))
+        .count();
+    assert!(
+        before > 0,
+        "the outage span should have been attempted at least once"
+    );
 
     // Retire the generation with a same-URL alertfile edit — the same code path
     // a restart takes. The queued blocks go with it.
@@ -829,13 +847,21 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
         probes += 1;
         let arrived = async {
             loop {
-                if receiver.all_attempts().await.iter().any(|r| r.json()["body"]["height"].as_u64() >= Some(6)) {
+                if receiver
+                    .all_attempts()
+                    .await
+                    .iter()
+                    .any(|r| r.json()["body"]["height"].as_u64() >= Some(6))
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         };
-        if tokio::time::timeout(Duration::from_secs(5), arrived).await.is_ok() {
+        if tokio::time::timeout(Duration::from_secs(5), arrived)
+            .await
+            .is_ok()
+        {
             break;
         }
         assert!(probes < 12, "no block after the reload reached the hook");
@@ -860,7 +886,12 @@ async fn a_hook_that_was_down_resumes_at_the_live_head() {
     // the next retry when one more attempt lands inside the grace.
     let attempts = receiver.all_attempts().await;
     let most = (2..=5u64)
-        .map(|h| attempts.iter().filter(|r| r.json()["body"]["height"] == h).count())
+        .map(|h| {
+            attempts
+                .iter()
+                .filter(|r| r.json()["body"]["height"] == h)
+                .count()
+        })
         .max()
         .unwrap_or(0) as u32;
     let window = satd_alert::retry_delay(most + 1).mul_f64(1.25) + Duration::from_secs(3);
@@ -929,7 +960,10 @@ async fn a_still_true_condition_is_raised_again_after_a_restart() {
     .collect();
     let restart_quiet = quiet_but_disk.clone();
     let (sn, dir) = node_with_hook(&receiver, "ops", "\"status\"", quiet_but_disk).await;
-    let alertfile_arg = format!("--alertfile={}", dir.path().join("alertfile.toml").display());
+    let alertfile_arg = format!(
+        "--alertfile={}",
+        dir.path().join("alertfile.toml").display()
+    );
 
     // Clear first so the raise below is an edge on any host, then trip
     // `disk_low` with a floor no filesystem can satisfy. Both go through the
@@ -1083,8 +1117,7 @@ async fn a_reorg_delivers_the_disconnects_and_a_deep_reorg_edge() {
     let receiver = MockReceiver::ok().await;
     let mut args = vec!["--alertreorgdepth=2".to_string()];
     args.extend(quiet_detectors());
-    let (sn, _dir) =
-        node_with_hook_keys(&receiver, "ops", "\"status\", \"chain\"", "", args).await;
+    let (sn, _dir) = node_with_hook_keys(&receiver, "ops", "\"status\", \"chain\"", "", args).await;
 
     // Mine three blocks to a known address so the height-2 hash is in hand to
     // invalidate. `mine` returns the hashes in height order.
@@ -1122,7 +1155,10 @@ async fn a_reorg_delivers_the_disconnects_and_a_deep_reorg_edge() {
         .wait_for(60, |r| r.json()["body"]["kind"] == "reorg")
         .await;
     let m = marker.json();
-    assert!(marker.signature_valid(SECRET), "the reorg marker must be signed");
+    assert!(
+        marker.signature_valid(SECRET),
+        "the reorg marker must be signed"
+    );
     assert_eq!(m["body"]["from_height"], 3, "abandoned tip height: {m}");
     assert_eq!(m["body"]["to_height"], 1, "new tip height: {m}");
 
@@ -1147,10 +1183,16 @@ async fn a_reorg_delivers_the_disconnects_and_a_deep_reorg_edge() {
     let edge = receiver
         .wait_for(60, |r| r.json()["body"]["kind"] == "deep_reorg")
         .await;
-    assert!(edge.signature_valid(SECRET), "the deep_reorg edge must be signed");
+    assert!(
+        edge.signature_valid(SECRET),
+        "the deep_reorg edge must be signed"
+    );
     let e = edge.json();
     assert_eq!(e["body"]["category"], "status", "event: {e}");
-    assert_eq!(e["body"]["state"], "edge", "one-shot, not a standing warning: {e}");
+    assert_eq!(
+        e["body"]["state"], "edge",
+        "one-shot, not a standing warning: {e}"
+    );
     assert_eq!(e["body"]["severity"], "critical", "event: {e}");
     assert_eq!(e["body"]["details"]["depth"], "2", "event: {e}");
     assert_eq!(e["body"]["details"]["from_height"], "3", "event: {e}");
@@ -1275,7 +1317,11 @@ async fn heartbeats_reach_a_hook_downsampled_to_its_interval() {
     // gap is never below the interval.
     let stamps: Vec<u64> = beats
         .iter()
-        .map(|r| r.header("x-satd-timestamp").parse().expect("numeric timestamp"))
+        .map(|r| {
+            r.header("x-satd-timestamp")
+                .parse()
+                .expect("numeric timestamp")
+        })
         .collect();
     for pair in stamps.windows(2) {
         assert!(
@@ -1287,7 +1333,10 @@ async fn heartbeats_reach_a_hook_downsampled_to_its_interval() {
     }
 
     let b = beats[0].json();
-    assert!(beats[0].signature_valid(SECRET), "heartbeats are signed like any other event");
+    assert!(
+        beats[0].signature_valid(SECRET),
+        "heartbeats are signed like any other event"
+    );
     assert!(
         b["body"]["uptime_ns"].is_number(),
         "the heartbeat carries uptime for pipeline-latency measurement: {b}",

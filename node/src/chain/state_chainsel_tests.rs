@@ -31,7 +31,10 @@ fn status(cs: &ChainState, hash: &BlockHash) -> Option<BlockStatus> {
 /// A block on `parent` that spends a coin that does not exist: well formed,
 /// with valid proof of work, and invalid at connect (`bad-txns-inputs-missingorspent`).
 fn spends_missing_coin(parent: BlockHash, height: u32, time: u32) -> Block {
-    let missing = OutPoint { txid: bitcoin::Txid::from_byte_array([0xc5; 32]), vout: 0 };
+    let missing = OutPoint {
+        txid: bitcoin::Txid::from_byte_array([0xc5; 32]),
+        vout: 0,
+    };
     build_test_block_spending(parent, height, time, missing)
 }
 
@@ -76,7 +79,11 @@ fn a_failed_activation_retries_the_valid_prefix_at_once() {
     let second = cs.activate_best_stored_chain().expect("second attempt");
     assert_eq!(second, Some(b4.block_hash()), "the valid prefix is taken");
     assert_eq!(cs.tip_hash(), b4.block_hash());
-    assert_eq!(cs.reorg_abort_count(), 1, "one failed reorg, then one that succeeded");
+    assert_eq!(
+        cs.reorg_abort_count(),
+        1,
+        "one failed reorg, then one that succeeded"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -91,7 +98,11 @@ fn marking_a_branch_clears_the_activation_attempt_key() {
     let a = connect_chain(&cs, 3);
     let side = build_test_block(a[0].block_hash(), 2, BASE + 9_000);
     announce_and_store(&cs, &side);
-    assert_eq!(cs.best_header_hash(), a[2].block_hash(), "fixture: the side block is lighter");
+    assert_eq!(
+        cs.best_header_hash(),
+        a[2].block_hash(),
+        "fixture: the side block is lighter"
+    );
 
     let headers_before = cs.headers_tip_height();
     let key = (cs.tip_hash(), cs.best_header_hash(), 7);
@@ -102,7 +113,11 @@ fn marking_a_branch_clears_the_activation_attempt_key() {
     }
     assert_eq!(status(&cs, &side.block_hash()), Some(BlockStatus::Invalid));
     assert_eq!(*cs.last_activation_attempt.lock(), None);
-    assert_eq!(cs.best_header_hash(), a[2].block_hash(), "header tip not in the subtree");
+    assert_eq!(
+        cs.best_header_hash(),
+        a[2].block_hash(),
+        "header tip not in the subtree"
+    );
     assert_eq!(cs.headers_tip_height(), headers_before);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -123,7 +138,9 @@ fn a_block_that_fails_to_connect_moves_the_header_tip_off_it() {
     assert_eq!(cs.best_header_hash(), bad.block_hash());
     assert_eq!(cs.headers_tip_height(), 4);
 
-    let err = cs.accept_block(&bad).expect_err("a block spending a missing coin");
+    let err = cs
+        .accept_block(&bad)
+        .expect_err("a block spending a missing coin");
     assert_eq!(err.to_string(), "bad-txns-inputs-missingorspent");
     assert_eq!(status(&cs, &bad.block_hash()), Some(BlockStatus::Invalid));
     assert_eq!(cs.best_header_hash(), tip);
@@ -155,7 +172,9 @@ fn the_connector_marks_a_stored_block_that_fails_to_connect() {
     announce_and_store(&cs, &child);
     assert_eq!(cs.best_header_hash(), child.block_hash());
 
-    let err = cs.connect_stored_block(&bad.block_hash()).expect_err("cannot connect");
+    let err = cs
+        .connect_stored_block(&bad.block_hash())
+        .expect_err("cannot connect");
     assert_eq!(err.to_string(), "bad-txns-inputs-missingorspent");
     assert_eq!(status(&cs, &bad.block_hash()), Some(BlockStatus::Invalid));
     assert_eq!(status(&cs, &child.block_hash()), Some(BlockStatus::Invalid));
@@ -163,12 +182,15 @@ fn the_connector_marks_a_stored_block_that_fails_to_connect() {
     assert_eq!(cs.headers_tip_height(), 3);
     assert_eq!(cs.tip_hash(), tip);
 
-    let again = cs.connect_stored_block(&bad.block_hash()).expect_err("judged");
+    let again = cs
+        .connect_stored_block(&bad.block_hash())
+        .expect_err("judged");
     assert!(matches!(again, ChainError::Duplicate), "got {again:?}");
 
     let good = build_test_block(tip, 4, BASE + 600 * 4 + 1);
     announce_and_store(&cs, &good);
-    cs.connect_stored_block(&good.block_hash()).expect("a valid sibling connects");
+    cs.connect_stored_block(&good.block_hash())
+        .expect("a valid sibling connects");
     assert_eq!(cs.tip_hash(), good.block_hash());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -192,7 +214,10 @@ fn the_prefetch_connect_marks_a_stored_block_that_fails_to_connect() {
         height: 4,
         hash: bad.block_hash(),
         block: bad.clone(),
-        flat_pos: FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos },
+        flat_pos: FlatFilePos {
+            file_number: entry.file_number,
+            data_pos: entry.data_pos,
+        },
         mtp: 0,
         txids: bad.txdata.iter().map(|t| t.compute_txid()).collect(),
         script_verified_txs: Default::default(),
@@ -202,7 +227,9 @@ fn the_prefetch_connect_marks_a_stored_block_that_fails_to_connect() {
         entry,
         parent,
     };
-    let err = cs.connect_preprocessed_block(pre).expect_err("cannot connect");
+    let err = cs
+        .connect_preprocessed_block(pre)
+        .expect_err("cannot connect");
     assert_eq!(err.to_string(), "bad-txns-inputs-missingorspent");
     assert_eq!(status(&cs, &bad.block_hash()), Some(BlockStatus::Invalid));
     assert_eq!(cs.best_header_hash(), tip);
@@ -225,25 +252,40 @@ fn a_storage_gap_in_the_connector_does_not_mark_the_block() {
     announce_and_store(&cs, &next);
 
     cs.store
-        .write_batch(StoreBatch { height_hash_removes: vec![7], ..Default::default() })
+        .write_batch(StoreBatch {
+            height_hash_removes: vec![7],
+            ..Default::default()
+        })
         .unwrap();
     cs.mtp_cache.lock().clear();
 
-    let err = cs.connect_stored_block(&next.block_hash()).expect_err("window has a hole");
+    let err = cs
+        .connect_stored_block(&next.block_hash())
+        .expect_err("window has a hole");
     assert!(
         matches!(
             err,
-            ChainError::Connect(connect::ConnectError::MedianTimeWindowGap { height: 13, missing: 7 })
+            ChainError::Connect(connect::ConnectError::MedianTimeWindowGap {
+                height: 13,
+                missing: 7
+            })
         ),
         "got {err:?}"
     );
-    assert_eq!(status(&cs, &next.block_hash()), Some(BlockStatus::DataStored));
+    assert_eq!(
+        status(&cs, &next.block_hash()),
+        Some(BlockStatus::DataStored)
+    );
     assert_eq!(cs.best_header_hash(), next.block_hash());
 
     cs.store
-        .write_batch(StoreBatch { height_hash_puts: vec![(7, a[6].block_hash())], ..Default::default() })
+        .write_batch(StoreBatch {
+            height_hash_puts: vec![(7, a[6].block_hash())],
+            ..Default::default()
+        })
         .unwrap();
-    cs.connect_stored_block(&next.block_hash()).expect("connects once the window is whole");
+    cs.connect_stored_block(&next.block_hash())
+        .expect("connects once the window is whole");
     assert_eq!(cs.tip_hash(), next.block_hash());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -264,14 +306,23 @@ fn only_a_verdict_from_connect_marks_a_stored_block() {
     announce_and_store(&cs, &next);
     let guard = cs.accept_lock.lock();
 
-    cs.mark_stored_block_failure(&next.block_hash(), &connect::ConnectError::ChainTxGap { parent: tip });
-    assert_eq!(status(&cs, &next.block_hash()), Some(BlockStatus::DataStored));
+    cs.mark_stored_block_failure(
+        &next.block_hash(),
+        &connect::ConnectError::ChainTxGap { parent: tip },
+    );
+    assert_eq!(
+        status(&cs, &next.block_hash()),
+        Some(BlockStatus::DataStored)
+    );
     assert_eq!(cs.best_header_hash(), next.block_hash());
 
     cs.mark_stored_block_failure(
         &next.block_hash(),
         &connect::ConnectError::MissingOrSpentInput {
-            outpoint: OutPoint { txid: bitcoin::Txid::from_byte_array([0xc6; 32]), vout: 0 },
+            outpoint: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0xc6; 32]),
+                vout: 0,
+            },
         },
     );
     assert_eq!(status(&cs, &next.block_hash()), Some(BlockStatus::Invalid));

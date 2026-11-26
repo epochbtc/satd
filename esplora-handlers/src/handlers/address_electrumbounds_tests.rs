@@ -55,7 +55,10 @@ impl AddressIndex for SlowIndex {
     fn utxos(&self, _sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
         Ok(Vec::new())
     }
-    fn subscribe(&self, _sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+    fn subscribe(
+        &self,
+        _sh: Scripthash,
+    ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         Err(SubscribeError::CapReached(0))
     }
 }
@@ -142,8 +145,14 @@ async fn serve(
 fn get(addr: SocketAddr, path: &str) -> (u16, Duration) {
     let started = Instant::now();
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     let status = response
@@ -157,12 +166,16 @@ fn get(addr: SocketAddr, path: &str) -> (u16, Duration) {
 /// Run `client` on its own OS thread and re-raise its panic, if any.
 async fn on_thread(client: impl FnOnce() + Send + 'static) {
     let handle = std::thread::spawn(client);
-    if let Err(panic) = tokio::task::spawn_blocking(move || handle.join()).await.unwrap() {
+    if let Err(panic) = tokio::task::spawn_blocking(move || handle.join())
+        .await
+        .unwrap()
+    {
         std::panic::resume_unwind(panic);
     }
 }
 
-const SH_PATH: &str = "/scripthash/1111111111111111111111111111111111111111111111111111111111111111";
+const SH_PATH: &str =
+    "/scripthash/1111111111111111111111111111111111111111111111111111111111111111";
 
 /// One runtime worker, as on a small box: a slow address read must not
 /// hold the worker every other Esplora request (and Electrum, gRPC and
@@ -170,7 +183,9 @@ const SH_PATH: &str = "/scripthash/111111111111111111111111111111111111111111111
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_slow_address_read_does_not_hold_up_other_requests() {
     let index = Arc::new(SlowIndex::default());
-    index.delay_ms.store(SLOW.as_millis() as u64, Ordering::SeqCst);
+    index
+        .delay_ms
+        .store(SLOW.as_millis() as u64, Ordering::SeqCst);
     let (addr, _dir) = serve(index, Duration::from_secs(30), 256).await;
 
     on_thread(move || {
@@ -192,7 +207,9 @@ async fn a_slow_address_read_does_not_hold_up_other_requests() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_address_read_past_the_request_timeout_is_answered_503_on_time() {
     let index = Arc::new(SlowIndex::default());
-    index.delay_ms.store(SLOW.as_millis() as u64, Ordering::SeqCst);
+    index
+        .delay_ms
+        .store(SLOW.as_millis() as u64, Ordering::SeqCst);
     let (addr, _dir) = serve(index, Duration::from_millis(300), 256).await;
 
     on_thread(move || {
@@ -217,7 +234,9 @@ async fn an_address_read_past_the_request_timeout_is_answered_503_on_time() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_timed_out_read_keeps_its_work_permit_until_it_ends() {
     let index = Arc::new(SlowIndex::default());
-    index.delay_ms.store(SLOW.as_millis() as u64, Ordering::SeqCst);
+    index
+        .delay_ms
+        .store(SLOW.as_millis() as u64, Ordering::SeqCst);
     let (addr, _dir) = serve(index.clone(), Duration::from_millis(300), 1).await;
 
     on_thread(move || {

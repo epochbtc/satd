@@ -12,7 +12,10 @@ use node_index::SpendingRef;
 use serde_json::json;
 
 fn prev(tag: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
+    OutPoint {
+        txid: Txid::from_byte_array([tag; 32]),
+        vout: 0,
+    }
 }
 
 fn coin() -> Coin {
@@ -29,17 +32,31 @@ fn spend(prev: OutPoint) -> Transaction {
     Transaction {
         version: Version(2),
         lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn { previous_output: prev, script_sig: Default::default(), sequence: Sequence::MAX, witness: Witness::new() }],
+        input: vec![TxIn {
+            previous_output: prev,
+            script_sig: Default::default(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
         output: vec![TxOut {
             value: Amount::from_sat(99_000),
-            script_pubkey: bitcoin::ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x22; 20]].concat()),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(
+                [&[0x00, 0x14][..], &[0x22; 20]].concat(),
+            ),
         }],
     }
 }
 
 fn env() -> (ChainState, Mempool, std::path::PathBuf) {
-    let (cs, mp, dir) = make_funded_template_env_with(&[(prev(1), coin()), (prev(2), coin())], Box::new(NoopVerifier));
-    mp.reload_policy(MempoolConfig { max_size_bytes: 1_000_000, min_fee_rate: 0, ..Default::default() });
+    let (cs, mp, dir) = make_funded_template_env_with(
+        &[(prev(1), coin()), (prev(2), coin())],
+        Box::new(NoopVerifier),
+    );
+    mp.reload_policy(MempoolConfig {
+        max_size_bytes: 1_000_000,
+        min_fee_rate: 0,
+        ..Default::default()
+    });
     (cs, mp, dir)
 }
 
@@ -80,10 +97,21 @@ fn call(
 fn a_mempool_spender_is_found_and_an_unspent_output_echoed() {
     let (cs, mp, dir) = env();
     let tx = spend(prev(1));
-    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
-    let unspent = OutPoint { txid: tx.compute_txid(), vout: 5 };
+    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("admitted");
+    let unspent = OutPoint {
+        txid: tx.compute_txid(),
+        vout: 5,
+    };
 
-    let r = call(&cs, &mp, None, vec![arg(prev(1)), arg(unspent)], Value::Null).unwrap();
+    let r = call(
+        &cs,
+        &mp,
+        None,
+        vec![arg(prev(1)), arg(unspent)],
+        Value::Null,
+    )
+    .unwrap();
     assert_eq!(
         r,
         json!([
@@ -91,7 +119,14 @@ fn a_mempool_spender_is_found_and_an_unspent_output_echoed() {
             {"txid": tx.compute_txid().to_string(), "vout": 5},
         ])
     );
-    let r = call(&cs, &mp, None, vec![arg(prev(1))], json!({"return_spending_tx": true})).unwrap();
+    let r = call(
+        &cs,
+        &mp,
+        None,
+        vec![arg(prev(1))],
+        json!({"return_spending_tx": true}),
+    )
+    .unwrap();
     assert_eq!(r[0]["spendingtx"], serialize_hex(&tx));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -102,10 +137,22 @@ fn a_mempool_spender_is_found_and_an_unspent_output_echoed() {
 #[test]
 fn without_the_index_only_the_mempool_answers() {
     let (cs, mp, dir) = env();
-    let r = call(&cs, &mp, None, vec![arg(prev(2))], json!({"mempool_only": false}));
+    let r = call(
+        &cs,
+        &mp,
+        None,
+        vec![arg(prev(2))],
+        json!({"mempool_only": false}),
+    );
     assert_eq!(
         r,
-        Err((-1, format!("No spending tx for the outpoint {}:0 in mempool, and txospenderindex is unavailable.", prev(2).txid)))
+        Err((
+            -1,
+            format!(
+                "No spending tx for the outpoint {}:0 in mempool, and txospenderindex is unavailable.",
+                prev(2).txid
+            )
+        ))
     );
     // An index still filling is unavailable too.
     let filling = FixedIndex(Err(()));
@@ -122,13 +169,36 @@ fn the_index_names_a_confirmed_spender_and_its_block() {
     let (cs, mp, dir) = env();
     let genesis = cs.get_block_hash_by_height(0).expect("genesis");
     let coinbase = cs.get_block(&genesis).expect("genesis block").txdata[0].clone();
-    let index = FixedIndex(Ok(vec![(prev(2), SpendingRef { spending_txid: coinbase.compute_txid(), spending_vin: 0, height: 0 })]));
+    let index = FixedIndex(Ok(vec![(
+        prev(2),
+        SpendingRef {
+            spending_txid: coinbase.compute_txid(),
+            spending_vin: 0,
+            height: 0,
+        },
+    )]));
     let mempool_spend = spend(prev(1));
-    mp.accept_transaction(mempool_spend.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
-    let unspent = OutPoint { txid: coinbase.compute_txid(), vout: 0 };
+    mp.accept_transaction(
+        mempool_spend.clone(),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+    )
+    .expect("admitted");
+    let unspent = OutPoint {
+        txid: coinbase.compute_txid(),
+        vout: 0,
+    };
 
-    let r = call(&cs, &mp, Some(&index), vec![arg(prev(2)), arg(prev(1)), arg(unspent)], json!({"return_spending_tx": true}))
-        .unwrap();
+    let r = call(
+        &cs,
+        &mp,
+        Some(&index),
+        vec![arg(prev(2)), arg(prev(1)), arg(unspent)],
+        json!({"return_spending_tx": true}),
+    )
+    .unwrap();
     assert_eq!(
         r,
         json!([
@@ -147,7 +217,14 @@ fn the_index_names_a_confirmed_spender_and_its_block() {
         ]),
         "input order is kept"
     );
-    let r = call(&cs, &mp, Some(&index), vec![arg(prev(2))], json!({"mempool_only": true})).unwrap();
+    let r = call(
+        &cs,
+        &mp,
+        Some(&index),
+        vec![arg(prev(2))],
+        json!({"mempool_only": true}),
+    )
+    .unwrap();
     assert_eq!(r, json!([arg(prev(2))]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -157,22 +234,53 @@ fn the_index_names_a_confirmed_spender_and_its_block() {
 fn arguments_are_checked_as_core_checks_them() {
     let (cs, mp, dir) = env();
     let txid = prev(1).txid.to_string();
-    let err = |outputs: Vec<Value>, options: Value| call(&cs, &mp, None, outputs, options).unwrap_err();
+    let err =
+        |outputs: Vec<Value>, options: Value| call(&cs, &mp, None, outputs, options).unwrap_err();
 
-    assert_eq!(err(vec![], Value::Null), (-8, "Invalid parameter, outputs are missing".into()));
-    assert_eq!(err(vec![json!({"txid": txid, "vout": 1, "unknown": 42})], Value::Null), (-3, "Unexpected key unknown".into()));
-    assert_eq!(err(vec![json!({"txid": txid, "vout": -1})], Value::Null), (-8, "Invalid parameter, vout cannot be negative".into()));
+    assert_eq!(
+        err(vec![], Value::Null),
+        (-8, "Invalid parameter, outputs are missing".into())
+    );
+    assert_eq!(
+        err(
+            vec![json!({"txid": txid, "vout": 1, "unknown": 42})],
+            Value::Null
+        ),
+        (-3, "Unexpected key unknown".into())
+    );
+    assert_eq!(
+        err(vec![json!({"txid": txid, "vout": -1})], Value::Null),
+        (-8, "Invalid parameter, vout cannot be negative".into())
+    );
     assert_eq!(
         err(vec![json!({"txid": 42, "vout": 0})], Value::Null),
-        (-3, "JSON value of type number for field txid is not of expected type string".into())
+        (
+            -3,
+            "JSON value of type number for field txid is not of expected type string".into()
+        )
     );
-    assert_eq!(err(vec![json!({"txid": txid})], Value::Null), (-3, "Missing vout".into()));
-    assert_eq!(err(vec![json!({"vout": 3})], Value::Null), (-3, "Missing txid".into()));
-    assert_eq!(err(vec![json!({"txid": "ab", "vout": 0})], Value::Null), (-8, "txid must be of length 64 (not 2, for 'ab')".into()));
-    assert_eq!(err(vec![arg(prev(1))], json!({"other": true})), (-3, "Unexpected key other".into()));
+    assert_eq!(
+        err(vec![json!({"txid": txid})], Value::Null),
+        (-3, "Missing vout".into())
+    );
+    assert_eq!(
+        err(vec![json!({"vout": 3})], Value::Null),
+        (-3, "Missing txid".into())
+    );
+    assert_eq!(
+        err(vec![json!({"txid": "ab", "vout": 0})], Value::Null),
+        (-8, "txid must be of length 64 (not 2, for 'ab')".into())
+    );
+    assert_eq!(
+        err(vec![arg(prev(1))], json!({"other": true})),
+        (-3, "Unexpected key other".into())
+    );
     assert_eq!(
         err(vec![arg(prev(1))], json!({"mempool_only": 1})),
-        (-3, "JSON value of type number for field mempool_only is not of expected type bool".into())
+        (
+            -3,
+            "JSON value of type number for field mempool_only is not of expected type bool".into()
+        )
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -184,14 +292,32 @@ fn arguments_are_checked_as_core_checks_them() {
 fn outputs_spent_by_one_transaction_name_it_for_each() {
     let (cs, mp, dir) = env();
     let mut tx = spend(prev(1));
-    tx.input.push(TxIn { previous_output: prev(2), script_sig: Default::default(), sequence: Sequence::MAX, witness: Witness::new() });
-    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+    tx.input.push(TxIn {
+        previous_output: prev(2),
+        script_sig: Default::default(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    });
+    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("admitted");
     let txid = tx.compute_txid();
     let (spenders, txs) = mp.spending_transactions_acting(&[prev(1), prev(2), prev(3)], true);
     assert_eq!(spenders, vec![Some(txid), Some(txid), None]);
     assert_eq!(txs.len(), 1, "one copy of the spender, not one per output");
-    assert!(mp.spending_transactions_acting(&[prev(1)], false).1.is_empty(), "no copy unless asked for");
-    let r = call(&cs, &mp, None, vec![arg(prev(1)), arg(prev(2))], Value::Null).unwrap();
+    assert!(
+        mp.spending_transactions_acting(&[prev(1)], false)
+            .1
+            .is_empty(),
+        "no copy unless asked for"
+    );
+    let r = call(
+        &cs,
+        &mp,
+        None,
+        vec![arg(prev(1)), arg(prev(2))],
+        Value::Null,
+    )
+    .unwrap();
     assert_eq!(r[0]["spendingtxid"], r[1]["spendingtxid"]);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -204,17 +330,24 @@ fn outputs_spent_by_one_transaction_name_it_for_each() {
 fn spending_tx_copies_are_held_to_the_response_limit() {
     let (cs, mp, dir) = env();
     let tx = spend(prev(1));
-    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+    mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("admitted");
     let one = serialize_hex(&tx).len();
     let options = json!({"return_spending_tx": true}).as_object().cloned();
     let outputs = vec![arg(prev(1)); 3];
 
-    assert!(answer(&cs, &mp, None, outputs.clone(), options.clone(), 3 * one).is_ok(), "three copies fit");
+    assert!(
+        answer(&cs, &mp, None, outputs.clone(), options.clone(), 3 * one).is_ok(),
+        "three copies fit"
+    );
     assert_eq!(
         answer(&cs, &mp, None, outputs.clone(), options, 3 * one - 1),
         Err((-32008, "Response is too big".to_string()))
     );
-    assert!(answer(&cs, &mp, None, outputs, None, 0).is_ok(), "no copies, nothing counted");
+    assert!(
+        answer(&cs, &mp, None, outputs, None, 0).is_ok(),
+        "no copies, nothing counted"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

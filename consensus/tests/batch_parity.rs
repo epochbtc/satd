@@ -68,7 +68,15 @@ fn per_input_all_ok(tx: &Transaction, prev_outputs: &[TxOut], flag_set: u32) -> 
     let spent: &[TxOut] = if has_taproot { prev_outputs } else { &[] };
     prev_outputs.iter().enumerate().all(|(i, prev)| {
         let precomputed = consensus::PrecomputedTransactionData::new(tx, spent).unwrap();
-        consensus::verify(&prev.script_pubkey, prev.value, tx, i, flag_set, &precomputed).is_ok()
+        consensus::verify(
+            &prev.script_pubkey,
+            prev.value,
+            tx,
+            i,
+            flag_set,
+            &precomputed,
+        )
+        .is_ok()
     })
 }
 
@@ -199,8 +207,14 @@ fn batch_handles_multiple_trivial_inputs() {
     // scriptPubKey = OP_TRUE. scriptSig = empty. Always verifies.
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let prev_outputs = vec![
-        TxOut { value: Amount::from_sat(1_000), script_pubkey: op_true.clone() },
-        TxOut { value: Amount::from_sat(2_000), script_pubkey: op_true.clone() },
+        TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true.clone(),
+        },
+        TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: op_true.clone(),
+        },
     ];
 
     let dummy_txid = Txid::from_byte_array([1u8; 32]);
@@ -209,13 +223,19 @@ fn batch_handles_multiple_trivial_inputs() {
         lock_time: LockTime::ZERO,
         input: vec![
             TxIn {
-                previous_output: OutPoint { txid: dummy_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: dummy_txid,
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             },
             TxIn {
-                previous_output: OutPoint { txid: dummy_txid, vout: 1 },
+                previous_output: OutPoint {
+                    txid: dummy_txid,
+                    vout: 1,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
@@ -231,7 +251,11 @@ fn batch_handles_multiple_trivial_inputs() {
 
     let flag_set = consensus::flags::VERIFY_P2SH;
     let result = consensus::verify_transaction(&tx, &prev_outputs, flag_set);
-    assert!(result.is_ok(), "2-input OP_TRUE tx must verify: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "2-input OP_TRUE tx must verify: {:?}",
+        result
+    );
 }
 
 /// A 2-input transaction where input 1 fails (script = OP_FALSE). Batch
@@ -246,8 +270,14 @@ fn batch_reports_correct_failing_input_index() {
     let op_false = ScriptBuf::from_bytes(vec![0x00]); // OP_0 — always fails
 
     let prev_outputs = vec![
-        TxOut { value: Amount::from_sat(1_000), script_pubkey: op_true },
-        TxOut { value: Amount::from_sat(2_000), script_pubkey: op_false },
+        TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true,
+        },
+        TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: op_false,
+        },
     ];
 
     let dummy_txid = Txid::from_byte_array([2u8; 32]);
@@ -256,13 +286,19 @@ fn batch_reports_correct_failing_input_index() {
         lock_time: LockTime::ZERO,
         input: vec![
             TxIn {
-                previous_output: OutPoint { txid: dummy_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: dummy_txid,
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             },
             TxIn {
-                previous_output: OutPoint { txid: dummy_txid, vout: 1 },
+                previous_output: OutPoint {
+                    txid: dummy_txid,
+                    vout: 1,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),

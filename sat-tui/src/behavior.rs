@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::nap::printable;
-use crate::rpc::{RpcError, JSONRPC_METHOD_NOT_FOUND};
+use crate::rpc::{JSONRPC_METHOD_NOT_FOUND, RpcError};
 
 /// What the fingerprint classifier found for a peer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -132,13 +132,18 @@ fn scalar(v: &Value) -> Option<String> {
 }
 
 fn text(v: &Value, key: &str) -> String {
-    v.get(key).and_then(Value::as_str).map(printable).unwrap_or_default()
+    v.get(key)
+        .and_then(Value::as_str)
+        .map(printable)
+        .unwrap_or_default()
 }
 
 /// Flatten the counters object: scalars as they are, `getdata_latency` and
 /// `version` as `name.field`, arrays (the latency histogram) joined.
 fn flatten_counters(v: &Value) -> Vec<(String, String)> {
-    let Some(obj) = v.as_object() else { return Vec::new() };
+    let Some(obj) = v.as_object() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for (k, val) in obj {
         let k = printable(k);
@@ -146,7 +151,9 @@ fn flatten_counters(v: &Value) -> Vec<(String, String)> {
             Value::Object(inner) => {
                 for (k2, v2) in inner {
                     let shown = match v2 {
-                        Value::Array(a) => a.iter().filter_map(scalar).collect::<Vec<_>>().join(" "),
+                        Value::Array(a) => {
+                            a.iter().filter_map(scalar).collect::<Vec<_>>().join(" ")
+                        }
                         other => scalar(other).unwrap_or_default(),
                     };
                     out.push((format!("{k}.{}", printable(k2)), shown));
@@ -167,13 +174,21 @@ fn parse_peer(v: &Value) -> Option<PeerBehavior> {
     let fingerprint = match fp.and_then(|f| f.get("result")).and_then(Value::as_str) {
         Some("known") => {
             let f = fp?;
-            Fingerprint::Known { family: text(f, "family"), confidence: text(f, "confidence") }
+            Fingerprint::Known {
+                family: text(f, "family"),
+                confidence: text(f, "confidence"),
+            }
         }
         Some("mismatch") => {
             let f = fp?;
-            Fingerprint::Mismatch { claimed: text(f, "claimed"), observed: text(f, "observed") }
+            Fingerprint::Mismatch {
+                claimed: text(f, "claimed"),
+                observed: text(f, "observed"),
+            }
         }
-        Some("claimed") => Fingerprint::Claimed { family: text(fp?, "claimed") },
+        Some("claimed") => Fingerprint::Claimed {
+            family: text(fp?, "claimed"),
+        },
         _ => Fingerprint::Unknown,
     };
     let flags = v
@@ -188,7 +203,9 @@ fn parse_peer(v: &Value) -> Option<PeerBehavior> {
                         .get("evidence")
                         .and_then(Value::as_object)
                         .map(|e| {
-                            e.iter().map(|(k, v)| (printable(k), scalar(v).unwrap_or_default())).collect()
+                            e.iter()
+                                .map(|(k, v)| (printable(k), scalar(v).unwrap_or_default()))
+                                .collect()
                         })
                         .unwrap_or_default(),
                 })
@@ -202,7 +219,10 @@ fn parse_peer(v: &Value) -> Option<PeerBehavior> {
         subver: text(v, "subver"),
         evaluated: v.get("evaluated").and_then(Value::as_bool).unwrap_or(false),
         fingerprint,
-        settled: fp.and_then(|f| f.get("settled")).and_then(Value::as_bool).unwrap_or(false),
+        settled: fp
+            .and_then(|f| f.get("settled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         handshake: fp
             .and_then(|f| f.get("handshake"))
             .and_then(Value::as_array)
@@ -215,7 +235,10 @@ fn parse_peer(v: &Value) -> Option<PeerBehavior> {
             if a.get("fallback").and_then(Value::as_bool).unwrap_or(false) {
                 AltSlot::Fallback
             } else {
-                AltSlot::Matched { rule: text(a, "rule"), trust: text(a, "trust") }
+                AltSlot::Matched {
+                    rule: text(a, "rule"),
+                    trust: text(a, "trust"),
+                }
             }
         }),
     })
@@ -224,7 +247,13 @@ fn parse_peer(v: &Value) -> Option<PeerBehavior> {
 /// Parse a `getpeerbehavior` reply. `None` unless it is an array; entries
 /// without an id are skipped.
 pub fn parse(v: &Value) -> Option<BehaviorMap> {
-    Some(v.as_array()?.iter().filter_map(parse_peer).map(|p| (p.id, p)).collect())
+    Some(
+        v.as_array()?
+            .iter()
+            .filter_map(parse_peer)
+            .map(|p| (p.id, p))
+            .collect(),
+    )
 }
 
 /// Width of the Flags column: room for an alt-slot tag and two flag codes
@@ -250,7 +279,11 @@ pub fn flags_cell(p: &PeerBehavior) -> (String, FlagsTone) {
         Some(AltSlot::Fallback) => "alt* ",
         None => "",
     };
-    let codes: String = format!("{tag}{}", p.flag_codes).trim_end().chars().take(FLAGS_WIDTH as usize).collect();
+    let codes: String = format!("{tag}{}", p.flag_codes)
+        .trim_end()
+        .chars()
+        .take(FLAGS_WIDTH as usize)
+        .collect();
     let n = p.flag_codes.chars().count();
     let tone = if n == 0 {
         FlagsTone::None
@@ -329,7 +362,9 @@ pub fn fingerprint_line(p: &PeerBehavior) -> String {
         Fingerprint::Mismatch { claimed, observed } => {
             format!("{observed}, but the user agent names {claimed}")
         }
-        Fingerprint::Claimed { family } => format!("unknown; the user agent names {family} (claimed)"),
+        Fingerprint::Claimed { family } => {
+            format!("unknown; the user agent names {family} (claimed)")
+        }
         Fingerprint::Unknown if !p.settled => "unknown (not settled yet)".into(),
         Fingerprint::Unknown => "unknown".into(),
     }
@@ -337,7 +372,11 @@ pub fn fingerprint_line(p: &PeerBehavior) -> String {
 
 /// A flag's evidence line: `key=value key=value`.
 pub fn evidence_line(f: &Flag) -> String {
-    f.evidence.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+    f.evidence
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -391,14 +430,23 @@ pub(crate) mod tests {
         assert_eq!(p.connection_type, "outbound-full-relay");
         assert_eq!(
             p.fingerprint,
-            Fingerprint::Mismatch { claimed: "core".into(), observed: "btcd".into() }
+            Fingerprint::Mismatch {
+                claimed: "core".into(),
+                observed: "btcd".into()
+            }
         );
         assert_eq!(p.handshake, ["version", "verack", "sendaddrv2"]);
         assert_eq!(p.flags[0].code, "F");
         assert_eq!(evidence_line(&p.flags[0]), "claimed=core observed=btcd");
         assert!(p.counters.contains(&("inv_tx_in".into(), "12".into())));
-        assert!(p.counters.contains(&("getdata_latency.buckets".into(), "1 1".into())));
-        assert!(p.counters.contains(&("version.start_height".into(), "900000".into())));
+        assert!(
+            p.counters
+                .contains(&("getdata_latency.buckets".into(), "1 1".into()))
+        );
+        assert!(
+            p.counters
+                .contains(&("version.start_height".into(), "900000".into()))
+        );
         assert_eq!(map[&11].fingerprint, Fingerprint::Unknown);
         assert!(!map[&11].settled);
         assert!(parse(&json!({"not": "an array"})).is_none());
@@ -409,7 +457,10 @@ pub(crate) mod tests {
     /// failure, and any other error keeps what the TUI had.
     #[test]
     fn method_not_found_means_not_served() {
-        let mnf = RpcError::Rpc { code: JSONRPC_METHOD_NOT_FOUND, message: "Method not found".into() };
+        let mnf = RpcError::Rpc {
+            code: JSONRPC_METHOD_NOT_FOUND,
+            message: "Method not found".into(),
+        };
         assert!(matches!(classify(Err(mnf)), Poll::NotServed));
         assert!(matches!(classify(Err(RpcError::Timeout)), Poll::Failed(_)));
         assert!(matches!(classify(Ok(json!({}))), Poll::Failed(_)));
@@ -419,12 +470,34 @@ pub(crate) mod tests {
     #[test]
     fn flags_cell_colours() {
         let map = parse(&reply()).unwrap();
-        assert_eq!(flags_cell(&map[&7]), ("C".into(), FlagsTone::Warn), "one flag is yellow");
-        assert_eq!(flags_cell(&map[&9]), ("ST".into(), FlagsTone::Alarm), "two flags are red");
-        assert_eq!(flags_cell(&map[&11]), (String::new(), FlagsTone::None), "none is empty");
-        let spy = PeerBehavior { flag_codes: "S".into(), ..Default::default() };
-        assert_eq!(flags_cell(&spy), ("S".into(), FlagsTone::Alarm), "S alone is red");
-        let many = PeerBehavior { flag_codes: "CSFAHNT".into(), ..Default::default() };
+        assert_eq!(
+            flags_cell(&map[&7]),
+            ("C".into(), FlagsTone::Warn),
+            "one flag is yellow"
+        );
+        assert_eq!(
+            flags_cell(&map[&9]),
+            ("ST".into(), FlagsTone::Alarm),
+            "two flags are red"
+        );
+        assert_eq!(
+            flags_cell(&map[&11]),
+            (String::new(), FlagsTone::None),
+            "none is empty"
+        );
+        let spy = PeerBehavior {
+            flag_codes: "S".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            flags_cell(&spy),
+            ("S".into(), FlagsTone::Alarm),
+            "S alone is red"
+        );
+        let many = PeerBehavior {
+            flag_codes: "CSFAHNT".into(),
+            ..Default::default()
+        };
         assert_eq!(flags_cell(&many).0.chars().count(), FLAGS_WIDTH as usize);
     }
 
@@ -438,12 +511,18 @@ pub(crate) mod tests {
         let map = parse(&v).unwrap();
         assert_eq!(
             map[&3].alt_slot,
-            Some(AltSlot::Matched { rule: "family:btcd@2".into(), trust: "verified".into() })
+            Some(AltSlot::Matched {
+                rule: "family:btcd@2".into(),
+                trust: "verified".into()
+            })
         );
         assert_eq!(flags_cell(&map[&3]).0, "alt F");
         assert_eq!(flags_cell(&map[&7]).0, "alt* C");
         assert_eq!(flags_cell(&map[&11]).0, "", "no tag without an alt_slot");
-        let quiet = PeerBehavior { alt_slot: Some(AltSlot::Fallback), ..Default::default() };
+        let quiet = PeerBehavior {
+            alt_slot: Some(AltSlot::Fallback),
+            ..Default::default()
+        };
         assert_eq!(flags_cell(&quiet), ("alt*".into(), FlagsTone::None));
         assert_eq!(alt_slot_counts(&map), (1, 1));
         assert_eq!(alt_slot_counts(&parse(&reply()).unwrap()), (0, 0));
@@ -452,9 +531,19 @@ pub(crate) mod tests {
     #[test]
     fn mismatch_marker_follows_the_agent() {
         let map = parse(&reply()).unwrap();
-        assert_eq!(agent_cell("/Satoshi:27.0.0/", Some(&map[&3])), "/Satoshi:27.0.0/ ≠");
-        assert_eq!(agent_cell("/Satoshi:28.1.0/", Some(&map[&9])), "/Satoshi:28.1.0/");
-        assert_eq!(agent_cell("/Satoshi:27.0.0/", None), "/Satoshi:27.0.0/", "no data, no marker");
+        assert_eq!(
+            agent_cell("/Satoshi:27.0.0/", Some(&map[&3])),
+            "/Satoshi:27.0.0/ ≠"
+        );
+        assert_eq!(
+            agent_cell("/Satoshi:28.1.0/", Some(&map[&9])),
+            "/Satoshi:28.1.0/"
+        );
+        assert_eq!(
+            agent_cell("/Satoshi:27.0.0/", None),
+            "/Satoshi:27.0.0/",
+            "no data, no marker"
+        );
     }
 
     /// A user agent is the peer's own text: an escape sequence in it must
@@ -488,9 +577,17 @@ pub(crate) mod tests {
              "fingerprint": {"result": "known", "family": "core", "confidence": "high", "settled": true, "handshake": []}}
         ]);
         let map = parse(&v).unwrap();
-        assert_eq!(map[&1].fingerprint, Fingerprint::Claimed { family: "core".into() });
+        assert_eq!(
+            map[&1].fingerprint,
+            Fingerprint::Claimed {
+                family: "core".into()
+            }
+        );
         assert_eq!(map[&1].fingerprint.observed(), "unknown");
-        assert_eq!(fingerprint_line(&map[&1]), "unknown; the user agent names core (claimed)");
+        assert_eq!(
+            fingerprint_line(&map[&1]),
+            "unknown; the user agent names core (claimed)"
+        );
         assert_eq!(
             family_distribution(&map, 8),
             [("core".to_string(), 1), ("unknown [core]".to_string(), 1)]
@@ -519,8 +616,14 @@ pub(crate) mod tests {
     #[test]
     fn fingerprint_lines() {
         let map = parse(&reply()).unwrap();
-        assert_eq!(fingerprint_line(&map[&3]), "btcd, but the user agent names core");
-        assert_eq!(fingerprint_line(&map[&7]), "bitcoin-seeder (high confidence)");
+        assert_eq!(
+            fingerprint_line(&map[&3]),
+            "btcd, but the user agent names core"
+        );
+        assert_eq!(
+            fingerprint_line(&map[&7]),
+            "bitcoin-seeder (high confidence)"
+        );
         assert_eq!(fingerprint_line(&map[&11]), "unknown (not settled yet)");
     }
 }

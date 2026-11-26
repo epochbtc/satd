@@ -112,7 +112,11 @@ const SATD_EXTRA_ARGS: &[(&str, &str)] = &[("createpsbt", "psbt_version")];
 
 pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
     let args: &'static [ArgSpec] = match method {
-        "addconnection" => &[("address", false), ("connection_type", false), ("v2transport", false)],
+        "addconnection" => &[
+            ("address", false),
+            ("connection_type", false),
+            ("v2transport", false),
+        ],
         "addnode" => &[("node", false), ("command", false), ("v2transport", false)],
         "addpeeraddress" => &[("address", false), ("port", false), ("tried", false)],
         "analyzepsbt" => &[("psbt", false)],
@@ -121,13 +125,36 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "clearbanned" => &[],
         "combinepsbt" => &[("txs", false)],
         "combinerawtransaction" => &[("txs", false)],
-        "converttopsbt" => &[("hexstring", false), ("permitsigdata", false), ("iswitness", false), ("psbt_version", false)],
+        "converttopsbt" => &[
+            ("hexstring", false),
+            ("permitsigdata", false),
+            ("iswitness", false),
+            ("psbt_version", false),
+        ],
         // SATD_ONLY trailing argument: `psbt_version`. It sits after Core's
         // own, so a positional call written against Core is unaffected.
         // SATD_ONLY: createnapattestation
-        "createnapattestation" => &[("outpoint", false), ("key", false), ("value", false), ("descriptor", false)],
-        "createpsbt" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false), ("psbt_version", false)],
-        "createrawtransaction" => &[("inputs", false), ("outputs", false), ("locktime", false), ("replaceable", false), ("version", false)],
+        "createnapattestation" => &[
+            ("outpoint", false),
+            ("key", false),
+            ("value", false),
+            ("descriptor", false),
+        ],
+        "createpsbt" => &[
+            ("inputs", false),
+            ("outputs", false),
+            ("locktime", false),
+            ("replaceable", false),
+            ("version", false),
+            ("psbt_version", false),
+        ],
+        "createrawtransaction" => &[
+            ("inputs", false),
+            ("outputs", false),
+            ("locktime", false),
+            ("replaceable", false),
+            ("version", false),
+        ],
         "decodepsbt" => &[("psbt", false)],
         "decoderawtransaction" => &[("hexstring", false), ("iswitness", false)],
         "decodescript" => &[("hexstring", false)],
@@ -136,20 +163,60 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "disconnectnode" => &[("address", false), ("nodeid", false)],
         // SATD_ONLY: dumpcrawlsnapshot
         "dumpcrawlsnapshot" => &[("raw", false)],
-        "dumptxoutset" => &[("path", false), ("type", false), ("rollback", true), ("in_memory", true), ("options", false)],
-        "echo" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
+        "dumptxoutset" => &[
+            ("path", false),
+            ("type", false),
+            ("rollback", true),
+            ("in_memory", true),
+            ("options", false),
+        ],
+        "echo" => &[
+            ("arg0", false),
+            ("arg1", false),
+            ("arg2", false),
+            ("arg3", false),
+            ("arg4", false),
+            ("arg5", false),
+            ("arg6", false),
+            ("arg7", false),
+            ("arg8", false),
+            ("arg9", false),
+        ],
         "echoipc" => &[("arg", false)],
-        "echojson" => &[("arg0", false), ("arg1", false), ("arg2", false), ("arg3", false), ("arg4", false), ("arg5", false), ("arg6", false), ("arg7", false), ("arg8", false), ("arg9", false)],
+        "echojson" => &[
+            ("arg0", false),
+            ("arg1", false),
+            ("arg2", false),
+            ("arg3", false),
+            ("arg4", false),
+            ("arg5", false),
+            ("arg6", false),
+            ("arg7", false),
+            ("arg8", false),
+            ("arg9", false),
+        ],
         "estimatefees" => &[("targets", false), ("mode", false)],
         "estimaterawfee" => &[("conf_target", false), ("threshold", false)],
-        "estimatesmartfee" => &[("conf_target", false), ("estimate_mode", false), ("options", false)],
+        "estimatesmartfee" => &[
+            ("conf_target", false),
+            ("estimate_mode", false),
+            ("options", false),
+        ],
         // SATD_ONLY: exportnapsnapshot
         "exportnapsnapshot" => &[("path", false)],
         "finalizepsbt" => &[("psbt", false), ("extract", false)],
         "generate" => &[],
-        "generateblock" => &[("output", false), ("transactions", false), ("submit", false)],
+        "generateblock" => &[
+            ("output", false),
+            ("transactions", false),
+            ("submit", false),
+        ],
         "generatetoaddress" => &[("nblocks", false), ("address", false), ("maxtries", false)],
-        "generatetodescriptor" => &[("num_blocks", false), ("descriptor", false), ("maxtries", false)],
+        "generatetodescriptor" => &[
+            ("num_blocks", false),
+            ("descriptor", false),
+            ("maxtries", false),
+        ],
         "getaddednodeinfo" => &[("node", false)],
         "getaddressbalance" => &[("address", false)],
         "getaddresshistory" => &[("address", false)],
@@ -209,19 +276,36 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "getquarantineinfo" => &[],
         "getrawaddrman" => &[],
         "getrawmempool" => &[("verbose", false), ("mempool_sequence", false)],
-        "getrawtransaction" => &[("txid", false), ("verbosity|verbose", false), ("blockhash", false)],
+        "getrawtransaction" => &[
+            ("txid", false),
+            ("verbosity|verbose", false),
+            ("blockhash", false),
+        ],
         "getreorghistory" => &[("since_secs", false)],
         "getrpcinfo" => &[],
         "getsatdindexinfo" => &[],
         "getserverstatus" => &[],
-        "getsilentpaymentblockdata" => &[("blockhash", false), ("verbosity", false), ("dust_limit", false)],
+        "getsilentpaymentblockdata" => &[
+            ("blockhash", false),
+            ("verbosity", false),
+            ("dust_limit", false),
+        ],
         "getstoragefootprint" => &[],
         "getstratuminfo" => &[],
         "getsysteminfo" => &[],
         "gettxout" => &[("txid", false), ("n", false), ("include_mempool", false)],
         "gettxoutproof" => &[("txids", false), ("blockhash", false)],
-        "gettxoutsetinfo" => &[("hash_type", false), ("hash_or_height", false), ("use_index", false)],
-        "gettxspendingprevout" => &[("outputs", false), ("mempool_only", true), ("return_spending_tx", true), ("options", false)],
+        "gettxoutsetinfo" => &[
+            ("hash_type", false),
+            ("hash_or_height", false),
+            ("use_index", false),
+        ],
+        "gettxspendingprevout" => &[
+            ("outputs", false),
+            ("mempool_only", true),
+            ("return_spending_tx", true),
+            ("options", false),
+        ],
         "getwarnings" => &[],
         "getzmqnotifications" => &[],
         "help" => &[("command", false)],
@@ -250,19 +334,37 @@ pub fn arg_names(method: &str) -> Option<&'static [ArgSpec]> {
         "savemempool" => &[],
         "scantxoutset" => &[("action", false), ("scanobjects", false)],
         "sendmsgtopeer" => &[("peer_id", false), ("msg_type", false), ("msg", false)],
-        "sendrawtransaction" => &[("hexstring", false), ("maxfeerate|allowquarantined", false), ("maxburnamount", false)],
-        "setban" => &[("subnet", false), ("command", false), ("bantime", false), ("absolute", false)],
+        "sendrawtransaction" => &[
+            ("hexstring", false),
+            ("maxfeerate|allowquarantined", false),
+            ("maxburnamount", false),
+        ],
+        "setban" => &[
+            ("subnet", false),
+            ("command", false),
+            ("bantime", false),
+            ("absolute", false),
+        ],
         "setmocktime" => &[("timestamp", false)],
         "setnetworkactive" => &[("state", false)],
         "signmessagewithprivkey" => &[("privkey", false), ("message", false)],
-        "signrawtransactionwithkey" => &[("hexstring", false), ("privkeys", false), ("prevtxs", false), ("sighashtype", false)],
+        "signrawtransactionwithkey" => &[
+            ("hexstring", false),
+            ("privkeys", false),
+            ("prevtxs", false),
+            ("sighashtype", false),
+        ],
         "stop" => &[("wait", false)],
         "stripopreturns" => &[("blockhash", false), ("threshold", false)],
         "submitblock" => &[("hexdata", false), ("dummy", false)],
         "submitheader" => &[("hexdata", false)],
         // SATD_ONLY: submitnapattestation
         "submitnapattestation" => &[("message", false), ("signature", false)],
-        "submitpackage" => &[("package", false), ("maxfeerate", false), ("maxburnamount", false)],
+        "submitpackage" => &[
+            ("package", false),
+            ("maxfeerate", false),
+            ("maxburnamount", false),
+        ],
         "subscribemempool" => &[],
         "syncwithvalidationinterfacequeue" => &[],
         "testmempoolaccept" => &[("rawtxs", false), ("maxfeerate", false)],
@@ -348,51 +450,165 @@ fn check_arity(method: &str, specs: &[ArgSpec], given: usize) -> Result<(), Erro
 /// and the handler parses the array again, so counting must not cost a second
 /// full materialisation.
 fn count_slots(body: &str) -> Option<usize> {
-    serde_json::from_str::<Vec<&serde_json::value::RawValue>>(body).ok().map(|v| v.len())
+    serde_json::from_str::<Vec<&serde_json::value::RawValue>>(body)
+        .ok()
+        .map(|v| v.len())
 }
 
 /// Every method known to the named-parameter table, in the same order as the
 /// `match` arm above. Used by the `help("dump_all_command_conversions")` RPC
 /// to build the conversion table that Core's `rpc_help.py` test validates.
 pub(crate) const ALL_METHODS: &[&str] = &[
-    "addconnection", "addnode", "addpeeraddress", "analyzepsbt", "backfillindex", "cancelindex", "clearbanned",
-    "combinepsbt", "combinerawtransaction", "converttopsbt", "createnapattestation", "createpsbt",
-    "createrawtransaction", "decodepsbt", "decoderawtransaction", "decodescript",
-    "deriveaddresses", "disconnectnode", "dumpcrawlsnapshot", "dumptxoutset",
-    "echo", "echoipc", "echojson",
-    "estimatefees", "estimaterawfee", "estimatesmartfee", "exportnapsnapshot",
-    "finalizepsbt", "generate", "generateblock", "generatetoaddress",
+    "addconnection",
+    "addnode",
+    "addpeeraddress",
+    "analyzepsbt",
+    "backfillindex",
+    "cancelindex",
+    "clearbanned",
+    "combinepsbt",
+    "combinerawtransaction",
+    "converttopsbt",
+    "createnapattestation",
+    "createpsbt",
+    "createrawtransaction",
+    "decodepsbt",
+    "decoderawtransaction",
+    "decodescript",
+    "deriveaddresses",
+    "disconnectnode",
+    "dumpcrawlsnapshot",
+    "dumptxoutset",
+    "echo",
+    "echoipc",
+    "echojson",
+    "estimatefees",
+    "estimaterawfee",
+    "estimatesmartfee",
+    "exportnapsnapshot",
+    "finalizepsbt",
+    "generate",
+    "generateblock",
+    "generatetoaddress",
     "generatetodescriptor",
-    "getaddednodeinfo", "getaddressbalance", "getaddrmaninfo", "getaddresshistory",
-    "getaddressutxos", "getbestblockhash", "getblock", "getblockchaininfo",
-    "getblockcount", "getblockfileaudit", "getblockfilter", "getblockfrompeer",
-    "getblockhash", "getblockheader", "getblockstats", "getblocktemplate",
-    "getchainstates", "getchaintips", "getchaintxstats", "getconfig",
-    "getconnectioncount", "getcrawlinfo", "getcrawlnodes", "getdeploymentinfo", "getdescriptorinfo", "getdifficulty",
-    "getibdprogress", "getindexinfo",
+    "getaddednodeinfo",
+    "getaddressbalance",
+    "getaddrmaninfo",
+    "getaddresshistory",
+    "getaddressutxos",
+    "getbestblockhash",
+    "getblock",
+    "getblockchaininfo",
+    "getblockcount",
+    "getblockfileaudit",
+    "getblockfilter",
+    "getblockfrompeer",
+    "getblockhash",
+    "getblockheader",
+    "getblockstats",
+    "getblocktemplate",
+    "getchainstates",
+    "getchaintips",
+    "getchaintxstats",
+    "getconfig",
+    "getconnectioncount",
+    "getcrawlinfo",
+    "getcrawlnodes",
+    "getdeploymentinfo",
+    "getdescriptorinfo",
+    "getdifficulty",
+    "getibdprogress",
+    "getindexinfo",
     "getmemoryinfo",
-    "getmempoolancestors", "getmempoolcluster", "getmempooldescendants", "getmempoolentry",
-    "getmempoolfeeratediagram", "getmempoolhistory", "getmempoolinfo", "getmempoolsummary",
-    "getmininginfo", "getnapreport", "getnettotals",
-    "getnetworkhashps", "getnetworkinfo", "getnodeaddresses", "getopreturnpruneinfo", "getorphaninfo", "getorphantxs", "getpeerbehavior", "getpeerinfo", "getpeersurvey",
-    "getpolicyinfo", "getprioritisedtransactions", "getquarantineentry",
-    "getquarantineinfo", "getrawaddrman", "getrawmempool",
-    "getrawtransaction", "getreorghistory", "getrpcinfo", "getserverstatus",
-    "getsatdindexinfo", "getsilentpaymentblockdata", "getstoragefootprint", "getstratuminfo",
-    "getsysteminfo", "gettxout",
-    "gettxoutproof", "gettxoutsetinfo", "gettxspendingprevout",
-    "getwarnings", "getzmqnotifications",
-    "help", "invalidateblock", "joinpsbts", "listbanned", "listnapaggregate", "listnapattestations",
-    "listquarantine", "loadtxoutset", "logging",
-    "pauseindex", "ping", "policytest", "preciousblock", "prioritisetransaction",
+    "getmempoolancestors",
+    "getmempoolcluster",
+    "getmempooldescendants",
+    "getmempoolentry",
+    "getmempoolfeeratediagram",
+    "getmempoolhistory",
+    "getmempoolinfo",
+    "getmempoolsummary",
+    "getmininginfo",
+    "getnapreport",
+    "getnettotals",
+    "getnetworkhashps",
+    "getnetworkinfo",
+    "getnodeaddresses",
+    "getopreturnpruneinfo",
+    "getorphaninfo",
+    "getorphantxs",
+    "getpeerbehavior",
+    "getpeerinfo",
+    "getpeersurvey",
+    "getpolicyinfo",
+    "getprioritisedtransactions",
+    "getquarantineentry",
+    "getquarantineinfo",
+    "getrawaddrman",
+    "getrawmempool",
+    "getrawtransaction",
+    "getreorghistory",
+    "getrpcinfo",
+    "getserverstatus",
+    "getsatdindexinfo",
+    "getsilentpaymentblockdata",
+    "getstoragefootprint",
+    "getstratuminfo",
+    "getsysteminfo",
+    "gettxout",
+    "gettxoutproof",
+    "gettxoutsetinfo",
+    "gettxspendingprevout",
+    "getwarnings",
+    "getzmqnotifications",
+    "help",
+    "invalidateblock",
+    "joinpsbts",
+    "listbanned",
+    "listnapaggregate",
+    "listnapattestations",
+    "listquarantine",
+    "loadtxoutset",
+    "logging",
+    "pauseindex",
+    "ping",
+    "policytest",
+    "preciousblock",
+    "prioritisetransaction",
     "pruneblockchain",
-    "reconsiderblock", "removenapattestation", "replaynapsnapshot", "resumeindex", "savemempool", "scantxoutset",
-    "sendmsgtopeer", "sendrawtransaction", "setban", "setmocktime", "setnetworkactive",
-    "signmessagewithprivkey", "signrawtransactionwithkey", "stop", "stripopreturns", "submitblock", "submitheader",
-    "submitnapattestation", "submitpackage", "subscribemempool", "syncwithvalidationinterfacequeue",
-    "testmempoolaccept", "unsubscribemempool", "uptime",
-    "utxoupdatepsbt", "validateaddress", "verifybip322", "verifychain", "verifymessage", "verifytxoutproof",
-    "waitforblock", "waitforblockheight", "waitfornewblock",
+    "reconsiderblock",
+    "removenapattestation",
+    "replaynapsnapshot",
+    "resumeindex",
+    "savemempool",
+    "scantxoutset",
+    "sendmsgtopeer",
+    "sendrawtransaction",
+    "setban",
+    "setmocktime",
+    "setnetworkactive",
+    "signmessagewithprivkey",
+    "signrawtransactionwithkey",
+    "stop",
+    "stripopreturns",
+    "submitblock",
+    "submitheader",
+    "submitnapattestation",
+    "submitpackage",
+    "subscribemempool",
+    "syncwithvalidationinterfacequeue",
+    "testmempoolaccept",
+    "unsubscribemempool",
+    "uptime",
+    "utxoupdatepsbt",
+    "validateaddress",
+    "verifybip322",
+    "verifychain",
+    "verifymessage",
+    "verifytxoutproof",
+    "waitforblock",
+    "waitforblockheight",
+    "waitfornewblock",
 ];
 
 /// Build the conversion table for `help("dump_all_command_conversions")`.
@@ -735,8 +951,8 @@ mod tests {
     #[test]
     fn satd_extra_args_are_trailing() {
         for (method, extra) in SATD_EXTRA_ARGS {
-            let row = arg_names(method)
-                .unwrap_or_else(|| panic!("{method} has no named-parameter row"));
+            let row =
+                arg_names(method).unwrap_or_else(|| panic!("{method} has no named-parameter row"));
             assert_eq!(
                 row.last().map(|(name, _)| *name),
                 Some(*extra),
@@ -776,11 +992,19 @@ mod tests {
     #[test]
     fn a_surplus_positional_argument_is_refused() {
         let err = dispatch("getblockheader", json!(["ff", true, "EXTRA", 99])).unwrap_err();
-        assert_eq!(err.code(), -1, "Core's HelpResult surfaces as RPC_MISC_ERROR");
+        assert_eq!(
+            err.code(),
+            -1,
+            "Core's HelpResult surfaces as RPC_MISC_ERROR"
+        );
         // Core's message is the help text, which begins with the method name;
         // `rpc_estimatefee.py` and `rpc_blockchain.py` assert exactly that
         // substring, so it has to lead here too.
-        assert!(err.message().starts_with("getblockheader"), "{}", err.message());
+        assert!(
+            err.message().starts_with("getblockheader"),
+            "{}",
+            err.message()
+        );
         assert!(err.message().contains('4'), "{}", err.message());
     }
 
@@ -790,7 +1014,11 @@ mod tests {
     fn a_method_with_no_arguments_refuses_all_of_them() {
         let err = dispatch("getblockcount", json!([1, 2, 3])).unwrap_err();
         assert_eq!(err.code(), -1);
-        assert!(err.message().contains("takes no arguments"), "{}", err.message());
+        assert!(
+            err.message().contains("takes no arguments"),
+            "{}",
+            err.message()
+        );
         // ... and still accepts the empty array every client sends.
         dispatch("getblockcount", json!([])).unwrap();
     }
@@ -838,12 +1066,23 @@ mod tests {
     /// the limit. Core checks the transformed params for the same reason.
     #[test]
     fn a_named_call_is_translated_and_then_counted() {
-        let out = dispatch("getblockheader", json!({"blockhash": "ff", "verbose": false})).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), json!(["ff", false]));
+        let out = dispatch(
+            "getblockheader",
+            json!({"blockhash": "ff", "verbose": false}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!(["ff", false])
+        );
 
         let err = dispatch("getblockheader", json!({"args": ["ff", true, "EXTRA"]})).unwrap_err();
         assert_eq!(err.code(), -1, "an oversized `args` array is still surplus");
-        assert!(err.message().starts_with("getblockheader"), "{}", err.message());
+        assert!(
+            err.message().starts_with("getblockheader"),
+            "{}",
+            err.message()
+        );
     }
 
     /// Params that are not an array satd can read are left to the layer that
@@ -851,9 +1090,8 @@ mod tests {
     #[test]
     fn unreadable_params_are_passed_through() {
         for params in [json!("not-an-array"), json!(7), json!(null)] {
-            dispatch("getblockcount", params.clone()).unwrap_or_else(|e| {
-                panic!("{params} must pass through, got {}", e.message())
-            });
+            dispatch("getblockcount", params.clone())
+                .unwrap_or_else(|e| panic!("{params} must pass through, got {}", e.message()));
         }
     }
 
@@ -880,12 +1118,19 @@ mod tests {
 
         // Either name alone still resolves to the shared slot.
         assert_eq!(
-            map("sendrawtransaction", json!({"hexstring": "0200", "maxfeerate": 0})).unwrap(),
+            map(
+                "sendrawtransaction",
+                json!({"hexstring": "0200", "maxfeerate": 0})
+            )
+            .unwrap(),
             vec![json!("0200"), json!(0)]
         );
         assert_eq!(
-            map("sendrawtransaction", json!({"hexstring": "0200", "allowquarantined": true}))
-                .unwrap(),
+            map(
+                "sendrawtransaction",
+                json!({"hexstring": "0200", "allowquarantined": true})
+            )
+            .unwrap(),
             vec![json!("0200"), json!(true)]
         );
     }
@@ -951,8 +1196,11 @@ mod tests {
     fn using_both_spellings_of_one_arg_reports_the_second_as_unknown() {
         // Core resolves the first alias present and leaves the other in the
         // map, so it falls out of the unknown-parameter check.
-        let err = map("getblock", json!({"blockhash": "ab", "verbosity": 1, "verbose": 2}))
-            .unwrap_err();
+        let err = map(
+            "getblock",
+            json!({"blockhash": "ab", "verbosity": 1, "verbose": 2}),
+        )
+        .unwrap_err();
         assert_eq!(err, "Unknown named parameter verbose");
     }
 
@@ -961,7 +1209,11 @@ mod tests {
         // Naming only the third argument has to push the first two out as
         // nulls, or `blockhash` would arrive as `verbosity`.
         assert_eq!(
-            map("getrawtransaction", json!({"txid": "ff", "blockhash": "aa"})).unwrap(),
+            map(
+                "getrawtransaction",
+                json!({"txid": "ff", "blockhash": "aa"})
+            )
+            .unwrap(),
             vec![json!("ff"), Value::Null, json!("aa")]
         );
     }
@@ -1027,8 +1279,16 @@ mod tests {
         // The layer passes unknown methods through, so a missing row is a
         // silent Core-compat gap rather than an error. Spot-check the
         // generated table has not lost its Core-derived entries.
-        for m in ["getblock", "sendrawtransaction", "createrawtransaction", "addnode"] {
-            assert!(arg_names(m).is_some_and(|a| !a.is_empty()), "{m} lost its args");
+        for m in [
+            "getblock",
+            "sendrawtransaction",
+            "createrawtransaction",
+            "addnode",
+        ] {
+            assert!(
+                arg_names(m).is_some_and(|a| !a.is_empty()),
+                "{m} lost its args"
+            );
         }
         // satd-only methods take the names the Operator Manual documents.
         assert_eq!(
@@ -1068,14 +1328,21 @@ mod tests {
         // Manual tells operators to pass it by name. Without the alias that call
         // is rejected as an unknown parameter and the transaction is not sent.
         assert_eq!(
-            map("sendrawtransaction", json!({"hexstring": "0200", "allowquarantined": true}))
-                .unwrap(),
+            map(
+                "sendrawtransaction",
+                json!({"hexstring": "0200", "allowquarantined": true})
+            )
+            .unwrap(),
             vec![json!("0200"), json!(true)]
         );
         // Core's own name still binds the same slot, so Core clients are
         // unaffected.
         assert_eq!(
-            map("sendrawtransaction", json!({"hexstring": "0200", "maxfeerate": 0.1})).unwrap(),
+            map(
+                "sendrawtransaction",
+                json!({"hexstring": "0200", "maxfeerate": 0.1})
+            )
+            .unwrap(),
             vec![json!("0200"), json!(0.1)]
         );
     }
@@ -1087,7 +1354,11 @@ mod tests {
         // later argument is not silently promoted into it. `contains_key`
         // rather than `is_null` is what keeps that true.
         assert_eq!(
-            map("getblock", json!({"blockhash": "ab", "verbosity": Value::Null})).unwrap(),
+            map(
+                "getblock",
+                json!({"blockhash": "ab", "verbosity": Value::Null})
+            )
+            .unwrap(),
             vec![json!("ab"), Value::Null]
         );
     }

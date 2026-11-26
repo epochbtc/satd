@@ -48,13 +48,20 @@ fn a_re_sent_connected_block_does_not_count_as_downloaded() {
     for h in 1..=3 {
         sched.block_received(2, h, hash_at(&cs, h));
     }
-    assert_eq!(sched.progress().0, 0, "connected heights entered the window");
+    assert_eq!(
+        sched.progress().0,
+        0,
+        "connected heights entered the window"
+    );
 
     // A block that was asked for still counts.
     let asked = sched.assign_blocks(1);
     assert!(asked.contains(&hash_at(&cs, 11)));
     sched.block_received(1, 11, hash_at(&cs, 11));
-    assert!(sched.is_downloaded(11), "a requested block counts as downloaded");
+    assert!(
+        sched.is_downloaded(11),
+        "a requested block counts as downloaded"
+    );
     assert_eq!(sched.progress().0, 1);
 }
 
@@ -102,7 +109,10 @@ fn a_released_next_height_goes_to_another_peer_with_the_window_full() {
     sched.in_flight_at.insert(1, Instant::now());
     sched.peer_slots.get_mut(&1).unwrap().assigned.push(1);
     assert!(sched.release_height(1, 1));
-    assert!(!sched.assign_blocks(1).contains(&hash_at(&cs, 1)), "peer 1 is on cooldown for height 1");
+    assert!(
+        !sched.assign_blocks(1).contains(&hash_at(&cs, 1)),
+        "peer 1 is on cooldown for height 1"
+    );
     let hashes = sched.assign_blocks(2);
     assert!(
         hashes.contains(&hash_at(&cs, 1)),
@@ -118,9 +128,17 @@ fn a_pooled_height_below_the_cursor_is_not_handed_out() {
     let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
     sched.connect_cursor_advanced(10);
     let hashes = sched.assign_blocks(1);
-    let heights: Vec<u32> = (1..=20).filter(|h| hashes.contains(&hash_at(&cs, *h))).collect();
-    assert!(!heights.is_empty(), "heights above the cursor are handed out");
-    assert!(heights.iter().all(|h| *h > 10), "connected heights handed out: {heights:?}");
+    let heights: Vec<u32> = (1..=20)
+        .filter(|h| hashes.contains(&hash_at(&cs, *h)))
+        .collect();
+    assert!(
+        !heights.is_empty(),
+        "heights above the cursor are handed out"
+    );
+    assert!(
+        heights.iter().all(|h| *h > 10),
+        "connected heights handed out: {heights:?}"
+    );
 }
 
 /// Only a block asked of the peer resets its stall clock and failure count.
@@ -144,8 +162,14 @@ fn only_a_requested_block_resets_the_stall_clock() {
     // Peer 1 sends a block peer 2 was asked for.
     sched.block_received(1, theirs, hash_at(&cs, theirs));
     let slots = &sched.peer_slots[&1];
-    assert_eq!(slots.consecutive_failures, 2, "an unrequested block reset the failure count");
-    assert_eq!(slots.last_activity, old, "an unrequested block reset the stall clock");
+    assert_eq!(
+        slots.consecutive_failures, 2,
+        "an unrequested block reset the failure count"
+    );
+    assert_eq!(
+        slots.last_activity, old,
+        "an unrequested block reset the stall clock"
+    );
     assert_eq!(sched.take_stalled_peer(), Some(1), "peer 1 still stalls");
 
     // Its own block does reset it.

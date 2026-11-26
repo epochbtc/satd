@@ -189,7 +189,10 @@ fn a_single_flipped_bit_breaks_every_passing_proof() {
         );
         checked += 1;
     }
-    assert!(checked > 400, "expected a few hundred negatives, got {checked}");
+    assert!(
+        checked > 400,
+        "expected a few hundred negatives, got {checked}"
+    );
 }
 
 /// The BIP does not bound `e`, and the specification's comparison is against
@@ -268,12 +271,24 @@ fn generated_proofs_verify() {
             .unwrap();
 
         for message in [None, Some([i; 32])] {
-            let proof = dleq::generate_proof(&a, &b, &[i ^ 0x5a; 32], message.as_ref())
-                .expect("a proof");
-            assert!(dleq::verify_proof(&big_a, &b, &big_c, &proof, message.as_ref()));
+            let proof =
+                dleq::generate_proof(&a, &b, &[i ^ 0x5a; 32], message.as_ref()).expect("a proof");
+            assert!(dleq::verify_proof(
+                &big_a,
+                &b,
+                &big_c,
+                &proof,
+                message.as_ref()
+            ));
             // The same proof against the wrong C must fail.
             let wrong_c = PublicKey::from_secret_key(&secp, &b_secret);
-            assert!(!dleq::verify_proof(&big_a, &b, &wrong_c, &proof, message.as_ref()));
+            assert!(!dleq::verify_proof(
+                &big_a,
+                &b,
+                &wrong_c,
+                &proof,
+                message.as_ref()
+            ));
         }
     }
 }

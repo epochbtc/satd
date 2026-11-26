@@ -146,9 +146,14 @@ impl KeySource {
 
 /// Read a key file: exactly [`EXPORT_KEY_BYTES`] bytes.
 pub fn read_key(path: &Path) -> Result<ExportKey, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("reading the export key {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("reading the export key {}: {e}", path.display()))?;
     let key: [u8; EXPORT_KEY_BYTES] = bytes.as_slice().try_into().map_err(|_| {
-        format!("the export key {} must be {EXPORT_KEY_BYTES} bytes, not {}", path.display(), bytes.len())
+        format!(
+            "the export key {} must be {EXPORT_KEY_BYTES} bytes, not {}",
+            path.display(),
+            bytes.len()
+        )
     })?;
     Ok(ExportKey(key))
 }
@@ -180,15 +185,23 @@ pub fn load_key(source: &KeySource) -> Result<ExportKey, String> {
 /// private temporary file first, which is then linked into place, so the
 /// file is never seen short and an existing one is never replaced.
 fn create_key_file(path: &Path, key: &[u8; EXPORT_KEY_BYTES]) -> Result<(), String> {
-    let tmp = path.with_extension(format!("key.new-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    let tmp = path.with_extension(format!(
+        "key.new-{}-{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     let result = (|| {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-        let mut f = opts.open(&tmp).map_err(|e| format!("creating {}: {e}", tmp.display()))?;
-        f.write_all(key).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+        f.write_all(key)
+            .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
         match std::fs::hard_link(&tmp, path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -225,7 +238,11 @@ pub struct ExportContext<'a> {
 
 /// The port as an export gives it.
 fn port_class(peer: &PeerAddr, default_port: u16) -> &'static str {
-    if peer.port() == default_port { "default" } else { "other" }
+    if peer.port() == default_port {
+        "default"
+    } else {
+        "other"
+    }
 }
 
 /// Our fields of a node, the `satd` object after Bitnodes' thirteen.
@@ -258,7 +275,12 @@ fn satd_fields(peer: &PeerAddr, e: &CrawlEntry, default_port: u16) -> serde_json
 }
 
 /// A node as Bitnodes lists one, then our `satd` object.
-fn node_value(peer: &PeerAddr, e: &CrawlEntry, asn: Option<String>, default_port: u16) -> serde_json::Value {
+fn node_value(
+    peer: &PeerAddr,
+    e: &CrawlEntry,
+    asn: Option<String>,
+    default_port: u16,
+) -> serde_json::Value {
     let o = e.observation.as_ref();
     serde_json::json!([
         o.map(|o| o.protocol_version),
@@ -305,12 +327,20 @@ pub fn export_json(book: &CrawlBook, ctx: &ExportContext<'_>, mode: &Mode) -> se
             // port is kept, so two services of one onion are two nodes.
             // An onion's port is as public as its address.
             (Mode::Keyed { .. }, PeerAddr::Onion { host, port }) => {
-                let key = if *port == ctx.default_port { host.clone() } else { format!("{host}:{port}") };
+                let key = if *port == ctx.default_port {
+                    host.clone()
+                } else {
+                    format!("{host}:{port}")
+                };
                 (key, asn_of(e).map(asn_text))
             }
             (Mode::Keyed { key, min_k }, PeerAddr::Socket(sa)) => {
                 let asn = asn_of(e).map(|a| {
-                    if per_asn.get(&a).copied().unwrap_or(0) < *min_k { "other".to_string() } else { asn_text(a) }
+                    if per_asn.get(&a).copied().unwrap_or(0) < *min_k {
+                        "other".to_string()
+                    } else {
+                        asn_text(a)
+                    }
                 });
                 (node_id(key, sa), asn)
             }
@@ -318,7 +348,8 @@ pub fn export_json(book: &CrawlBook, ctx: &ExportContext<'_>, mode: &Mode) -> se
         nodes.insert(key, node_value(peer, e, asn, ctx.default_port));
     }
     let counts = book.counts();
-    let learned = |n: Network| counts.learned[Network::ALL.iter().position(|x| *x == n).expect("in ALL")];
+    let learned =
+        |n: Network| counts.learned[Network::ALL.iter().position(|x| *x == n).expect("in ALL")];
     let mut satd = serde_json::json!({
         "export": match mode { Mode::Keyed { .. } => "keyed", Mode::Raw => "raw" },
         "chain": ctx.chain,
@@ -368,7 +399,11 @@ const CRC_TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xedb8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[i] = c;
@@ -408,7 +443,8 @@ pub fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, String> {
         return Err("not a gzip member this module wrote".into());
     }
     let (body, trailer) = bytes[10..].split_at(bytes.len() - 18);
-    let data = miniz_oxide::inflate::decompress_to_vec(body).map_err(|e| format!("inflate: {e:?}"))?;
+    let data =
+        miniz_oxide::inflate::decompress_to_vec(body).map_err(|e| format!("inflate: {e:?}"))?;
     let crc = u32::from_le_bytes(trailer[..4].try_into().unwrap());
     let len = u32::from_le_bytes(trailer[4..].try_into().unwrap());
     if crc != crc32(&data) || len != data.len() as u32 {
@@ -458,7 +494,10 @@ pub fn prune_plan(times: &[u64], now: u64) -> Vec<u64> {
     let gone = |t: u64| now.saturating_sub(t) >= DAILY_KEEP_SECS;
     let mut first_of_day: BTreeMap<u64, u64> = BTreeMap::new();
     for &t in times.iter().filter(|t| daily(**t)) {
-        first_of_day.entry(t / DAY).and_modify(|f| *f = (*f).min(t)).or_insert(t);
+        first_of_day
+            .entry(t / DAY)
+            .and_modify(|f| *f = (*f).min(t))
+            .or_insert(t);
     }
     let mut delete: Vec<u64> = times
         .iter()
@@ -497,7 +536,11 @@ impl SnapshotStore {
     /// so a restart within the hour writes none.
     pub fn open(dir: PathBuf) -> Self {
         let last = list_snapshots(&dir).ok().and_then(|t| t.last().copied());
-        SnapshotStore { dir, last, failed: None }
+        SnapshotStore {
+            dir,
+            last,
+            failed: None,
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -508,7 +551,9 @@ impl SnapshotStore {
     /// hour.
     pub fn due(&self, now: u64) -> bool {
         self.last.is_none_or(|l| l / HOUR != now / HOUR)
-            && self.failed.is_none_or(|f| now.saturating_sub(f) >= SNAPSHOT_RETRY_SECS)
+            && self
+                .failed
+                .is_none_or(|f| now.saturating_sub(f) >= SNAPSHOT_RETRY_SECS)
     }
 
     /// Note a failed write at `now`: [`Self::due`] waits
@@ -536,10 +581,16 @@ impl SnapshotStore {
             let p = self.dir.join(snapshot_file_name(t));
             match std::fs::remove_file(&p) {
                 Ok(()) => pruned += 1,
-                Err(e) => tracing::warn!(file = %p.display(), "Could not delete an old crawl snapshot: {e}"),
+                Err(e) => {
+                    tracing::warn!(file = %p.display(), "Could not delete an old crawl snapshot: {e}")
+                }
             }
         }
-        Ok(Written { path, bytes: gz.len(), pruned })
+        Ok(Written {
+            path,
+            bytes: gz.len(),
+            pruned,
+        })
     }
 
     /// Create the directory, with its parent's permissions, if it is not
@@ -553,12 +604,20 @@ impl SnapshotStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-            let parent = self.dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-            let mode =
-                std::fs::metadata(parent).map_err(|e| format!("reading {}: {e}", parent.display()))?.permissions().mode();
+            let parent = self
+                .dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mode = std::fs::metadata(parent)
+                .map_err(|e| format!("reading {}: {e}", parent.display()))?
+                .permissions()
+                .mode();
             builder.mode(mode & 0o777);
         }
-        builder.create(&self.dir).map_err(|e| format!("creating {}: {e}", self.dir.display()))
+        builder
+            .create(&self.dir)
+            .map_err(|e| format!("creating {}: {e}", self.dir.display()))
     }
 }
 

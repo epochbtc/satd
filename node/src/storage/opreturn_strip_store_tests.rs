@@ -58,7 +58,10 @@ fn the_strip_family_is_created_by_the_first_put_and_not_by_a_remove() {
     let dir = tempfile::tempdir().unwrap();
     {
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-        assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "fresh datadir");
+        assert!(
+            !chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()),
+            "fresh datadir"
+        );
         assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap(), None);
         assert_eq!(store.opreturn_strip_meta().unwrap(), None);
 
@@ -70,11 +73,17 @@ fn the_strip_family_is_created_by_the_first_put_and_not_by_a_remove() {
 
         store.write_batch(put(hash(1), b"record")).unwrap();
         assert!(chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()));
-        assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
+        assert_eq!(
+            store.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+            Some(&b"record"[..])
+        );
     }
     // And it is declared again on the next open, record intact.
     let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-    assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
+    assert_eq!(
+        store.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        Some(&b"record"[..])
+    );
     store.write_batch(remove(hash(1))).unwrap();
     assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap(), None);
 }
@@ -84,7 +93,10 @@ fn the_strip_family_is_created_by_the_first_put_and_not_by_a_remove() {
 fn strip_meta_round_trips_beside_the_records() {
     let (store, _dir) = {
         let dir = tempfile::tempdir().unwrap();
-        (RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap(), dir)
+        (
+            RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap(),
+            dir,
+        )
     };
     store
         .write_batch(StoreBatch {
@@ -92,10 +104,16 @@ fn strip_meta_round_trips_beside_the_records() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(store.opreturn_strip_meta().unwrap().as_deref(), Some(&b"cursor"[..]));
+    assert_eq!(
+        store.opreturn_strip_meta().unwrap().as_deref(),
+        Some(&b"cursor"[..])
+    );
     // A batch without meta leaves it alone.
     store.write_batch(put(hash(2), b"r")).unwrap();
-    assert_eq!(store.opreturn_strip_meta().unwrap().as_deref(), Some(&b"cursor"[..]));
+    assert_eq!(
+        store.opreturn_strip_meta().unwrap().as_deref(),
+        Some(&b"cursor"[..])
+    );
 }
 
 /// A release that predates the family declares every family but it, and
@@ -133,10 +151,19 @@ fn reindex_clears_keep_the_strip_records() {
         .unwrap();
 
     store.clear_chainstate().unwrap();
-    assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
+    assert_eq!(
+        store.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        Some(&b"record"[..])
+    );
     store.clear_all().unwrap();
-    assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
-    assert_eq!(store.opreturn_strip_meta().unwrap().as_deref(), Some(&b"cursor"[..]));
+    assert_eq!(
+        store.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        Some(&b"record"[..])
+    );
+    assert_eq!(
+        store.opreturn_strip_meta().unwrap().as_deref(),
+        Some(&b"cursor"[..])
+    );
 }
 
 #[test]
@@ -145,7 +172,10 @@ fn in_memory_clears_keep_the_strip_records() {
     store.write_batch(put(hash(1), b"record")).unwrap();
     store.clear_chainstate().unwrap();
     store.clear_all().unwrap();
-    assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
+    assert_eq!(
+        store.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        Some(&b"record"[..])
+    );
 }
 
 /// `merge` is last-writer-wins by hash, and a later batch without meta does
@@ -155,12 +185,22 @@ fn merge_is_last_writer_wins_by_hash_and_keeps_meta() {
     let mut a = put(hash(1), b"one");
     a.opreturn_strip_meta = Some(b"meta".to_vec());
     a.merge(remove(hash(1)));
-    assert!(a.opreturn_strip_puts.is_empty(), "a later remove drops the put");
+    assert!(
+        a.opreturn_strip_puts.is_empty(),
+        "a later remove drops the put"
+    );
     assert_eq!(a.opreturn_strip_removes, vec![hash(1)]);
-    assert_eq!(a.opreturn_strip_meta.as_deref(), Some(&b"meta"[..]), "None must not erase Some");
+    assert_eq!(
+        a.opreturn_strip_meta.as_deref(),
+        Some(&b"meta"[..]),
+        "None must not erase Some"
+    );
 
     a.merge(put(hash(1), b"again"));
-    assert!(a.opreturn_strip_removes.is_empty(), "a later put drops the remove");
+    assert!(
+        a.opreturn_strip_removes.is_empty(),
+        "a later put drops the remove"
+    );
     assert_eq!(a.opreturn_strip_puts, vec![(hash(1), b"again".to_vec())]);
 
     a.merge(StoreBatch {
@@ -197,7 +237,11 @@ fn a_coin_free_strip_batch_goes_straight_to_the_backing_store() {
     let cache = CoinCache::new(Box::new(InMemoryStore::new()), 10);
     cache.write_batch(put(hash(1), b"record")).unwrap();
     assert_eq!(
-        cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        cache
+            .inner_for_test()
+            .get_opreturn_strip(&hash(1))
+            .unwrap()
+            .as_deref(),
         Some(&b"record"[..]),
         "the record must not wait for a flush"
     );
@@ -214,13 +258,24 @@ fn a_buffered_remove_is_seen_by_reads_and_applied_by_the_flush() {
     connect.opreturn_strip_removes.push(hash(1));
     cache.write_batch(connect).unwrap();
     assert!(
-        cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap().is_some(),
+        cache
+            .inner_for_test()
+            .get_opreturn_strip(&hash(1))
+            .unwrap()
+            .is_some(),
         "premise: the remove is still buffered"
     );
-    assert_eq!(cache.get_opreturn_strip(&hash(1)).unwrap(), None, "reads see the buffered remove");
+    assert_eq!(
+        cache.get_opreturn_strip(&hash(1)).unwrap(),
+        None,
+        "reads see the buffered remove"
+    );
 
     cache.flush().unwrap();
-    assert_eq!(cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap(), None);
+    assert_eq!(
+        cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap(),
+        None
+    );
 }
 
 /// A record written after a buffered remove of the same block is newer. It
@@ -234,10 +289,17 @@ fn a_pass_through_put_supersedes_a_buffered_remove() {
     cache.write_batch(connect).unwrap();
 
     cache.write_batch(put(hash(1), b"record")).unwrap();
-    assert_eq!(cache.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
+    assert_eq!(
+        cache.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        Some(&b"record"[..])
+    );
     cache.flush().unwrap();
     assert_eq!(
-        cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        cache
+            .inner_for_test()
+            .get_opreturn_strip(&hash(1))
+            .unwrap()
+            .as_deref(),
         Some(&b"record"[..]),
         "the flush must not replay the older remove over the record"
     );
@@ -254,12 +316,24 @@ fn split_store_keeps_strip_records_in_the_block_store() {
     batch.opreturn_strip_meta = Some(b"meta".to_vec());
     split.write_batch(batch).unwrap();
 
-    assert_eq!(block_store.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
-    assert_eq!(block_store.opreturn_strip_meta().unwrap().as_deref(), Some(&b"meta"[..]));
+    assert_eq!(
+        block_store.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        Some(&b"record"[..])
+    );
+    assert_eq!(
+        block_store.opreturn_strip_meta().unwrap().as_deref(),
+        Some(&b"meta"[..])
+    );
     assert_eq!(coins_store.get_opreturn_strip(&hash(1)).unwrap(), None);
     assert_eq!(coins_store.opreturn_strip_meta().unwrap(), None);
-    assert_eq!(split.get_opreturn_strip(&hash(1)).unwrap().as_deref(), Some(&b"record"[..]));
-    assert_eq!(split.opreturn_strip_meta().unwrap().as_deref(), Some(&b"meta"[..]));
+    assert_eq!(
+        split.get_opreturn_strip(&hash(1)).unwrap().as_deref(),
+        Some(&b"record"[..])
+    );
+    assert_eq!(
+        split.opreturn_strip_meta().unwrap().as_deref(),
+        Some(&b"meta"[..])
+    );
 }
 
 /// One batch can carry a put and a remove for the same block. Every store
@@ -269,12 +343,22 @@ fn split_store_keeps_strip_records_in_the_block_store() {
 fn a_buffered_put_and_remove_in_one_batch_reads_as_it_flushes() {
     let cache = CoinCache::new(Box::new(InMemoryStore::new()), 10);
     let mut connect = coin_batch();
-    connect.opreturn_strip_puts.push((hash(1), b"record".to_vec()));
+    connect
+        .opreturn_strip_puts
+        .push((hash(1), b"record".to_vec()));
     connect.opreturn_strip_removes.push(hash(1));
     cache.write_batch(connect).unwrap();
-    assert_eq!(cache.get_opreturn_strip(&hash(1)).unwrap(), None, "buffered");
+    assert_eq!(
+        cache.get_opreturn_strip(&hash(1)).unwrap(),
+        None,
+        "buffered"
+    );
     cache.flush().unwrap();
-    assert_eq!(cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap(), None, "flushed");
+    assert_eq!(
+        cache.inner_for_test().get_opreturn_strip(&hash(1)).unwrap(),
+        None,
+        "flushed"
+    );
 }
 
 /// Dropping the family (plan §11.5) takes the records and the meta with it,
@@ -288,14 +372,20 @@ fn dropping_the_strip_family_makes_the_datadir_ordinary_again() {
         let mut batch = put(hash(1), b"record");
         batch.opreturn_strip_meta = Some(b"cursor".to_vec());
         store.write_batch(batch).unwrap();
-        assert!(chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "premise");
+        assert!(
+            chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()),
+            "premise"
+        );
 
         store.drop_opreturn_strip_cf().unwrap();
         assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()));
         assert_eq!(store.get_opreturn_strip(&hash(1)).unwrap(), None);
         assert_eq!(store.opreturn_strip_meta().unwrap(), None);
         store.write_batch(remove(hash(1))).unwrap();
-        assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "a remove must not recreate it");
+        assert!(
+            !chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()),
+            "a remove must not recreate it"
+        );
         store.drop_opreturn_strip_cf().unwrap();
     }
     open_without_strip_cf(dir.path()).expect("an older release opens the datadir again");
@@ -317,7 +407,9 @@ fn a_drop_waits_for_a_batch_that_holds_the_family() {
         let store = store.clone();
         std::thread::spawn(move || store.write_batch(remove(hash(1))))
     };
-    began_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the write reached the family");
+    began_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the write reached the family");
     let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
     let dropper = {
         let store = store.clone();
@@ -328,11 +420,16 @@ fn a_drop_waits_for_a_batch_that_holds_the_family() {
         })
     };
     assert!(
-        dropped_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
         "the drop ran while a write held the family"
     );
     resume_tx.send(()).unwrap();
-    writer.join().unwrap().expect("the write racing the drop lands");
+    writer
+        .join()
+        .unwrap()
+        .expect("the write racing the drop lands");
     dropper.join().unwrap().unwrap();
     assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()));
 }
@@ -348,21 +445,36 @@ fn every_layer_drops_the_strip_family() {
     let store = InMemoryStore::new();
     store.write_batch(batch()).unwrap();
     store.drop_opreturn_strip_cf().unwrap();
-    assert_eq!((store.get_opreturn_strip(&hash(1)).unwrap(), store.opreturn_strip_meta().unwrap()), (None, None));
+    assert_eq!(
+        (
+            store.get_opreturn_strip(&hash(1)).unwrap(),
+            store.opreturn_strip_meta().unwrap()
+        ),
+        (None, None)
+    );
 
     let dir = tempfile::tempdir().unwrap();
-    let cache = CoinCache::new(Box::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap()), 10);
+    let cache = CoinCache::new(
+        Box::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap()),
+        10,
+    );
     cache.write_batch(batch()).unwrap();
     cache.drop_opreturn_strip_cf().unwrap();
-    assert!(!chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()), "through a CoinCache");
+    assert!(
+        !chainstate_cfs(dir.path()).contains(&STRIP_CF.to_string()),
+        "through a CoinCache"
+    );
 
     let block_store = Arc::new(InMemoryStore::new());
     let split = SplitStore::new(block_store.clone(), Arc::new(InMemoryStore::new()), None);
     split.write_batch(batch()).unwrap();
     split.drop_opreturn_strip_cf().unwrap();
-    assert_eq!(block_store.get_opreturn_strip(&hash(1)).unwrap(), None, "through a SplitStore");
+    assert_eq!(
+        block_store.get_opreturn_strip(&hash(1)).unwrap(),
+        None,
+        "through a SplitStore"
+    );
 }
-
 
 /// A durability flush racing the drop must not fail either: RocksDB refuses
 /// a flush that lists a family dropped after its handle was taken.

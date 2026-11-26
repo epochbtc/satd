@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 use bitcoin::OutPoint;
 use node::chain::state::ChainState;
 use node::index::silent_payments::{SpBlockRow, SpIndex, SpIndexError};
-use serde_json::{json, Map, Value};
-use tokio::sync::{mpsc, Semaphore};
+use serde_json::{Map, Value, json};
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::error::JsonRpcError;
 use crate::state::ElectrumState;
@@ -173,10 +173,16 @@ pub fn parse_req(params: &Value) -> Result<TweakReq, JsonRpcError> {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
         Some(_) => {
-            return Err(JsonRpcError::invalid_params("historical_mode must be a boolean"));
+            return Err(JsonRpcError::invalid_params(
+                "historical_mode must be a boolean",
+            ));
         }
     };
-    Ok(TweakReq { start, count, historical })
+    Ok(TweakReq {
+        start,
+        count,
+        historical,
+    })
 }
 
 fn u32_param(v: Option<&Value>, name: &str) -> Result<u32, JsonRpcError> {
@@ -271,7 +277,11 @@ fn absence_is_an_answer(height: u32, activation: u32, tip_at_start: u32) -> bool
 /// `{"<height>": {}}`. That is a real answer,
 /// not an error: it is how a client's progress marker advances across barren
 /// stretches of chain.
-pub fn height_map(src: &TweakSource, height: u32, cut_through: bool) -> Result<Value, JsonRpcError> {
+pub fn height_map(
+    src: &TweakSource,
+    height: u32,
+    cut_through: bool,
+) -> Result<Value, JsonRpcError> {
     let row = match src.index.tweaks_at(height) {
         Ok(row) => row,
         Err(SpIndexError::NotFound(_)) => {
@@ -494,9 +504,9 @@ fn index_unavailable(e: &SpIndexError) -> JsonRpcError {
         // routing this one there would hand the datadir layout to any
         // unauthenticated Electrum client. `internal` logs the detail and sends
         // a fixed `"internal error"`.
-        SpIndexError::Storage(_) => JsonRpcError::internal(format!(
-            "blockchain.tweaks.subscribe unavailable: {e}"
-        )),
+        SpIndexError::Storage(_) => {
+            JsonRpcError::internal(format!("blockchain.tweaks.subscribe unavailable: {e}"))
+        }
         // These two are satd's own text and name the option an operator has to
         // change, so they are worth putting in front of the user.
         SpIndexError::Disabled | SpIndexError::Incomplete | SpIndexError::NotFound(_) => {
@@ -557,11 +567,17 @@ pub async fn stream_chunk(
         // progress marker to move (it reads the map's last key), but one line
         // per height would be ~700k lines on mainnet.
         if let Some(end) = pre_activation_wave_end(h, last, activation) {
-            if notify_tx.send(notification_line(&empty_heights(h, end))).await.is_err() {
+            if notify_tx
+                .send(notification_line(&empty_heights(h, end)))
+                .await
+                .is_err()
+            {
                 return;
             }
             served_through = Some(end);
-            let Some(next) = advance(end, 1, last) else { break };
+            let Some(next) = advance(end, 1, last) else {
+                break;
+            };
             h = next;
             continue;
         }
@@ -614,7 +630,9 @@ pub async fn stream_chunk(
             break;
         }
         served_through = Some(h.saturating_add(served - 1));
-        let Some(next) = advance(h, served, last) else { break };
+        let Some(next) = advance(h, served, last) else {
+            break;
+        };
         h = next;
     }
 
@@ -636,7 +654,14 @@ mod tests {
     #[test]
     fn parses_cake_probe_params() {
         let req = parse_req(&json!([0, 1, false])).expect("probe parses");
-        assert_eq!(req, TweakReq { start: 0, count: 1, historical: false });
+        assert_eq!(
+            req,
+            TweakReq {
+                start: 0,
+                count: 1,
+                historical: false
+            }
+        );
         assert!(req.cut_through(), "historicalMode=false means cut through");
     }
 
@@ -658,14 +683,22 @@ mod tests {
             held.push(p);
             assert!(held.len() <= 64, "the semaphore must be finite");
         }
-        assert!(held.len() >= 2, "at least two concurrent scans, got {}", held.len());
+        assert!(
+            held.len() >= 2,
+            "at least two concurrent scans, got {}",
+            held.len()
+        );
 
         // Exhausted: a further claim fails instead of waiting, and the refusal
         // tells the client it is transient.
         assert!(try_claim_scan_slot().is_none(), "must refuse once full");
         let err = scan_slots_busy();
         assert_eq!(err.code, 1, "in-band refusal, not a transport error");
-        assert!(err.message.contains("retry"), "must say it is transient: {}", err.message);
+        assert!(
+            err.message.contains("retry"),
+            "must say it is transient: {}",
+            err.message
+        );
 
         // Releasing one frees exactly one.
         held.pop();
@@ -681,7 +714,11 @@ mod tests {
         // sends `count = tip - syncHeight + 1`. Serving only part of an accepted
         // range and then saying `done` tells kiss-bdk the rest was scanned and
         // empty, so the range satd accepts has to be one it will finish.
-        let huge = TweakReq { start: 800_000, count: u32::MAX, historical: false };
+        let huge = TweakReq {
+            start: 800_000,
+            count: u32::MAX,
+            historical: false,
+        };
         assert_eq!(
             huge.last_height(900_000),
             Some(800_000 + MAX_CHUNK_HEIGHTS - 1),
@@ -689,15 +726,31 @@ mod tests {
         );
 
         // The tip still wins when it is the tighter bound.
-        let past_tip = TweakReq { start: 899_990, count: u32::MAX, historical: false };
-        assert_eq!(past_tip.last_height(900_000), Some(900_000), "clamped to the tip");
+        let past_tip = TweakReq {
+            start: 899_990,
+            count: u32::MAX,
+            historical: false,
+        };
+        assert_eq!(
+            past_tip.last_height(900_000),
+            Some(900_000),
+            "clamped to the tip"
+        );
 
         // Under the cap nothing changes.
-        let small = TweakReq { start: 100, count: 5, historical: false };
+        let small = TweakReq {
+            start: 100,
+            count: 5,
+            historical: false,
+        };
         assert_eq!(small.last_height(900_000), Some(104));
 
         // The cap is a height count, so the boundary case serves exactly it.
-        let exact = TweakReq { start: 0, count: MAX_CHUNK_HEIGHTS, historical: false };
+        let exact = TweakReq {
+            start: 0,
+            count: MAX_CHUNK_HEIGHTS,
+            historical: false,
+        };
         assert_eq!(exact.last_height(900_000), Some(MAX_CHUNK_HEIGHTS - 1));
     }
 
@@ -709,10 +762,19 @@ mod tests {
         // resume.
         let line = incomplete_line(899_998, "chunk budget elapsed");
         let v: Value = serde_json::from_str(&line).expect("valid JSON");
-        assert_eq!(v["method"], METHOD, "same notification envelope as a height");
+        assert_eq!(
+            v["method"], METHOD,
+            "same notification envelope as a height"
+        );
         let msg = v["params"][0]["message"].as_str().expect("message");
-        assert!(!msg.contains("done"), "must not read as completion, got {msg:?}");
-        assert!(msg.contains("899999"), "names the resume height, got {msg:?}");
+        assert!(
+            !msg.contains("done"),
+            "must not read as completion, got {msg:?}"
+        );
+        assert!(
+            msg.contains("899999"),
+            "names the resume height, got {msg:?}"
+        );
 
         // And the completion marker still says exactly `done`, which is the
         // string the clients match on.
@@ -730,39 +792,87 @@ mod tests {
     #[test]
     fn rejects_missing_or_malformed_params() {
         assert!(parse_req(&json!([])).is_err());
-        assert!(parse_req(&json!(["850000"])).is_err(), "height must be numeric");
-        assert!(parse_req(&json!([1, 1, "yes"])).is_err(), "mode must be boolean");
-        assert!(parse_req(&json!([-1])).is_err(), "negative height is not a height");
+        assert!(
+            parse_req(&json!(["850000"])).is_err(),
+            "height must be numeric"
+        );
+        assert!(
+            parse_req(&json!([1, 1, "yes"])).is_err(),
+            "mode must be boolean"
+        );
+        assert!(
+            parse_req(&json!([-1])).is_err(),
+            "negative height is not a height"
+        );
     }
 
     #[test]
     fn last_height_clamps_to_tip_and_stops_above_it() {
-        let req = TweakReq { start: 100, count: 50, historical: false };
+        let req = TweakReq {
+            start: 100,
+            count: 50,
+            historical: false,
+        };
         assert_eq!(req.last_height(120), Some(120), "clamped to tip");
         assert_eq!(req.last_height(1_000), Some(149), "start + count - 1");
-        assert_eq!(TweakReq { start: 200, count: 1, historical: false }.last_height(120), None);
+        assert_eq!(
+            TweakReq {
+                start: 200,
+                count: 1,
+                historical: false
+            }
+            .last_height(120),
+            None
+        );
     }
 
     #[test]
     fn a_missing_row_is_an_answer_only_outside_the_served_range() {
         // Outside [activation, tip]: no row exists by construction, so an empty
         // map is the honest reply and the client's marker advances.
-        assert!(absence_is_an_answer(0, 709_632, 900_000), "below activation");
-        assert!(absence_is_an_answer(709_631, 709_632, 900_000), "one below activation");
-        assert!(absence_is_an_answer(900_001, 709_632, 900_000), "one above the tip");
-        assert!(absence_is_an_answer(u32::MAX, 709_632, 900_000), "far above the tip");
+        assert!(
+            absence_is_an_answer(0, 709_632, 900_000),
+            "below activation"
+        );
+        assert!(
+            absence_is_an_answer(709_631, 709_632, 900_000),
+            "one below activation"
+        );
+        assert!(
+            absence_is_an_answer(900_001, 709_632, 900_000),
+            "one above the tip"
+        );
+        assert!(
+            absence_is_an_answer(u32::MAX, 709_632, 900_000),
+            "far above the tip"
+        );
 
         // Inside it: a complete index must have a row, so a miss is a reorg
         // window. Answering `{}` here is the silent skip -- the client records
         // the height as scanned and never revisits the block that replaces it.
-        assert!(!absence_is_an_answer(709_632, 709_632, 900_000), "activation itself");
-        assert!(!absence_is_an_answer(800_000, 709_632, 900_000), "mid-range");
-        assert!(!absence_is_an_answer(900_000, 709_632, 900_000), "the tip itself");
+        assert!(
+            !absence_is_an_answer(709_632, 709_632, 900_000),
+            "activation itself"
+        );
+        assert!(
+            !absence_is_an_answer(800_000, 709_632, 900_000),
+            "mid-range"
+        );
+        assert!(
+            !absence_is_an_answer(900_000, 709_632, 900_000),
+            "the tip itself"
+        );
 
         // Regtest and signet activate at 0, so every height at or below the tip
         // is inside the range and no height is "below activation".
-        assert!(!absence_is_an_answer(0, 0, 10), "regtest genesis is in range");
-        assert!(absence_is_an_answer(11, 0, 10), "still an answer above the tip");
+        assert!(
+            !absence_is_an_answer(0, 0, 10),
+            "regtest genesis is in range"
+        );
+        assert!(
+            absence_is_an_answer(11, 0, 10),
+            "still an answer above the tip"
+        );
     }
 
     #[test]
@@ -800,7 +910,10 @@ mod tests {
 
         // Above the promise it stays an answer, reorg or not: that is the
         // caught-up wallet polling one past the tip.
-        assert!(absence_is_an_answer(900_001, ACT, TIP_AT_START), "one past the promise");
+        assert!(
+            absence_is_an_answer(900_001, ACT, TIP_AT_START),
+            "one past the promise"
+        );
     }
 
     #[test]
@@ -847,9 +960,17 @@ mod tests {
         // guard `h <= last` stays true, and a request naming height 4294967295
         // spins the whole chunk budget re-serving one empty height.
         assert_eq!(advance(5, 3, 10), Some(8));
-        assert_eq!(advance(9, 1, 10), Some(10), "landing exactly on last is fine");
+        assert_eq!(
+            advance(9, 1, 10),
+            Some(10),
+            "landing exactly on last is fine"
+        );
         assert_eq!(advance(10, 1, 10), None, "one past last ends the chunk");
-        assert_eq!(advance(u32::MAX, 1, u32::MAX), None, "no fixed point at the ceiling");
+        assert_eq!(
+            advance(u32::MAX, 1, u32::MAX),
+            None,
+            "no fixed point at the ceiling"
+        );
     }
 
     #[test]
@@ -857,10 +978,16 @@ mod tests {
         // Below activation: one wave, capped at EMPTY_WAVE_HEIGHTS and at the
         // decimal-width boundary that keeps the map's last key its highest.
         assert_eq!(pre_activation_wave_end(0, 1_000_000, 709_632), Some(9));
-        assert_eq!(pre_activation_wave_end(1_000, 1_000_000, 709_632), Some(2_023));
+        assert_eq!(
+            pre_activation_wave_end(1_000, 1_000_000, 709_632),
+            Some(2_023)
+        );
         // The wave never crosses activation, so the first real height is served
         // from the index rather than swallowed as "empty".
-        assert_eq!(pre_activation_wave_end(709_000, 1_000_000, 709_632), Some(709_631));
+        assert_eq!(
+            pre_activation_wave_end(709_000, 1_000_000, 709_632),
+            Some(709_631)
+        );
         // Requested range ends first.
         assert_eq!(pre_activation_wave_end(10, 42, 709_632), Some(42));
         // At or above activation there is no empty wave at all (regtest/signet

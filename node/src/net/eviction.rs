@@ -64,7 +64,11 @@ pub struct EvictionCandidate {
 }
 
 /// A strict-weak "less than" turned into the `Ordering` Rust's sort takes.
-fn ordering(less: impl Fn(&EvictionCandidate, &EvictionCandidate) -> bool, a: &EvictionCandidate, b: &EvictionCandidate) -> Ordering {
+fn ordering(
+    less: impl Fn(&EvictionCandidate, &EvictionCandidate) -> bool,
+    a: &EvictionCandidate,
+    b: &EvictionCandidate,
+) -> Ordering {
     if less(a, b) {
         Ordering::Less
     } else if less(b, a) {
@@ -153,7 +157,10 @@ impl Disadvantaged {
             Self::Local => None,
             Self::Net(net) => Some(net),
         };
-        let (a_in, b_in) = (net.is_some() && a.network == net, net.is_some() && b.network == net);
+        let (a_in, b_in) = (
+            net.is_some() && a.network == net,
+            net.is_some() && b.network == net,
+        );
         if a_in != b_in {
             return b_in;
         }
@@ -217,7 +224,12 @@ pub fn protect_eviction_candidates_by_ratio(candidates: &mut Vec<EvictionCandida
             }
             let net = *net;
             let before = candidates.len();
-            erase_last_k_elements(candidates, |a, b| net.less(a, b), protect_per_network, |c| net.matches(c));
+            erase_last_k_elements(
+                candidates,
+                |a, b| net.less(a, b),
+                protect_per_network,
+                |c| net.matches(c),
+            );
             let after = candidates.len();
             if before > after {
                 protected_at_least_one = true;
@@ -237,7 +249,12 @@ pub fn protect_eviction_candidates_by_ratio(candidates: &mut Vec<EvictionCandida
     // Protect the rest by uptime alone.
     debug_assert_eq!(num_protected, initial_size - candidates.len());
     let remaining_to_protect = total_protect_size - num_protected;
-    erase_last_k_elements(candidates, reverse_compare_node_time_connected, remaining_to_protect, |_| true);
+    erase_last_k_elements(
+        candidates,
+        reverse_compare_node_time_connected,
+        remaining_to_protect,
+        |_| true,
+    );
 }
 
 /// Core's `SelectNodeToEvict`: the peer to evict once the protected ones are
@@ -259,13 +276,21 @@ pub fn select_node_to_evict(mut candidates: Vec<EvictionCandidate>) -> Option<Pe
     // Four peers by keyed netgroup: an attacker cannot predict which.
     erase_last_k_elements(&mut candidates, compare_net_group_keyed, 4, |_| true);
     // The eight with the lowest minimum ping: hard to fake without moving.
-    erase_last_k_elements(&mut candidates, reverse_compare_node_min_ping_time, 8, |_| true);
+    erase_last_k_elements(
+        &mut candidates,
+        reverse_compare_node_min_ping_time,
+        8,
+        |_| true,
+    );
     // The four that most recently sent us transactions the mempool accepted.
     erase_last_k_elements(&mut candidates, compare_node_tx_time, 4, |_| true);
     // Up to eight non-tx-relay peers that sent us novel blocks.
-    erase_last_k_elements(&mut candidates, compare_node_block_relay_only_time, 8, |c| {
-        !c.relay_txs && c.relevant_services
-    });
+    erase_last_k_elements(
+        &mut candidates,
+        compare_node_block_relay_only_time,
+        8,
+        |c| !c.relay_txs && c.relevant_services,
+    );
     // The four that most recently sent us novel blocks.
     erase_last_k_elements(&mut candidates, compare_node_block_time, 4, |_| true);
 
@@ -297,7 +322,9 @@ fn youngest_of_largest_group(candidates: &[EvictionCandidate]) -> Option<PeerId>
         let group = groups.entry(c.keyed_net_group).or_default();
         group.push(c);
         let group_time = group[0].connected;
-        if group.len() > most_connections || (group.len() == most_connections && group_time > most_connections_time) {
+        if group.len() > most_connections
+            || (group.len() == most_connections && group_time > most_connections_time)
+        {
             most_connections = group.len();
             most_connections_time = group_time;
             most_connections_group = c.keyed_net_group;
@@ -317,7 +344,13 @@ mod tests {
 
     /// Core's `GetRandomNodeEvictionCandidates` (`src/test/util/net.cpp`).
     fn random_candidates(n: usize, rng: &mut rand::rngs::StdRng) -> Vec<EvictionCandidate> {
-        const NETS: [Network; 5] = [Network::Ipv4, Network::Ipv6, Network::Onion, Network::I2p, Network::Cjdns];
+        const NETS: [Network; 5] = [
+            Network::Ipv4,
+            Network::Ipv6,
+            Network::Onion,
+            Network::I2p,
+            Network::Cjdns,
+        ];
         (0..n)
             .map(|id| EvictionCandidate {
                 id: id as PeerId,
@@ -353,7 +386,8 @@ mod tests {
         protect_eviction_candidates_by_ratio(&mut candidates);
         assert_eq!(candidates.len(), expected);
         let left: HashSet<PeerId> = candidates.iter().map(|c| c.id).collect();
-        protected.iter().all(|id| !left.contains(id)) && unprotected.iter().all(|id| left.contains(id))
+        protected.iter().all(|id| !left.contains(id))
+            && unprotected.iter().all(|id| left.contains(id))
     }
 
     #[test]
@@ -377,7 +411,11 @@ mod tests {
             |c| {
                 c.connected = c.id;
                 c.is_local = false;
-                c.network = Some(if c.id == 3 || c.id > 7 { Network::Onion } else { Network::Ipv6 });
+                c.network = Some(if c.id == 3 || c.id > 7 {
+                    Network::Onion
+                } else {
+                    Network::Ipv6
+                });
             },
             &[0, 1, 2, 3, 8, 9],
             &[4, 5, 6, 7, 10, 11],
@@ -418,7 +456,12 @@ mod tests {
         ));
     }
 
-    fn is_evicted(n: usize, setup: impl Fn(&mut EvictionCandidate, usize), ids: &[PeerId], rng: &mut rand::rngs::StdRng) -> bool {
+    fn is_evicted(
+        n: usize,
+        setup: impl Fn(&mut EvictionCandidate, usize),
+        ids: &[PeerId],
+        rng: &mut rand::rngs::StdRng,
+    ) -> bool {
         let mut candidates = random_candidates(n, rng);
         candidates.iter_mut().for_each(|c| setup(c, n));
         candidates.shuffle(rng);
@@ -430,9 +473,24 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(2);
         for n in 0..200usize {
             let first = |k: u64| (0..k).collect::<Vec<PeerId>>();
-            assert!(!is_evicted(n, |c, n| c.keyed_net_group = n as u64 - c.id, &first(4), &mut rng));
-            assert!(!is_evicted(n, |c, _| c.min_ping_us = c.id, &first(8), &mut rng));
-            assert!(!is_evicted(n, |c, n| c.last_tx_time = n as u64 - c.id, &first(4), &mut rng));
+            assert!(!is_evicted(
+                n,
+                |c, n| c.keyed_net_group = n as u64 - c.id,
+                &first(4),
+                &mut rng
+            ));
+            assert!(!is_evicted(
+                n,
+                |c, _| c.min_ping_us = c.id,
+                &first(8),
+                &mut rng
+            ));
+            assert!(!is_evicted(
+                n,
+                |c, n| c.last_tx_time = n as u64 - c.id,
+                &first(4),
+                &mut rng
+            ));
             assert!(!is_evicted(
                 n,
                 |c, n| {
@@ -445,7 +503,12 @@ mod tests {
                 &first(8),
                 &mut rng
             ));
-            assert!(!is_evicted(n, |c, n| c.last_block_time = n as u64 - c.id, &first(4), &mut rng));
+            assert!(!is_evicted(
+                n,
+                |c, n| c.last_block_time = n as u64 - c.id,
+                &first(4),
+                &mut rng
+            ));
             assert!(!is_evicted(
                 n,
                 |c, n| {
@@ -460,10 +523,16 @@ mod tests {
             // At least 29 random candidates always yield an eviction; at most
             // 20 never do.
             if n >= 29 {
-                assert!(select_node_to_evict(random_candidates(n, &mut rng)).is_some(), "{n}");
+                assert!(
+                    select_node_to_evict(random_candidates(n, &mut rng)).is_some(),
+                    "{n}"
+                );
             }
             if n <= 20 {
-                assert!(select_node_to_evict(random_candidates(n, &mut rng)).is_none(), "{n}");
+                assert!(
+                    select_node_to_evict(random_candidates(n, &mut rng)).is_none(),
+                    "{n}"
+                );
             }
         }
     }
@@ -552,7 +621,13 @@ mod tests {
                 },
                 &|c, n| c.last_block_time = n as u64 - c.id,
                 &|c, _| c.connected = c.id,
-                &|c, _| c.network = Some(if c.id == 0 { Network::Onion } else { Network::Ipv4 }),
+                &|c, _| {
+                    c.network = Some(if c.id == 0 {
+                        Network::Onion
+                    } else {
+                        Network::Ipv4
+                    })
+                },
             ];
             for setup in setups {
                 let mut candidates = random_candidates(n, &mut rng);
@@ -579,9 +654,17 @@ mod tests {
                 c.inbound = c.id % 3 != 1;
                 c.flagged = c.id % 3 != 2;
             }
-            let unflagged: Vec<EvictionCandidate> =
-                candidates.iter().map(|c| EvictionCandidate { flagged: false, ..c.clone() }).collect();
-            assert_eq!(select_node_to_evict(candidates), select_node_to_evict(unflagged));
+            let unflagged: Vec<EvictionCandidate> = candidates
+                .iter()
+                .map(|c| EvictionCandidate {
+                    flagged: false,
+                    ..c.clone()
+                })
+                .collect();
+            assert_eq!(
+                select_node_to_evict(candidates),
+                select_node_to_evict(unflagged)
+            );
         }
     }
 

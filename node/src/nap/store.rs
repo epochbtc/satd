@@ -169,10 +169,14 @@ impl Record {
 
     fn decode(kind: u8, payload: &[u8]) -> Result<Self, String> {
         match kind {
-            PUT => Attestation::from_bytes(payload).map(Record::Put).map_err(|e| e.to_string()),
+            PUT => Attestation::from_bytes(payload)
+                .map(Record::Put)
+                .map_err(|e| e.to_string()),
             REMOVE if payload.len() >= 36 => {
-                let outpoint: OutPoint = encode::deserialize(&payload[..36]).map_err(|e| e.to_string())?;
-                let key = String::from_utf8(payload[36..].to_vec()).map_err(|_| "the key is not text".to_string())?;
+                let outpoint: OutPoint =
+                    encode::deserialize(&payload[..36]).map_err(|e| e.to_string())?;
+                let key = String::from_utf8(payload[36..].to_vec())
+                    .map_err(|_| "the key is not text".to_string())?;
                 Ok(Record::Remove(outpoint, key))
             }
             REMOVE => Err("a removal shorter than an outpoint".into()),
@@ -189,7 +193,11 @@ pub fn journal_path(path: &Path) -> PathBuf {
 /// The checksum a journal names its file by: the file's own, the last 32
 /// bytes; zeros when there is no file.
 fn base_checksum(base: Option<&[u8]>) -> [u8; 32] {
-    base.map_or([0; 32], |b| b[b.len() - CHECKSUM_LEN..].try_into().expect("a decoded file holds its checksum"))
+    base.map_or([0; 32], |b| {
+        b[b.len() - CHECKSUM_LEN..]
+            .try_into()
+            .expect("a decoded file holds its checksum")
+    })
 }
 
 /// The checksum of the file a journal's bytes name, from its header.
@@ -235,14 +243,21 @@ fn journal_records(bytes: &[u8]) -> Result<(Vec<Record>, usize), String> {
             break; // zeros past the last write
         }
         let Some(max) = max_payload(rest[0]) else {
-            return Err(format!("journal record at byte {at}: unknown record kind {}", rest[0]));
+            return Err(format!(
+                "journal record at byte {at}: unknown record kind {}",
+                rest[0]
+            ));
         };
-        let Some(len) = rest.get(1..RECORD_HEADER_LEN).map(|l| u32::from_le_bytes(l.try_into().expect("4 bytes")) as usize)
+        let Some(len) = rest
+            .get(1..RECORD_HEADER_LEN)
+            .map(|l| u32::from_le_bytes(l.try_into().expect("4 bytes")) as usize)
         else {
             break; // cut short
         };
         if len > max {
-            return Err(format!("journal record at byte {at}: a length of {len}, longer than any record"));
+            return Err(format!(
+                "journal record at byte {at}: a length of {len}, longer than any record"
+            ));
         }
         let end = RECORD_HEADER_LEN + len + CHECKSUM_LEN;
         if rest.len() < end {
@@ -253,7 +268,9 @@ fn journal_records(bytes: &[u8]) -> Result<(Vec<Record>, usize), String> {
             if rest[end..].iter().all(|b| *b == 0) {
                 break; // the last record, torn, perhaps with zeros after it
             }
-            return Err(format!("journal record at byte {at}: the checksum does not match"));
+            return Err(format!(
+                "journal record at byte {at}: the checksum does not match"
+            ));
         }
         let record = Record::decode(rest[0], &body[RECORD_HEADER_LEN..])
             .map_err(|e| format!("journal record at byte {at}: {e}"))?;
@@ -289,8 +306,16 @@ pub fn read(path: &Path) -> Result<Opened, String> {
     let checksum = base_checksum(base_bytes.as_deref());
     let base_len = base_bytes.as_ref().map_or(0, |b| b.len() as u64);
     let jpath = journal_path(path);
-    let mut journal =
-        Journal { path: jpath.clone(), file: None, len: 0, base: checksum, base_len, compact_at: MIN_COMPACT_LEN, retry_at: 0, partial: false, closed: false,
+    let mut journal = Journal {
+        path: jpath.clone(),
+        file: None,
+        len: 0,
+        base: checksum,
+        base_len,
+        compact_at: MIN_COMPACT_LEN,
+        retry_at: 0,
+        partial: false,
+        closed: false,
         #[cfg(test)]
         compactions: 0,
     };
@@ -311,7 +336,8 @@ pub fn read(path: &Path) -> Result<Opened, String> {
                 );
                 Vec::new()
             } else {
-                let (records, whole) = journal_records(&bytes).map_err(|e| format!("{}: {e}", jpath.display()))?;
+                let (records, whole) =
+                    journal_records(&bytes).map_err(|e| format!("{}: {e}", jpath.display()))?;
                 let file = std::fs::OpenOptions::new()
                     .append(true)
                     .open(&jpath)
@@ -319,7 +345,9 @@ pub fn read(path: &Path) -> Result<Opened, String> {
                 if whole < bytes.len() {
                     file.set_len(whole as u64)
                         .and_then(|()| file.sync_all())
-                        .map_err(|e| format!("cutting the torn end off {}: {e}", jpath.display()))?;
+                        .map_err(|e| {
+                            format!("cutting the torn end off {}: {e}", jpath.display())
+                        })?;
                 }
                 journal.file = Some(file);
                 journal.len = whole as u64;
@@ -329,7 +357,11 @@ pub fn read(path: &Path) -> Result<Opened, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(format!("reading {}: {e}", jpath.display())),
     };
-    Ok(Opened { base, records, journal })
+    Ok(Opened {
+        base,
+        records,
+        journal,
+    })
 }
 
 /// The journal a publisher records its changes in.
@@ -389,7 +421,10 @@ impl Journal {
 
     /// Whether the journal has outgrown the file it follows.
     pub fn wants_compaction(&self) -> bool {
-        !self.closed && self.len >= self.compact_at && self.len > self.base_len && self.len >= self.retry_at
+        !self.closed
+            && self.len >= self.compact_at
+            && self.len > self.base_len
+            && self.len >= self.retry_at
     }
 
     /// Record no change after this one: the shutdown fold has written the
@@ -506,7 +541,12 @@ mod tests {
         let err = journal.append(&record).unwrap_err();
         assert!(err.contains("cutting a failed write off"), "{err}");
         // Once it can be cut off, the journal goes on, whole.
-        journal.file = Some(std::fs::OpenOptions::new().append(true).open(&journal.path).unwrap());
+        journal.file = Some(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal.path)
+                .unwrap(),
+        );
         journal.append(&record).unwrap();
         assert!(!journal.partial);
         assert_eq!(read(&path).unwrap().records, vec![record.clone(), record]);

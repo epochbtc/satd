@@ -15,7 +15,10 @@ use bitcoin::Txid;
 const COIN_VALUE: u64 = 100_000;
 
 fn prev(tag: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
+    OutPoint {
+        txid: Txid::from_byte_array([tag; 32]),
+        vout: 0,
+    }
 }
 
 fn p2wpkh(tag: u8) -> bitcoin::ScriptBuf {
@@ -47,7 +50,10 @@ fn spend(prev: OutPoint, outs: &[(u64, u8)]) -> Transaction {
         }],
         output: outs
             .iter()
-            .map(|&(value, tag)| TxOut { value: Amount::from_sat(value), script_pubkey: p2wpkh(tag) })
+            .map(|&(value, tag)| TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: p2wpkh(tag),
+            })
             .collect(),
     }
 }
@@ -55,12 +61,17 @@ fn spend(prev: OutPoint, outs: &[(u64, u8)]) -> Transaction {
 /// A regtest chain holding `coins`, and an empty pool with no relay floor.
 fn env(coins: &[(OutPoint, Coin)]) -> (ChainState, Mempool, std::path::PathBuf) {
     let (cs, mp, dir) = make_funded_template_env_with(coins, Box::new(NoopVerifier));
-    mp.reload_policy(MempoolConfig { max_size_bytes: 1_000_000, min_fee_rate: 0, ..Default::default() });
+    mp.reload_policy(MempoolConfig {
+        max_size_bytes: 1_000_000,
+        min_fee_rate: 0,
+        ..Default::default()
+    });
     (cs, mp, dir)
 }
 
 fn admit(mp: &Mempool, cs: &ChainState, tx: Transaction) -> Txid {
-    mp.accept_transaction(tx, cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted")
+    mp.accept_transaction(tx, cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("admitted")
 }
 
 #[test]
@@ -79,9 +90,14 @@ fn getmempoolinfo_bytes_is_vsize_and_total_fee_is_base_fees() {
     let mut tx = spend(prev(1), &[(COIN_VALUE - 1_234, 2)]);
     tx.input[0].witness = Witness::from_slice(&[[0x01]]);
     let weight = tx.weight().to_wu();
-    assert_ne!(weight % 4, 0, "the fixture's weight must not be a multiple of four");
+    assert_ne!(
+        weight % 4,
+        0,
+        "the fixture's weight must not be a multiple of four"
+    );
     let txid = admit(&mp, &cs, tx);
-    mp.prioritise_transaction(&txid, 10_000).expect("prioritised");
+    mp.prioritise_transaction(&txid, 10_000)
+        .expect("prioritised");
 
     let info = get_mempool_info(&mp);
     // `GetTotalTxSize`: virtual sizes, rounded up.
@@ -116,14 +132,22 @@ fn getmempoolinfo_reports_the_cluster_limits_in_cores_units() {
 fn gettxout_hides_an_output_spent_in_the_mempool() {
     let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
     let txid = prev(1).txid.to_string();
-    assert!(get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap().is_object());
+    assert!(
+        get_tx_out_view(&cs, Some(&mp), &txid, 0)
+            .unwrap()
+            .is_object()
+    );
 
     admit(&mp, &cs, spend(prev(1), &[(COIN_VALUE - 1_000, 2)]));
     // Core: "an unspent output that is spent in the mempool won't appear".
     assert!(get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap().is_null());
     // `include_mempool=false` reads the UTXO set alone.
     let chain_only = get_tx_out_view(&cs, None, &txid, 0).unwrap();
-    assert_eq!(chain_only["value"].to_string(), "0.00100000", "{chain_only}");
+    assert_eq!(
+        chain_only["value"].to_string(),
+        "0.00100000",
+        "{chain_only}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -161,9 +185,16 @@ fn gettxout_does_not_see_a_quarantined_transaction() {
         .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, true)
         .expect("held")
         .to_string();
-    assert!(mp.get(&txid.parse().unwrap()).is_some(), "the transaction is held");
+    assert!(
+        mp.get(&txid.parse().unwrap()).is_some(),
+        "the transaction is held"
+    );
 
-    assert!(get_tx_out_view(&cs, Some(&mp), &prev(1).txid.to_string(), 0).unwrap().is_object());
+    assert!(
+        get_tx_out_view(&cs, Some(&mp), &prev(1).txid.to_string(), 0)
+            .unwrap()
+            .is_object()
+    );
     assert!(get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap().is_null());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -175,18 +206,37 @@ fn gettxout_trusts_the_pool_only_while_the_coins_it_spends_remain() {
     // reply must describe the tip it names.
     let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
     let tx = spend(prev(1), &[(COIN_VALUE - 1_000, 2)]);
-    let out = OutPoint { txid: tx.compute_txid(), vout: 0 };
+    let out = OutPoint {
+        txid: tx.compute_txid(),
+        vout: 0,
+    };
     let txid = admit(&mp, &cs, tx.clone()).to_string();
-    assert_eq!(get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap()["confirmations"], 0);
+    assert_eq!(
+        get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap()["confirmations"],
+        0
+    );
 
     // The tip confirms the transaction; the pool has not caught up.
     let mut batch = crate::storage::StoreBatch::default();
     batch.coin_removes.push((prev(1), COIN_VALUE, 1));
-    batch.coin_puts.push((out, Coin { amount: COIN_VALUE - 1_000, height: 0, ..coin(0) }));
+    batch.coin_puts.push((
+        out,
+        Coin {
+            amount: COIN_VALUE - 1_000,
+            height: 0,
+            ..coin(0)
+        },
+    ));
     cs.store_ref().write_batch(batch).unwrap();
-    assert!(mp.get(&tx.compute_txid()).is_some(), "the pool still holds it");
+    assert!(
+        mp.get(&tx.compute_txid()).is_some(),
+        "the pool still holds it"
+    );
     let confirmed = get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap();
-    assert_eq!(confirmed["confirmations"], 1, "the chain answers: {confirmed}");
+    assert_eq!(
+        confirmed["confirmations"], 1,
+        "the chain answers: {confirmed}"
+    );
 
     // The tip also spends that output.
     let mut batch = crate::storage::StoreBatch::default();
@@ -205,24 +255,44 @@ fn gettxout_names_the_script_type_address_and_descriptor() {
     let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
     let tx = spend(prev(1), &[(COIN_VALUE - 1_000, 2)]);
     let txid = admit(&mp, &cs, tx.clone()).to_string();
-    let addr = bitcoin::Address::from_script(&p2wpkh(2), bitcoin::Network::Regtest).unwrap().to_string();
+    let addr = bitcoin::Address::from_script(&p2wpkh(2), bitcoin::Network::Regtest)
+        .unwrap()
+        .to_string();
     let check = |spk: &Value, from: &str| {
         assert_eq!(spk["type"], "witness_v0_keyhash", "{from}: {spk}");
         assert_eq!(spk["address"], addr.as_str(), "{from}: {spk}");
-        let desc = spk["desc"].as_str().unwrap_or_else(|| panic!("{from}: no desc in {spk}"));
-        assert!(desc.starts_with(&format!("addr({addr})#")), "{from}: {desc}");
+        let desc = spk["desc"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{from}: no desc in {spk}"));
+        assert!(
+            desc.starts_with(&format!("addr({addr})#")),
+            "{from}: {desc}"
+        );
         assert_eq!(spk["hex"], hex::encode(p2wpkh(2).as_bytes()), "{from}");
         assert!(spk["asm"].is_string(), "{from}");
     };
-    check(&get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap()["scriptPubKey"], "pool");
+    check(
+        &get_tx_out_view(&cs, Some(&mp), &txid, 0).unwrap()["scriptPubKey"],
+        "pool",
+    );
     let funding = get_tx_out_view(&cs, None, &prev(1).txid.to_string(), 0).unwrap();
-    assert_eq!(funding["scriptPubKey"]["type"], "witness_v0_keyhash", "chain: {funding}");
     assert_eq!(
-        funding["scriptPubKey"]["address"],
-        bitcoin::Address::from_script(&p2wpkh(0x11), bitcoin::Network::Regtest).unwrap().to_string(),
+        funding["scriptPubKey"]["type"], "witness_v0_keyhash",
         "chain: {funding}"
     );
-    assert!(funding["scriptPubKey"]["desc"].as_str().is_some_and(|d| d.starts_with("addr(")), "chain: {funding}");
+    assert_eq!(
+        funding["scriptPubKey"]["address"],
+        bitcoin::Address::from_script(&p2wpkh(0x11), bitcoin::Network::Regtest)
+            .unwrap()
+            .to_string(),
+        "chain: {funding}"
+    );
+    assert!(
+        funding["scriptPubKey"]["desc"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("addr(")),
+        "chain: {funding}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -247,7 +317,10 @@ fn script_type_follows_core_solver() {
         // `ValidSize`); m pushed non-minimally is not a number.
         (format!("514c21{k33}51ae"), "multisig"),
         (format!("01{}", seventeen_of_seventeen("0111")), "multisig"),
-        (format!("4c01{}", seventeen_of_seventeen("0111")), "nonstandard"),
+        (
+            format!("4c01{}", seventeen_of_seventeen("0111")),
+            "nonstandard",
+        ),
         ("51024e73".to_string(), "anchor"),
         (format!("5220{}", "33".repeat(32)), "witness_unknown"),
         (format!("5102{}", "4e74"), "witness_unknown"),
@@ -271,10 +344,22 @@ fn script_type_follows_core_solver() {
 #[test]
 fn a_negative_amount_formats_as_core_does() {
     use crate::rpc::amounts::{AmountUnit, format_signed_amount};
-    assert_eq!(format_signed_amount(-1_000, AmountUnit::Btc).to_string(), "-0.00001000");
-    assert_eq!(format_signed_amount(-250_000_000, AmountUnit::Btc).to_string(), "-2.50000000");
-    assert_eq!(format_signed_amount(1_000, AmountUnit::Btc).to_string(), "0.00001000");
-    assert_eq!(format_signed_amount(-1_000, AmountUnit::Sats).to_string(), "-1000");
+    assert_eq!(
+        format_signed_amount(-1_000, AmountUnit::Btc).to_string(),
+        "-0.00001000"
+    );
+    assert_eq!(
+        format_signed_amount(-250_000_000, AmountUnit::Btc).to_string(),
+        "-2.50000000"
+    );
+    assert_eq!(
+        format_signed_amount(1_000, AmountUnit::Btc).to_string(),
+        "0.00001000"
+    );
+    assert_eq!(
+        format_signed_amount(-1_000, AmountUnit::Sats).to_string(),
+        "-1000"
+    );
 }
 
 #[test]
@@ -282,7 +367,10 @@ fn preflight_finds_a_confirmed_transaction_in_the_utxo_set() {
     // Core answers -27 when one of the transaction's outputs is a coin,
     // which needs no txindex.
     let tx = spend(prev(1), &[(50_000, 2), (40_000, 3)]);
-    let confirmed_out = OutPoint { txid: tx.compute_txid(), vout: 1 };
+    let confirmed_out = OutPoint {
+        txid: tx.compute_txid(),
+        vout: 1,
+    };
     let (cs, mp, dir) = env(&[(confirmed_out, coin(40_000))]);
     assert_eq!(
         send_raw_transaction_preflight(&cs, &mp, &tx, 10_000_000),
@@ -302,9 +390,15 @@ fn preflight_caps_the_fee_rate() {
     let tx = spend(prev(1), &[(COIN_VALUE - 50_000, 2)]);
     assert_eq!(
         send_raw_transaction_preflight(&cs, &mp, &tx, 100_000),
-        Err((-25, "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_string()))
+        Err((
+            -25,
+            "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_string()
+        ))
     );
-    assert_eq!(send_raw_transaction_preflight(&cs, &mp, &tx, 1_000_000), Ok(()));
+    assert_eq!(
+        send_raw_transaction_preflight(&cs, &mp, &tx, 1_000_000),
+        Ok(())
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -314,8 +408,8 @@ fn preflight_caps_the_fee_of_a_transaction_only_a_policy_admits() {
     // forgives that on submission, and since #999 in the dry run too. The
     // cap must hold on the transaction the submission would admit.
     let (cs, mp, dir) = env(&[(prev(1), coin(COIN_VALUE))]);
-    let rs = satd_policy::parse_ruleset("version 1\nallow mine when tx.source == rpc")
-        .expect("ruleset");
+    let rs =
+        satd_policy::parse_ruleset("version 1\nallow mine when tx.source == rpc").expect("ruleset");
     mp.set_policy(std::sync::Arc::new(rs));
     // 50,000 sat in fees.
     let tx = spend(prev(1), &[(1, 2), (1, 3), (COIN_VALUE - 50_002, 4)]);
@@ -326,7 +420,10 @@ fn preflight_caps_the_fee_of_a_transaction_only_a_policy_admits() {
 
     assert_eq!(
         send_raw_transaction_preflight(&cs, &mp, &tx, 100_000),
-        Err((-25, "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_string()))
+        Err((
+            -25,
+            "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_string()
+        ))
     );
     // With no cap it goes on, and the submission does admit it.
     assert_eq!(send_raw_transaction_preflight(&cs, &mp, &tx, 0), Ok(()));

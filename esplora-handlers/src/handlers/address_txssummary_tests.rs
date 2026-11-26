@@ -25,8 +25,7 @@ use tokio::sync::broadcast;
 
 use super::historycap_tests::{SH, esplora_state, history, txid};
 use super::{
-    TxSummaryJson, build_address_info, build_chain_txs, build_summary_txs, net_values,
-    pinned_page,
+    TxSummaryJson, build_address_info, build_chain_txs, build_summary_txs, net_values, pinned_page,
 };
 use crate::chain_tip::Pin;
 use crate::error::EsploraError;
@@ -73,7 +72,10 @@ impl AddressIndex for ListIndex {
     fn utxos(&self, _sh: &Scripthash) -> Result<Vec<Utxo>, IndexError> {
         unreachable!("the summary reads no UTXO")
     }
-    fn subscribe(&self, _sh: Scripthash) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
+    fn subscribe(
+        &self,
+        _sh: Scripthash,
+    ) -> Result<broadcast::Receiver<StatusUpdate>, SubscribeError> {
         unreachable!("the summary opens no stream")
     }
 }
@@ -85,7 +87,12 @@ fn state_over(history: Vec<HistoryEntry>) -> (EsploraState, tempfile::TempDir) {
 }
 
 fn fund(height: u32, n: u8, vout: u32, amount_sat: u64) -> HistoryEntry {
-    HistoryEntry::Funding { height, txid: txid(n), vout, amount_sat }
+    HistoryEntry::Funding {
+        height,
+        txid: txid(n),
+        vout,
+        amount_sat,
+    }
 }
 
 fn spend(height: u32, n: u8, vin: u32, of: u8, vout: u32) -> HistoryEntry {
@@ -93,7 +100,10 @@ fn spend(height: u32, n: u8, vin: u32, of: u8, vout: u32) -> HistoryEntry {
         height,
         txid: txid(n),
         vin,
-        prev_outpoint: OutPoint { txid: txid(of), vout },
+        prev_outpoint: OutPoint {
+            txid: txid(of),
+            vout,
+        },
     }
 }
 
@@ -105,11 +115,19 @@ fn rows_carry_the_net_value_newest_first() {
     let page = build_summary_txs(&state, &pin_at(9), &SH, None).unwrap();
     assert_eq!(
         rows(&page),
-        vec![(5, -2_000, 9), (4, 9_000, 8), (3, 3_000, 5), (2, 1_000, 5), (1, 1_000, 3)]
+        vec![
+            (5, -2_000, 9),
+            (4, 9_000, 8),
+            (3, 3_000, 5),
+            (2, 1_000, 5),
+            (1, 1_000, 3)
+        ]
     );
 
     // The values add up to the balance the stats give.
-    let stats = build_address_info(&state, &pin_at(9), "label", &SH).unwrap().chain_stats;
+    let stats = build_address_info(&state, &pin_at(9), "label", &SH)
+        .unwrap()
+        .chain_stats;
     assert_eq!(
         page.iter().map(|row| row.value).sum::<i64>(),
         (stats.funded_txo_sum - stats.spent_txo_sum) as i64
@@ -138,7 +156,10 @@ fn row_shape_is_the_one_rbitcoins_esplora_serves() {
     let page = build_summary_txs(&state, &pin_at(9), &SH, None).unwrap();
     assert_eq!(
         serde_json::to_string(&page[0]).unwrap(),
-        format!(r#"{{"txid":"{}","value":-2000,"height":9,"time":0}}"#, txid(5))
+        format!(
+            r#"{{"txid":"{}","value":-2000,"height":9,"time":0}}"#,
+            txid(5)
+        )
     );
     let placed = TxSummaryJson {
         txid: txid(7).to_string(),
@@ -191,7 +212,11 @@ fn value_is_funded_minus_spent_for_the_script() {
             (0x10, 7_500, 1),
         ]
     );
-    assert_eq!(page.iter().map(|row| row.value).sum::<i64>(), 0, "everything was spent");
+    assert_eq!(
+        page.iter().map(|row| row.value).sum::<i64>(),
+        0,
+        "everything was spent"
+    );
 
     // The same values whatever order the rows are in.
     let page_txs: Vec<(u32, Txid)> = page
@@ -200,7 +225,10 @@ fn value_is_funded_minus_spent_for_the_script() {
         .collect();
     let mut reversed = history.clone();
     reversed.reverse();
-    assert_eq!(net_values(&page_txs, &history), net_values(&page_txs, &reversed));
+    assert_eq!(
+        net_values(&page_txs, &history),
+        net_values(&page_txs, &reversed)
+    );
 }
 
 /// 60 transactions: 25, 25, 10, then an empty page, each row exactly once,
@@ -218,7 +246,11 @@ fn pages_hold_25_rows_and_the_cursor_continues_below_itself() {
     }
     let expected = |n: u8| -> i64 {
         let funded = i64::from(n) * 100;
-        if n.is_multiple_of(3) { funded - (i64::from(n) - 1) * 100 } else { funded }
+        if n.is_multiple_of(3) {
+            funded - (i64::from(n) - 1) * 100
+        } else {
+            funded
+        }
     };
     let (state, _dir) = state_over(history);
     let pin = pin_at(60);
@@ -238,14 +270,20 @@ fn pages_hold_25_rows_and_the_cursor_continues_below_itself() {
             .iter()
             .map(|(_, t)| t.to_string())
             .collect();
-        assert_eq!(page.iter().map(|row| row.txid.clone()).collect::<Vec<_>>(), chain);
+        assert_eq!(
+            page.iter().map(|row| row.txid.clone()).collect::<Vec<_>>(),
+            chain
+        );
         cursor = Some(last.txid.parse().unwrap());
         seen.extend(rows(&page));
     }
     assert_eq!(sizes, vec![25, 25, 10, 0]);
     assert_eq!(
         seen,
-        (1..=60u8).rev().map(|n| (n, expected(n), u32::from(n))).collect::<Vec<_>>()
+        (1..=60u8)
+            .rev()
+            .map(|n| (n, expected(n), u32::from(n)))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -257,12 +295,23 @@ fn an_unknown_cursor_is_422() {
     let err = build_summary_txs(&state, &pin_at(9), &SH, Some(txid(0xee))).expect_err("unknown");
     assert!(matches!(err, EsploraError::Unprocessable(_)), "{err:?}");
     assert_eq!(err.to_string(), "after_txid not found");
-    assert_eq!(err.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        err.into_response().status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
 
     // The oldest transaction as the cursor: the end, an empty page.
-    assert!(build_summary_txs(&state, &pin_at(9), &SH, Some(txid(1))).unwrap().is_empty());
+    assert!(
+        build_summary_txs(&state, &pin_at(9), &SH, Some(txid(1)))
+            .unwrap()
+            .is_empty()
+    );
     // `/txs/chain` keeps its own answer for an unknown cursor.
-    assert!(build_chain_txs(&state, &pin_at(9), &SH, Some(txid(0xee))).unwrap().is_empty());
+    assert!(
+        build_chain_txs(&state, &pin_at(9), &SH, Some(txid(0xee)))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// As of a block: the transactions confirmed up to it, with the values they
@@ -272,11 +321,21 @@ fn rows_are_as_of_the_pin() {
     let (state, _dir) = esplora_state(100);
     for pin in [asof(5), pin_at(5)] {
         let page = build_summary_txs(&state, &pin, &SH, None).unwrap();
-        assert_eq!(rows(&page), vec![(3, 3_000, 5), (2, 1_000, 5), (1, 1_000, 3)]);
+        assert_eq!(
+            rows(&page),
+            vec![(3, 3_000, 5), (2, 1_000, 5), (1, 1_000, 3)]
+        );
     }
     let page = build_summary_txs(&state, &asof(8), &SH, Some(txid(4))).unwrap();
-    assert_eq!(rows(&page), vec![(3, 3_000, 5), (2, 1_000, 5), (1, 1_000, 3)]);
-    assert!(build_summary_txs(&state, &asof(2), &SH, None).unwrap().is_empty());
+    assert_eq!(
+        rows(&page),
+        vec![(3, 3_000, 5), (2, 1_000, 5), (1, 1_000, 3)]
+    );
+    assert!(
+        build_summary_txs(&state, &asof(2), &SH, None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The values need the whole history, so the route takes the history cap
@@ -287,10 +346,18 @@ fn summary_is_refused_over_the_history_cap_and_served_at_it() {
     for cursor in [None, Some(txid(4)), Some(txid(0xee))] {
         let err = build_summary_txs(&state, &pin_at(9), &SH, cursor).expect_err("over the cap");
         assert!(matches!(err, EsploraError::HistoryTooLarge(4)), "{err:?}");
-        assert_eq!(err.to_string(), "Too many history entries (more than 4 transactions)");
+        assert_eq!(
+            err.to_string(),
+            "Too many history entries (more than 4 transactions)"
+        );
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
     }
     let (state, _dir) = esplora_state(5);
-    assert_eq!(build_summary_txs(&state, &pin_at(9), &SH, None).unwrap().len(), 5);
+    assert_eq!(
+        build_summary_txs(&state, &pin_at(9), &SH, None)
+            .unwrap()
+            .len(),
+        5
+    );
     assert_eq!(history().len(), 7, "five transactions in seven rows");
 }

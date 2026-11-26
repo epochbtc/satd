@@ -20,7 +20,9 @@ struct Peer {
 
 impl Peer {
     fn send(&mut self, msg: NetworkMessage) {
-        let _ = self.stream.write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
+        let _ = self
+            .stream
+            .write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
     }
 
     fn recv(&mut self, timeout: Duration) -> io::Result<NetworkMessage> {
@@ -31,8 +33,8 @@ impl Peer {
         let mut buf = header.to_vec();
         buf.resize(24 + len, 0);
         self.stream.read_exact(&mut buf[24..])?;
-        let raw: RawNetworkMessage =
-            deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let raw: RawNetworkMessage = deserialize(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
 
@@ -44,7 +46,9 @@ impl Peer {
         let stream = loop {
             match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
                 Err(e) => panic!("connect: {e}"),
             }
         };
@@ -86,7 +90,9 @@ fn getpeerbehavior_reports_a_borrowed_user_agent_and_repeated_getaddr() {
     let port = node.p2p_port.expect("p2p port");
 
     assert_eq!(node.rpc_ok("getpeerbehavior", vec![]), json!([]));
-    let unknown = node.rpc_call_with_params("getpeerbehavior", vec![json!(99)]).unwrap();
+    let unknown = node
+        .rpc_call_with_params("getpeerbehavior", vec![json!(99)])
+        .unwrap();
     assert_eq!(unknown["error"]["code"], -8, "{unknown}");
 
     let mut peer = Peer::btcd_shaped(port, "/Satoshi:31.2.0/");
@@ -110,21 +116,29 @@ fn getpeerbehavior_reports_a_borrowed_user_agent_and_repeated_getaddr() {
             "handshake": ["version", "sendaddrv2", "verack", "getaddr"],
         })
     );
-    assert_eq!(p["flags"][0]["evidence"], json!({"claimed": "core", "observed": "btcd"}));
+    assert_eq!(
+        p["flags"][0]["evidence"],
+        json!({"claimed": "core", "observed": "btcd"})
+    );
     assert_eq!(p["flags"][1]["evidence"]["getaddr_in"], 2);
     assert_eq!(p["counters"]["getaddr_in"], 2);
     assert!(!p.to_string().contains("127.0.0.1"), "no address: {p}");
 
     // By id, and by name.
     assert_eq!(node.rpc_ok("getpeerbehavior", vec![json!(id)]), json!([p]));
-    let named = node.rpc_call_with_named_params("getpeerbehavior", json!({"peer_id": id})).unwrap();
+    let named = node
+        .rpc_call_with_named_params("getpeerbehavior", json!({"peer_id": id}))
+        .unwrap();
     assert_eq!(named["result"], json!([p]), "{named}");
 
     // Help lists it with the Network RPCs.
     let help = node.rpc_ok("help", vec![]);
     assert!(help.as_str().unwrap().contains("getpeerbehavior"));
 
-    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
+    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+        .unwrap()
+        .text()
+        .unwrap();
     for line in [
         "satd_peer_flagged{flag=\"F\"} 1",
         "satd_peer_flagged{flag=\"A\"} 1",
@@ -132,7 +146,10 @@ fn getpeerbehavior_reports_a_borrowed_user_agent_and_repeated_getaddr() {
         "satd_peer_fingerprint{family=\"btcd\"} 1",
         "satd_peer_fingerprint{family=\"core\"} 0",
     ] {
-        assert!(body.lines().any(|l| l == line), "missing `{line}` in\n{body}");
+        assert!(
+            body.lines().any(|l| l == line),
+            "missing `{line}` in\n{body}"
+        );
     }
     drop(peer);
     node.stop();
@@ -153,7 +170,10 @@ fn peerflagpolicy_evict_takes_the_flagged_inbound_peer_first() {
             &format!("--peerflagpolicy={policy}"),
         ]);
         let port = node.p2p_port.expect("p2p port");
-        assert_eq!(node.rpc_ok("getconfig", vec![])["p2p"]["peer_flag_policy"], policy);
+        assert_eq!(
+            node.rpc_ok("getconfig", vec![])["p2p"]["peer_flag_policy"],
+            policy
+        );
 
         // btcd's capture ends its setup with one `getaddr`.
         let mut flagged = Peer::btcd_shaped(port, "/Satoshi:31.2.0/");
@@ -162,23 +182,47 @@ fn peerflagpolicy_evict_takes_the_flagged_inbound_peer_first() {
         honest.send(NetworkMessage::GetAddr);
         let both = poll_until_json(
             || node.rpc_ok("getpeerbehavior", vec![]),
-            |v| v.as_array().is_some_and(|a| a.len() == 2 && a.iter().any(|p| p["flag_codes"] == "F")),
+            |v| {
+                v.as_array()
+                    .is_some_and(|a| a.len() == 2 && a.iter().any(|p| p["flag_codes"] == "F"))
+            },
             test_timeout(30).as_secs(),
         );
-        let flagged_id = both.as_array().unwrap().iter().find(|p| p["flag_codes"] == "F").unwrap()["id"].clone();
-        let honest_id = both.as_array().unwrap().iter().find(|p| p["flag_codes"] != "F").unwrap()["id"].clone();
+        let flagged_id = both
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["flag_codes"] == "F")
+            .unwrap()["id"]
+            .clone();
+        let honest_id = both
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["flag_codes"] != "F")
+            .unwrap()["id"]
+            .clone();
 
         // A third inbound peer, with both slots taken. A refused one is
         // closed at once; an admitted one waits for us to speak first (the
         // node gives up after 5 s), so 2 s of silence means admitted.
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let mut third = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
-        third.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        third
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut byte = [0u8; 1];
         let refused = match third.read(&mut byte) {
             Ok(0) => true,
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => true,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => false,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                false
+            }
             other => panic!("{policy}: unexpected read {other:?}"),
         };
 
@@ -192,9 +236,19 @@ fn peerflagpolicy_evict_takes_the_flagged_inbound_peer_first() {
         .iter()
         .map(|p| p["id"].clone())
         .collect();
-        assert!(ids.contains(&honest_id), "{policy}: the honest peer stays: {ids:?}");
-        assert_eq!(!ids.contains(&flagged_id), flagged_evicted, "{policy}: {ids:?}");
-        assert_eq!(refused, !flagged_evicted, "{policy}: the third peer refused under observe only");
+        assert!(
+            ids.contains(&honest_id),
+            "{policy}: the honest peer stays: {ids:?}"
+        );
+        assert_eq!(
+            !ids.contains(&flagged_id),
+            flagged_evicted,
+            "{policy}: {ids:?}"
+        );
+        assert_eq!(
+            refused, !flagged_evicted,
+            "{policy}: the third peer refused under observe only"
+        );
         drop((flagged, honest, third));
         node.stop();
     }

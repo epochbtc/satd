@@ -10,13 +10,18 @@ use crate::ui::{format_duration, format_hash};
 pub fn draw(f: &mut Frame, state: &AppState) {
     let size = f.area();
 
-    let title = format!(" Reorg History ({} recorded, last 7 days) ", state.reorg_history.len());
+    let title = format!(
+        " Reorg History ({} recorded, last 7 days) ",
+        state.reorg_history.len()
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let chunks = Layout::default()
@@ -71,9 +76,14 @@ fn entry_lines(r: &ReorgEntry, now_unix: u64) -> Vec<Line<'static>> {
             Span::styled("  depth ", Style::default().fg(Color::Gray)),
             Span::styled(
                 format!("{:<3}", r.depth),
-                Style::default().fg(depth_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(depth_color)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" │ {:>8} ago │ fork at ", ago), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!(" │ {:>8} ago │ fork at ", ago),
+                Style::default().fg(Color::Gray),
+            ),
             Span::styled(r.fork_height.to_string(), Style::default().fg(Color::White)),
             Span::styled(
                 format!(" │ -{} +{} blocks", r.disconnected_len, r.reconnected_len),

@@ -31,7 +31,16 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    (PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx), dir)
+    (
+        PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        ),
+        dir,
+    )
 }
 
 /// A connected peer in a /16 of its own, connected `id` seconds before the
@@ -97,7 +106,11 @@ fn the_inbound_relay_percent_scales_the_cap_as_core_computes_it() {
     pm.set_max_connections(111);
     assert_eq!(pm.max_inbound(), 100);
     pm.set_inbound_relay_percent(29);
-    assert_eq!(pm.max_inbound_full_relay(), 28, "0.29 * 100 truncates to 28 in Core");
+    assert_eq!(
+        pm.max_inbound_full_relay(),
+        28,
+        "0.29 * 100 truncates to 28 in Core"
+    );
     pm.set_inbound_relay_percent(250);
     assert_eq!(pm.max_inbound_full_relay(), 100);
     pm.set_inbound_relay_percent(0);
@@ -134,11 +147,18 @@ fn a_tx_relay_inbound_peer_past_the_cap_evicts_another() {
     let newcomer = 22;
     let before = ids(&pm);
 
-    assert!(pm.evict_tx_peer_if_full(Some(newcomer)), "an eviction makes room");
+    assert!(
+        pm.evict_tx_peer_if_full(Some(newcomer)),
+        "an eviction makes room"
+    );
 
     let gone: Vec<PeerId> = before.difference(&ids(&pm)).copied().collect();
     assert_eq!(gone.len(), 1, "exactly one peer evicted: {gone:?}");
-    assert!((5..=21).contains(&gone[0]), "evicted an unprotected tx-relay inbound peer, not {}", gone[0]);
+    assert!(
+        (5..=21).contains(&gone[0]),
+        "evicted an unprotected tx-relay inbound peer, not {}",
+        gone[0]
+    );
 }
 
 /// Past the cap with every tx-relaying inbound candidate protected (Core
@@ -169,7 +189,10 @@ fn block_relay_only_inbound_peers_do_not_count() {
         add(&pm, peer(id, Direction::Inbound, false));
     }
     let before = ids(&pm);
-    assert!(pm.evict_tx_peer_if_full(Some(10)), "10 tx-relaying inbound peers are at the cap, not past it");
+    assert!(
+        pm.evict_tx_peer_if_full(Some(10)),
+        "10 tx-relaying inbound peers are at the cap, not past it"
+    );
     assert_eq!(ids(&pm), before);
 
     // An eleventh is past it, and the 40 block-relay-only peers are no
@@ -220,15 +243,23 @@ async fn the_inbound_handshake_drops_a_tx_relay_peer_past_the_cap() {
         };
         let (handshake, seen) = tokio::join!(
             async {
-                let r = pm.perform_handshake(50, &mut ours, Direction::Inbound, crate::time::now_secs()).await;
+                let r = pm
+                    .perform_handshake(50, &mut ours, Direction::Inbound, crate::time::now_secs())
+                    .await;
                 drop(ours);
                 r
             },
             remote
         );
         if relay {
-            assert!(handshake.is_err(), "a tx-relay peer past the cap is dropped");
-            assert!(!seen.iter().any(|c| c == "verack"), "dropped before satd's verack: {seen:?}");
+            assert!(
+                handshake.is_err(),
+                "a tx-relay peer past the cap is dropped"
+            );
+            assert!(
+                !seen.iter().any(|c| c == "verack"),
+                "dropped before satd's verack: {seen:?}"
+            );
         } else {
             handshake.expect("a block-relay-only peer is let in");
             assert!(!pm.peers.read()[&50].info.tx_relay_requested);
@@ -249,7 +280,11 @@ async fn accept_one(pm: &Arc<PeerManager>) -> tokio::net::TcpStream {
 }
 
 fn loopback_peers(pm: &PeerManager) -> usize {
-    pm.peers.read().values().filter(|h| h.info.addr.ip().is_loopback()).count()
+    pm.peers
+        .read()
+        .values()
+        .filter(|h| h.info.addr.ip().is_loopback())
+        .count()
 }
 
 /// Core's `CreateNodeFromAcceptedSocket` (v32.1 `src/net.cpp`): with every
@@ -305,7 +340,11 @@ async fn a_full_inbound_set_with_no_candidate_drops_the_newcomer() {
     }
     let before = ids(&pm);
     let _dialer = accept_one(&pm).await;
-    assert_eq!(ids(&pm), before, "nobody evicted, and the newcomer not added");
+    assert_eq!(
+        ids(&pm),
+        before,
+        "nobody evicted, and the newcomer not added"
+    );
 }
 
 /// After a successful eviction the newcomer is admitted without counting

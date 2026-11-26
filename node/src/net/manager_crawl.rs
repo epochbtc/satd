@@ -83,19 +83,19 @@
 //! A panic in a crawl task stops the crawl, with an error in the log; the
 //! node keeps running.
 
+use super::survey_conn::{Next, listen_passive, next_message, send_probes};
 use super::*;
-use super::survey_conn::{listen_passive, next_message, send_probes, Next};
 use crate::net::behavior::PeerBehavior;
 use crate::net::crawl::{self, CrawlConfig, Scheduler};
 use crate::net::crawlbook::{
-    Attempt, BookParams, CrawlAddr, CrawlBook, GetaddrResult, Network, Observation, SessionKind, SessionResult,
-    UnknownShape,
+    Attempt, BookParams, CrawlAddr, CrawlBook, GetaddrResult, Network, Observation, SessionKind,
+    SessionResult, UnknownShape,
 };
 use crate::net::crawlreport;
 use crate::net::crawlsnapshot::{self, SnapshotStore};
 use crate::net::fingerprint::{AddrKind, CrawlFeatures};
-use crate::net::v2transport::V2Greeting;
 use crate::net::survey::{self, ProbeContext, ProbeResults, Verdict};
+use crate::net::v2transport::V2Greeting;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use rand::seq::SliceRandom as _;
 
@@ -240,7 +240,10 @@ pub(super) struct SessionOutput {
 type GetaddrAnswer = (Vec<AddrV2Message>, AddrKind, u32);
 
 /// The next message on a connection still in its handshake, by `deadline`.
-async fn recv_by(conn: &mut Connection, deadline: tokio::time::Instant) -> Result<NetworkMessage, String> {
+async fn recv_by(
+    conn: &mut Connection,
+    deadline: tokio::time::Instant,
+) -> Result<NetworkMessage, String> {
     match tokio::time::timeout_at(deadline, conn.recv()).await {
         Ok(Ok(m)) => Ok(m),
         Ok(Err(e)) => Err(format!("recv: {e}")),
@@ -256,7 +259,12 @@ fn addr_entry_v2(time: u32, addr: &bitcoin::p2p::Address) -> Option<AddrV2Messag
         IpAddr::V4(v4) => AddrV2::Ipv4(v4),
         IpAddr::V6(v6) => AddrV2::Ipv6(v6),
     };
-    Some(AddrV2Message { time, services: addr.services, addr: addr_v2, port: sa.port() })
+    Some(AddrV2Message {
+        time,
+        services: addr.services,
+        addr: addr_v2,
+        port: sa.port(),
+    })
 }
 
 impl PeerManager {
@@ -299,7 +307,10 @@ impl PeerManager {
             None => CrawlBook::new(params),
         };
         let epoch = Instant::now();
-        let snapshots = config.snapshot_dir.clone().map(|dir| parking_lot::Mutex::new(SnapshotStore::open(dir)));
+        let snapshots = config
+            .snapshot_dir
+            .clone()
+            .map(|dir| parking_lot::Mutex::new(SnapshotStore::open(dir)));
         let run = CrawlRun {
             scheduler: parking_lot::Mutex::new(Scheduler::new(config.limits, 0)),
             config,
@@ -336,7 +347,9 @@ impl PeerManager {
 
     /// Whether `nonce` is a crawl session's, still in its handshake.
     pub(super) fn is_crawl_nonce(&self, nonce: u64) -> bool {
-        self.crawl.get().is_some_and(|run| run.nonces.lock().contains(&nonce))
+        self.crawl
+            .get()
+            .is_some_and(|run| run.nonces.lock().contains(&nonce))
     }
 
     /// Write the crawl's book to its file. A no-op with the crawl off.
@@ -385,7 +398,9 @@ impl PeerManager {
     /// bandwidth), networking is on, and the node makes automatic
     /// connections (not under `-connect`).
     pub(super) fn crawl_may_run(&self) -> bool {
-        let Some(run) = self.crawl.get() else { return false };
+        let Some(run) = self.crawl.get() else {
+            return false;
+        };
         !run.stopped.load(Ordering::Relaxed) && self.crawl_holds().is_empty()
     }
 
@@ -398,7 +413,11 @@ impl PeerManager {
         }
         let ibd = self.chain_state.is_initial_block_download();
         #[cfg(test)]
-        let ibd = ibd && !self.crawl.get().is_some_and(|run| run.out_of_ibd.load(Ordering::Relaxed));
+        let ibd = ibd
+            && !self
+                .crawl
+                .get()
+                .is_some_and(|run| run.out_of_ibd.load(Ordering::Relaxed));
         let mut holds = Vec::new();
         if ibd {
             holds.push(CrawlHold::InitialBlockDownload);
@@ -419,11 +438,18 @@ impl PeerManager {
     /// (regtest) clearnet is dialled with a proxy set too.
     pub fn crawl_networks(&self) -> Vec<Network> {
         use crate::net::reachable::Network as Reach;
-        let Some(run) = self.crawl.get() else { return Vec::new() };
+        let Some(run) = self.crawl.get() else {
+            return Vec::new();
+        };
         let direct = self.proxy.is_none() || run.book.lock().params().allow_local;
         crawlreport::DIALLED
             .into_iter()
-            .filter(|n| run.config.networks.as_ref().is_none_or(|nets| nets.contains(n)))
+            .filter(|n| {
+                run.config
+                    .networks
+                    .as_ref()
+                    .is_none_or(|nets| nets.contains(n))
+            })
             .filter(|n| match n {
                 Network::Ipv4 => direct && self.network_reachable(Reach::Ipv4),
                 Network::Ipv6 => direct && self.network_reachable(Reach::Ipv6),
@@ -435,7 +461,11 @@ impl PeerManager {
 
     /// The last aggregate if younger than `max_age`, else a fresh one.
     fn crawl_aggregate(&self, run: &CrawlRun, max_age: Duration) -> crawlreport::Aggregate {
-        let cached = run.aggregate.lock().clone().filter(|(at, _)| at.elapsed() < max_age);
+        let cached = run
+            .aggregate
+            .lock()
+            .clone()
+            .filter(|(at, _)| at.elapsed() < max_age);
         match cached {
             Some((_, agg)) => agg,
             None => self.crawl_aggregate_now(run),
@@ -523,7 +553,9 @@ impl PeerManager {
     /// included; with `verbose` every field. An empty list with the crawl
     /// off.
     pub fn get_crawl_nodes(&self, verbose: bool) -> serde_json::Value {
-        let Some(run) = self.crawl.get() else { return serde_json::json!([]) };
+        let Some(run) = self.crawl.get() else {
+            return serde_json::json!([]);
+        };
         // Copied under the lock, serialized outside it.
         let book = run.book.lock().clone();
         crawlreport::nodes_json(&book, crate::time::now_secs(), verbose)
@@ -542,8 +574,12 @@ impl PeerManager {
     /// Write the hourly snapshot if one is due at `now`, and prune the old
     /// ones. Whether one was written.
     pub(super) fn crawl_snapshot_tick(&self, now: u64) -> bool {
-        let Some(run) = self.crawl.get() else { return false };
-        let Some(store) = &run.snapshots else { return false };
+        let Some(run) = self.crawl.get() else {
+            return false;
+        };
+        let Some(store) = &run.snapshots else {
+            return false;
+        };
         let mut store = store.lock();
         if !store.due(now) {
             return false;
@@ -578,8 +614,15 @@ impl PeerManager {
         let mode = if raw {
             crawlsnapshot::Mode::Raw
         } else {
-            let source = run.config.export_key.as_ref().ok_or("No export key: the crawl keeps no files")?;
-            crawlsnapshot::Mode::Keyed { key: crawlsnapshot::load_key(source)?, min_k: run.config.export_min_k }
+            let source = run
+                .config
+                .export_key
+                .as_ref()
+                .ok_or("No export key: the crawl keeps no files")?;
+            crawlsnapshot::Mode::Keyed {
+                key: crawlsnapshot::load_key(source)?,
+                min_k: run.config.export_min_k,
+            }
         };
         let ctx = self.crawl_export_context(crate::time::now_secs());
         Ok(crawlsnapshot::export_json(&run.book.lock(), &ctx, &mode))
@@ -685,8 +728,15 @@ impl PeerManager {
     /// reaches and `-crawlnet` keeps, not clearnet through the proxy, not
     /// banned, not one of the node's own addresses, and not a bad port.
     pub(super) fn crawl_may_dial(&self, addr: &PeerAddr) -> bool {
-        let Some(run) = self.crawl.get() else { return false };
-        if run.config.networks.as_ref().is_some_and(|nets| !nets.contains(&crawl::network_of(addr))) {
+        let Some(run) = self.crawl.get() else {
+            return false;
+        };
+        if run
+            .config
+            .networks
+            .as_ref()
+            .is_some_and(|nets| !nets.contains(&crawl::network_of(addr)))
+        {
             return false;
         }
         let reachable = match addr {
@@ -717,7 +767,10 @@ impl PeerManager {
         if budget == 0 || !sched.has_room() {
             return;
         }
-        let candidates = run.book.lock().next_due_where(now, budget * 4 + 16, |a| self.crawl_may_dial(a));
+        let candidates = run
+            .book
+            .lock()
+            .next_due_where(now, budget * 4 + 16, |a| self.crawl_may_dial(a));
         let rate = u64::from(sched.limits().rate.max(1));
         let mut started = 0u64;
         for (addr, kind) in candidates {
@@ -744,7 +797,12 @@ impl PeerManager {
     /// One session, bounded as a whole, and its record: whatever the session
     /// ends with, its result goes to the book under `session`, the token
     /// [`CrawlBook::mark_dialling`] gave it.
-    pub(super) async fn run_crawl_session(self: &Arc<Self>, addr: PeerAddr, kind: SessionKind, session: Option<u64>) {
+    pub(super) async fn run_crawl_session(
+        self: &Arc<Self>,
+        addr: PeerAddr,
+        kind: SessionKind,
+        session: Option<u64>,
+    ) {
         let Some(run) = self.crawl.get() else { return };
         #[cfg(test)]
         if run.panic_in_session.swap(false, Ordering::Relaxed) {
@@ -755,7 +813,10 @@ impl PeerManager {
             Ok(out) => out,
             Err(_) => {
                 tracing::debug!(%addr, "crawl session past its {}s bound, closed", cap.as_secs());
-                SessionOutput { result: SessionResult::default(), answer: None }
+                SessionOutput {
+                    result: SessionResult::default(),
+                    answer: None,
+                }
             }
         };
         let reached = out.result.v2 == Attempt::Ok || out.result.v1 == Attempt::Ok;
@@ -783,7 +844,11 @@ impl PeerManager {
             book.record_result(&addr, session, kind, out.result, now);
         }
         run.scheduler.lock().finish(&addr);
-        let counter = if reached { &run.reached } else { &run.unreached };
+        let counter = if reached {
+            &run.reached
+        } else {
+            &run.unreached
+        };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -795,19 +860,31 @@ impl PeerManager {
     pub(super) async fn crawl_seed_round(self: &Arc<Self>) {
         let Some(run) = self.crawl.get() else { return };
         let network = self.chain_state.network;
-        let mut seeds: Vec<(PeerAddr, u64)> = run.config.seeds.iter().map(|a| (a.clone(), 0)).collect();
+        let mut seeds: Vec<(PeerAddr, u64)> =
+            run.config.seeds.iter().map(|a| (a.clone(), 0)).collect();
         if run.config.fixed_seeds {
-            seeds.extend(crate::net::dns::fixed_seeds_for_network(network).into_iter().map(|a| (a, 0)));
+            seeds.extend(
+                crate::net::dns::fixed_seeds_for_network(network)
+                    .into_iter()
+                    .map(|a| (a, 0)),
+            );
         }
         seeds.extend(self.crawl_addrman_sample(crawl::ADDRMAN_SAMPLE));
         if run.config.dns_seeds {
-            let found =
-                crate::net::dns::resolve_seeds_with(network, self.proxy.as_deref(), &run.config.signet_seeds).await;
+            let found = crate::net::dns::resolve_seeds_with(
+                network,
+                self.proxy.as_deref(),
+                &run.config.signet_seeds,
+            )
+            .await;
             seeds.extend(found.into_iter().map(|a| (a, 0)));
         }
         let now = crate::time::now_secs();
         let mut book = run.book.lock();
-        let seeded = seeds.into_iter().filter(|(a, services)| book.seed(a.clone(), *services, now)).count();
+        let seeded = seeds
+            .into_iter()
+            .filter(|(a, services)| book.seed(a.clone(), *services, now))
+            .count();
         book.expire(now);
         tracing::debug!(seeded, entries = book.len(), "Crawl seeding round");
     }
@@ -815,8 +892,12 @@ impl PeerManager {
     /// Up to `n` address-book entries, drawn uniformly, with their
     /// services. Reads the book; writes nothing.
     pub(super) fn crawl_addrman_sample(&self, n: usize) -> Vec<(PeerAddr, u64)> {
-        let mut all: Vec<(PeerAddr, u64)> =
-            self.addrman.read().iter().map(|e| (e.addr.clone(), e.services)).collect();
+        let mut all: Vec<(PeerAddr, u64)> = self
+            .addrman
+            .read()
+            .iter()
+            .map(|e| (e.addr.clone(), e.services))
+            .collect();
         all.sort_unstable();
         all.shuffle(&mut rand::thread_rng());
         all.truncate(n);
@@ -831,7 +912,9 @@ impl PeerManager {
             .crawl
             .get()
             .map(|run| run.user_agent.clone())
-            .unwrap_or_else(|| crawl::user_agent(None).expect("the bare crawler user agent is valid"));
+            .unwrap_or_else(|| {
+                crawl::user_agent(None).expect("the bare crawler user agent is valid")
+            });
         let dummy = SocketAddr::from(([0, 0, 0, 0], 0));
         VersionMessage {
             version: crawl::CRAWL_PROTOCOL_VERSION,
@@ -849,21 +932,34 @@ impl PeerManager {
     /// Reach `target`: directly from `-crawlbind`'s address for its family,
     /// or an onion through the proxy with credentials of its own.
     async fn crawl_dial(&self, target: &PeerAddr) -> Result<TcpStream, String> {
-        let Some(run) = self.crawl.get() else { return Err("the crawl is off".into()) };
+        let Some(run) = self.crawl.get() else {
+            return Err("the crawl is off".into());
+        };
         #[cfg(test)]
         run.dialled.lock().push(target.clone());
         match target {
             PeerAddr::Socket(sa) => {
                 let sa = SocketAddr::new(sa.ip().to_canonical(), sa.port());
                 let (socket, bind) = match sa.ip() {
-                    IpAddr::V4(_) => (tokio::net::TcpSocket::new_v4(), run.config.bind_v4.map(IpAddr::V4)),
-                    IpAddr::V6(_) => (tokio::net::TcpSocket::new_v6(), run.config.bind_v6.map(IpAddr::V6)),
+                    IpAddr::V4(_) => (
+                        tokio::net::TcpSocket::new_v4(),
+                        run.config.bind_v4.map(IpAddr::V4),
+                    ),
+                    IpAddr::V6(_) => (
+                        tokio::net::TcpSocket::new_v6(),
+                        run.config.bind_v6.map(IpAddr::V6),
+                    ),
                 };
                 let socket = socket.map_err(|e| format!("socket: {e}"))?;
                 if let Some(ip) = bind {
-                    socket.bind(SocketAddr::new(ip, 0)).map_err(|e| format!("bind {ip}: {e}"))?;
+                    socket
+                        .bind(SocketAddr::new(ip, 0))
+                        .map_err(|e| format!("bind {ip}: {e}"))?;
                 }
-                socket.connect(sa).await.map_err(|e| format!("connect: {e}"))
+                socket
+                    .connect(sa)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))
             }
             PeerAddr::Onion { host, port } => {
                 if self.onion_disabled.load(Ordering::Relaxed) {
@@ -876,9 +972,15 @@ impl PeerManager {
                     .ok_or("no proxy configured for .onion connections")?;
                 // A circuit of its own, whatever -proxyrandomize says.
                 let token = format!("{:016x}", rand::random::<u64>());
-                proxy::connect_socks5_onion(proxy_addr, host, *port, Some((&token, &token)), self.socks_dial_timeouts())
-                    .await
-                    .map_err(|e| format!("connect to onion via proxy: {e}"))
+                proxy::connect_socks5_onion(
+                    proxy_addr,
+                    host,
+                    *port,
+                    Some((&token, &token)),
+                    self.socks_dial_timeouts(),
+                )
+                .await
+                .map_err(|e| format!("connect to onion via proxy: {e}"))
             }
         }
     }
@@ -888,7 +990,11 @@ impl PeerManager {
     async fn crawl_open(&self, target: &PeerAddr, v2: bool) -> (Opened, tokio::time::Instant) {
         let run = self.crawl.get().expect("the crawl is on");
         let t = run.config.timings;
-        let (connect, handshake) = if target.is_onion() { (t.tor_connect, t.tor_handshake) } else { (t.connect, t.handshake) };
+        let (connect, handshake) = if target.is_onion() {
+            (t.tor_connect, t.tor_handshake)
+        } else {
+            (t.connect, t.handshake)
+        };
         let stream = tokio::time::timeout(connect, self.crawl_dial(target)).await;
         let deadline = tokio::time::Instant::now() + handshake;
         let mut stream = match stream {
@@ -898,18 +1004,28 @@ impl PeerManager {
         let _ = stream.set_nodelay(true);
         let magic = self.chain_state.p2p_magic();
         if !v2 {
-            return (Opened::Open(Box::new(Connection::with_magic(stream, magic)), None), deadline);
+            return (
+                Opened::Open(Box::new(Connection::with_magic(stream, magic)), None),
+                deadline,
+            );
         }
         let stats = PeerStats::new(run.totals.clone());
         let exchange = tokio::time::timeout_at(
             deadline,
-            crate::net::v2transport::initiator_handshake_observed(&mut stream, self.chain_state.network, 0, Some(&stats)),
+            crate::net::v2transport::initiator_handshake_observed(
+                &mut stream,
+                self.chain_state.network,
+                0,
+                Some(&stats),
+            ),
         )
         .await;
         match exchange {
             Ok(Ok((cipher, leftover, greeting))) => (
                 Opened::Open(
-                    Box::new(Connection::v2(crate::net::v2transport::V2Connection::new(stream, cipher, leftover))),
+                    Box::new(Connection::v2(crate::net::v2transport::V2Connection::new(
+                        stream, cipher, leftover,
+                    ))),
                     Some(greeting),
                 ),
                 deadline,
@@ -939,10 +1055,16 @@ impl PeerManager {
         run.nonces.lock().insert(ours.nonce);
         let _nonce = NonceGuard(&run.nonces, ours.nonce);
         let sent = Instant::now();
-        conn.send(NetworkMessage::Version(ours.clone())).await.map_err(|e| format!("send version: {e}"))?;
+        conn.send(NetworkMessage::Version(ours.clone()))
+            .await
+            .map_err(|e| format!("send version: {e}"))?;
         let their = loop {
             match recv_by(conn, deadline).await? {
-                NetworkMessage::Version(v) if v.user_agent.len() <= crate::MAX_SUBVERSION_LENGTH => break v,
+                NetworkMessage::Version(v)
+                    if v.user_agent.len() <= crate::MAX_SUBVERSION_LENGTH =>
+                {
+                    break v;
+                }
                 _ => {}
             }
         };
@@ -950,18 +1072,25 @@ impl PeerManager {
             return Err("connected to self".into());
         }
         // The peer's timestamp is its own to set: i64::MIN must not overflow.
-        let clock_offset_secs = their.timestamp.saturating_sub(crate::time::now_secs() as i64);
+        let clock_offset_secs = their
+            .timestamp
+            .saturating_sub(crate::time::now_secs() as i64);
         let our_height = self.chain_state.tip_height();
         let mut behavior = PeerBehavior::default();
         behavior.note_version(&their, our_height);
         behavior.handshake.observe("version", false);
         let at_70016 = their.version.min(crawl::CRAWL_PROTOCOL_VERSION) >= WTXID_RELAY_VERSION;
         self.send_feature_negotiation(conn, at_70016).await?;
-        conn.send(NetworkMessage::Verack).await.map_err(|e| format!("send verack: {e}"))?;
+        conn.send(NetworkMessage::Verack)
+            .await
+            .map_err(|e| format!("send verack: {e}"))?;
         let mut wtxid_relay = false;
         loop {
             let msg = recv_by(conn, deadline).await?;
-            behavior.handshake.observe(crate::net::behavior::wire_command(&msg), matches!(msg, NetworkMessage::Pong(_)));
+            behavior.handshake.observe(
+                crate::net::behavior::wire_command(&msg),
+                matches!(msg, NetworkMessage::Pong(_)),
+            );
             match msg {
                 NetworkMessage::Verack => break,
                 NetworkMessage::WtxidRelay if at_70016 => wtxid_relay = true,
@@ -983,11 +1112,19 @@ impl PeerManager {
     /// alone to any other node and for a recheck), the handshake, the
     /// passive wait, and for a discovery session `getaddr` and, under
     /// `-crawlprobes`, the probes.
-    pub(super) async fn crawl_session(&self, target: &PeerAddr, kind: SessionKind) -> SessionOutput {
+    pub(super) async fn crawl_session(
+        &self,
+        target: &PeerAddr,
+        kind: SessionKind,
+    ) -> SessionOutput {
         let run = self.crawl.get().expect("the crawl is on");
         let mut result = SessionResult::default();
         let v2_first = kind != SessionKind::V1Recheck
-            && run.book.lock().get(&CrawlAddr::Peer(target.clone())).is_some_and(|e| e.dials_v2_first());
+            && run
+                .book
+                .lock()
+                .get(&CrawlAddr::Peer(target.clone()))
+                .is_some_and(|e| e.dials_v2_first());
         let opened = if !v2_first {
             match self.crawl_open(target, false).await {
                 (Opened::Open(c, g), d) => Some((*c, g, d)),
@@ -1011,7 +1148,10 @@ impl PeerManager {
             }
         };
         let Some((mut conn, greeting, deadline)) = opened else {
-            return SessionOutput { result, answer: None };
+            return SessionOutput {
+                result,
+                answer: None,
+            };
         };
         let v2 = greeting.is_some();
         let shook = self.crawl_handshake(&mut conn, target, deadline).await;
@@ -1024,7 +1164,10 @@ impl PeerManager {
             Err(e) => {
                 tracing::debug!(%target, v2, "crawl handshake failed: {e}");
                 *slot = Attempt::Failed;
-                return SessionOutput { result, answer: None };
+                return SessionOutput {
+                    result,
+                    answer: None,
+                };
             }
         };
 
@@ -1046,9 +1189,19 @@ impl PeerManager {
         let t = run.config.timings;
         let passive_deadline = tokio::time::Instant::now() + t.passive;
         let capture = &mut hs.behavior.handshake;
-        let listened = listen_passive(0, &mut writer, &mut read_rx, &abort, passive_deadline, |msg| {
-            capture.observe(crate::net::behavior::wire_command(msg), matches!(msg, NetworkMessage::Pong(_)))
-        })
+        let listened = listen_passive(
+            0,
+            &mut writer,
+            &mut read_rx,
+            &abort,
+            passive_deadline,
+            |msg| {
+                capture.observe(
+                    crate::net::behavior::wire_command(msg),
+                    matches!(msg, NetworkMessage::Pong(_)),
+                )
+            },
+        )
         .await;
         let mut closed = listened.closed();
         // Judged on the handshake and the passive wait alone: nothing after
@@ -1069,12 +1222,15 @@ impl PeerManager {
         let mut chain_check = None;
         if kind == SessionKind::Discovery && !closed {
             let deadline = tokio::time::Instant::now() + t.discovery;
-            let (got, was_closed) = self.crawl_getaddr(&mut writer, &mut read_rx, &abort, deadline).await;
+            let (got, was_closed) = self
+                .crawl_getaddr(&mut writer, &mut read_rx, &abort, deadline)
+                .await;
             closed = was_closed;
             getaddr = Some(match &got {
-                Some((entries, _, delay_ms)) => {
-                    GetaddrResult::Answered { entries: entries.len() as u32, delay_ms: *delay_ms }
-                }
+                Some((entries, _, delay_ms)) => GetaddrResult::Answered {
+                    entries: entries.len() as u32,
+                    delay_ms: *delay_ms,
+                },
                 None => GetaddrResult::NoAnswer,
             });
             answer_kind = got.as_ref().map(|(_, kind, _)| *kind);
@@ -1108,7 +1264,8 @@ impl PeerManager {
                 .await;
                 // The chain check reads the `getheaders` probe's answer.
                 if let Some(headers) = headers {
-                    chain_check = self.crawl_chain_check(&top, &stop, &headers, hs.version.start_height);
+                    chain_check =
+                        self.crawl_chain_check(&top, &stop, &headers, hs.version.start_height);
                 }
             }
         }
@@ -1135,14 +1292,22 @@ impl PeerManager {
                 .map(|o| o.probes)
                 .unwrap_or_default()
         };
-        let features = CrawlFeatures { v2: greeting, probes: judged_probes, getaddr: answer_kind };
+        let features = CrawlFeatures {
+            v2: greeting,
+            probes: judged_probes,
+            getaddr: answer_kind,
+        };
         let capture = &hs.behavior.handshake;
         // A peer that closed before its transcript settled showed nothing
         // of its implementation: no fingerprint.
         let fingerprint = if verdict == Verdict::ClosedEarly {
             crate::net::fingerprint::Fingerprint::Unknown
         } else {
-            crate::net::fingerprint::classify_crawl(capture, hs.behavior.version.as_ref(), &features)
+            crate::net::fingerprint::classify_crawl(
+                capture,
+                hs.behavior.version.as_ref(),
+                &features,
+            )
         };
         // A shape no row matched (unknown, or only claimed by its user
         // agent) keeps its raw features, so a new implementation or release
@@ -1154,9 +1319,11 @@ impl PeerManager {
             getaddr: answer_kind,
         });
         let asn = match target {
-            PeerAddr::Socket(sa) if crate::net::is_routable(sa.ip()) => {
-                self.asmap.get().map(|m| m.lookup(sa.ip())).filter(|a| *a != 0)
-            }
+            PeerAddr::Socket(sa) if crate::net::is_routable(sa.ip()) => self
+                .asmap
+                .get()
+                .map(|m| m.lookup(sa.ip()))
+                .filter(|a| *a != 0),
             _ => None,
         };
         result.observation = Some(Observation {
@@ -1197,10 +1364,19 @@ impl PeerManager {
         // record, and a walk per header would cost a crawl too much.
         let ours = |hash: &bitcoin::BlockHash| match chain.get_block_index(hash) {
             None => OurBlock::Unknown,
-            Some(e) if chain.active_chain_hash_at_height_indexed(e.height) == Some(*hash) => OurBlock::Active(e.height),
+            Some(e) if chain.active_chain_hash_at_height_indexed(e.height) == Some(*hash) => {
+                OurBlock::Active(e.height)
+            }
             Some(_) => OurBlock::Stale,
         };
-        Some(crawl::chain_check(locator, locator_height, stop, headers, peer_height, ours))
+        Some(crawl::chain_check(
+            locator,
+            locator_height,
+            stop,
+            headers,
+            peer_height,
+            ours,
+        ))
     }
 
     /// Send one `getaddr` and wait for the answer: the first `addr` or
@@ -1232,7 +1408,10 @@ impl PeerManager {
                     return (Some((entries, AddrKind::AddrV2, delay())), false);
                 }
                 NetworkMessage::Addr(entries) if entries.len() > 1 => {
-                    let v2 = entries.iter().filter_map(|(time, a)| addr_entry_v2(*time, a)).collect();
+                    let v2 = entries
+                        .iter()
+                        .filter_map(|(time, a)| addr_entry_v2(*time, a))
+                        .collect();
                     return (Some((v2, AddrKind::Addr, delay())), false);
                 }
                 NetworkMessage::Ping(n) => {

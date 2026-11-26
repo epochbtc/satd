@@ -61,7 +61,11 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
     // Scripts are spelled as the version 0 decoder spells them.
     let script_net = network.unwrap_or(bitcoin::Network::Bitcoin);
     let script = |bytes: &[u8], include_address: bool| {
-        psbt::script_univ(bitcoin::Script::from_bytes(bytes), include_address, script_net)
+        psbt::script_univ(
+            bitcoin::Script::from_bytes(bytes),
+            include_address,
+            script_net,
+        )
     };
 
     let mut out = json!({
@@ -127,11 +131,11 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
             v["final_scriptSig"] = psbt::final_script_sig_univ(bitcoin::Script::from_bytes(sig));
         }
         if let Some(wit) = map.get_single(keys::input::FINAL_SCRIPTWITNESS) {
-            v["final_scriptwitness"] = match bitcoin::consensus::deserialize::<bitcoin::Witness>(wit)
-            {
-                Ok(w) => json!(w.iter().map(hex::encode).collect::<Vec<_>>()),
-                Err(_) => json!(hex::encode(wit)),
-            };
+            v["final_scriptwitness"] =
+                match bitcoin::consensus::deserialize::<bitcoin::Witness>(wit) {
+                    Ok(w) => json!(w.iter().map(hex::encode).collect::<Vec<_>>()),
+                    Err(_) => json!(hex::encode(wit)),
+                };
         }
         v["has_utxo"] = json!(
             map.contains_type(keys::input::WITNESS_UTXO)
@@ -183,8 +187,7 @@ pub fn decode(raw: &RawPsbt, network: Option<bitcoin::Network>) -> Result<Value,
                         bitcoin::secp256k1::PublicKey::from_slice(&info[33..]),
                     )
                 {
-                    sp["address"] =
-                        json!(satd_psbt::SpAddress::new(scan, spend).encode(network));
+                    sp["address"] = json!(satd_psbt::SpAddress::new(scan, spend).encode(network));
                 }
             } else {
                 // Shown, not swallowed: an operator staring at a rejected
@@ -360,9 +363,9 @@ pub fn analyze(raw: &RawPsbt, chain_state: Option<&ChainState>) -> Result<Value,
     // A silent payment output whose script has not been computed is the
     // Signer's job, whatever the inputs look like. Nothing downstream of the
     // Signer can run while the transaction is still undetermined.
-    let awaiting_script = view.outputs().any(|o| {
-        o.map().contains_type(keys::output::SP_V0_INFO) && !script_is_computed(o.map())
-    });
+    let awaiting_script = view
+        .outputs()
+        .any(|o| o.map().contains_type(keys::output::SP_V0_INFO) && !script_is_computed(o.map()));
     if awaiting_script && (next == "extractor" || next == "finalizer") {
         next = "signer";
     }
@@ -692,8 +695,7 @@ pub fn join(psbts: &[RawPsbt]) -> Result<RawPsbt, RpcError> {
             )));
         }
         let modifiable = view.tx_modifiable().map_err(bad)?;
-        if modifiable & keys::modifiable::INPUTS == 0
-            || modifiable & keys::modifiable::OUTPUTS == 0
+        if modifiable & keys::modifiable::INPUTS == 0 || modifiable & keys::modifiable::OUTPUTS == 0
         {
             return Err(refuse(format!(
                 "PSBT {n} does not allow inputs and outputs to be added; \

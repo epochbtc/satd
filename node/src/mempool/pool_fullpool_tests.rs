@@ -18,7 +18,10 @@ use bitcoin::{Amount, Sequence, TxIn, Witness};
 pub(super) const COIN_VALUE: u64 = 100_000;
 
 pub(super) fn prev(tag: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
+    OutPoint {
+        txid: Txid::from_byte_array([tag; 32]),
+        vout: 0,
+    }
 }
 
 pub(super) fn p2wpkh(tag: u8) -> ScriptBuf {
@@ -40,10 +43,19 @@ fn coin() -> Coin {
 /// Spend `prevs` (worth `in_value` together), paying `fee` and splitting the
 /// rest over `outs` P2WPKH outputs. One input and one output is 82 bytes;
 /// each further output adds 31.
-pub(super) fn spend(prevs: &[OutPoint], in_value: u64, fee: u64, outs: u64, tag: u8) -> Transaction {
+pub(super) fn spend(
+    prevs: &[OutPoint],
+    in_value: u64,
+    fee: u64,
+    outs: u64,
+    tag: u8,
+) -> Transaction {
     let each = (in_value - fee) / outs;
     let mut output: Vec<TxOut> = (0..outs)
-        .map(|_| TxOut { value: Amount::from_sat(each), script_pubkey: p2wpkh(tag) })
+        .map(|_| TxOut {
+            value: Amount::from_sat(each),
+            script_pubkey: p2wpkh(tag),
+        })
         .collect();
     output[0].value = Amount::from_sat(in_value - fee - each * (outs - 1));
     Transaction {
@@ -67,8 +79,11 @@ pub(super) fn spend(prevs: &[OutPoint], in_value: u64, fee: u64, outs: u64, tag:
 pub(super) fn env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
     let coins: Vec<(OutPoint, Coin)> = tags.iter().map(|t| (prev(*t), coin())).collect();
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
-    *mp.config.write() =
-        MempoolConfig { max_size_bytes: 1_000_000, min_fee_rate: 0, ..Default::default() };
+    *mp.config.write() = MempoolConfig {
+        max_size_bytes: 1_000_000,
+        min_fee_rate: 0,
+        ..Default::default()
+    };
     (cs, mp, dir)
 }
 
@@ -78,7 +93,8 @@ pub(super) fn set_max(mp: &Mempool, max: usize) {
 }
 
 pub(super) fn admit(mp: &Mempool, cs: &ChainState, tx: Transaction) -> Txid {
-    mp.accept_transaction(tx, cs, &NoopVerifier, TxSource::P2p, false).expect("admitted")
+    mp.accept_transaction(tx, cs, &NoopVerifier, TxSource::P2p, false)
+        .expect("admitted")
 }
 
 pub(super) fn pool(mp: &Mempool) -> HashSet<Txid> {
@@ -95,7 +111,12 @@ pub(super) fn events(mp: &Mempool) -> broadcast::Receiver<MempoolEvent> {
 pub(super) fn evicted(rx: &mut broadcast::Receiver<MempoolEvent>) -> Vec<Txid> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
-        if let MempoolEvent::LeaveEvicted { txid, reason: EvictReason::FullPool, .. } = ev {
+        if let MempoolEvent::LeaveEvicted {
+            txid,
+            reason: EvictReason::FullPool,
+            ..
+        } = ev
+        {
             out.push(txid);
         }
     }
@@ -112,7 +133,10 @@ impl ScriptVerifier for Refuses {
         _prev_outputs: &[TxOut],
         _at: crate::validation::script::ScriptContext,
     ) -> Result<(), ScriptError> {
-        Err(ScriptError::VerifyFailed { input: 0, reason: "Invalid Schnorr signature".into() })
+        Err(ScriptError::VerifyFailed {
+            input: 0,
+            reason: "Invalid Schnorr signature".into(),
+        })
     }
 }
 
@@ -135,15 +159,27 @@ fn a_script_failure_on_a_full_pool_evicts_nothing() {
         .accept_transaction(rich.clone(), &cs, &Refuses, TxSource::P2p, false)
         .expect_err("its scripts fail");
     assert!(matches!(err, MempoolError::Script(..)), "{err:?}");
-    assert_eq!(pool(&mp), before, "a transaction whose scripts fail evicted entries");
-    assert_eq!(mp.info().mempool_min_fee, floor, "a transaction whose scripts fail raised the floor");
+    assert_eq!(
+        pool(&mp),
+        before,
+        "a transaction whose scripts fail evicted entries"
+    );
+    assert_eq!(
+        mp.info().mempool_min_fee,
+        floor,
+        "a transaction whose scripts fail raised the floor"
+    );
     assert!(evicted(&mut rx).is_empty());
 
     let txid = mp
         .accept_transaction(rich, &cs, &NoopVerifier, TxSource::P2p, false)
         .expect("admitted");
     let gone = evicted(&mut rx);
-    assert_eq!(gone.len(), 1, "one 82-byte entry makes room for one 82-byte transaction");
+    assert_eq!(
+        gone.len(),
+        1,
+        "one 82-byte entry makes room for one 82-byte transaction"
+    );
     assert!(before.contains(&gone[0]));
     assert!(pool(&mp).contains(&txid));
 
@@ -164,11 +200,26 @@ fn a_child_keeps_its_parent_in_a_full_pool() {
     let child = admit(
         &mp,
         &cs,
-        spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 100, 10_000, 1, 4),
+        spend(
+            &[OutPoint {
+                txid: parent,
+                vout: 0,
+            }],
+            COIN_VALUE - 100,
+            10_000,
+            1,
+            4,
+        ),
     );
     let now = pool(&mp);
-    assert!(now.contains(&parent), "the child's own parent was evicted to make room for it");
-    assert!(!now.contains(&second), "the cheapest entry that is not an ancestor makes the room");
+    assert!(
+        now.contains(&parent),
+        "the child's own parent was evicted to make room for it"
+    );
+    assert!(
+        !now.contains(&second),
+        "the cheapest entry that is not an ancestor makes the room"
+    );
     assert!(now.contains(&third));
     assert!(now.contains(&child));
 
@@ -185,7 +236,16 @@ fn a_grandchild_keeps_its_grandparent_in_a_full_pool() {
     let parent = admit(
         &mp,
         &cs,
-        spend(&[OutPoint { txid: grandparent, vout: 0 }], COIN_VALUE - 100, 100, 1, 5),
+        spend(
+            &[OutPoint {
+                txid: grandparent,
+                vout: 0,
+            }],
+            COIN_VALUE - 100,
+            100,
+            1,
+            5,
+        ),
     );
     let second = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 200, 1, 2));
     let third = admit(&mp, &cs, spend(&[prev(3)], COIN_VALUE, 300, 1, 3));
@@ -194,12 +254,27 @@ fn a_grandchild_keeps_its_grandparent_in_a_full_pool() {
     let child = admit(
         &mp,
         &cs,
-        spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 200, 10_000, 1, 4),
+        spend(
+            &[OutPoint {
+                txid: parent,
+                vout: 0,
+            }],
+            COIN_VALUE - 200,
+            10_000,
+            1,
+            4,
+        ),
     );
     let now = pool(&mp);
-    assert!(now.contains(&grandparent), "the child's grandparent was evicted to make room for it");
+    assert!(
+        now.contains(&grandparent),
+        "the child's grandparent was evicted to make room for it"
+    );
     assert!(now.contains(&parent));
-    assert!(!now.contains(&second), "the cheapest entry that is not an ancestor makes the room");
+    assert!(
+        !now.contains(&second),
+        "the cheapest entry that is not an ancestor makes the room"
+    );
     assert!(now.contains(&third));
     assert!(now.contains(&child));
 
@@ -218,7 +293,16 @@ fn a_child_that_outbids_only_its_parent_is_refused() {
     set_max(&mp, mp.acting_bytes());
     let before = pool(&mp);
 
-    let child = spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 100, 1_000, 1, 4);
+    let child = spend(
+        &[OutPoint {
+            txid: parent,
+            vout: 0,
+        }],
+        COIN_VALUE - 100,
+        1_000,
+        1,
+        4,
+    );
     let err = mp
         .accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p, false)
         .expect_err("it pays less than every entry it could evict");
@@ -239,13 +323,26 @@ fn a_full_pool_refusal_reports_its_evictions() {
     let mut rx = events(&mp);
 
     // 144 bytes, and only the 82-byte `cheap` can go.
-    let child = spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 200, 10_000, 3, 3);
+    let child = spend(
+        &[OutPoint {
+            txid: parent,
+            vout: 0,
+        }],
+        COIN_VALUE - 200,
+        10_000,
+        3,
+        3,
+    );
     let err = mp
         .accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p, false)
         .expect_err("evicting everything but its parent does not make enough room");
     assert!(matches!(err, MempoolError::MempoolFull), "{err:?}");
     assert_eq!(pool(&mp), HashSet::from([parent]));
-    assert_eq!(evicted(&mut rx), vec![cheap], "an eviction was never reported");
+    assert_eq!(
+        evicted(&mut rx),
+        vec![cheap],
+        "an eviction was never reported"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -257,14 +354,27 @@ fn a_full_pool_refusal_reports_its_evictions() {
 fn lowering_maxmempool_trims_the_pool_at_once() {
     let (cs, mp, dir) = env(&[1, 2, 3, 4, 5]);
     let ids: Vec<Txid> = (1..=4u8)
-        .map(|t| admit(&mp, &cs, spend(&[prev(t)], COIN_VALUE, 100 * t as u64, 1, t)))
+        .map(|t| {
+            admit(
+                &mp,
+                &cs,
+                spend(&[prev(t)], COIN_VALUE, 100 * t as u64, 1, t),
+            )
+        })
         .collect();
     let two = mp.acting_bytes() / 2;
     let mut rx = events(&mp);
 
-    let cfg = MempoolConfig { max_size_bytes: two, ..mp.config.read().clone() };
+    let cfg = MempoolConfig {
+        max_size_bytes: two,
+        ..mp.config.read().clone()
+    };
     mp.reload_policy(cfg);
-    assert!(mp.acting_bytes() <= two, "{} bytes over a {two}-byte limit", mp.acting_bytes());
+    assert!(
+        mp.acting_bytes() <= two,
+        "{} bytes over a {two}-byte limit",
+        mp.acting_bytes()
+    );
     assert_eq!(pool(&mp), HashSet::from([ids[2], ids[3]]));
     let mut gone = evicted(&mut rx);
     gone.sort();
@@ -286,13 +396,25 @@ fn lowering_maxmempool_trims_the_pool_at_once() {
 fn an_admission_trims_an_over_limit_pool() {
     let (cs, mp, dir) = env(&[1, 2, 3, 4, 5]);
     let ids: Vec<Txid> = (1..=4u8)
-        .map(|t| admit(&mp, &cs, spend(&[prev(t)], COIN_VALUE, 100 * t as u64, 1, t)))
+        .map(|t| {
+            admit(
+                &mp,
+                &cs,
+                spend(&[prev(t)], COIN_VALUE, 100 * t as u64, 1, t),
+            )
+        })
         .collect();
     let two = mp.acting_bytes() / 2;
     set_max(&mp, two);
 
     let txid = mp
-        .accept_transaction(spend(&[prev(5)], COIN_VALUE, 10_000, 1, 5), &cs, &NoopVerifier, TxSource::P2p, false)
+        .accept_transaction(
+            spend(&[prev(5)], COIN_VALUE, 10_000, 1, 5),
+            &cs,
+            &NoopVerifier,
+            TxSource::P2p,
+            false,
+        )
         .expect("the pool is trimmed to its limit and the transaction admitted");
     assert_eq!(pool(&mp), HashSet::from([ids[3], txid]));
     assert!(mp.acting_bytes() <= two);
@@ -309,18 +431,35 @@ fn evicting_a_parent_takes_every_descendant() {
     let parent = admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 100, 3, 1));
     let out = |txid, vout| OutPoint { txid, vout };
     let per = (COIN_VALUE - 100) / 3;
-    let two_outs = admit(&mp, &cs, spend(&[out(parent, 1), out(parent, 2)], 2 * per, 5_000, 1, 2));
-    let one_out = admit(&mp, &cs, spend(&[out(parent, 0)], COIN_VALUE - 100 - 2 * per, 5_000, 1, 3));
-    let grandchild = admit(&mp, &cs, spend(&[out(two_outs, 0)], 2 * per - 5_000, 5_000, 1, 4));
+    let two_outs = admit(
+        &mp,
+        &cs,
+        spend(&[out(parent, 1), out(parent, 2)], 2 * per, 5_000, 1, 2),
+    );
+    let one_out = admit(
+        &mp,
+        &cs,
+        spend(&[out(parent, 0)], COIN_VALUE - 100 - 2 * per, 5_000, 1, 3),
+    );
+    let grandchild = admit(
+        &mp,
+        &cs,
+        spend(&[out(two_outs, 0)], 2 * per - 5_000, 5_000, 1, 4),
+    );
     // Pays more than the family as a package, so the family goes first: the
     // order is by descendant score, and the parent ranks with its children.
     let other = admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 50_000, 1, 5));
     let other_size = bitcoin::consensus::serialize(&mp.get(&other).unwrap().tx).len();
 
     let mut inner = mp.inner.write();
-    let mut gone: Vec<Txid> =
-        Mempool::evict_lowest_fee_entries(&mut inner, 1, false, 0).into_iter().map(|(t, _)| t).collect();
-    assert_eq!(inner.entries.keys().copied().collect::<HashSet<_>>(), HashSet::from([other]));
+    let mut gone: Vec<Txid> = Mempool::evict_lowest_fee_entries(&mut inner, 1, false, 0)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(
+        inner.entries.keys().copied().collect::<HashSet<_>>(),
+        HashSet::from([other])
+    );
     assert_eq!(inner.spends.len(), 1);
     assert_eq!(inner.acting_bytes(), other_size);
     drop(inner);
@@ -351,7 +490,16 @@ fn eviction_cost_follows_what_it_evicts() {
     for i in 0..N {
         let mut bytes = [0u8; 32];
         bytes[..4].copy_from_slice(&i.to_le_bytes());
-        let tx = spend(&[OutPoint { txid: Txid::from_byte_array(bytes), vout: 0 }], COIN_VALUE, 1_000, 1, 7);
+        let tx = spend(
+            &[OutPoint {
+                txid: Txid::from_byte_array(bytes),
+                vout: 0,
+            }],
+            COIN_VALUE,
+            1_000,
+            1,
+            7,
+        );
         let txid = tx.compute_txid();
         size = bitcoin::consensus::serialize(&tx).len();
         inner.spends.insert(tx.input[0].previous_output, txid);
@@ -395,7 +543,10 @@ fn eviction_cost_follows_what_it_evicts() {
     let mut got = gone.clone();
     got.sort();
     assert_eq!(got, expected, "the {EVICT} lowest feerates go");
-    assert!(took < std::time::Duration::from_secs(2), "evicting {EVICT} of {N} took {took:?}");
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "evicting {EVICT} of {N} took {took:?}"
+    );
 }
 
 /// Fails every transaction with the kernel engine's coarse reason, and
@@ -412,7 +563,10 @@ impl ScriptVerifier for NamesWhenAsked<'_> {
         _prev_outputs: &[TxOut],
         _at: crate::validation::script::ScriptContext,
     ) -> Result<(), ScriptError> {
-        Err(ScriptError::VerifyFailed { input: 0, reason: "ERR_SCRIPT".into() })
+        Err(ScriptError::VerifyFailed {
+            input: 0,
+            reason: "ERR_SCRIPT".into(),
+        })
     }
 
     fn name_failure(
@@ -423,7 +577,10 @@ impl ScriptVerifier for NamesWhenAsked<'_> {
         err: ScriptError,
     ) -> ScriptError {
         *self.pool_free.lock() = Some(self.mp.inner.try_write().is_some());
-        ScriptError::VerifyFailed { input: err.input(), reason: "Invalid Schnorr signature".into() }
+        ScriptError::VerifyFailed {
+            input: err.input(),
+            reason: "Invalid Schnorr signature".into(),
+        }
     }
 }
 
@@ -434,31 +591,64 @@ impl ScriptVerifier for NamesWhenAsked<'_> {
 #[test]
 fn a_script_failure_is_named_after_the_pool_is_released() {
     let (cs, mp, dir) = env(&[1]);
-    let verifier = NamesWhenAsked { mp: &mp, pool_free: Mutex::new(None) };
+    let verifier = NamesWhenAsked {
+        mp: &mp,
+        pool_free: Mutex::new(None),
+    };
     let err = mp
-        .accept_transaction(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1), &cs, &verifier, TxSource::P2p, false)
+        .accept_transaction(
+            spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1),
+            &cs,
+            &verifier,
+            TxSource::P2p,
+            false,
+        )
         .expect_err("its scripts fail");
     match err {
         MempoolError::Script(reason, _) => assert_eq!(reason, "Invalid Schnorr signature"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(*verifier.pool_free.lock(), Some(true), "the failure was named under the pool's write lock");
+    assert_eq!(
+        *verifier.pool_free.lock(),
+        Some(true),
+        "the failure was named under the pool's write lock"
+    );
     assert!(pool(&mp).is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-const HELD: QuarantineScope = QuarantineScope { relay: true, template: true };
+const HELD: QuarantineScope = QuarantineScope {
+    relay: true,
+    template: true,
+};
 
 /// An acting parent with a held child, and a better-paying acting entry.
 /// The held child never emitted an `Enter`, so it must not be reported as
 /// leaving the standard stream when it goes with its parent.
 fn parent_with_held_child(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf, Txid, Txid) {
     let (cs, mp, dir) = env(tags);
-    let parent = admit(&mp, &cs, spend(&[prev(tags[0])], COIN_VALUE, 100, 1, tags[0]));
-    admit(&mp, &cs, spend(&[prev(tags[1])], COIN_VALUE, 2_000, 1, tags[1]));
+    let parent = admit(
+        &mp,
+        &cs,
+        spend(&[prev(tags[0])], COIN_VALUE, 100, 1, tags[0]),
+    );
+    admit(
+        &mp,
+        &cs,
+        spend(&[prev(tags[1])], COIN_VALUE, 2_000, 1, tags[1]),
+    );
     let child = mp.insert_tx_scoped_for_test(
-        spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 100, 1_000, 1, 0x40),
+        spend(
+            &[OutPoint {
+                txid: parent,
+                vout: 0,
+            }],
+            COIN_VALUE - 100,
+            1_000,
+            1,
+            0x40,
+        ),
         HELD,
     );
     // Unexpired, so the expiry sweep after an admission leaves it alone.
@@ -477,7 +667,11 @@ fn a_held_descendant_evicted_on_admission_is_not_reported() {
     admit(&mp, &cs, spend(&[prev(3)], COIN_VALUE, 10_000, 1, 3));
     let now = pool(&mp);
     assert!(!now.contains(&parent) && !now.contains(&child));
-    assert_eq!(evicted(&mut rx), vec![parent], "a held entry was reported leaving the standard stream");
+    assert_eq!(
+        evicted(&mut rx),
+        vec![parent],
+        "a held entry was reported leaving the standard stream"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -488,11 +682,18 @@ fn a_held_descendant_trimmed_on_reload_is_not_reported() {
     let (_cs, mp, dir, parent, child) = parent_with_held_child(&[1, 2]);
     let mut rx = events(&mp);
 
-    let cfg = MempoolConfig { max_size_bytes: mp.acting_bytes() - 1, ..mp.config.read().clone() };
+    let cfg = MempoolConfig {
+        max_size_bytes: mp.acting_bytes() - 1,
+        ..mp.config.read().clone()
+    };
     mp.reload_policy(cfg);
     let now = pool(&mp);
     assert!(!now.contains(&parent) && !now.contains(&child));
-    assert_eq!(evicted(&mut rx), vec![parent], "a held entry was reported leaving the standard stream");
+    assert_eq!(
+        evicted(&mut rx),
+        vec![parent],
+        "a held entry was reported leaving the standard stream"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -502,11 +703,29 @@ fn a_held_descendant_trimmed_on_reload_is_not_reported() {
 #[test]
 fn test_inserted_entries_index_their_spends() {
     let mp = Mempool::new(1_000_000, 0);
-    let parent = mp.insert_tx_scoped_for_test(spend(&[prev(1)], COIN_VALUE, 100, 1, 1), QuarantineScope::acting());
-    let child = spend(&[OutPoint { txid: parent, vout: 0 }], COIN_VALUE - 100, 100, 1, 2);
+    let parent = mp.insert_tx_scoped_for_test(
+        spend(&[prev(1)], COIN_VALUE, 100, 1, 1),
+        QuarantineScope::acting(),
+    );
+    let child = spend(
+        &[OutPoint {
+            txid: parent,
+            vout: 0,
+        }],
+        COIN_VALUE - 100,
+        100,
+        1,
+        2,
+    );
     let child_txid = child.compute_txid();
     mp.insert_entry_for_test(child_txid, child, 1);
     let inner = mp.inner.read();
     assert_eq!(inner.spends.get(&prev(1)), Some(&parent));
-    assert_eq!(inner.spends.get(&OutPoint { txid: parent, vout: 0 }), Some(&child_txid));
+    assert_eq!(
+        inner.spends.get(&OutPoint {
+            txid: parent,
+            vout: 0
+        }),
+        Some(&child_txid)
+    );
 }

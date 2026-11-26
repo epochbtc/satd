@@ -51,7 +51,10 @@ impl HeadersSyncParams {
             Network::Signet => (629, 15885),
             _ => (275, 7017),
         };
-        Self { commitment_period, redownload_buffer_size }
+        Self {
+            commitment_period,
+            redownload_buffer_size,
+        }
     }
 }
 
@@ -239,11 +242,23 @@ impl HeadersSyncState {
         now: u64,
     ) -> Result<Self, SystemClockError> {
         use rand::Rng as _;
-        assert!(params.commitment_period > 0, "commitment_period must be non-zero");
+        assert!(
+            params.commitment_period > 0,
+            "commitment_period must be non-zero"
+        );
         let mut rng = rand::thread_rng();
         let commit_offset = rng.gen_range(0..params.commitment_period);
         let hash_keys = (rng.r#gen(), rng.r#gen());
-        Self::with_salt(id, network, params, chain_start, minimum_required_work, now, commit_offset, hash_keys)
+        Self::with_salt(
+            id,
+            network,
+            params,
+            chain_start,
+            minimum_required_work,
+            now,
+            commit_offset,
+            hash_keys,
+        )
     }
 
     /// [`Self::new`] with the offset and salt given, for tests.
@@ -261,7 +276,10 @@ impl HeadersSyncState {
         let max_seconds_since_start =
             now as i64 - i64::from(chain_start.median_time_past) + MAX_FUTURE_BLOCK_TIME as i64;
         if max_seconds_since_start < 0 {
-            return Err(SystemClockError { now, chain_start_mtp: chain_start.median_time_past });
+            return Err(SystemClockError {
+                now,
+                chain_start_mtp: chain_start.median_time_past,
+            });
         }
         let max_commitments = 6 * max_seconds_since_start as u64 / params.commitment_period as u64;
         tracing::debug!(
@@ -355,7 +373,11 @@ impl HeadersSyncState {
     /// Core's `ProcessNextHeaders`. `headers` must be non-empty, continuous,
     /// and meet the proof of work they claim; `full_message` is whether the
     /// message held the most headers one may.
-    pub fn process_next_headers(&mut self, headers: &[Header], full_message: bool) -> ProcessingResult {
+    pub fn process_next_headers(
+        &mut self,
+        headers: &[Header],
+        full_message: bool,
+    ) -> ProcessingResult {
         let mut ret = ProcessingResult::default();
         if headers.is_empty() || self.state == State::Final {
             return ret;
@@ -376,7 +398,9 @@ impl HeadersSyncState {
                 }
             }
             State::Redownload => {
-                ret.success = headers.iter().all(|h| self.validate_and_store_redownloaded_header(h));
+                ret.success = headers
+                    .iter()
+                    .all(|h| self.validate_and_store_redownloaded_header(h));
                 if ret.success {
                     ret.pow_validated_headers = self.pop_headers_ready_for_acceptance();
                     if self.redownloaded_headers.is_empty() && self.process_all_remaining_headers {
@@ -477,13 +501,19 @@ impl HeadersSyncState {
             Some(h) => h.bits,
             None => self.chain_start.header.bits.to_consensus(),
         };
-        if !permitted_difficulty_transition(self.network, next_height as u32, previous_bits, header.bits.to_consensus()) {
+        if !permitted_difficulty_transition(
+            self.network,
+            next_height as u32,
+            previous_bits,
+            header.bits.to_consensus(),
+        ) {
             tracing::debug!(
                 "Initial headers sync aborted with peer={id}: invalid difficulty transition at height={next_height} (redownload phase)"
             );
             return false;
         }
-        self.redownload_chain_work = add_u256(&self.redownload_chain_work, &work_for_bits(header.bits));
+        self.redownload_chain_work =
+            add_u256(&self.redownload_chain_work, &work_for_bits(header.bits));
         if compare_u256(&self.redownload_chain_work, &self.minimum_required_work) >= 0 {
             self.process_all_remaining_headers = true;
         }
@@ -506,7 +536,8 @@ impl HeadersSyncState {
                 return false;
             }
         }
-        self.redownloaded_headers.push_back(CompressedHeader::new(header));
+        self.redownloaded_headers
+            .push_back(CompressedHeader::new(header));
         self.redownload_buffer_last_height = next_height;
         self.redownload_buffer_last_hash = hash;
         true
@@ -520,7 +551,9 @@ impl HeadersSyncState {
         while self.redownloaded_headers.len() > self.params.redownload_buffer_size
             || (!self.redownloaded_headers.is_empty() && self.process_all_remaining_headers)
         {
-            let Some(front) = self.redownloaded_headers.pop_front() else { break };
+            let Some(front) = self.redownloaded_headers.pop_front() else {
+                break;
+            };
             let header = front.full_header(self.redownload_buffer_first_prev_hash);
             self.redownload_buffer_first_prev_hash = header.block_hash();
             ret.push(header);

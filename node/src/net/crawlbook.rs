@@ -52,14 +52,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 
-use bitcoin::hashes::{sha256, sha256d, Hash};
-use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use bitcoin::hashes::{Hash, sha256, sha256d};
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 
 use crate::net::fingerprint::{AddrKind, Family, Fingerprint};
-use crate::net::v2transport::V2Greeting;
 use crate::net::peer::PeerAddr;
-use crate::net::survey::{self, ClosedEarlyRetry, Probe, ProbeOutcome, ProbeResults, Reader, Verdict};
+use crate::net::survey::{
+    self, ClosedEarlyRetry, Probe, ProbeOutcome, ProbeResults, Reader, Verdict,
+};
+use crate::net::v2transport::V2Greeting;
 
 /// The file's name in the network data directory.
 pub const CRAWL_FILE: &str = "crawlbook.dat";
@@ -168,7 +170,13 @@ pub enum Network {
 }
 
 impl Network {
-    pub const ALL: [Network; 5] = [Network::Ipv4, Network::Ipv6, Network::Onion, Network::I2p, Network::Cjdns];
+    pub const ALL: [Network; 5] = [
+        Network::Ipv4,
+        Network::Ipv6,
+        Network::Onion,
+        Network::I2p,
+        Network::Cjdns,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -226,7 +234,12 @@ pub enum ChainCheck {
 }
 
 impl ChainCheck {
-    const ALL: [ChainCheck; 4] = [ChainCheck::OnChain, ChainCheck::Behind, ChainCheck::Fork, ChainCheck::OtherChain];
+    const ALL: [ChainCheck; 4] = [
+        ChainCheck::OnChain,
+        ChainCheck::Behind,
+        ChainCheck::Fork,
+        ChainCheck::OtherChain,
+    ];
 }
 
 /// What the last session with a completed handshake showed.
@@ -314,7 +327,8 @@ impl Observation {
     /// Whether the user agent names one family and a row observed
     /// another: never for a fake or closed-early session.
     pub fn mismatch(&self) -> bool {
-        self.verdict == Verdict::Classified && matches!(self.fingerprint, Fingerprint::Mismatch { .. })
+        self.verdict == Verdict::Classified
+            && matches!(self.fingerprint, Fingerprint::Mismatch { .. })
     }
 }
 
@@ -437,7 +451,10 @@ impl CrawlEntry {
     /// dials v1 and sends no v2 bytes: a v1-only node that answers v2 bytes
     /// by closing, or by banning the dialler, is still reached.
     pub fn dials_v2_first(&self) -> bool {
-        let services = self.observation.as_ref().map_or(self.advertised_services, |o| o.services);
+        let services = self
+            .observation
+            .as_ref()
+            .map_or(self.advertised_services, |o| o.services);
         ServiceFlags::from(services).has(ServiceFlags::P2P_V2)
     }
 
@@ -449,7 +466,8 @@ impl CrawlEntry {
     /// Whether a session is open to it at `now`: one opened and neither
     /// reported nor abandoned ([`ABANDONED_AFTER_SECS`]).
     pub fn in_flight(&self, now: u64) -> bool {
-        self.in_flight.is_some_and(|(opened, _)| now.saturating_sub(opened) < ABANDONED_AFTER_SECS)
+        self.in_flight
+            .is_some_and(|(opened, _)| now.saturating_sub(opened) < ABANDONED_AFTER_SECS)
     }
 
     fn named(&mut self, source: u64, services: u64, time: u32, now: u64) {
@@ -479,7 +497,10 @@ impl CrawlEntry {
         if !dialable {
             return unnamed;
         }
-        unnamed && self.failing_since.is_some_and(|f| now.saturating_sub(f) >= DROP_AFTER_SECS)
+        unnamed
+            && self
+                .failing_since
+                .is_some_and(|f| now.saturating_sub(f) >= DROP_AFTER_SECS)
     }
 
     /// When it is due and for what; `None` while not due.
@@ -492,11 +513,20 @@ impl CrawlEntry {
         }
         let Some(success) = self.last_success else {
             // First contact.
-            return Some((self.retry_at.unwrap_or(self.first_learned), SessionKind::Discovery));
+            return Some((
+                self.retry_at.unwrap_or(self.first_learned),
+                SessionKind::Discovery,
+            ));
         };
-        let discovery = self.last_discovery.map_or(success, |d| d + DISCOVERY_INTERVAL_SECS);
+        let discovery = self
+            .last_discovery
+            .map_or(success, |d| d + DISCOVERY_INTERVAL_SECS);
         if let Some(retry) = self.retry_at {
-            let kind = if discovery <= now { SessionKind::Discovery } else { SessionKind::Liveness };
+            let kind = if discovery <= now {
+                SessionKind::Discovery
+            } else {
+                SessionKind::Liveness
+            };
             return Some((retry, kind));
         }
         if discovery <= now {
@@ -508,7 +538,9 @@ impl CrawlEntry {
             return Some((at, SessionKind::Liveness));
         }
         if self.v2_ok == Some(true) {
-            let v1 = self.last_v1_check.map_or(success, |c| c + V1_RECHECK_INTERVAL_SECS);
+            let v1 = self
+                .last_v1_check
+                .map_or(success, |c| c + V1_RECHECK_INTERVAL_SECS);
             if v1 <= now {
                 return Some((v1, SessionKind::V1Recheck));
             }
@@ -540,7 +572,10 @@ impl BookParams {
     /// The defaults for `network`: local addresses are admitted on regtest
     /// alone.
     pub fn for_network(network: bitcoin::Network) -> Self {
-        BookParams { allow_local: network == bitcoin::Network::Regtest, ..BookParams::default() }
+        BookParams {
+            allow_local: network == bitcoin::Network::Regtest,
+            ..BookParams::default()
+        }
     }
 
     /// Whether an IP address may enter the book: public unicast, or under
@@ -661,17 +696,32 @@ fn crawl_addr(m: &AddrV2Message, params: &BookParams) -> Result<CrawlAddr, Unusa
         AddrV2::Ipv4(v4) => IpAddr::V4(*v4),
         AddrV2::Ipv6(v6) => IpAddr::V6(*v6).to_canonical(),
         AddrV2::TorV3(key) => {
-            return Ok(CrawlAddr::Peer(PeerAddr::Onion { host: crate::net::peer::torv3_to_onion_host(key), port: m.port }))
+            return Ok(CrawlAddr::Peer(PeerAddr::Onion {
+                host: crate::net::peer::torv3_to_onion_host(key),
+                port: m.port,
+            }));
         }
-        AddrV2::I2p(dest) => return Ok(CrawlAddr::I2p { dest: *dest, port: m.port }),
-        AddrV2::Cjdns(ip) if ip.octets()[0] == 0xfc => return Ok(CrawlAddr::Cjdns { ip: *ip, port: m.port }),
+        AddrV2::I2p(dest) => {
+            return Ok(CrawlAddr::I2p {
+                dest: *dest,
+                port: m.port,
+            });
+        }
+        AddrV2::Cjdns(ip) if ip.octets()[0] == 0xfc => {
+            return Ok(CrawlAddr::Cjdns {
+                ip: *ip,
+                port: m.port,
+            });
+        }
         AddrV2::Cjdns(_) => return Err(Unusable::NotPublic),
         AddrV2::TorV2(_) | AddrV2::Unknown(..) => return Err(Unusable::Unsupported),
     };
     if !params.admits_ip(ip) {
         return Err(Unusable::NotPublic);
     }
-    Ok(CrawlAddr::Peer(PeerAddr::Socket(std::net::SocketAddr::new(ip, m.port))))
+    Ok(CrawlAddr::Peer(PeerAddr::Socket(
+        std::net::SocketAddr::new(ip, m.port),
+    )))
 }
 
 /// The crawl frontier.
@@ -741,7 +791,10 @@ impl CrawlBook {
 
     /// Read the addresses of one `addr` or `addrv2` answer from `source`.
     pub fn admit(&mut self, source: &PeerAddr, answer: &[AddrV2Message], now: u64) -> AdmitReport {
-        let mut report = AdmitReport { entries: answer.len(), ..AdmitReport::default() };
+        let mut report = AdmitReport {
+            entries: answer.len(),
+            ..AdmitReport::default()
+        };
         if answer.len() > MAX_ANSWER_ENTRIES {
             report.dropped_whole = true;
             return report;
@@ -783,7 +836,10 @@ impl CrawlBook {
             }
             // The caps count IPs: another port of an IP already in the
             // book takes no prefix slot.
-            match socket_ip(&addr).filter(|ip| !self.ips.contains_key(ip)).map(prefix) {
+            match socket_ip(&addr)
+                .filter(|ip| !self.ips.contains_key(ip))
+                .map(prefix)
+            {
                 Some(p @ Prefix::V6(_)) if self.prefix_count(p) >= IPV6_PER_64 => {
                     report.ipv6_prefix_full += 1;
                     continue;
@@ -794,7 +850,11 @@ impl CrawlBook {
                 }
                 _ => {}
             }
-            if self.insert(addr, CrawlEntry::new(now, source, m.services.to_u64(), m.time), now) {
+            if self.insert(
+                addr,
+                CrawlEntry::new(now, source, m.services.to_u64(), m.time),
+                now,
+            ) {
                 report.admitted += 1;
             } else {
                 report.not_kept += 1;
@@ -811,7 +871,9 @@ impl CrawlBook {
     /// failing. Returns whether the address is in the book afterwards.
     pub fn seed(&mut self, addr: PeerAddr, services: u64, now: u64) -> bool {
         let addr = match addr {
-            PeerAddr::Socket(sa) => PeerAddr::Socket(std::net::SocketAddr::new(sa.ip().to_canonical(), sa.port())),
+            PeerAddr::Socket(sa) => {
+                PeerAddr::Socket(std::net::SocketAddr::new(sa.ip().to_canonical(), sa.port()))
+            }
             onion @ PeerAddr::Onion { .. } => onion,
         };
         let usable = match &addr {
@@ -825,7 +887,16 @@ impl CrawlBook {
         if self.entries.contains_key(&addr) {
             // A seed with no services says nothing of them (a DNS seed, a
             // fixed seed, `-crawlseed`): what an answer advertised stands.
-            self.update(&addr, |e| e.seeded(SEED_SOURCE, if services == 0 { e.advertised_services } else { services }));
+            self.update(&addr, |e| {
+                e.seeded(
+                    SEED_SOURCE,
+                    if services == 0 {
+                        e.advertised_services
+                    } else {
+                        services
+                    },
+                )
+            });
             true
         } else {
             self.insert(addr, CrawlEntry::new(now, SEED_SOURCE, services, 0), now)
@@ -854,7 +925,9 @@ impl CrawlBook {
             .entries
             .iter()
             .filter_map(|(addr, e)| {
-                let CrawlAddr::Peer(peer) = addr else { return None };
+                let CrawlAddr::Peer(peer) = addr else {
+                    return None;
+                };
                 let (at, kind) = e.due(now, liveness)?;
                 if !dialable(peer) {
                     return None;
@@ -863,7 +936,10 @@ impl CrawlBook {
             })
             .collect();
         due.sort_unstable();
-        due.into_iter().take(limit).map(|(_, _, kind, peer)| (peer.clone(), kind)).collect()
+        due.into_iter()
+            .take(limit)
+            .map(|(_, _, kind, peer)| (peer.clone(), kind))
+            .collect()
     }
 
     /// Note a session opened to `addr`: it is not due again until
@@ -961,7 +1037,10 @@ impl CrawlBook {
                     e.last_discovery = Some(now);
                 }
                 if let Some(mut obs) = result.observation {
-                    let settled = e.observation.as_ref().is_some_and(|o| o.verdict != Verdict::ClosedEarly);
+                    let settled = e
+                        .observation
+                        .as_ref()
+                        .is_some_and(|o| o.verdict != Verdict::ClosedEarly);
                     if obs.verdict == Verdict::ClosedEarly && settled {
                         // The settled observation stands, and needs no retry.
                         e.closed_early_retry = ClosedEarlyRetry::default();
@@ -1014,7 +1093,10 @@ impl CrawlBook {
     pub fn counts(&self) -> NetworkCounts {
         let mut c = NetworkCounts::default();
         for (addr, e) in &self.entries {
-            let i = Network::ALL.iter().position(|n| *n == addr.network()).expect("every network is in ALL");
+            let i = Network::ALL
+                .iter()
+                .position(|n| *n == addr.network())
+                .expect("every network is in ALL");
             c.learned[i] += 1;
             if e.last_success.is_some() {
                 c.reached[i] += 1;
@@ -1056,7 +1138,12 @@ impl CrawlBook {
         self.lru.insert((entry.lru_key(), addr.clone()));
         self.entries.insert(addr.clone(), entry);
         while self.entries.len() > self.params.max_entries {
-            let Some(oldest) = self.lru.iter().map(|(_, a)| a).find(|a| !self.entries[*a].in_flight(now)).cloned()
+            let Some(oldest) = self
+                .lru
+                .iter()
+                .map(|(_, a)| a)
+                .find(|a| !self.entries[*a].in_flight(now))
+                .cloned()
             else {
                 break;
             };
@@ -1066,10 +1153,14 @@ impl CrawlBook {
     }
 
     fn remove(&mut self, addr: &CrawlAddr) {
-        let Some(e) = self.entries.remove(addr) else { return };
+        let Some(e) = self.entries.remove(addr) else {
+            return;
+        };
         self.lru.remove(&(e.lru_key(), addr.clone()));
         let Some(ip) = socket_ip(addr) else { return };
-        let Some(n) = self.ips.get_mut(&ip) else { return };
+        let Some(n) = self.ips.get_mut(&ip) else {
+            return;
+        };
         *n -= 1;
         if *n > 0 {
             return;
@@ -1086,7 +1177,9 @@ impl CrawlBook {
 
     /// Change one entry, keeping the LRU order in step.
     fn update(&mut self, addr: &CrawlAddr, f: impl FnOnce(&mut CrawlEntry)) {
-        let Some(e) = self.entries.get_mut(addr) else { return };
+        let Some(e) = self.entries.get_mut(addr) else {
+            return;
+        };
         let before = e.lru_key();
         f(e);
         let after = e.lru_key();
@@ -1125,7 +1218,12 @@ impl CrawlBook {
 
     /// Read [`Self::encode`]'s bytes under `params`, dropping what has
     /// expired as of `now` and the least recently used past the size bound.
-    pub fn decode(bytes: &[u8], network_magic: [u8; 4], now: u64, params: BookParams) -> Result<Self, String> {
+    pub fn decode(
+        bytes: &[u8],
+        network_magic: [u8; 4],
+        now: u64,
+        params: BookParams,
+    ) -> Result<Self, String> {
         if bytes.len() < FILE_MAGIC.len() + 4 + 4 + 4 + 32 {
             return Err("file too short".to_string());
         }
@@ -1151,7 +1249,10 @@ impl CrawlBook {
             let addr = decode_crawl_addr(&mut r)?;
             let mut entry = decode_entry(&mut r, version)?;
             if entry.closed_early_retry != ClosedEarlyRetry::default()
-                && entry.observation.as_ref().is_none_or(|o| o.verdict != Verdict::ClosedEarly)
+                && entry
+                    .observation
+                    .as_ref()
+                    .is_none_or(|o| o.verdict != Verdict::ClosedEarly)
             {
                 return Err("a retry on an entry not closed early".to_string());
             }
@@ -1180,7 +1281,12 @@ impl CrawlBook {
 
     /// Read the book from `path` under `params`; an absent file is an
     /// empty book.
-    pub fn load(path: &Path, network_magic: [u8; 4], now: u64, params: BookParams) -> Result<Self, String> {
+    pub fn load(
+        path: &Path,
+        network_magic: [u8; 4],
+        now: u64,
+        params: BookParams,
+    ) -> Result<Self, String> {
         match std::fs::read(path) {
             Ok(bytes) => Self::decode(&bytes, network_magic, now, params),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new(params)),
@@ -1217,7 +1323,10 @@ fn decode_crawl_addr(r: &mut Reader) -> Result<CrawlAddr, String> {
         Some(2) => {
             r.u8()?;
             let dest: [u8; 32] = r.take(32)?.try_into().expect("32 bytes");
-            Ok(CrawlAddr::I2p { dest, port: r.u16()? })
+            Ok(CrawlAddr::I2p {
+                dest,
+                port: r.u16()?,
+            })
         }
         Some(3) => {
             r.u8()?;
@@ -1225,7 +1334,10 @@ fn decode_crawl_addr(r: &mut Reader) -> Result<CrawlAddr, String> {
             if octets[0] != 0xfc {
                 return Err("bad CJDNS address".to_string());
             }
-            Ok(CrawlAddr::Cjdns { ip: Ipv6Addr::from(octets), port: r.u16()? })
+            Ok(CrawlAddr::Cjdns {
+                ip: Ipv6Addr::from(octets),
+                port: r.u16()?,
+            })
         }
         Some(t) => Err(format!("bad address type {t}")),
         None => Err("file truncated".to_string()),
@@ -1339,7 +1451,11 @@ fn decode_entry(r: &mut Reader, version: u32) -> Result<CrawlEntry, String> {
         v2_only: get_flag(r)?,
         reachable_count: r.u32()?,
         first_reachable: get_opt_u64(r)?,
-        observation: if get_flag(r)? { Some(decode_observation(r, version)?) } else { None },
+        observation: if get_flag(r)? {
+            Some(decode_observation(r, version)?)
+        } else {
+            None
+        },
         closed_early_retry: ClosedEarlyRetry::default(),
     };
     if version >= 5 {
@@ -1367,7 +1483,12 @@ fn encode_observation(buf: &mut Vec<u8>, o: &Observation, version: u32) {
     buf.push(u8::from(o.v2));
     buf.extend_from_slice(&o.height.to_le_bytes());
     buf.extend_from_slice(&o.our_height.to_le_bytes());
-    buf.push(o.chain_check.map_or(0, |c| 1 + ChainCheck::ALL.iter().position(|x| *x == c).expect("in ALL") as u8));
+    buf.push(o.chain_check.map_or(0, |c| {
+        1 + ChainCheck::ALL
+            .iter()
+            .position(|x| *x == c)
+            .expect("in ALL") as u8
+    }));
     buf.push(u8::from(o.clock_offset_secs.is_some()));
     buf.extend_from_slice(&o.clock_offset_secs.unwrap_or(0).to_le_bytes());
     buf.push(u8::from(o.handshake_rtt_ms.is_some()));
@@ -1390,7 +1511,10 @@ fn encode_observation(buf: &mut Vec<u8>, o: &Observation, version: u32) {
 }
 
 fn encode_shape(buf: &mut Vec<u8>, s: &UnknownShape) {
-    let commands = &s.commands[..s.commands.len().min(crate::net::behavior::HANDSHAKE_CAPTURE_MAX)];
+    let commands = &s.commands[..s
+        .commands
+        .len()
+        .min(crate::net::behavior::HANDSHAKE_CAPTURE_MAX)];
     buf.push(commands.len() as u8);
     for c in commands {
         let b = c.as_bytes();
@@ -1422,8 +1546,17 @@ fn decode_shape(r: &mut Reader) -> Result<UnknownShape, String> {
         if len > SHAPE_COMMAND_LEN {
             return Err(format!("shape command of {len} bytes"));
         }
-        let text: String =
-            r.take(len)?.iter().map(|b| if b.is_ascii_graphic() { char::from(*b) } else { '?' }).collect();
+        let text: String = r
+            .take(len)?
+            .iter()
+            .map(|b| {
+                if b.is_ascii_graphic() {
+                    char::from(*b)
+                } else {
+                    '?'
+                }
+            })
+            .collect();
         commands.push(text);
     }
     let relay = get_flag(r)?;
@@ -1431,14 +1564,23 @@ fn decode_shape(r: &mut Reader) -> Result<UnknownShape, String> {
     let garbage_len = r.u16()?;
     let decoys = r.u32()?;
     let version_len = r.u32()?;
-    let v2 = has_v2.then_some(V2Greeting { garbage_len, decoys, version_len });
+    let v2 = has_v2.then_some(V2Greeting {
+        garbage_len,
+        decoys,
+        version_len,
+    });
     let getaddr = match r.u8()? {
         0 => None,
         1 => Some(AddrKind::Addr),
         2 => Some(AddrKind::AddrV2),
         k => return Err(format!("bad getaddr kind {k}")),
     };
-    Ok(UnknownShape { commands, relay, v2, getaddr })
+    Ok(UnknownShape {
+        commands,
+        relay,
+        v2,
+        getaddr,
+    })
 }
 
 /// An observation as file `version` wrote it: from version 4 on, with its
@@ -1465,7 +1607,11 @@ fn decode_observation(r: &mut Reader, version: u32) -> Result<Observation, Strin
     let our_height = r.u32()?;
     let chain_check = match r.u8()? {
         0 => None,
-        c => Some(*ChainCheck::ALL.get(usize::from(c) - 1).ok_or_else(|| format!("bad chain check {c}"))?),
+        c => Some(
+            *ChainCheck::ALL
+                .get(usize::from(c) - 1)
+                .ok_or_else(|| format!("bad chain check {c}"))?,
+        ),
     };
     let has_offset = get_flag(r)?;
     let offset = i64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
@@ -1480,8 +1626,16 @@ fn decode_observation(r: &mut Reader, version: u32) -> Result<Observation, Strin
         2 => Some(GetaddrResult::Answered { entries, delay_ms }),
         t => return Err(format!("bad getaddr result {t}")),
     };
-    let shape = if get_flag(r)? { Some(decode_shape(r)?) } else { None };
-    let verdict = if version >= 4 { survey::decode_verdict(r)? } else { Verdict::Classified };
+    let shape = if get_flag(r)? {
+        Some(decode_shape(r)?)
+    } else {
+        None
+    };
+    let verdict = if version >= 4 {
+        survey::decode_verdict(r)?
+    } else {
+        Verdict::Classified
+    };
     Ok(Observation {
         at,
         fingerprint,

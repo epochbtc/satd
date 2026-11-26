@@ -119,10 +119,7 @@ pub fn summarize_v2(raw: &satd_psbt::RawPsbt) -> Result<SignSummary, String> {
     use satd_psbt::keys;
 
     let view = satd_psbt::V2View::new(raw).map_err(|e| e.to_string())?;
-    let prevouts: Vec<Option<TxOut>> = view
-        .inputs()
-        .map(|i| i.prevout().ok().flatten())
-        .collect();
+    let prevouts: Vec<Option<TxOut>> = view.inputs().map(|i| i.prevout().ok().flatten()).collect();
     let all_prevouts_known = prevouts.iter().all(|p| p.is_some());
 
     let per_input = view

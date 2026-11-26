@@ -10,8 +10,8 @@
 
 use super::*;
 use crate::net::txrequest::{
-    GETDATA_TX_INTERVAL, MAX_PEER_TX_ANNOUNCEMENTS, MAX_PEER_TX_REQUEST_IN_FLIGHT, NONPREF_PEER_TX_DELAY,
-    OVERLOADED_PEER_TX_DELAY, TXID_RELAY_DELAY,
+    GETDATA_TX_INTERVAL, MAX_PEER_TX_ANNOUNCEMENTS, MAX_PEER_TX_REQUEST_IN_FLIGHT,
+    NONPREF_PEER_TX_DELAY, OVERLOADED_PEER_TX_DELAY, TXID_RELAY_DELAY,
 };
 
 const SECOND: u64 = 1_000_000;
@@ -24,7 +24,9 @@ pub(super) struct MockClock {
 
 impl MockClock {
     pub(super) fn install() -> Self {
-        let lock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = crate::time::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let now = crate::time::now_secs();
         crate::time::set_mock_time(Some(now));
         Self { now, _lock: lock }
@@ -74,9 +76,16 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     std::mem::forget(shutdown_tx);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     let tip = pm.chain_state.tip_hash();
-    let block = crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+    let block =
+        crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
     pm.chain_state.accept_block(&block).expect("block connects");
     assert!(!pm.is_ibd());
     (pm, dir)
@@ -84,7 +93,11 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
 
 /// A connected peer that relays by wtxid and serves blocks. Outbound is a
 /// preferred announcer (Core's `fPreferredDownload`); inbound is not.
-pub(super) fn add_peer(pm: &PeerManager, id: PeerId, direction: Direction) -> mpsc::Receiver<NetworkMessage> {
+pub(super) fn add_peer(
+    pm: &PeerManager,
+    id: PeerId,
+    direction: Direction,
+) -> mpsc::Receiver<NetworkMessage> {
     add_peer_with(pm, id, direction, |_| {})
 }
 
@@ -136,7 +149,12 @@ fn tx_getdata(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<Inventory> {
     while let Ok(msg) = rx.try_recv() {
         if let NetworkMessage::GetData(inv) = msg {
             out.extend(inv.into_iter().filter(|i| {
-                matches!(i, Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_))
+                matches!(
+                    i,
+                    Inventory::Transaction(_)
+                        | Inventory::WitnessTransaction(_)
+                        | Inventory::WTx(_)
+                )
             }));
         }
     }
@@ -156,7 +174,10 @@ fn orphan_tx(seed: u8) -> bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([seed; 32]), vout: 0 },
+            previous_output: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([seed; 32]),
+                vout: 0,
+            },
             script_sig: bitcoin::ScriptBuf::new(),
             sequence: bitcoin::Sequence::MAX,
             witness: bitcoin::Witness::from_slice(&[vec![0xaa]]),
@@ -169,7 +190,11 @@ fn orphan_tx(seed: u8) -> bitcoin::Transaction {
 }
 
 fn notfound(pm: &PeerManager, id: PeerId, inv: Vec<Inventory>) {
-    pm.handle_message(id, NetworkMessage::NotFound(inv), crate::net::flow::InFlight::new(None));
+    pm.handle_message(
+        id,
+        NetworkMessage::NotFound(inv),
+        crate::net::flow::InFlight::new(None),
+    );
 }
 
 /// Two preferred peers announce the same transaction: one `getdata` goes
@@ -185,17 +210,34 @@ fn a_second_announcer_is_asked_only_after_the_first_request_expires() {
 
     pm.handle_inv(1, vec![Inventory::WTx(w)]);
     pm.handle_inv(2, vec![Inventory::WTx(w)]);
-    assert_eq!(tx_getdata(&mut rx1), vec![Inventory::WTx(w)], "the first announcer is asked");
-    assert!(tx_getdata(&mut rx2).is_empty(), "and only the first: the request is in flight");
+    assert_eq!(
+        tx_getdata(&mut rx1),
+        vec![Inventory::WTx(w)],
+        "the first announcer is asked"
+    );
+    assert!(
+        tx_getdata(&mut rx2).is_empty(),
+        "and only the first: the request is in flight"
+    );
 
     clock.advance(GETDATA_TX_INTERVAL - SECOND);
     pm.send_all_tx_requests();
-    assert!(tx_getdata(&mut rx2).is_empty(), "not before the request expires");
+    assert!(
+        tx_getdata(&mut rx2).is_empty(),
+        "not before the request expires"
+    );
 
     clock.advance(SECOND);
     pm.send_all_tx_requests();
-    assert_eq!(tx_getdata(&mut rx2), vec![Inventory::WTx(w)], "the second announcer, on expiry");
-    assert!(tx_getdata(&mut rx1).is_empty(), "the first is never asked again");
+    assert_eq!(
+        tx_getdata(&mut rx2),
+        vec![Inventory::WTx(w)],
+        "the second announcer, on expiry"
+    );
+    assert!(
+        tx_getdata(&mut rx1).is_empty(),
+        "the first is never asked again"
+    );
 }
 
 /// A `notfound` from the asked peer hands the transaction to the next
@@ -216,7 +258,10 @@ fn notfound_asks_the_next_announcer_at_once() {
     // announcement, as Core's `ReceivedResponse` does for a candidate.)
     notfound(&pm, 2, vec![Inventory::WTx(wtxid(0x99))]);
     notfound(&pm, 3, vec![Inventory::WTx(w)]);
-    assert!(tx_getdata(&mut rx2).is_empty(), "a spurious notfound is ignored");
+    assert!(
+        tx_getdata(&mut rx2).is_empty(),
+        "a spurious notfound is ignored"
+    );
     notfound(&pm, 1, vec![Inventory::WTx(w)]);
     assert_eq!(tx_getdata(&mut rx2), vec![Inventory::WTx(w)]);
 }
@@ -254,11 +299,18 @@ fn an_inbound_announcer_waits_and_an_outbound_one_inside_the_window_wins() {
     clock.advance(SECOND);
     let mut outbound = add_peer(&pm, 2, Direction::Outbound);
     pm.handle_inv(2, vec![Inventory::WTx(w)]);
-    assert_eq!(tx_getdata(&mut outbound), vec![Inventory::WTx(w)], "outbound: at once");
+    assert_eq!(
+        tx_getdata(&mut outbound),
+        vec![Inventory::WTx(w)],
+        "outbound: at once"
+    );
 
     clock.advance(NONPREF_PEER_TX_DELAY);
     pm.send_all_tx_requests();
-    assert!(tx_getdata(&mut inbound).is_empty(), "the outbound peer's request is in flight");
+    assert!(
+        tx_getdata(&mut inbound).is_empty(),
+        "the outbound peer's request is in flight"
+    );
 
     // Alone, an inbound announcer is asked exactly at its delay.
     let w2 = wtxid(5);
@@ -290,7 +342,11 @@ fn a_txid_announcement_waits_while_a_wtxid_peer_is_connected() {
     let mut rx = add_peer_with(&pm, 1, Direction::Outbound, |i| i.wtxid_relay = false);
     let t1 = bitcoin::Txid::from_byte_array([0x11; 32]);
     pm.handle_inv(1, vec![Inventory::Transaction(t1)]);
-    assert_eq!(tx_getdata(&mut rx), vec![Inventory::WitnessTransaction(t1)], "no wtxid peer: no delay");
+    assert_eq!(
+        tx_getdata(&mut rx),
+        vec![Inventory::WitnessTransaction(t1)],
+        "no wtxid peer: no delay"
+    );
 
     let _rx2 = add_peer(&pm, 2, Direction::Outbound);
     let t2 = bitcoin::Txid::from_byte_array([0x12; 32]);
@@ -309,18 +365,25 @@ fn announcements_beyond_the_per_peer_cap_are_ignored_without_relay_permission() 
     let (pm, _dir) = mk_pm();
     let mut plain = add_peer(&pm, 1, Direction::Inbound);
     let mut relay = add_peer_with(&pm, 2, Direction::Inbound, |i| i.permissions.relay = true);
-    let inv: Vec<Inventory> = (0..=MAX_PEER_TX_ANNOUNCEMENTS as u32).map(|n| Inventory::WTx(wtxid(n))).collect();
+    let inv: Vec<Inventory> = (0..=MAX_PEER_TX_ANNOUNCEMENTS as u32)
+        .map(|n| Inventory::WTx(wtxid(n)))
+        .collect();
     pm.handle_inv(1, inv.clone());
     // The relay peer's are other transactions, so peer 1's requests do not
     // stand in their way.
-    let inv2: Vec<Inventory> =
-        (0..=MAX_PEER_TX_ANNOUNCEMENTS as u32).map(|n| Inventory::WTx(wtxid(n + 1_000_000))).collect();
+    let inv2: Vec<Inventory> = (0..=MAX_PEER_TX_ANNOUNCEMENTS as u32)
+        .map(|n| Inventory::WTx(wtxid(n + 1_000_000)))
+        .collect();
     pm.handle_inv(2, inv2);
     clock.advance(NONPREF_PEER_TX_DELAY);
     pm.send_all_tx_requests();
     let got = tx_getdata(&mut plain);
     assert_eq!(got.len(), MAX_PEER_TX_ANNOUNCEMENTS);
-    assert_eq!(got[..], inv[..MAX_PEER_TX_ANNOUNCEMENTS], "the first 5000, in announcement order");
+    assert_eq!(
+        got[..],
+        inv[..MAX_PEER_TX_ANNOUNCEMENTS],
+        "the first 5000, in announcement order"
+    );
     assert_eq!(tx_getdata(&mut relay).len(), MAX_PEER_TX_ANNOUNCEMENTS + 1);
 }
 
@@ -331,7 +394,9 @@ fn an_overloaded_peer_s_announcements_are_delayed() {
     let mut clock = MockClock::install();
     let (pm, _dir) = mk_pm();
     let mut rx = add_peer(&pm, 1, Direction::Outbound);
-    let inv: Vec<Inventory> = (0..MAX_PEER_TX_REQUEST_IN_FLIGHT as u32).map(|n| Inventory::WTx(wtxid(n))).collect();
+    let inv: Vec<Inventory> = (0..MAX_PEER_TX_REQUEST_IN_FLIGHT as u32)
+        .map(|n| Inventory::WTx(wtxid(n)))
+        .collect();
     pm.handle_inv(1, inv);
     assert_eq!(tx_getdata(&mut rx).len(), MAX_PEER_TX_REQUEST_IN_FLIGHT);
 
@@ -373,7 +438,10 @@ fn receiving_the_transaction_forgets_the_other_announcers() {
     let bad_txid = bad.compute_txid();
     pm.handle_inv(1, vec![Inventory::WTx(bad.compute_wtxid())]);
     pm.handle_inv(2, vec![Inventory::WTx(bad.compute_wtxid())]);
-    assert_eq!(tx_getdata(&mut rx1), vec![Inventory::WTx(bad.compute_wtxid())]);
+    assert_eq!(
+        tx_getdata(&mut rx1),
+        vec![Inventory::WTx(bad.compute_wtxid())]
+    );
     pm.handle_tx(1, bad);
 
     let bad_wtxid = bitcoin::Wtxid::from_byte_array(bad_txid.to_byte_array());
@@ -385,7 +453,10 @@ fn receiving_the_transaction_forgets_the_other_announcers() {
         clock.advance(step);
         pm.send_all_tx_requests();
         for got in tx_getdata(&mut rx1).into_iter().chain(tx_getdata(&mut rx2)) {
-            assert_eq!(got, parent, "nobody is asked again for a transaction we received");
+            assert_eq!(
+                got, parent,
+                "nobody is asked again for a transaction we received"
+            );
         }
     }
     for hash in [w.to_byte_array(), bad_wtxid.to_byte_array()] {
@@ -409,16 +480,31 @@ fn an_orphan_s_parent_is_requested_once_through_the_scheduler() {
     pm.handle_inv(2, vec![Inventory::WTx(orphan.compute_wtxid())]);
     assert_eq!(tx_getdata(&mut rx1).len(), 1);
     pm.handle_tx(1, orphan);
-    assert!(tx_getdata(&mut rx1).is_empty(), "the parent waits TXID_RELAY_DELAY");
+    assert!(
+        tx_getdata(&mut rx1).is_empty(),
+        "the parent waits TXID_RELAY_DELAY"
+    );
 
     clock.advance(TXID_RELAY_DELAY);
     pm.send_all_tx_requests();
     let asked1 = tx_getdata(&mut rx1);
     let asked2 = tx_getdata(&mut rx2);
-    assert_eq!(asked1.len() + asked2.len(), 1, "one request for the parent: {asked1:?} {asked2:?}");
+    assert_eq!(
+        asked1.len() + asked2.len(),
+        1,
+        "one request for the parent: {asked1:?} {asked2:?}"
+    );
     // The other announcer is the fallback.
-    notfound(&pm, if asked1.is_empty() { 2 } else { 1 }, vec![Inventory::WitnessTransaction(parent)]);
-    let fallback = if asked1.is_empty() { tx_getdata(&mut rx1) } else { tx_getdata(&mut rx2) };
+    notfound(
+        &pm,
+        if asked1.is_empty() { 2 } else { 1 },
+        vec![Inventory::WitnessTransaction(parent)],
+    );
+    let fallback = if asked1.is_empty() {
+        tx_getdata(&mut rx1)
+    } else {
+        tx_getdata(&mut rx2)
+    };
     assert_eq!(fallback, vec![Inventory::WitnessTransaction(parent)]);
 }
 
@@ -429,7 +515,8 @@ fn a_confirmed_transaction_is_not_requested() {
     let (pm, _dir) = mk_pm();
     let mut rx1 = add_peer(&pm, 1, Direction::Inbound);
     let tip = pm.chain_state.tip_hash();
-    let block = crate::chain::state::tests::build_test_block(tip, 2, crate::time::now_secs() as u32 + 1);
+    let block =
+        crate::chain::state::tests::build_test_block(tip, 2, crate::time::now_secs() as u32 + 1);
     let coinbase = &block.txdata[0];
     pm.handle_inv(1, vec![Inventory::WTx(coinbase.compute_wtxid())]);
     pm.forget_tx_requests_for_block(&block);
@@ -449,12 +536,23 @@ fn a_getdata_that_could_not_be_queued_is_retried_on_the_next_pass() {
     pm.send_to_peer(1, NetworkMessage::Verack);
     let w = wtxid(7);
     pm.handle_inv(1, vec![Inventory::WTx(w)]);
-    assert!(matches!(rx.try_recv(), Ok(NetworkMessage::Verack)), "only the filler was queued");
+    assert!(
+        matches!(rx.try_recv(), Ok(NetworkMessage::Verack)),
+        "only the filler was queued"
+    );
     assert!(rx.try_recv().is_err());
-    assert_eq!(pm.tx_requests.lock().count_in_flight(1), 0, "nothing sent, nothing in flight");
+    assert_eq!(
+        pm.tx_requests.lock().count_in_flight(1),
+        0,
+        "nothing sent, nothing in flight"
+    );
 
     pm.send_all_tx_requests();
-    assert_eq!(tx_getdata(&mut rx), vec![Inventory::WTx(w)], "asked again at once");
+    assert_eq!(
+        tx_getdata(&mut rx),
+        vec![Inventory::WTx(w)],
+        "asked again at once"
+    );
     assert_eq!(pm.tx_requests.lock().count_in_flight(1), 1);
 }
 
@@ -507,7 +605,10 @@ fn a_witness_stripped_reply_leaves_the_other_announcers_of_the_txid() {
         spk.extend_from_slice(&[0x11; 20]);
         bitcoin::ScriptBuf::from_bytes(spk)
     };
-    let prev = bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([0x61; 32]), vout: 0 };
+    let prev = bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_byte_array([0x61; 32]),
+        vout: 0,
+    };
     let coin = crate::storage::coinview::Coin {
         amount: 100_000,
         script_pubkey: p2wpkh.clone(),
@@ -515,13 +616,22 @@ fn a_witness_stripped_reply_leaves_the_other_announcers_of_the_txid() {
         coinbase: false,
         txseq: node_index::TXSEQ_UNKNOWN,
     };
-    let (cs, mp, dir) =
-        crate::mining::template::tests::make_funded_template_env_with(&[(prev, coin)], Box::new(StrippedFails));
+    let (cs, mp, dir) = crate::mining::template::tests::make_funded_template_env_with(
+        &[(prev, coin)],
+        Box::new(StrippedFails),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     std::mem::forget(shutdown_tx);
-    let pm = PeerManager::new(Arc::new(cs), Arc::new(mp), Arc::new(FeeEstimator::new()), Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        Arc::new(cs),
+        Arc::new(mp),
+        Arc::new(FeeEstimator::new()),
+        Network::Regtest,
+        shutdown_rx,
+    );
     let tip = pm.chain_state.tip_hash();
-    let block = crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+    let block =
+        crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
     pm.chain_state.accept_block(&block).expect("block connects");
 
     let witnessed = bitcoin::Transaction {
@@ -533,22 +643,34 @@ fn a_witness_stripped_reply_leaves_the_other_announcers_of_the_txid() {
             sequence: bitcoin::Sequence::MAX,
             witness: bitcoin::Witness::from_slice(&[vec![0x30; 72], vec![0x02; 33]]),
         }],
-        output: vec![bitcoin::TxOut { value: bitcoin::Amount::from_sat(90_000), script_pubkey: p2wpkh }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(90_000),
+            script_pubkey: p2wpkh,
+        }],
     };
     let mut stripped = witnessed.clone();
     stripped.input[0].witness = bitcoin::Witness::new();
     let txid = witnessed.compute_txid();
-    assert_eq!(stripped.compute_wtxid().to_byte_array(), txid.to_byte_array());
+    assert_eq!(
+        stripped.compute_wtxid().to_byte_array(),
+        txid.to_byte_array()
+    );
 
     let mut rx1 = add_peer_with(&pm, 1, Direction::Outbound, |i| i.wtxid_relay = false);
     let mut rx2 = add_peer_with(&pm, 2, Direction::Outbound, |i| i.wtxid_relay = false);
     pm.handle_inv(1, vec![Inventory::Transaction(txid)]);
     pm.handle_inv(2, vec![Inventory::Transaction(txid)]);
-    assert_eq!(tx_getdata(&mut rx1), vec![Inventory::WitnessTransaction(txid)]);
+    assert_eq!(
+        tx_getdata(&mut rx1),
+        vec![Inventory::WitnessTransaction(txid)]
+    );
     assert!(tx_getdata(&mut rx2).is_empty());
 
     pm.handle_tx(1, stripped);
-    assert!(pm.mempool.get(&txid).is_none(), "the stripped copy fails its scripts");
+    assert!(
+        pm.mempool.get(&txid).is_none(),
+        "the stripped copy fails its scripts"
+    );
     pm.send_all_tx_requests();
     assert_eq!(
         tx_getdata(&mut rx2),
@@ -556,6 +678,9 @@ fn a_witness_stripped_reply_leaves_the_other_announcers_of_the_txid() {
         "the other announcer is asked for the witnessed copy"
     );
     pm.handle_tx(2, witnessed);
-    assert!(pm.mempool.get(&txid).is_some(), "the witnessed copy is accepted");
+    assert!(
+        pm.mempool.get(&txid).is_some(),
+        "the witnessed copy is accepted"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -156,7 +156,8 @@ impl LiveKeys {
                         store.get_tx_seq(&input.previous_output.txid)
                     };
                     if let Some(funding_txseq) = funding_txseq {
-                        keys.spent.insert((funding_txseq, input.previous_output.vout));
+                        keys.spent
+                            .insert((funding_txseq, input.previous_output.vout));
                     }
                 }
             }
@@ -208,10 +209,7 @@ impl BackfillRunner {
         // `resumeindex`/`cancelindex` — the check_pause_loop below
         // will wait at the entry point until the operator hits resume.
         let cur = self.handle.cursor();
-        if !matches!(
-            cur.state,
-            BackfillState::Running | BackfillState::Paused
-        ) {
+        if !matches!(cur.state, BackfillState::Running | BackfillState::Paused) {
             return Err(BackfillError::Chain(format!(
                 "runner spawned with unexpected state {} (expected Running or Paused)",
                 cur.state.label()
@@ -289,12 +287,16 @@ impl BackfillRunner {
             if h == 0 {
                 break;
             }
-            let entry = self.chain.store_ref().get_block_index(&current).ok_or_else(|| {
-                BackfillError::Chain(format!(
-                    "snapshot walk: missing block index entry for {} at height {}",
-                    current, h
-                ))
-            })?;
+            let entry = self
+                .chain
+                .store_ref()
+                .get_block_index(&current)
+                .ok_or_else(|| {
+                    BackfillError::Chain(format!(
+                        "snapshot walk: missing block index entry for {} at height {}",
+                        current, h
+                    ))
+                })?;
             current = entry.header.prev_blockhash;
             h -= 1;
         }
@@ -336,14 +338,12 @@ impl BackfillRunner {
                 .chain
                 .store_ref()
                 .get_block_index(&current)
-                .ok_or_else(|| {
-                    BackfillError::ReorgInvalidated {
-                        height: snapshot_height,
-                        detail: format!(
-                            "missing block-index entry walking back from tip {}",
-                            current
-                        ),
-                    }
+                .ok_or_else(|| BackfillError::ReorgInvalidated {
+                    height: snapshot_height,
+                    detail: format!(
+                        "missing block-index entry walking back from tip {}",
+                        current
+                    ),
                 })?;
             current = entry.header.prev_blockhash;
             h -= 1;
@@ -477,9 +477,8 @@ impl BackfillRunner {
 
         // The keys the active chain owns from the first divergent height up:
         // exactly the rows the live connect path wrote for those blocks.
-        let first_divergent = (1..=funding_high).find(|h| {
-            live_hashes.get(*h as usize) != Some(&old_snapshot.hashes[*h as usize])
-        });
+        let first_divergent = (1..=funding_high)
+            .find(|h| live_hashes.get(*h as usize) != Some(&old_snapshot.hashes[*h as usize]));
         let live = match first_divergent {
             None => LiveKeys::default(),
             Some(d) => match LiveKeys::collect(chain, &live_hashes, d) {
@@ -588,11 +587,11 @@ impl BackfillRunner {
                         // remove. An unconditional remove against an
                         // ordinal this code cannot know would name some
                         // other transaction's output.
-                        let (sh, funding_txseq) = match chain.store_ref().lookup_backfill_temp(&prev)
-                        {
-                            Ok(Some(v)) => v,
-                            Ok(None) | Err(_) => continue,
-                        };
+                        let (sh, funding_txseq) =
+                            match chain.store_ref().lookup_backfill_temp(&prev) {
+                                Ok(Some(v)) => v,
+                                Ok(None) | Err(_) => continue,
+                            };
                         if !live.spent.contains(&(funding_txseq, prev.vout)) {
                             batch.spent_removes.push((funding_txseq, prev.vout));
                         }
@@ -733,7 +732,10 @@ impl BackfillRunner {
                         amount_sat: output.value.to_sat(),
                     });
                     batch.addr_backfill_temp_puts.push((
-                        OutPoint { txid, vout: vout as u32 },
+                        OutPoint {
+                            txid,
+                            vout: vout as u32,
+                        },
                         sh,
                         txseq,
                     ));
@@ -931,7 +933,6 @@ impl BackfillRunner {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-
 }
 
 /// Disk-space pre-flight gate. Refuses if free bytes on the chain

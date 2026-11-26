@@ -73,17 +73,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bitcoin::consensus::encode::{self, serialize, Decodable, Encodable};
-use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::Network;
+use bitcoin::consensus::encode::{self, Decodable, Encodable, serialize};
+use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_compact_blocks::SendCmpct;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
-use bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 
-use node::net::addrv2::{AddrV2DecodeError, ADDRV2_COMMAND};
+use node::net::addrv2::{ADDRV2_COMMAND, AddrV2DecodeError};
 use node::net::v2transport::V2CodecError;
 
 /// The commands satd reads that this differential covers (#1135).
@@ -107,21 +107,76 @@ pub const COMMANDS: [&str; 13] = [
 /// names one is skipped: neither side would call it unknown, and their
 /// handlers are not what this differential compares.
 const OTHER_KNOWN: [&str; 26] = [
-    "verack", "getaddr", "mempool", "ping", "pong", "notfound", "filterload", "filteradd",
-    "filterclear", "getblocks", "getheaders", "sendheaders", "merkleblock", "getcfilters",
-    "cfilter", "getcfheaders", "cfheaders", "getcfcheckpt", "cfcheckpt", "wtxidrelay",
-    "sendtxrcncl", "sendaddrv2", "feature", "alert", "reject", "checkorder",
+    "verack",
+    "getaddr",
+    "mempool",
+    "ping",
+    "pong",
+    "notfound",
+    "filterload",
+    "filteradd",
+    "filterclear",
+    "getblocks",
+    "getheaders",
+    "sendheaders",
+    "merkleblock",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "wtxidrelay",
+    "sendtxrcncl",
+    "sendaddrv2",
+    "feature",
+    "alert",
+    "reject",
+    "checkorder",
 ];
 
 /// Core's `V2_MESSAGE_IDS` (`src/net.cpp:925`, v32.1): the type each BIP 324
 /// short id stands for. An empty name is an unimplemented id, which Core
 /// reads as the empty message type and its handler drops as unknown.
 const CORE_V2_MESSAGE_IDS: [&str; 38] = [
-    "", "addr", "block", "blocktxn", "cmpctblock", "feefilter", "filteradd", "filterclear",
-    "filterload", "getblocks", "getblocktxn", "getdata", "getheaders", "headers", "inv",
-    "mempool", "merkleblock", "notfound", "ping", "pong", "sendcmpct", "tx", "getcfilters",
-    "cfilter", "getcfheaders", "cfheaders", "getcfcheckpt", "cfcheckpt", "addrv2", "", "", "",
-    "", "", "", "", "", "feature",
+    "",
+    "addr",
+    "block",
+    "blocktxn",
+    "cmpctblock",
+    "feefilter",
+    "filteradd",
+    "filterclear",
+    "filterload",
+    "getblocks",
+    "getblocktxn",
+    "getdata",
+    "getheaders",
+    "headers",
+    "inv",
+    "mempool",
+    "merkleblock",
+    "notfound",
+    "ping",
+    "pong",
+    "sendcmpct",
+    "tx",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "addrv2",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "feature",
 ];
 
 /// Largest payload a case carries. Far below Core's 4 MB message limit,
@@ -138,7 +193,10 @@ const PROBE_USER_AGENT: &str = "/p2pdiff-probe:0.1/";
 pub enum MsgType {
     /// A v1 frame with this 12-byte command field, and a correct checksum
     /// unless `bad_checksum`.
-    V1 { command: [u8; 12], bad_checksum: bool },
+    V1 {
+        command: [u8; 12],
+        bad_checksum: bool,
+    },
     /// v2 contents starting with this BIP 324 short id (never 0).
     V2Short(u8),
     /// v2 contents in the long form: a zero byte, then these 12 bytes.
@@ -170,7 +228,10 @@ fn command_bytes(name: &str) -> [u8; 12] {
 }
 
 fn short_id(name: &str) -> Option<u8> {
-    CORE_V2_MESSAGE_IDS.iter().position(|n| !n.is_empty() && *n == name).map(|i| i as u8)
+    CORE_V2_MESSAGE_IDS
+        .iter()
+        .position(|n| !n.is_empty() && *n == name)
+        .map(|i| i as u8)
 }
 
 /// Core's reading of a 12-byte message type field: printable ASCII up to the
@@ -199,15 +260,27 @@ fn classify_name(name: &str) -> TypeName {
 
 impl Case {
     pub fn v1(name: &str, payload: Vec<u8>) -> Self {
-        Case { msg_type: MsgType::V1 { command: command_bytes(name), bad_checksum: false }, payload }
+        Case {
+            msg_type: MsgType::V1 {
+                command: command_bytes(name),
+                bad_checksum: false,
+            },
+            payload,
+        }
     }
 
     pub fn v2_short(name: &str, payload: Vec<u8>) -> Self {
-        Case { msg_type: MsgType::V2Short(short_id(name).expect("has a short id")), payload }
+        Case {
+            msg_type: MsgType::V2Short(short_id(name).expect("has a short id")),
+            payload,
+        }
     }
 
     pub fn v2_long(name: &str, payload: Vec<u8>) -> Self {
-        Case { msg_type: MsgType::V2Long(command_bytes(name)), payload }
+        Case {
+            msg_type: MsgType::V2Long(command_bytes(name)),
+            payload,
+        }
     }
 
     /// Read a case from fuzzer bytes: a transport byte (v1, v2 short id, v2
@@ -225,7 +298,10 @@ impl Case {
         let (msg_type, payload) = if sel < COMMANDS.len() {
             let name = COMMANDS[sel];
             let mt = match (transport, short_id(name)) {
-                (0, _) => MsgType::V1 { command: command_bytes(name), bad_checksum },
+                (0, _) => MsgType::V1 {
+                    command: command_bytes(name),
+                    bad_checksum,
+                },
                 (1, Some(id)) => MsgType::V2Short(id),
                 _ => MsgType::V2Long(command_bytes(name)),
             };
@@ -243,7 +319,13 @@ impl Case {
             let (field, rest) = rest.split_at(12);
             let field: [u8; 12] = field.try_into().expect("12 bytes");
             if transport == 0 {
-                (MsgType::V1 { command: field, bad_checksum }, rest)
+                (
+                    MsgType::V1 {
+                        command: field,
+                        bad_checksum,
+                    },
+                    rest,
+                )
             } else {
                 (MsgType::V2Long(field), rest)
             }
@@ -251,7 +333,10 @@ impl Case {
         if payload.len() > MAX_CASE_PAYLOAD {
             return None;
         }
-        Some(Case { msg_type, payload: payload.to_vec() })
+        Some(Case {
+            msg_type,
+            payload: payload.to_vec(),
+        })
     }
 
     /// The fuzzer bytes [`Case::from_bytes`] reads back as this case.
@@ -259,7 +344,10 @@ impl Case {
         let raw = COMMANDS.len() as u8;
         let mut out = Vec::new();
         match &self.msg_type {
-            MsgType::V1 { command, bad_checksum } => {
+            MsgType::V1 {
+                command,
+                bad_checksum,
+            } => {
                 let flags = u8::from(*bad_checksum);
                 match COMMANDS.iter().position(|n| command_bytes(n) == *command) {
                     Some(i) => out.extend([0, i as u8, flags]),
@@ -279,7 +367,10 @@ impl Case {
             MsgType::V2Long(field) => {
                 // A named type with a short id would read back as the short
                 // form, so the long form of a named type is written raw.
-                match COMMANDS.iter().position(|n| command_bytes(n) == *field && short_id(n).is_none()) {
+                match COMMANDS
+                    .iter()
+                    .position(|n| command_bytes(n) == *field && short_id(n).is_none())
+                {
                     Some(i) => out.extend([2, i as u8, 0]),
                     None => {
                         out.extend([2, raw, 0]);
@@ -295,10 +386,12 @@ impl Case {
     /// The message type as Core reads it.
     pub fn type_name(&self) -> TypeName {
         match &self.msg_type {
-            MsgType::V1 { command, .. } | MsgType::V2Long(command) => match core_message_type(command) {
-                Some(name) => classify_name(&name),
-                None => TypeName::Unknown,
-            },
+            MsgType::V1 { command, .. } | MsgType::V2Long(command) => {
+                match core_message_type(command) {
+                    Some(name) => classify_name(&name),
+                    None => TypeName::Unknown,
+                }
+            }
             MsgType::V2Short(id) => match CORE_V2_MESSAGE_IDS.get(*id as usize) {
                 Some(name) if !name.is_empty() => classify_name(name),
                 _ => TypeName::Unknown,
@@ -312,12 +405,20 @@ impl Case {
 
     /// The v1 frame, magic through payload.
     fn v1_frame(&self) -> Vec<u8> {
-        let MsgType::V1 { command, bad_checksum } = &self.msg_type else { panic!("not a v1 case") };
+        let MsgType::V1 {
+            command,
+            bad_checksum,
+        } = &self.msg_type
+        else {
+            panic!("not a v1 case")
+        };
         let mut frame = Vec::with_capacity(24 + self.payload.len());
         frame.extend(Magic::from(Network::Regtest).to_bytes());
         frame.extend(command);
         frame.extend((self.payload.len() as u32).to_le_bytes());
-        let mut checksum: [u8; 4] = sha256d::Hash::hash(&self.payload)[..4].try_into().expect("4 bytes");
+        let mut checksum: [u8; 4] = sha256d::Hash::hash(&self.payload)[..4]
+            .try_into()
+            .expect("4 bytes");
         if *bad_checksum {
             checksum[0] ^= 0xff;
         }
@@ -345,7 +446,10 @@ impl Case {
 impl fmt::Display for Case {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.msg_type {
-            MsgType::V1 { command, bad_checksum } => {
+            MsgType::V1 {
+                command,
+                bad_checksum,
+            } => {
                 write!(f, "v1 command={}", hex::encode(command))?;
                 if *bad_checksum {
                     write!(f, " (bad checksum)")?;
@@ -354,7 +458,13 @@ impl fmt::Display for Case {
             MsgType::V2Short(id) => write!(f, "v2 short id {id}")?,
             MsgType::V2Long(field) => write!(f, "v2 long type={}", hex::encode(field))?,
         }
-        write!(f, " [{:?}] payload ({} bytes)={}", self.type_name(), self.payload.len(), hex::encode(&self.payload))
+        write!(
+            f,
+            " [{:?}] payload ({} bytes)={}",
+            self.type_name(),
+            self.payload.len(),
+            hex::encode(&self.payload)
+        )
     }
 }
 
@@ -384,14 +494,20 @@ pub fn satd_decode(case: &Case) -> SatdVerdict {
             if *command == ADDRV2_COMMAND {
                 return match node::net::addrv2::decode_v1_payload(&frame[..24], &case.payload) {
                     Ok(addrs) => SatdVerdict::Accept(Box::new(NetworkMessage::AddrV2(addrs))),
-                    Err(AddrV2DecodeError::BadChecksum) => SatdVerdict::Ignore("bad checksum".into()),
+                    Err(AddrV2DecodeError::BadChecksum) => {
+                        SatdVerdict::Ignore("bad checksum".into())
+                    }
                     Err(e) => SatdVerdict::Reject(e.to_string()),
                 };
             }
             match node::net::payload::decode_v1_frame(&frame) {
-                Ok(NetworkMessage::Unknown { .. }) => SatdVerdict::Ignore("unknown message type".into()),
+                Ok(NetworkMessage::Unknown { .. }) => {
+                    SatdVerdict::Ignore("unknown message type".into())
+                }
                 Ok(msg) => SatdVerdict::Accept(Box::new(msg)),
-                Err(encode::Error::InvalidChecksum { .. }) => SatdVerdict::Ignore("bad checksum".into()),
+                Err(encode::Error::InvalidChecksum { .. }) => {
+                    SatdVerdict::Ignore("bad checksum".into())
+                }
                 Err(e) => {
                     if CommandString::consensus_decode(&mut &command[..]).is_err() {
                         SatdVerdict::Ignore(format!("message type: {e}"))
@@ -404,13 +520,21 @@ pub fn satd_decode(case: &Case) -> SatdVerdict {
         MsgType::V2Short(_) | MsgType::V2Long(_) => {
             let contents = case.v2_contents();
             match node::net::v2transport::decode_message(&contents) {
-                Ok(NetworkMessage::Unknown { .. }) => SatdVerdict::Ignore("unknown message type".into()),
+                Ok(NetworkMessage::Unknown { .. }) => {
+                    SatdVerdict::Ignore("unknown message type".into())
+                }
                 Ok(msg) => SatdVerdict::Accept(Box::new(msg)),
-                Err(V2CodecError::Truncated) => SatdVerdict::Ignore("truncated message type".into()),
+                Err(V2CodecError::Truncated) => {
+                    SatdVerdict::Ignore("truncated message type".into())
+                }
                 Err(e) => {
                     let type_failed = match &case.msg_type {
-                        MsgType::V2Short(id) => e.to_string().contains(&format!("unknown short message id {id}")),
-                        MsgType::V2Long(field) => CommandString::consensus_decode(&mut &field[..]).is_err(),
+                        MsgType::V2Short(id) => e
+                            .to_string()
+                            .contains(&format!("unknown short message id {id}")),
+                        MsgType::V2Long(field) => {
+                            CommandString::consensus_decode(&mut &field[..]).is_err()
+                        }
                         MsgType::V1 { .. } => unreachable!(),
                     };
                     if type_failed {
@@ -449,7 +573,11 @@ pub struct Observed {
 
 fn user_agent_as_core_logs(raw: &str) -> String {
     let clean = node::net::limits::sanitize_string(raw);
-    if clean.is_empty() { "<no user agent>".to_string() } else { clean }
+    if clean.is_empty() {
+        "<no user agent>".to_string()
+    } else {
+        clean
+    }
 }
 
 /// The fields of satd's decoded message that Core can report.
@@ -470,7 +598,10 @@ pub fn satd_observed(msg: &NetworkMessage) -> Observed {
         NetworkMessage::Inv(i) | NetworkMessage::GetData(i) => o.count = Some(i.len()),
         NetworkMessage::Headers(h) => o.count = Some(h.len()),
         NetworkMessage::Tx(tx) => {
-            o.tx = Some((tx.compute_txid().to_string(), node::validation::decode::wtxid(tx).to_string()))
+            o.tx = Some((
+                tx.compute_txid().to_string(),
+                node::validation::decode::wtxid(tx).to_string(),
+            ))
         }
         NetworkMessage::Block(b) => o.block = Some(b.block_hash().to_string()),
         _ => {}
@@ -562,13 +693,18 @@ pub fn compare(case: &Case, satd: &SatdVerdict, core: &CoreVerdict) -> Outcome {
             }
             diffs.join("; ")
         }
-        (SatdVerdict::Reject(_), CoreVerdict::Reject(_)) | (SatdVerdict::Ignore(_), CoreVerdict::Ignore(_)) => {
+        (SatdVerdict::Reject(_), CoreVerdict::Reject(_))
+        | (SatdVerdict::Ignore(_), CoreVerdict::Ignore(_)) => {
             return Outcome::Agree;
         }
-        (s, c) => format!("satd {} ({}), Core {c:?}", verdict_word(s), match s {
-            SatdVerdict::Accept(m) => m.cmd().to_string(),
-            SatdVerdict::Reject(e) | SatdVerdict::Ignore(e) => e.clone(),
-        }),
+        (s, c) => format!(
+            "satd {} ({}), Core {c:?}",
+            verdict_word(s),
+            match s {
+                SatdVerdict::Accept(m) => m.cmd().to_string(),
+                SatdVerdict::Reject(e) | SatdVerdict::Ignore(e) => e.clone(),
+            }
+        ),
     };
     if let Some(a) = ALLOWED.iter().find(|a| (a.matches)(case, satd, core)) {
         return Outcome::Allowed(a.why);
@@ -601,7 +737,9 @@ fn free_port() -> io::Result<u16> {
 }
 
 fn scratch_root() -> PathBuf {
-    std::env::var_os("P2P_DIFF_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    std::env::var_os("P2P_DIFF_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// The `bitcoind` to run: `$BITCOIND` if set, else the binary copied out of
@@ -613,21 +751,45 @@ fn bitcoind_binary(work: &Path) -> Result<PathBuf, String> {
         None => {
             let image = core_image();
             let name = format!("satd-p2pdiff-extract-{}", std::process::id());
-            let _ = Command::new("docker").args(["rm", "-f", &name]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             let out = Command::new("docker")
                 .args(["create", "--name", &name, image])
                 .output()
-                .map_err(|e| format!("could not run docker (set BITCOIND to a bitcoind {}): {e}", core_version()))?;
+                .map_err(|e| {
+                    format!(
+                        "could not run docker (set BITCOIND to a bitcoind {}): {e}",
+                        core_version()
+                    )
+                })?;
             if !out.status.success() {
-                return Err(format!("docker create {image} failed: {}", String::from_utf8_lossy(&out.stderr)));
+                return Err(format!(
+                    "docker create {image} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
             }
             let dest = work.join("bitcoind");
             let src = format!("{name}:/opt/bitcoin-{}/bin/bitcoind", core_version());
-            let cp = Command::new("docker").args(["cp", &src]).arg(&dest).output();
-            let _ = Command::new("docker").args(["rm", "-f", &name]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let cp = Command::new("docker")
+                .args(["cp", &src])
+                .arg(&dest)
+                .output();
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             match cp {
                 Ok(o) if o.status.success() => dest,
-                Ok(o) => return Err(format!("docker cp {src} failed: {}", String::from_utf8_lossy(&o.stderr))),
+                Ok(o) => {
+                    return Err(format!(
+                        "docker cp {src} failed: {}",
+                        String::from_utf8_lossy(&o.stderr)
+                    ));
+                }
                 Err(e) => return Err(format!("docker cp failed: {e}")),
             }
         }
@@ -636,7 +798,11 @@ fn bitcoind_binary(work: &Path) -> Result<PathBuf, String> {
         .arg("-version")
         .output()
         .map_err(|e| format!("could not run {}: {e}", path.display()))?;
-    let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string();
+    let first = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
     let want = format!("v{}.", core_version());
     if !first.contains(&want) {
         return Err(format!(
@@ -665,10 +831,15 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Peer {
     fn connect(port: u16, v2: bool) -> Result<Peer, String> {
-        let stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
+        let stream =
+            TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
-        stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|e| e.to_string())?;
-        stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| e.to_string())?;
         let local_port = stream.local_addr().map_err(|e| e.to_string())?.port();
         let clone = || stream.try_clone().map_err(|e| e.to_string());
         let conn = if v2 {
@@ -685,7 +856,11 @@ impl Peer {
         } else {
             Conn::V1(clone()?)
         };
-        Ok(Peer { conn, stream, local_port })
+        Ok(Peer {
+            conn,
+            stream,
+            local_port,
+        })
     }
 
     /// Whether Core has closed the connection: a non-blocking peek that
@@ -704,15 +879,21 @@ impl Peer {
     fn send_raw(&mut self, case: &Case) -> Result<(), String> {
         match &mut self.conn {
             Conn::V1(s) => s.write_all(&case.v1_frame()).map_err(|e| e.to_string()),
-            Conn::V2(p) => p.write(&bip324::io::Payload::genuine(case.v2_contents())).map_err(|e| format!("{e:?}")),
+            Conn::V2(p) => p
+                .write(&bip324::io::Payload::genuine(case.v2_contents()))
+                .map_err(|e| format!("{e:?}")),
         }
     }
 
     fn send(&mut self, msg: NetworkMessage) -> Result<(), String> {
         match &mut self.conn {
-            Conn::V1(s) => s.write_all(&serialize(&RawNetworkMessage::new(MAGIC, msg))).map_err(|e| e.to_string()),
+            Conn::V1(s) => s
+                .write_all(&serialize(&RawNetworkMessage::new(MAGIC, msg)))
+                .map_err(|e| e.to_string()),
             Conn::V2(p) => p
-                .write(&bip324::io::Payload::genuine(node::net::v2transport::encode_message(msg)))
+                .write(&bip324::io::Payload::genuine(
+                    node::net::v2transport::encode_message(msg),
+                ))
                 .map_err(|e| format!("{e:?}")),
         }
     }
@@ -735,15 +916,23 @@ impl Peer {
                     continue;
                 }
                 let c = packet.contents();
-                let Some((&first, rest)) = c.split_first() else { continue };
+                let Some((&first, rest)) = c.split_first() else {
+                    continue;
+                };
                 if first == 0 {
                     if rest.len() < 12 {
                         continue;
                     }
                     let field: [u8; 12] = rest[..12].try_into().expect("12 bytes");
-                    return Ok((core_message_type(&field).unwrap_or_default(), rest[12..].to_vec()));
+                    return Ok((
+                        core_message_type(&field).unwrap_or_default(),
+                        rest[12..].to_vec(),
+                    ));
                 }
-                let name = CORE_V2_MESSAGE_IDS.get(first as usize).copied().unwrap_or("");
+                let name = CORE_V2_MESSAGE_IDS
+                    .get(first as usize)
+                    .copied()
+                    .unwrap_or("");
                 return Ok((name.to_string(), rest.to_vec()));
             },
         }
@@ -763,7 +952,11 @@ impl Peer {
                     let n = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
                     self.send(NetworkMessage::Pong(n))?;
                 }
-                "pong" if payload.len() >= 8 && u64::from_le_bytes(payload[..8].try_into().expect("8 bytes")) == nonce => {
+                "pong"
+                    if payload.len() >= 8
+                        && u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"))
+                            == nonce =>
+                {
                     return Ok(());
                 }
                 _ => {}
@@ -787,7 +980,11 @@ impl Peer {
                     let n = u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"));
                     self.send(NetworkMessage::Pong(n))?;
                 }
-                "pong" if payload.len() >= 8 && u64::from_le_bytes(payload[..8].try_into().expect("8 bytes")) == nonce => {
+                "pong"
+                    if payload.len() >= 8
+                        && u64::from_le_bytes(payload[..8].try_into().expect("8 bytes"))
+                            == nonce =>
+                {
                     return Ok(seen);
                 }
                 _ => seen.push(cmd),
@@ -811,7 +1008,10 @@ impl Peer {
             }
         }
         self.send(NetworkMessage::Verack)?;
-        self.send(NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }))?;
+        self.send(NetworkMessage::SendCmpct(SendCmpct {
+            send_compact: false,
+            version: 2,
+        }))?;
         self.sync(nonce ^ 0x5a5a)
     }
 }
@@ -823,7 +1023,10 @@ impl Drop for Peer {
 }
 
 fn our_version(nonce: u64, user_agent: &str) -> VersionMessage {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     version_at(now, nonce, user_agent)
 }
 
@@ -868,8 +1071,11 @@ impl ProbeVerdict {
             .iter()
             .filter(|l| {
                 let m = core_message(l);
-                l.split(|c: char| !c.is_ascii_alphanumeric() && c != '=').any(|w| w == me)
-                    && (m.starts_with("Misbehaving") || m.contains("disconnecting") || m.contains("Disconnecting"))
+                l.split(|c: char| !c.is_ascii_alphanumeric() && c != '=')
+                    .any(|w| w == me)
+                    && (m.starts_with("Misbehaving")
+                        || m.contains("disconnecting")
+                        || m.contains("Disconnecting"))
             })
             .collect()
     }
@@ -931,7 +1137,11 @@ impl CoreOracle {
     }
 
     fn start_once(whitelist: bool) -> Result<CoreOracle, String> {
-        let work = scratch_root().join(format!("satd-p2pdiff-{}-{}", std::process::id(), free_port().map_err(|e| e.to_string())?));
+        let work = scratch_root().join(format!(
+            "satd-p2pdiff-{}-{}",
+            std::process::id(),
+            free_port().map_err(|e| e.to_string())?
+        ));
         std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
         // Removed on every early return below, and with the oracle.
         let work = WorkDir(work);
@@ -954,10 +1164,22 @@ impl CoreOracle {
         ];
         args.extend(
             [
-                "-listen=1", "-connect=0", "-dnsseed=0", "-fixedseeds=0", "-discover=0", "-listenonion=0",
-                "-natpmp=0", "-v2transport=1", "-debug=net", "-debug=mempool",
-                "-debug=mempoolrej", "-debug=cmpctblock", "-printtoconsole=0", "-shrinkdebugfile=0",
-                "-logthreadnames=0", "-logtimestamps=0",
+                "-listen=1",
+                "-connect=0",
+                "-dnsseed=0",
+                "-fixedseeds=0",
+                "-discover=0",
+                "-listenonion=0",
+                "-natpmp=0",
+                "-v2transport=1",
+                "-debug=net",
+                "-debug=mempool",
+                "-debug=mempoolrej",
+                "-debug=cmpctblock",
+                "-printtoconsole=0",
+                "-shrinkdebugfile=0",
+                "-logthreadnames=0",
+                "-logtimestamps=0",
             ]
             .map(String::from),
         );
@@ -965,8 +1187,11 @@ impl CoreOracle {
             args.push("-whitelist=noban@127.0.0.1".into());
         }
         let mut daemon = Daemon::spawn(&bitcoind, &args, &work.0)?;
-        let rpc = Client::new(&format!("http://127.0.0.1:{rpc_port}"), Auth::UserPass(user.into(), pass))
-            .map_err(|e| format!("rpc client: {e}"))?;
+        let rpc = Client::new(
+            &format!("http://127.0.0.1:{rpc_port}"),
+            Auth::UserPass(user.into(), pass),
+        )
+        .map_err(|e| format!("rpc client: {e}"))?;
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(status) = daemon.exited() {
@@ -981,7 +1206,8 @@ impl CoreOracle {
             std::thread::sleep(Duration::from_millis(200));
         }
         let log_path = datadir.join("regtest").join("debug.log");
-        let log = std::fs::File::open(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+        let log =
+            std::fs::File::open(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
         let mut oracle = CoreOracle {
             daemon,
             work,
@@ -998,12 +1224,21 @@ impl CoreOracle {
             .rpc
             .call("getdescriptorinfo", &[serde_json::json!("raw(51)")])
             .map_err(|e| format!("getdescriptorinfo: {e}"))?;
-        let desc = desc["descriptor"].as_str().ok_or("getdescriptorinfo: no descriptor")?.to_string();
+        let desc = desc["descriptor"]
+            .as_str()
+            .ok_or("getdescriptorinfo: no descriptor")?
+            .to_string();
         let _: serde_json::Value = oracle
             .rpc
-            .call("generatetodescriptor", &[serde_json::json!(1), serde_json::json!(desc)])
+            .call(
+                "generatetodescriptor",
+                &[serde_json::json!(1), serde_json::json!(desc)],
+            )
             .map_err(|e| format!("generatetodescriptor: {e}"))?;
-        let info = oracle.rpc.get_blockchain_info().map_err(|e| format!("getblockchaininfo: {e}"))?;
+        let info = oracle
+            .rpc
+            .get_blockchain_info()
+            .map_err(|e| format!("getblockchaininfo: {e}"))?;
         if info.initial_block_download {
             return Err("Core is still in initial block download after mining a block".into());
         }
@@ -1024,8 +1259,14 @@ impl CoreOracle {
     }
 
     /// One RPC call to Core.
-    pub fn call(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value, String> {
-        self.rpc.call(method, params).map_err(|e| format!("{method}: {e}"))
+    pub fn call(
+        &self,
+        method: &str,
+        params: &[serde_json::Value],
+    ) -> Result<serde_json::Value, String> {
+        self.rpc
+            .call(method, params)
+            .map_err(|e| format!("{method}: {e}"))
     }
 
     /// The complete lines Core has written to its log since the last read.
@@ -1039,7 +1280,11 @@ impl CoreOracle {
     }
 
     fn peer(&mut self, v2: bool) -> Result<&mut Peer, String> {
-        let slot_empty = if v2 { self.v2.is_none() } else { self.v1.is_none() };
+        let slot_empty = if v2 {
+            self.v2.is_none()
+        } else {
+            self.v1.is_none()
+        };
         if slot_empty {
             let nonce = self.next_nonce();
             let mut p = Peer::connect(self.p2p_port, v2)?;
@@ -1050,7 +1295,11 @@ impl CoreOracle {
                 self.v1 = Some(p);
             }
         }
-        Ok(if v2 { self.v2.as_mut().expect("v2 peer") } else { self.v1.as_mut().expect("v1 peer") })
+        Ok(if v2 {
+            self.v2.as_mut().expect("v2 peer")
+        } else {
+            self.v1.as_mut().expect("v1 peer")
+        })
     }
 
     fn drop_peer(&mut self, v2: bool) {
@@ -1077,13 +1326,18 @@ impl CoreOracle {
         };
         let rest = self.log_partial.split_off(end + 1);
         let done = std::mem::replace(&mut self.log_partial, rest);
-        String::from_utf8_lossy(&done).lines().map(str::to_string).collect()
+        String::from_utf8_lossy(&done)
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Core's verdict on one case.
     pub fn verdict(&mut self, case: &Case) -> Result<CoreVerdict, String> {
         match case.type_name() {
-            TypeName::OtherKnown => return Ok(CoreVerdict::Unobservable("not a covered command".into())),
+            TypeName::OtherKnown => {
+                return Ok(CoreVerdict::Unobservable("not a covered command".into()));
+            }
             TypeName::Named("version") => return self.version_verdict(case),
             _ => {}
         }
@@ -1108,9 +1362,12 @@ impl CoreOracle {
         let mut peer = Peer::connect(self.p2p_port, case.is_v2())?;
         let local_port = peer.local_port;
         let probe_nonce = self.next_nonce();
-        let sent = peer
-            .send_raw(case)
-            .and_then(|()| peer.send(NetworkMessage::Version(our_version(probe_nonce, PROBE_USER_AGENT))));
+        let sent = peer.send_raw(case).and_then(|()| {
+            peer.send(NetworkMessage::Version(our_version(
+                probe_nonce,
+                PROBE_USER_AGENT,
+            )))
+        });
         let mut lines = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(10);
         // Polled even when a send failed: Core may have logged its verdict
@@ -1130,28 +1387,48 @@ impl CoreOracle {
         lines.extend(self.read_log());
         // Read while the connection is still up: Core drops the peer from
         // getpeerinfo once it is closed.
-        let services = if sent.is_ok() { self.peer_services(local_port) } else { None };
+        let services = if sent.is_ok() {
+            self.peer_services(local_port)
+        } else {
+            None
+        };
         drop(peer);
         if let Err(e) = sent {
-            return Ok(classify_drop(&lines).unwrap_or_else(|| CoreVerdict::Unobservable(format!("send failed: {e}"))));
+            return Ok(classify_drop(&lines)
+                .unwrap_or_else(|| CoreVerdict::Unobservable(format!("send failed: {e}"))));
         }
         let messages: Vec<&str> = lines.iter().map(|l| core_message(l)).collect();
-        if messages.iter().any(|m| m.starts_with("peer using obsolete version") || m.starts_with("connected to self")) {
-            return Ok(CoreVerdict::Unobservable("version refused by policy before its read completed".into()));
+        if messages.iter().any(|m| {
+            m.starts_with("peer using obsolete version") || m.starts_with("connected to self")
+        }) {
+            return Ok(CoreVerdict::Unobservable(
+                "version refused by policy before its read completed".into(),
+            ));
         }
         // Core reads the fuzzed version before the probe, so when the probe
         // is redundant the first version Core logged is the fuzzed one.
         // Lines are matched at their start: the user agent is the peer's
         // text and can contain any of these markers.
-        if messages.iter().any(|m| m.starts_with("redundant version message")) {
-            let Some(line) = messages.iter().find(|m| m.starts_with("receive version message: ")) else {
-                return Ok(CoreVerdict::Unobservable("accepted version not logged".into()));
+        if messages
+            .iter()
+            .any(|m| m.starts_with("redundant version message"))
+        {
+            let Some(line) = messages
+                .iter()
+                .find(|m| m.starts_with("receive version message: "))
+            else {
+                return Ok(CoreVerdict::Unobservable(
+                    "accepted version not logged".into(),
+                ));
             };
             let Some(mut fields) = parse_version_line(line) else {
                 return Err(format!("could not parse Core's version line: {line}"));
             };
             fields.services = services;
-            return Ok(CoreVerdict::Accept(Observed { version: Some(fields), ..Observed::default() }));
+            return Ok(CoreVerdict::Accept(Observed {
+                version: Some(fields),
+                ..Observed::default()
+            }));
         }
         Ok(classify_drop(&lines).unwrap_or_else(|| {
             CoreVerdict::Unobservable(if closed {
@@ -1185,7 +1462,10 @@ impl CoreOracle {
         std::thread::sleep(Duration::from_millis(200));
         let log = self.read_log();
         let still_connected = !peer.closed_by_core() && self.core_peer(local_port).is_some();
-        let banned: serde_json::Value = self.rpc.call("listbanned", &[]).map_err(|e| format!("listbanned: {e}"))?;
+        let banned: serde_json::Value = self
+            .rpc
+            .call("listbanned", &[])
+            .map_err(|e| format!("listbanned: {e}"))?;
         drop(peer);
         Ok(ProbeVerdict {
             core_id,
@@ -1198,21 +1478,34 @@ impl CoreOracle {
 
     /// The active chain's genesis and first block, from Core.
     pub fn first_blocks(&self) -> Result<(bitcoin::BlockHash, bitcoin::BlockHash), String> {
-        let genesis = self.rpc.get_block_hash(0).map_err(|e| format!("getblockhash 0: {e}"))?;
-        let first = self.rpc.get_block_hash(1).map_err(|e| format!("getblockhash 1: {e}"))?;
+        let genesis = self
+            .rpc
+            .get_block_hash(0)
+            .map_err(|e| format!("getblockhash 0: {e}"))?;
+        let first = self
+            .rpc
+            .get_block_hash(1)
+            .map_err(|e| format!("getblockhash 1: {e}"))?;
         Ok((genesis, first))
     }
 
     fn core_peer(&self, local_port: u16) -> Option<serde_json::Value> {
         let peers: serde_json::Value = self.rpc.call("getpeerinfo", &[]).ok()?;
         let want = format!("127.0.0.1:{local_port}");
-        peers.as_array()?.iter().find(|p| p["addr"].as_str() == Some(want.as_str())).cloned()
+        peers
+            .as_array()?
+            .iter()
+            .find(|p| p["addr"].as_str() == Some(want.as_str()))
+            .cloned()
     }
 
     fn peer_services(&self, local_port: u16) -> Option<u64> {
         let peers: serde_json::Value = self.rpc.call("getpeerinfo", &[]).ok()?;
         let want = format!("127.0.0.1:{local_port}");
-        let p = peers.as_array()?.iter().find(|p| p["addr"].as_str() == Some(want.as_str()))?;
+        let p = peers
+            .as_array()?
+            .iter()
+            .find(|p| p["addr"].as_str() == Some(want.as_str()))?;
         u64::from_str_radix(p["services"].as_str()?, 16).ok()
     }
 
@@ -1352,13 +1645,22 @@ fn parse_version_line(line: &str) -> Option<VersionFields> {
             relay = Some(v == "1");
         }
     }
-    Some(VersionFields { version: version?, start_height: start_height?, relay: relay?, user_agent, services: None })
+    Some(VersionFields {
+        version: version?,
+        start_height: start_height?,
+        relay: relay?,
+        user_agent,
+        services: None,
+    })
 }
 
 /// The number after `prefix` in `line`.
 fn number_after(line: &str, prefix: &str) -> Option<usize> {
     let start = line.find(prefix)? + prefix.len();
-    let digits: String = line[start..].chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     digits.parse().ok()
 }
 
@@ -1401,7 +1703,10 @@ fn classify(case: &Case, lines: &[String], sync_error: Option<String>) -> CoreVe
         "transaction sent in violation of protocol",
         "while still loading blocks",
     ];
-    if let Some(stop) = POLICY_STOPS.iter().find(|s| lines.iter().any(|l| l.contains(*s))) {
+    if let Some(stop) = POLICY_STOPS
+        .iter()
+        .find(|s| lines.iter().any(|l| l.contains(*s)))
+    {
         return CoreVerdict::Unobservable(format!("{name}: policy stop before the read ({stop})"));
     }
     let reached = format!("received: {name} (");
@@ -1440,7 +1745,10 @@ fn classify(case: &Case, lines: &[String], sync_error: Option<String>) -> CoreVe
                 // "<txid> (wtxid=<wtxid>) from peer=N was not accepted".
                 if let Some(i) = l.find(" (wtxid=") {
                     let txid = l[..i].rsplit(' ').next().unwrap_or("");
-                    let wtxid: String = l[i + 8..].chars().take_while(char::is_ascii_hexdigit).collect();
+                    let wtxid: String = l[i + 8..]
+                        .chars()
+                        .take_while(char::is_ascii_hexdigit)
+                        .collect();
                     if txid.len() == 64 && wtxid.len() == 64 {
                         o.tx = Some((txid.to_string(), wtxid));
                     }
@@ -1448,7 +1756,10 @@ fn classify(case: &Case, lines: &[String], sync_error: Option<String>) -> CoreVe
             }
             "block" => {
                 if let Some(i) = l.find("received block ") {
-                    let hash: String = l[i + 15..].chars().take_while(char::is_ascii_hexdigit).collect();
+                    let hash: String = l[i + 15..]
+                        .chars()
+                        .take_while(char::is_ascii_hexdigit)
+                        .collect();
                     if hash.len() == 64 {
                         o.block = Some(hash);
                     }
@@ -1487,16 +1798,31 @@ fn addrv2_payload() -> Vec<u8> {
     };
     entry(0x409, 1, &[8, 8, 8, 8], 8333);
     entry(1 << 26 | 0x409, 1, &[1, 2, 3, 4], 8333);
-    entry(0x9, 2, &[0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88], 8333);
+    entry(
+        0x9,
+        2,
+        &[
+            0x20, 0x01, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+        ],
+        8333,
+    );
     entry(0x1, 4, &[0x11; 32], 8333);
     entry(0x1, 5, &[0x22; 32], 0);
-    entry(0x1, 6, &[0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 8333);
+    entry(
+        0x1,
+        6,
+        &[0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        8333,
+    );
     entry(0x1, 42, &[1, 2, 3], 9);
     p
 }
 
 fn sample_tx(witness: bool) -> bitcoin::Transaction {
-    use bitcoin::{absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    use bitcoin::{
+        Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime,
+        transaction::Version,
+    };
     let mut w = Witness::new();
     if witness {
         w.push([0x51]);
@@ -1505,12 +1831,18 @@ fn sample_tx(witness: bool) -> bitcoin::Transaction {
         version: Version(2),
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0x42; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x42; 32]),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: w,
         }],
-        output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::from(vec![0x51]) }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::from(vec![0x51]),
+        }],
     }
 }
 
@@ -1529,7 +1861,11 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     let mut no_relay = enc(&full);
     no_relay.pop();
     seeds.push(("version", "version-no-relay", no_relay));
-    seeds.push(("version", "version-four-fields", enc(&full)[..4 + 8 + 8 + 26].to_vec()));
+    seeds.push((
+        "version",
+        "version-four-fields",
+        enc(&full)[..4 + 8 + 8 + 26].to_vec(),
+    ));
     let mut odd_ua = full.clone();
     odd_ua.user_agent = String::new();
     let mut odd = enc(&odd_ua);
@@ -1541,17 +1877,30 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     long_ua.user_agent = "x".repeat(257);
     seeds.push(("version", "version-agent-over-256", enc(&long_ua)));
 
-    let addr = vec![(1_700_000_000u32, Address::new(&"8.8.4.4:8333".parse().expect("addr"), ServiceFlags::NETWORK))];
+    let addr = vec![(
+        1_700_000_000u32,
+        Address::new(
+            &"8.8.4.4:8333".parse().expect("addr"),
+            ServiceFlags::NETWORK,
+        ),
+    )];
     seeds.push(("addr", "addr-one", enc(&addr)));
     seeds.push(("addrv2", "addrv2-mixed-high-service-bit", addrv2_payload()));
 
-    let inv = vec![Inventory::Block(gh), Inventory::WTx(bitcoin::Wtxid::from_byte_array([7; 32]))];
+    let inv = vec![
+        Inventory::Block(gh),
+        Inventory::WTx(bitcoin::Wtxid::from_byte_array([7; 32])),
+    ];
     seeds.push(("inv", "inv-block-wtx", enc(&inv)));
     let mut inv_unknown = compact_size(1);
     inv_unknown.extend(0x7u32.to_le_bytes());
     inv_unknown.extend([9u8; 32]);
     seeds.push(("inv", "inv-unknown-type", inv_unknown));
-    seeds.push(("getdata", "getdata-genesis", enc(&vec![Inventory::Block(gh)])));
+    seeds.push((
+        "getdata",
+        "getdata-genesis",
+        enc(&vec![Inventory::Block(gh)]),
+    ));
 
     let mut headers = compact_size(1);
     headers.extend(enc(&genesis.header));
@@ -1590,15 +1939,26 @@ pub fn seed_payloads() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     getblocktxn.extend(compact_size(1));
     seeds.push(("getblocktxn", "getblocktxn-two", getblocktxn));
     // Core's indexes are 16-bit: 65535 is read, 65536 is refused.
-    for (name, diff) in [("getblocktxn-index-65535", 65535), ("getblocktxn-index-65536", 65536)] {
+    for (name, diff) in [
+        ("getblocktxn-index-65535", 65535),
+        ("getblocktxn-index-65536", 65536),
+    ] {
         let mut getblocktxn = enc(&gh);
         getblocktxn.extend(compact_size(1));
         getblocktxn.extend(compact_size(diff));
         seeds.push(("getblocktxn", name, getblocktxn));
     }
 
-    seeds.push(("feefilter", "feefilter-1000", 1000i64.to_le_bytes().to_vec()));
-    seeds.push(("feefilter", "feefilter-negative", (-1i64).to_le_bytes().to_vec()));
+    seeds.push((
+        "feefilter",
+        "feefilter-1000",
+        1000i64.to_le_bytes().to_vec(),
+    ));
+    seeds.push((
+        "feefilter",
+        "feefilter-negative",
+        (-1i64).to_le_bytes().to_vec(),
+    ));
     let mut sendcmpct = vec![0u8];
     sendcmpct.extend(2u64.to_le_bytes());
     seeds.push(("sendcmpct", "sendcmpct-v2", sendcmpct));
@@ -1621,15 +1981,30 @@ pub fn seed_cases() -> Vec<(String, Case)> {
     for (cmd, name, payload) in seed_payloads() {
         out.push((format!("{name}-v1"), Case::v1(cmd, payload.clone())));
         if short_id(cmd).is_some() {
-            out.push((format!("{name}-v2short"), Case::v2_short(cmd, payload.clone())));
+            out.push((
+                format!("{name}-v2short"),
+                Case::v2_short(cmd, payload.clone()),
+            ));
         }
         out.push((format!("{name}-v2long"), Case::v2_long(cmd, payload)));
     }
     out.push(("unknown-command-v1".into(), Case::v1("zzzz", vec![1, 2, 3])));
-    out.push(("unknown-command-v2long".into(), Case::v2_long("zzzz", vec![1, 2, 3])));
-    out.push(("unimplemented-short-id-v2".into(), Case { msg_type: MsgType::V2Short(30), payload: vec![0] }));
+    out.push((
+        "unknown-command-v2long".into(),
+        Case::v2_long("zzzz", vec![1, 2, 3]),
+    ));
+    out.push((
+        "unimplemented-short-id-v2".into(),
+        Case {
+            msg_type: MsgType::V2Short(30),
+            payload: vec![0],
+        },
+    ));
     let mut bad = Case::v1("tx", enc(&sample_tx(true)));
-    bad.msg_type = MsgType::V1 { command: command_bytes("tx"), bad_checksum: true };
+    bad.msg_type = MsgType::V1 {
+        command: command_bytes("tx"),
+        bad_checksum: true,
+    };
     out.push(("tx-bad-checksum-v1".into(), bad));
     out
 }

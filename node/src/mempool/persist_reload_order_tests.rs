@@ -10,7 +10,10 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, W
 /// A spend of every listed outpoint of `parents`, paying `fee` and splitting
 /// what is left over `outputs` outputs.
 fn spend(parents: &[(&Transaction, u32)], fee: u64, outputs: usize) -> Transaction {
-    let value: u64 = parents.iter().map(|(p, v)| p.output[*v as usize].value.to_sat()).sum();
+    let value: u64 = parents
+        .iter()
+        .map(|(p, v)| p.output[*v as usize].value.to_sat())
+        .sum();
     let each = (value - fee) / outputs as u64;
     Transaction {
         version: bitcoin::transaction::Version(2),
@@ -18,14 +21,20 @@ fn spend(parents: &[(&Transaction, u32)], fee: u64, outputs: usize) -> Transacti
         input: parents
             .iter()
             .map(|(p, v)| TxIn {
-                previous_output: OutPoint { txid: p.compute_txid(), vout: *v },
+                previous_output: OutPoint {
+                    txid: p.compute_txid(),
+                    vout: *v,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             })
             .collect(),
         output: (0..outputs)
-            .map(|i| TxOut { value: Amount::from_sat(each), script_pubkey: p2wpkh(0x40 + i as u8) })
+            .map(|i| TxOut {
+                value: Amount::from_sat(each),
+                script_pubkey: p2wpkh(0x40 + i as u8),
+            })
             .collect(),
     }
 }
@@ -37,8 +46,14 @@ fn family() -> Vec<Transaction> {
     let mut root = funded_spend(1, 1_000);
     let half = root.output[0].value.to_sat() / 2;
     root.output = vec![
-        TxOut { value: Amount::from_sat(half), script_pubkey: p2wpkh(0x21) },
-        TxOut { value: Amount::from_sat(half), script_pubkey: p2wpkh(0x22) },
+        TxOut {
+            value: Amount::from_sat(half),
+            script_pubkey: p2wpkh(0x21),
+        },
+        TxOut {
+            value: Amount::from_sat(half),
+            script_pubkey: p2wpkh(0x22),
+        },
     ];
     let a = spend(&[(&root, 0)], 1_000, 1);
     let b = spend(&[(&root, 1)], 1_000, 1);
@@ -66,8 +81,11 @@ fn restarted_pool() -> Mempool {
 
 /// Panics unless every record whose parent is also in `txs` comes after it.
 fn assert_parent_first(txs: &[Transaction]) {
-    let pos: std::collections::HashMap<bitcoin::Txid, usize> =
-        txs.iter().enumerate().map(|(i, t)| (t.compute_txid(), i)).collect();
+    let pos: std::collections::HashMap<bitcoin::Txid, usize> = txs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.compute_txid(), i))
+        .collect();
     for (i, tx) in txs.iter().enumerate() {
         for input in &tx.input {
             if let Some(&p) = pos.get(&input.previous_output.txid) {
@@ -97,9 +115,15 @@ fn dump_writes_same_second_parents_before_children_and_all_reload() {
 
     let fresh = restarted_pool();
     let stats = load_mempool(&fresh, &cs, &NoopVerifier, &dir).unwrap();
-    assert_eq!((stats.accepted, stats.skipped, stats.expired), (txs.len(), 0, 0));
+    assert_eq!(
+        (stats.accepted, stats.skipped, stats.expired),
+        (txs.len(), 0, 0)
+    );
     for tx in &txs {
-        assert_eq!(fresh.get(&tx.compute_txid()).expect("re-admitted").time, then);
+        assert_eq!(
+            fresh.get(&tx.compute_txid()).expect("re-admitted").time,
+            then
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -116,9 +140,15 @@ fn load_admits_a_file_written_children_first() {
     std::fs::write(dir.join("mempool.dat"), frame(&records)).unwrap();
 
     let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
-    assert_eq!((stats.accepted, stats.skipped, stats.expired), (txs.len(), 0, 0));
+    assert_eq!(
+        (stats.accepted, stats.skipped, stats.expired),
+        (txs.len(), 0, 0)
+    );
     for tx in &txs {
-        assert!(mp.get(&tx.compute_txid()).is_some(), "every generation is re-admitted");
+        assert!(
+            mp.get(&tx.compute_txid()).is_some(),
+            "every generation is re-admitted"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -139,7 +169,10 @@ fn load_admits_a_parent_stamped_later_than_its_child() {
 
     let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
     assert_eq!((stats.accepted, stats.skipped), (2, 0));
-    assert_eq!(mp.get(&parent.compute_txid()).expect("parent").time, now - 50);
+    assert_eq!(
+        mp.get(&parent.compute_txid()).expect("parent").time,
+        now - 50
+    );
     assert_eq!(mp.get(&child.compute_txid()).expect("child").time, now - 90);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -194,7 +227,10 @@ fn parent_first_order_handles_a_long_reversed_chain_and_duplicates() {
     for _ in 0..20_000 {
         let last = txs.last().unwrap().clone();
         let mut next = dummy_tx(7);
-        next.input[0].previous_output = OutPoint { txid: last.compute_txid(), vout: 0 };
+        next.input[0].previous_output = OutPoint {
+            txid: last.compute_txid(),
+            vout: 0,
+        };
         txs.push(next);
     }
     txs.push(txs[3].clone());
@@ -204,8 +240,10 @@ fn parent_first_order_handles_a_long_reversed_chain_and_duplicates() {
     let ordered = permute(txs, &order);
     // The duplicate links to nothing new; drop it before the parent check.
     let mut seen = std::collections::HashSet::new();
-    let unique: Vec<Transaction> =
-        ordered.into_iter().filter(|t| seen.insert(t.compute_txid())).collect();
+    let unique: Vec<Transaction> = ordered
+        .into_iter()
+        .filter(|t| seen.insert(t.compute_txid()))
+        .collect();
     assert_eq!(unique.len(), 20_001);
     assert_parent_first(&unique);
 }

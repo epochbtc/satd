@@ -41,7 +41,10 @@ fn easy_block(network: Network) -> Block {
 }
 
 fn is_bad_pow(e: &ChainError) -> bool {
-    matches!(e, ChainError::Validation(crate::validation::ValidationError::BadProofOfWork))
+    matches!(
+        e,
+        ChainError::Validation(crate::validation::ValidationError::BadProofOfWork)
+    )
 }
 
 #[test]
@@ -52,10 +55,16 @@ fn signet_header_easier_than_pow_limit_is_rejected() {
 
     let (accepted, err) = cs.accept_headers(&[block.header]);
     assert_eq!(accepted, 0);
-    assert!(err.as_ref().is_some_and(is_bad_pow), "accept_headers: {err:?}");
+    assert!(
+        err.as_ref().is_some_and(is_bad_pow),
+        "accept_headers: {err:?}"
+    );
     let err = cs.accept_header(&block.header).unwrap_err();
     assert!(is_bad_pow(&err), "accept_header: {err:?}");
-    assert!(cs.get_block_index(&hash).is_none(), "no index row for the header");
+    assert!(
+        cs.get_block_index(&hash).is_none(),
+        "no index row for the header"
+    );
 }
 
 #[test]
@@ -74,6 +83,7 @@ fn regtest_header_and_block_at_pow_limit_are_accepted() {
     let block = easy_block(Network::Regtest);
     let (accepted, err) = cs.accept_headers(&[block.header]);
     assert_eq!((accepted, err.map(|e| e.to_string())), (1, None));
-    cs.accept_block(&block).expect("regtest block at powLimit connects");
+    cs.accept_block(&block)
+        .expect("regtest block at powLimit connects");
     assert_eq!(cs.tip_height(), 1);
 }

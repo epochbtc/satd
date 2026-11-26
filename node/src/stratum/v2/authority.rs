@@ -147,7 +147,11 @@ mod tests {
             fs::write(&path, bad).unwrap();
             let err = load_or_create(&path).expect_err("a bad key file fails the start");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad}");
-            assert_eq!(fs::read_to_string(&path).unwrap(), bad, "the file is left alone");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                bad,
+                "the file is left alone"
+            );
         }
     }
 

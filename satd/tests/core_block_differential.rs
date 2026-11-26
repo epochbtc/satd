@@ -65,12 +65,12 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::pow::CompactTarget;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{
-    absolute::LockTime, Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Witness,
+    Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode,
+    TxOut, Witness, absolute::LockTime,
 };
 
-use common::core_node::{pull_core_image, CoreNode, Outcome};
 use common::TestNode;
+use common::core_node::{CoreNode, Outcome, pull_core_image};
 use node::chain::connect::block_subsidy;
 
 // ── consensus constants for regtest ───────────────────────────────────
@@ -112,7 +112,10 @@ fn coinbase(height: u32, value: u64, spk: ScriptBuf) -> Transaction {
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(value), script_pubkey: spk }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: spk,
+        }],
     }
 }
 
@@ -134,7 +137,10 @@ fn spend(
             sequence: Sequence(sequence),
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(value), script_pubkey: spk }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: spk,
+        }],
     }
 }
 
@@ -173,8 +179,8 @@ fn assemble(
         },
         txdata,
     };
-    b.header.merkle_root =
-        merkle_override.unwrap_or_else(|| b.compute_merkle_root().unwrap_or(TxMerkleNode::all_zeros()));
+    b.header.merkle_root = merkle_override
+        .unwrap_or_else(|| b.compute_merkle_root().unwrap_or(TxMerkleNode::all_zeros()));
     if do_grind {
         grind(&mut b.header);
     }
@@ -184,7 +190,11 @@ fn assemble(
 /// A plain, fully valid block on `prev` at `height`/`time` carrying `txdata`
 /// after its coinbase (coinbase pays the full subsidy to `OP_TRUE`).
 fn valid_block(prev: BlockHash, height: u32, time: u32, mut txdata: Vec<Transaction>) -> Block {
-    let mut txs = vec![coinbase(height, block_subsidy(Network::Regtest, height), op_true())];
+    let mut txs = vec![coinbase(
+        height,
+        block_subsidy(Network::Regtest, height),
+        op_true(),
+    )];
     txs.append(&mut txdata);
     assemble(prev, time, POWLIMIT_BITS, txs, None, true)
 }
@@ -222,7 +232,10 @@ fn satd_test_mempool_accept(node: &TestNode, hex: &str) -> Outcome {
     match first {
         Some(r) if r["allowed"].as_bool().unwrap_or(false) => Outcome::Accept,
         Some(r) => Outcome::Reject(
-            r["reject-reason"].as_str().unwrap_or("missing-reject-reason").to_string(),
+            r["reject-reason"]
+                .as_str()
+                .unwrap_or("missing-reject-reason")
+                .to_string(),
         ),
         None => Outcome::Reject("missing-testmempoolaccept-result".to_string()),
     }
@@ -295,8 +308,16 @@ impl Ctx {
 fn build_shared_base(satd: &TestNode, core: &CoreNode) -> Ctx {
     let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
     // Both must start at the identical regtest genesis.
-    assert_eq!(satd_best_hash(satd), genesis.to_string(), "satd not at regtest genesis");
-    assert_eq!(core.best_block_hash(), genesis.to_string(), "Core not at regtest genesis");
+    assert_eq!(
+        satd_best_hash(satd),
+        genesis.to_string(),
+        "satd not at regtest genesis"
+    );
+    assert_eq!(
+        core.best_block_hash(),
+        genesis.to_string(),
+        "Core not at regtest genesis"
+    );
 
     let mut ctx = Ctx {
         tip_hash: genesis,
@@ -313,7 +334,10 @@ fn build_shared_base(satd: &TestNode, core: &CoreNode) -> Ctx {
         submit_base_block(satd, core, &block, h);
         let cb_txid = block.txdata[0].compute_txid();
         ctx.coinbases.push(CoinRef {
-            outpoint: OutPoint { txid: cb_txid, vout: 0 },
+            outpoint: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
             amount: block_subsidy(Network::Regtest, h),
             height: h,
         });
@@ -337,7 +361,10 @@ fn build_shared_base(satd: &TestNode, core: &CoreNode) -> Ctx {
             witness: Witness::new(),
         }],
         output: (0..4)
-            .map(|_| TxOut { value: Amount::from_sat(per), script_pubkey: op_true() })
+            .map(|_| TxOut {
+                value: Amount::from_sat(per),
+                script_pubkey: op_true(),
+            })
             .collect(),
     };
     let funding_txid = funding_tx.compute_txid();
@@ -345,7 +372,10 @@ fn build_shared_base(satd: &TestNode, core: &CoreNode) -> Ctx {
     submit_base_block(satd, core, &fund_block, fund_h);
     for vout in 0..4u32 {
         ctx.nc_coins.push(CoinRef {
-            outpoint: OutPoint { txid: funding_txid, vout },
+            outpoint: OutPoint {
+                txid: funding_txid,
+                vout,
+            },
             amount: per,
             height: fund_h,
         });
@@ -353,9 +383,21 @@ fn build_shared_base(satd: &TestNode, core: &CoreNode) -> Ctx {
     ctx.advance_to(&fund_block);
 
     // Sanity: both nodes agree on the shared tip and height.
-    assert_eq!(satd_best_hash(satd), ctx.tip_hash.to_string(), "satd tip != tracked base tip");
-    assert_eq!(core.best_block_hash(), ctx.tip_hash.to_string(), "Core tip != tracked base tip");
-    assert_eq!(core.block_count(), ctx.tip_height as u64, "Core height != tracked base height");
+    assert_eq!(
+        satd_best_hash(satd),
+        ctx.tip_hash.to_string(),
+        "satd tip != tracked base tip"
+    );
+    assert_eq!(
+        core.best_block_hash(),
+        ctx.tip_hash.to_string(),
+        "Core tip != tracked base tip"
+    );
+    assert_eq!(
+        core.block_count(),
+        ctx.tip_height as u64,
+        "Core height != tracked base height"
+    );
 
     ctx
 }
@@ -451,7 +493,14 @@ fn c_multiple_coinbase(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         coinbase(h, block_subsidy(Network::Regtest, h), op_true()),
         coinbase(h, block_subsidy(Network::Regtest, h) / 2, op_true()),
     ];
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txs, None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        txs,
+        None,
+        true,
+    ))
 }
 
 fn c_bad_merkle_root(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
@@ -510,21 +559,42 @@ fn c_oversize_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         c.output = outputs;
         c
     };
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn c_coinbase_scriptsig_too_short(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.input[0].script_sig = ScriptBuf::from(vec![0xff]); // 1 byte < 2
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn c_coinbase_scriptsig_too_long(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.input[0].script_sig = ScriptBuf::from(vec![0xff; 101]); // > 100
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn c_merkle_mutation(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
@@ -532,10 +602,42 @@ fn c_merkle_mutation(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     // same merkle root as the honest odd list → Core flags `mutated` and
     // rejects bad-txns-duplicate.
     let h = ctx.candidate_height();
-    let t1 = spend(OutPoint { txid: bitcoin::Txid::from_byte_array([0x11; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0, op_true());
-    let t2 = spend(OutPoint { txid: bitcoin::Txid::from_byte_array([0x22; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0, op_true());
-    let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true()), t1, t2.clone(), t2];
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txs, None, true))
+    let t1 = spend(
+        OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        },
+        1_000,
+        1,
+        0xffff_ffff,
+        0,
+        op_true(),
+    );
+    let t2 = spend(
+        OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        },
+        1_000,
+        1,
+        0xffff_ffff,
+        0,
+        op_true(),
+    );
+    let txs = vec![
+        coinbase(h, block_subsidy(Network::Regtest, h), op_true()),
+        t1,
+        t2.clone(),
+        t2,
+    ];
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        txs,
+        None,
+        true,
+    ))
 }
 
 // -- context-free transaction (testmempoolaccept) --
@@ -560,9 +662,20 @@ fn c_block_tx_no_inputs(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     let empty = bitcoin::Txid::hash(&EMPTY_TX);
-    let root = bitcoin::merkle_tree::calculate_root([cb.compute_txid(), empty].into_iter().map(TxMerkleNode::from))
-        .unwrap();
-    let mut b = assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], Some(root), true);
+    let root = bitcoin::merkle_tree::calculate_root(
+        [cb.compute_txid(), empty]
+            .into_iter()
+            .map(TxMerkleNode::from),
+    )
+    .unwrap();
+    let mut b = assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        Some(root),
+        true,
+    );
     let mut raw = serialize(&b.header);
     raw.push(2);
     raw.extend(serialize(&b.txdata.remove(0)));
@@ -575,7 +688,10 @@ fn c_tx_no_outputs(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0xab; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -586,7 +702,10 @@ fn c_tx_no_outputs(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 
 fn c_tx_output_over_max(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     Submission::Tx(spend(
-        OutPoint { txid: bitcoin::Txid::from_byte_array([0xab; 32]), vout: 0 },
+        OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        },
         21_000_001 * 100_000_000,
         1,
         0xffff_ffff,
@@ -596,7 +715,10 @@ fn c_tx_output_over_max(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
 }
 
 fn c_tx_duplicate_inputs(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
-    let op = OutPoint { txid: bitcoin::Txid::from_byte_array([0xab; 32]), vout: 0 };
+    let op = OutPoint {
+        txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+        vout: 0,
+    };
     let dup = TxIn {
         previous_output: op,
         script_sig: ScriptBuf::new(),
@@ -607,7 +729,10 @@ fn c_tx_duplicate_inputs(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![dup.clone(), dup],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: op_true() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true(),
+        }],
     })
 }
 
@@ -617,7 +742,10 @@ fn c_non_coinbase_null_input(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         lock_time: LockTime::ZERO,
         input: vec![
             TxIn {
-                previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0xab; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -629,7 +757,10 @@ fn c_non_coinbase_null_input(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
                 witness: Witness::new(),
             },
         ],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: op_true() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true(),
+        }],
     })
 }
 
@@ -639,12 +770,18 @@ fn c_tx_oversize(_ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0xab; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: big }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: big,
+        }],
     })
 }
 
@@ -654,42 +791,85 @@ fn c_high_hash(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true())];
     // Hard (mainnet-ish) bits, NOT ground → hash fails the claimed target.
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), 0x1d00_ffff, txs, None, false))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        0x1d00_ffff,
+        txs,
+        None,
+        false,
+    ))
 }
 
 fn c_time_too_new(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true())];
     // 3 hours ahead of real now → beyond the 2h future-time slack.
-    Submission::Block(assemble(ctx.tip_hash, now_secs() + 3 * 3600, POWLIMIT_BITS, txs, None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        now_secs() + 3 * 3600,
+        POWLIMIT_BITS,
+        txs,
+        None,
+        true,
+    ))
 }
 
 fn c_time_too_old(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let txs = vec![coinbase(h, block_subsidy(Network::Regtest, h), op_true())];
     // At/below the median-time-past of the last 11 blocks → time-too-old.
-    Submission::Block(assemble(ctx.tip_hash, GENESIS_TIME, POWLIMIT_BITS, txs, None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        GENESIS_TIME,
+        POWLIMIT_BITS,
+        txs,
+        None,
+        true,
+    ))
 }
 
 // -- contextual / chain-level (submitblock) --
 
 fn c_spend_nonexistent(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
-    let fake = OutPoint { txid: bitcoin::Txid::from_byte_array([0xab; 32]), vout: 0 };
+    let fake = OutPoint {
+        txid: bitcoin::Txid::from_byte_array([0xab; 32]),
+        vout: 0,
+    };
     let s = spend(fake, 1_000, 2, 0xffff_ffff, 0, op_true());
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![s],
+    ))
 }
 
 fn c_coinbase_value_too_high(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let cb = coinbase(h, block_subsidy(Network::Regtest, h) + 1, op_true()); // no fees → over subsidy
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn c_bad_coinbase_height(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     // BIP34 height encodes 999, but the block is at `h`.
     let cb = coinbase(999, block_subsidy(Network::Regtest, h), op_true());
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn c_block_sigops(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
@@ -697,28 +877,60 @@ fn c_block_sigops(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     // 4001 bare OP_CHECKMULTISIG → 4001·20·4 sigop cost > 80_000.
     let script = ScriptBuf::from(vec![bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8(); 4001]);
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
-    cb.output = vec![TxOut { value: Amount::from_sat(0), script_pubkey: script }];
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    cb.output = vec![TxOut {
+        value: Amount::from_sat(0),
+        script_pubkey: script,
+    }];
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn c_inputs_below_outputs(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
     let coin = ctx.take_mature_coinbase(used);
     // Pay out more than the input provides → bad-txns-in-belowout.
-    let s = spend(coin.outpoint, coin.amount + 100_000_000, 2, 0xffff_ffff, 0, op_true());
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+    let s = spend(
+        coin.outpoint,
+        coin.amount + 100_000_000,
+        2,
+        0xffff_ffff,
+        0,
+        op_true(),
+    );
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![s],
+    ))
 }
 
 fn c_immature_coinbase_spend(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let coin = ctx.immature_coinbase();
     let s = spend(coin.outpoint, coin.amount, 2, 0xffff_ffff, 0, op_true());
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![s],
+    ))
 }
 
 fn c_locktime_not_final(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
     let coin = ctx.take_mature_coinbase(used);
     // Height-based locktime far in the future + non-max sequence → non-final.
     let s = spend(coin.outpoint, coin.amount, 2, 0, 1_000_000, op_true());
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![s],
+    ))
 }
 
 fn c_coinbase_nonfinal(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
@@ -731,7 +943,14 @@ fn c_coinbase_nonfinal(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.lock_time = LockTime::from_consensus(1_000_000);
     cb.input[0].sequence = Sequence(0);
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn c_locktime_equal_height(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
@@ -749,7 +968,12 @@ fn c_bip68_sequence_not_met(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     // a v2 relative-locktime requiring more blocks than have elapsed.
     let coin = ctx.nc_coins[0].clone();
     let s = spend(coin.outpoint, coin.amount, 2, 16, 0, op_true()); // require 16 blocks
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![s],
+    ))
 }
 
 fn c_bip68_high_bit_version(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
@@ -759,28 +983,65 @@ fn c_bip68_high_bit_version(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     // skipped enforcement, accepting a block Core rejects (issue #581
     // follow-up found auditing the finality fix).
     let coin = ctx.nc_coins[1].clone();
-    let s = spend(coin.outpoint, coin.amount, 0x8000_0002u32 as i32, 16, 0, op_true());
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+    let s = spend(
+        coin.outpoint,
+        coin.amount,
+        0x8000_0002u32 as i32,
+        16,
+        0,
+        op_true(),
+    );
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![s],
+    ))
 }
 
 // -- accept cases (advance the tip) --
 
 fn c_valid_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![]))
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![],
+    ))
 }
 
 fn c_mature_coinbase_spend_ok(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
     let coin = ctx.take_mature_coinbase(used);
     let s = spend(coin.outpoint, coin.amount, 2, 0xffff_ffff, 0, op_true()); // no fee
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![s]))
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![s],
+    ))
 }
 
 fn c_intra_block_spend_ok(ctx: &Ctx, used: &mut Vec<usize>) -> Submission {
     let coin = ctx.take_mature_coinbase(used);
     let mid = spend(coin.outpoint, coin.amount, 2, 0xffff_ffff, 0, op_true());
     let mid_txid = mid.compute_txid();
-    let child = spend(OutPoint { txid: mid_txid, vout: 0 }, coin.amount, 2, 0xffff_ffff, 0, op_true());
-    Submission::Block(valid_block(ctx.tip_hash, ctx.candidate_height(), ctx.candidate_time(), vec![mid, child]))
+    let child = spend(
+        OutPoint {
+            txid: mid_txid,
+            vout: 0,
+        },
+        coin.amount,
+        2,
+        0xffff_ffff,
+        0,
+        op_true(),
+    );
+    Submission::Block(valid_block(
+        ctx.tip_hash,
+        ctx.candidate_height(),
+        ctx.candidate_time(),
+        vec![mid, child],
+    ))
 }
 
 // -- BIP 141 witness rules (Core: `CheckWitnessMalleation`) --
@@ -799,7 +1060,10 @@ fn commitment_output(witness_root: [u8; 32], nonce: [u8; 32]) -> TxOut {
     let commitment = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend_from_slice(&commitment);
-    TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) }
+    TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    }
 }
 
 /// A coinbase-only candidate: the witness root is the merkle root over the
@@ -812,9 +1076,17 @@ const COINBASE_ONLY_WITNESS_ROOT: [u8; 32] = [0u8; 32];
 fn c_witness_nonce_size(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
-    cb.output.push(commitment_output(COINBASE_ONLY_WITNESS_ROOT, [0u8; 32]));
+    cb.output
+        .push(commitment_output(COINBASE_ONLY_WITNESS_ROOT, [0u8; 32]));
     cb.input[0].witness.push([0x11; 7]);
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 /// No commitment output, but the coinbase carries witness data. satd's scan
@@ -823,7 +1095,14 @@ fn c_unexpected_witness_coinbase(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     let h = ctx.candidate_height();
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.input[0].witness.push([0u8; 32]);
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 /// A length-legal block pushed past the weight cap by witness bytes, with a
@@ -865,19 +1144,33 @@ fn c_overweight_block(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
         output: outputs,
     };
     let mut preimage = [0u8; 64];
-    preimage[32..].copy_from_slice(node::validation::decode::wtxid(&big).to_raw_hash().as_byte_array());
+    preimage[32..].copy_from_slice(
+        node::validation::decode::wtxid(&big)
+            .to_raw_hash()
+            .as_byte_array(),
+    );
     let witness_root = bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array();
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
     cb.output.push(commitment_output(witness_root, [0u8; 32]));
     cb.input[0].witness.push([0u8; 32]);
-    let block = assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb, big], None, true);
+    let block = assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb, big],
+        None,
+        true,
+    );
     // Guard the proportions this case depends on: over the weight cap, under
     // both the stripped-size cap and the 4,000,000-byte decode cap.
     let total = block.total_size();
     let weight = block.weight().to_wu() as usize;
     let stripped = (weight - total) / 3;
     assert!(weight > 4_000_000, "weight {weight} must exceed the cap");
-    assert!(stripped * 4 <= 4_000_000, "stripped {stripped} must stay length-legal");
+    assert!(
+        stripped * 4 <= 4_000_000,
+        "stripped {stripped} must stay length-legal"
+    );
     assert!(total < 4_000_000, "total {total} must stay decodable");
     Submission::Block(block)
 }
@@ -893,7 +1186,14 @@ fn c_witness_commitment_mismatch(ctx: &Ctx, _u: &mut Vec<usize>) -> Submission {
     wrong.script_pubkey = ScriptBuf::from_bytes(spk);
     cb.output.push(wrong);
     cb.input[0].witness.push([0u8; 32]);
-    Submission::Block(assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, vec![cb], None, true))
+    Submission::Block(assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        vec![cb],
+        None,
+        true,
+    ))
 }
 
 fn cases() -> Vec<Case> {
@@ -905,44 +1205,200 @@ fn cases() -> Vec<Case> {
         matrix_reason: Option<&'static str>,
         build: fn(&Ctx, &mut Vec<usize>) -> Submission,
     ) -> Case {
-        Case { name, category, matrix_reason, core_reason_differs: None, build }
+        Case {
+            name,
+            category,
+            matrix_reason,
+            core_reason_differs: None,
+            build,
+        }
     }
     vec![
         // context-free block structure
-        case("multiple_coinbase", "block-structure", Some("bad-cb-multiple"), c_multiple_coinbase),
-        case("bad_merkle_root", "block-structure", Some("bad-txnmrklroot"), c_bad_merkle_root),
-        case("oversize_block", "block-structure", Some("bad-blk-length"), c_oversize_block),
-        case("oversize_and_bad_merkle", "block-structure", Some("bad-txnmrklroot"), c_oversize_and_bad_merkle),
-        case("overweight_block", "witness", Some("bad-blk-weight"), c_overweight_block),
-        case("coinbase_scriptsig_too_short", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_short),
-        case("coinbase_scriptsig_too_long", "block-structure", Some("bad-cb-length"), c_coinbase_scriptsig_too_long),
-        case("merkle_mutation_cve_2012_2459", "block-structure", Some("bad-txns-duplicate"), c_merkle_mutation),
+        case(
+            "multiple_coinbase",
+            "block-structure",
+            Some("bad-cb-multiple"),
+            c_multiple_coinbase,
+        ),
+        case(
+            "bad_merkle_root",
+            "block-structure",
+            Some("bad-txnmrklroot"),
+            c_bad_merkle_root,
+        ),
+        case(
+            "oversize_block",
+            "block-structure",
+            Some("bad-blk-length"),
+            c_oversize_block,
+        ),
+        case(
+            "oversize_and_bad_merkle",
+            "block-structure",
+            Some("bad-txnmrklroot"),
+            c_oversize_and_bad_merkle,
+        ),
+        case(
+            "overweight_block",
+            "witness",
+            Some("bad-blk-weight"),
+            c_overweight_block,
+        ),
+        case(
+            "coinbase_scriptsig_too_short",
+            "block-structure",
+            Some("bad-cb-length"),
+            c_coinbase_scriptsig_too_short,
+        ),
+        case(
+            "coinbase_scriptsig_too_long",
+            "block-structure",
+            Some("bad-cb-length"),
+            c_coinbase_scriptsig_too_long,
+        ),
+        case(
+            "merkle_mutation_cve_2012_2459",
+            "block-structure",
+            Some("bad-txns-duplicate"),
+            c_merkle_mutation,
+        ),
         // BIP 141 witness rules (issue #538)
-        case("witness_nonce_size", "witness", Some("bad-witness-nonce-size"), c_witness_nonce_size),
-        case("unexpected_witness_coinbase", "witness", Some("unexpected-witness"), c_unexpected_witness_coinbase),
-        case("witness_commitment_mismatch", "witness", Some("bad-witness-merkle-match"), c_witness_commitment_mismatch),
+        case(
+            "witness_nonce_size",
+            "witness",
+            Some("bad-witness-nonce-size"),
+            c_witness_nonce_size,
+        ),
+        case(
+            "unexpected_witness_coinbase",
+            "witness",
+            Some("unexpected-witness"),
+            c_unexpected_witness_coinbase,
+        ),
+        case(
+            "witness_commitment_mismatch",
+            "witness",
+            Some("bad-witness-merkle-match"),
+            c_witness_commitment_mismatch,
+        ),
         // context-free transaction
-        case("tx_no_inputs", "tx-context-free", Some("bad-txns-vin-empty"), c_tx_no_inputs),
-        case("block_tx_no_inputs", "tx-context-free", Some("bad-txns-vin-empty"), c_block_tx_no_inputs),
-        case("tx_no_outputs", "tx-context-free", Some("bad-txns-vout-empty"), c_tx_no_outputs),
-        case("tx_output_over_max", "tx-context-free", Some("bad-txns-vout-toolarge"), c_tx_output_over_max),
-        case("tx_duplicate_inputs", "tx-context-free", Some("bad-txns-inputs-duplicate"), c_tx_duplicate_inputs),
-        case("non_coinbase_null_input", "tx-context-free", Some("bad-txns-prevout-null"), c_non_coinbase_null_input),
-        case("tx_oversize", "tx-context-free", Some("bad-txns-oversize"), c_tx_oversize),
+        case(
+            "tx_no_inputs",
+            "tx-context-free",
+            Some("bad-txns-vin-empty"),
+            c_tx_no_inputs,
+        ),
+        case(
+            "block_tx_no_inputs",
+            "tx-context-free",
+            Some("bad-txns-vin-empty"),
+            c_block_tx_no_inputs,
+        ),
+        case(
+            "tx_no_outputs",
+            "tx-context-free",
+            Some("bad-txns-vout-empty"),
+            c_tx_no_outputs,
+        ),
+        case(
+            "tx_output_over_max",
+            "tx-context-free",
+            Some("bad-txns-vout-toolarge"),
+            c_tx_output_over_max,
+        ),
+        case(
+            "tx_duplicate_inputs",
+            "tx-context-free",
+            Some("bad-txns-inputs-duplicate"),
+            c_tx_duplicate_inputs,
+        ),
+        case(
+            "non_coinbase_null_input",
+            "tx-context-free",
+            Some("bad-txns-prevout-null"),
+            c_non_coinbase_null_input,
+        ),
+        case(
+            "tx_oversize",
+            "tx-context-free",
+            Some("bad-txns-oversize"),
+            c_tx_oversize,
+        ),
         // proof-of-work / timestamp
-        case("high_hash_bad_pow", "pow-timestamp", Some("high-hash"), c_high_hash),
-        case("time_too_new", "pow-timestamp", Some("time-too-new"), c_time_too_new),
-        case("time_too_old_mtp", "pow-timestamp", Some("time-too-old"), c_time_too_old),
+        case(
+            "high_hash_bad_pow",
+            "pow-timestamp",
+            Some("high-hash"),
+            c_high_hash,
+        ),
+        case(
+            "time_too_new",
+            "pow-timestamp",
+            Some("time-too-new"),
+            c_time_too_new,
+        ),
+        case(
+            "time_too_old_mtp",
+            "pow-timestamp",
+            Some("time-too-old"),
+            c_time_too_old,
+        ),
         // contextual / chain-level (reject)
-        case("spend_nonexistent", "contextual", Some("bad-txns-inputs-missingorspent"), c_spend_nonexistent),
-        case("coinbase_value_too_high", "contextual", Some("bad-cb-amount"), c_coinbase_value_too_high),
-        case("bad_coinbase_height_bip34", "contextual", Some("bad-cb-height"), c_bad_coinbase_height),
-        case("block_sigops", "contextual", Some("bad-blk-sigops"), c_block_sigops),
-        case("inputs_below_outputs", "contextual", Some("bad-txns-in-belowout"), c_inputs_below_outputs),
-        case("immature_coinbase_spend", "contextual", Some("bad-txns-premature-spend-of-coinbase"), c_immature_coinbase_spend),
-        case("locktime_not_final", "contextual", Some("bad-txns-nonfinal"), c_locktime_not_final),
-        case("coinbase_nonfinal", "contextual", Some("bad-txns-nonfinal"), c_coinbase_nonfinal),
-        case("locktime_equal_height", "contextual", Some("bad-txns-nonfinal"), c_locktime_equal_height),
+        case(
+            "spend_nonexistent",
+            "contextual",
+            Some("bad-txns-inputs-missingorspent"),
+            c_spend_nonexistent,
+        ),
+        case(
+            "coinbase_value_too_high",
+            "contextual",
+            Some("bad-cb-amount"),
+            c_coinbase_value_too_high,
+        ),
+        case(
+            "bad_coinbase_height_bip34",
+            "contextual",
+            Some("bad-cb-height"),
+            c_bad_coinbase_height,
+        ),
+        case(
+            "block_sigops",
+            "contextual",
+            Some("bad-blk-sigops"),
+            c_block_sigops,
+        ),
+        case(
+            "inputs_below_outputs",
+            "contextual",
+            Some("bad-txns-in-belowout"),
+            c_inputs_below_outputs,
+        ),
+        case(
+            "immature_coinbase_spend",
+            "contextual",
+            Some("bad-txns-premature-spend-of-coinbase"),
+            c_immature_coinbase_spend,
+        ),
+        case(
+            "locktime_not_final",
+            "contextual",
+            Some("bad-txns-nonfinal"),
+            c_locktime_not_final,
+        ),
+        case(
+            "coinbase_nonfinal",
+            "contextual",
+            Some("bad-txns-nonfinal"),
+            c_coinbase_nonfinal,
+        ),
+        case(
+            "locktime_equal_height",
+            "contextual",
+            Some("bad-txns-nonfinal"),
+            c_locktime_equal_height,
+        ),
         // BIP68 relative-locktime violation: BOTH reject (consensus agrees the
         // tx is invalid), but in block context Core labels it `bad-txns-nonfinal`
         // where satd emits the more specific `bad-txns-nonBIP68-final`. Pinned
@@ -966,8 +1422,18 @@ fn cases() -> Vec<Case> {
         },
         // accept cases (advance the tip — must run last)
         case("valid_block", "accept", None, c_valid_block),
-        case("mature_coinbase_spend_ok", "accept", None, c_mature_coinbase_spend_ok),
-        case("intra_block_spend_ok", "accept", None, c_intra_block_spend_ok),
+        case(
+            "mature_coinbase_spend_ok",
+            "accept",
+            None,
+            c_mature_coinbase_spend_ok,
+        ),
+        case(
+            "intra_block_spend_ok",
+            "accept",
+            None,
+            c_intra_block_spend_ok,
+        ),
     ]
 }
 
@@ -1012,7 +1478,10 @@ fn core_block_live_differential() {
             }
             Submission::Tx(t) => {
                 let hex = hex::encode(serialize(t));
-                (satd_test_mempool_accept(&satd, &hex), core.test_mempool_accept(&hex))
+                (
+                    satd_test_mempool_accept(&satd, &hex),
+                    core.test_mempool_accept(&hex),
+                )
             }
             Submission::RawBlock(raw) => {
                 let hex = hex::encode(raw);
@@ -1020,7 +1489,10 @@ fn core_block_live_differential() {
             }
             Submission::RawTx(raw) => {
                 let hex = hex::encode(raw);
-                (satd_test_mempool_accept(&satd, &hex), core.test_mempool_accept(&hex))
+                (
+                    satd_test_mempool_accept(&satd, &hex),
+                    core.test_mempool_accept(&hex),
+                )
             }
         };
 
@@ -1036,13 +1508,19 @@ fn core_block_live_differential() {
 
         match (&satd_out, &core_out) {
             (Outcome::Accept, Outcome::Accept) => {
-                report.push_str(&format!("✓ [{:<16}] {:<32} accept == Core\n", case.category, case.name));
+                report.push_str(&format!(
+                    "✓ [{:<16}] {:<32} accept == Core\n",
+                    case.category, case.name
+                ));
                 if let Submission::Block(b) = &submission {
                     ctx.advance_to(b);
                 }
             }
             (Outcome::Reject(a), Outcome::Reject(b)) if a == b => {
-                report.push_str(&format!("✓ [{:<16}] {:<32} reject({a}) == Core\n", case.category, case.name));
+                report.push_str(&format!(
+                    "✓ [{:<16}] {:<32} reject({a}) == Core\n",
+                    case.category, case.name
+                ));
                 // Cross-check the live Core reason against the static matrix's
                 // baked constant. A mismatch is informational (e.g. wording
                 // moved across a Core version), not a failure.
@@ -1053,7 +1531,9 @@ fn core_block_live_differential() {
                     ));
                 }
             }
-            (Outcome::Reject(a), Outcome::Reject(b)) if case.core_reason_differs == Some(b.as_str()) => {
+            (Outcome::Reject(a), Outcome::Reject(b))
+                if case.core_reason_differs == Some(b.as_str()) =>
+            {
                 // Documented ReasonDiffers: both reject (no consensus split),
                 // Core uses a known different label. Pinned so a *new*
                 // divergence still fails.
@@ -1083,7 +1563,11 @@ fn core_block_live_differential() {
         }
     }
 
-    report.push_str(&format!("\n{} cases, {} failures\n", cases().len(), failures.len()));
+    report.push_str(&format!(
+        "\n{} cases, {} failures\n",
+        cases().len(),
+        failures.len()
+    ));
     if !matrix_reason_notes.is_empty() {
         report.push_str("\nStatic-matrix constant cross-check notes (informational):\n");
         for n in &matrix_reason_notes {
@@ -1093,7 +1577,11 @@ fn core_block_live_differential() {
     println!("{report}");
 
     satd.stop();
-    assert!(failures.is_empty(), "Block-acceptance differential divergences:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "Block-acceptance differential divergences:\n{}",
+        failures.join("\n")
+    );
 }
 
 // ── getblockstats differential ─────────────────────────────────────────
@@ -1152,7 +1640,10 @@ fn pay(inputs: &[Utxo], fee: u64, outs: &[ScriptBuf]) -> Transaction {
     let each = spendable / outs.len() as u64;
     let mut output: Vec<TxOut> = outs
         .iter()
-        .map(|spk| TxOut { value: Amount::from_sat(each), script_pubkey: spk.clone() })
+        .map(|spk| TxOut {
+            value: Amount::from_sat(each),
+            script_pubkey: spk.clone(),
+        })
         .collect();
     output[0].value = Amount::from_sat(each + spendable % outs.len() as u64);
     Transaction {
@@ -1164,7 +1655,11 @@ fn pay(inputs: &[Utxo], fee: u64, outs: &[ScriptBuf]) -> Transaction {
                 previous_output: u.outpoint,
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
-                witness: if u.witness { p2wsh_op_true_witness() } else { Witness::new() },
+                witness: if u.witness {
+                    p2wsh_op_true_witness()
+                } else {
+                    Witness::new()
+                },
             })
             .collect(),
         output,
@@ -1175,7 +1670,10 @@ fn pay(inputs: &[Utxo], fee: u64, outs: &[ScriptBuf]) -> Transaction {
 fn out_of(tx: &Transaction, vout: u32) -> Utxo {
     let o = &tx.output[vout as usize];
     Utxo {
-        outpoint: OutPoint { txid: tx.compute_txid(), vout },
+        outpoint: OutPoint {
+            txid: tx.compute_txid(),
+            vout,
+        },
         value: o.value.to_sat(),
         witness: o.script_pubkey == p2wsh_op_true(),
     }
@@ -1186,19 +1684,38 @@ fn out_of(tx: &Transaction, vout: u32) -> Utxo {
 fn fee_block(ctx: &Ctx, txs: Vec<Transaction>) -> Block {
     let h = ctx.candidate_height();
     let mut cb = coinbase(h, block_subsidy(Network::Regtest, h), op_true());
-    let has_witness = txs.iter().any(|t| t.input.iter().any(|i| !i.witness.is_empty()));
+    let has_witness = txs
+        .iter()
+        .any(|t| t.input.iter().any(|i| !i.witness.is_empty()));
     let mut txdata = vec![cb.clone()];
     txdata.extend(txs);
     if has_witness {
         // The coinbase's wtxid counts as zero in the witness root, so the
         // root does not depend on the commitment about to be added to it.
-        let probe = assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txdata.clone(), None, false);
-        let root = probe.witness_root().expect("a block with a coinbase has a witness root");
-        cb.output.push(commitment_output(root.to_byte_array(), [0u8; 32]));
+        let probe = assemble(
+            ctx.tip_hash,
+            ctx.candidate_time(),
+            POWLIMIT_BITS,
+            txdata.clone(),
+            None,
+            false,
+        );
+        let root = probe
+            .witness_root()
+            .expect("a block with a coinbase has a witness root");
+        cb.output
+            .push(commitment_output(root.to_byte_array(), [0u8; 32]));
         cb.input[0].witness.push([0u8; 32]);
         txdata[0] = cb;
     }
-    assemble(ctx.tip_hash, ctx.candidate_time(), POWLIMIT_BITS, txdata, None, true)
+    assemble(
+        ctx.tip_hash,
+        ctx.candidate_time(),
+        POWLIMIT_BITS,
+        txdata,
+        None,
+        true,
+    )
 }
 
 /// Every `getblockstats` statistic from satd.
@@ -1232,8 +1749,16 @@ fn core_getblockstats_differential() {
         let hex = hex::encode(serialize(&block));
         let s = satd_submit_block(&satd, &hex);
         let c = core.submit_block(&hex);
-        assert_eq!(s, Outcome::Accept, "satd rejected fee-profile block `{name}`: {s:?}");
-        assert_eq!(c, Outcome::Accept, "Core rejected fee-profile block `{name}`: {c:?}");
+        assert_eq!(
+            s,
+            Outcome::Accept,
+            "satd rejected fee-profile block `{name}`: {s:?}"
+        );
+        assert_eq!(
+            c,
+            Outcome::Accept,
+            "Core rejected fee-profile block `{name}`: {c:?}"
+        );
         ctx.advance_to(&block);
         blocks.push((name, block));
     };
@@ -1244,7 +1769,15 @@ fn core_getblockstats_differential() {
 
     // 2. One zero-fee spend.
     let cb = ctx.take_mature_coinbase(&mut used);
-    let zero = pay(&[Utxo { outpoint: cb.outpoint, value: cb.amount, witness: false }], 0, &[op_true()]);
+    let zero = pay(
+        &[Utxo {
+            outpoint: cb.outpoint,
+            value: cb.amount,
+            witness: false,
+        }],
+        0,
+        &[op_true()],
+    );
     let b = fee_block(&ctx, vec![zero]);
     submit(&mut ctx, "single_zero_fee", b);
 
@@ -1253,7 +1786,15 @@ fn core_getblockstats_differential() {
     let cb = ctx.take_mature_coinbase(&mut used);
     let mut outs: Vec<ScriptBuf> = (0..10).map(|_| op_true()).collect();
     outs.extend((0..6).map(|_| p2wsh_op_true()));
-    let fan = pay(&[Utxo { outpoint: cb.outpoint, value: cb.amount, witness: false }], 10_000, &outs);
+    let fan = pay(
+        &[Utxo {
+            outpoint: cb.outpoint,
+            value: cb.amount,
+            witness: false,
+        }],
+        10_000,
+        &outs,
+    );
     let bare: Vec<Utxo> = (0..10).map(|v| out_of(&fan, v)).collect();
     let wsh: Vec<Utxo> = (10..16).map(|v| out_of(&fan, v)).collect();
     let b = fee_block(&ctx, vec![fan]);
@@ -1285,7 +1826,14 @@ fn core_getblockstats_differential() {
     let w4 = pay(&[out_of(&w3, 0), bare[7]], 12_345, &[op_true()]);
     let b = fee_block(
         &ctx,
-        vec![w1, w2, w3, w4, pay(&[bare[6]], 999, &[op_true()]), pay(&[wsh[2]], 77, &[op_true()])],
+        vec![
+            w1,
+            w2,
+            w3,
+            w4,
+            pay(&[bare[6]], 999, &[op_true()]),
+            pay(&[wsh[2]], 77, &[op_true()]),
+        ],
     );
     submit(&mut ctx, "witness_even_count", b);
 
@@ -1296,7 +1844,11 @@ fn core_getblockstats_differential() {
             pay(&[wsh[3]], 7, &[op_true()]),
             pay(&[bare[8]], 3, &[op_true()]),
             pay(&[bare[9]], 263, &[op_true()]),
-            pay(&[wsh[4], wsh[5]], 1_111, &[p2wsh_op_true(), p2wsh_op_true()]),
+            pay(
+                &[wsh[4], wsh[5]],
+                1_111,
+                &[p2wsh_op_true(), p2wsh_op_true()],
+            ),
         ],
     );
     submit(&mut ctx, "truncating_rates", b);
@@ -1330,11 +1882,26 @@ fn core_getblockstats_differential() {
             witness: Witness::new(),
         }],
         output: vec![
-            TxOut { value: Amount::from_sat(cb.amount - 30_000), script_pubkey: p2wsh_op_true() },
-            TxOut { value: Amount::ZERO, script_pubkey: op_return_data },
-            TxOut { value: Amount::from_sat(5_000), script_pubkey: op_return_bare },
-            TxOut { value: Amount::from_sat(5_000), script_pubkey: oversized },
-            TxOut { value: Amount::from_sat(10_000), script_pubkey: long_spendable },
+            TxOut {
+                value: Amount::from_sat(cb.amount - 30_000),
+                script_pubkey: p2wsh_op_true(),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: op_return_data,
+            },
+            TxOut {
+                value: Amount::from_sat(5_000),
+                script_pubkey: op_return_bare,
+            },
+            TxOut {
+                value: Amount::from_sat(5_000),
+                script_pubkey: oversized,
+            },
+            TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: long_spendable,
+            },
         ],
     };
     let witness_spend = pay(&[out_of(&unspendable, 0)], 4_321, &[op_true(), op_true()]);
@@ -1343,7 +1910,10 @@ fn core_getblockstats_differential() {
 
     // The genesis block: its coinbase is in `utxo_size_inc` but in neither
     // `_actual` statistic. Both nodes already hold it.
-    blocks.push(("genesis", bitcoin::constants::genesis_block(Network::Regtest)));
+    blocks.push((
+        "genesis",
+        bitcoin::constants::genesis_block(Network::Regtest),
+    ));
 
     let mut report = String::from("\nLive-Core getblockstats differential\n");
     let mut failures: Vec<String> = Vec::new();
@@ -1386,7 +1956,9 @@ fn core_getblockstats_differential() {
     }
     for known in KNOWN_DIFFERENT {
         if !still_different.contains(known) {
-            failures.push(format!("{known} matches Core on every block: take it off KNOWN_DIFFERENT"));
+            failures.push(format!(
+                "{known} matches Core on every block: take it off KNOWN_DIFFERENT"
+            ));
         }
     }
     println!("{report}");
@@ -1394,13 +1966,29 @@ fn core_getblockstats_differential() {
     // Non-vacuity: the blocks must exercise what they are there for, or a
     // statistic both nodes answer with a constant would pass.
     let core_stats = |name: &str| {
-        let (_, b) = blocks.iter().find(|(n, _)| *n == name).expect("block by name");
+        let (_, b) = blocks
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("block by name");
         core_fee_stats(&core, &b.block_hash().to_string())
     };
     let coinbase_only = core_stats("coinbase_only");
-    assert_eq!(coinbase_only["feerate_percentiles"], serde_json::json!([0, 0, 0, 0, 0]));
-    for zero in ["total_size", "total_weight", "avgtxsize", "mintxsize", "maxtxsize"] {
-        assert_eq!(coinbase_only[zero], serde_json::json!(0), "{zero}: {coinbase_only}");
+    assert_eq!(
+        coinbase_only["feerate_percentiles"],
+        serde_json::json!([0, 0, 0, 0, 0])
+    );
+    for zero in [
+        "total_size",
+        "total_weight",
+        "avgtxsize",
+        "mintxsize",
+        "maxtxsize",
+    ] {
+        assert_eq!(
+            coinbase_only[zero],
+            serde_json::json!(0),
+            "{zero}: {coinbase_only}"
+        );
     }
     let fan_out = core_stats("fan_out");
     assert!(fan_out["avgfeerate"].as_u64().unwrap() > 0, "{fan_out}");
@@ -1411,7 +1999,10 @@ fn core_getblockstats_differential() {
         .iter()
         .map(|v| v.as_u64().expect("integer percentile"))
         .collect();
-    assert!(pct[0] < pct[4], "the mixed block must spread its percentiles: {pct:?}");
+    assert!(
+        pct[0] < pct[4],
+        "the mixed block must spread its percentiles: {pct:?}"
+    );
     let witness = core_stats("witness_even_count");
     assert!(witness["mediantxsize"].as_u64().unwrap() > 0, "{witness}");
     // The unspendable outputs and the genesis coinbase must separate the
@@ -1425,10 +2016,23 @@ fn core_getblockstats_differential() {
     let unspendable = core_stats("unspendable_outputs");
     let left_out = unspendable["utxo_increase"].as_i64().unwrap()
         - unspendable["utxo_increase_actual"].as_i64().unwrap();
-    assert_eq!(left_out, 4, "three unspendable outputs and the coinbase commitment: {unspendable}");
-    assert!(unspendable["utxo_size_inc"].as_i64().unwrap() > 10_000, "{unspendable}");
-    assert_eq!(core_stats("coinbase_only")["total_out"], serde_json::json!(0));
+    assert_eq!(
+        left_out, 4,
+        "three unspendable outputs and the coinbase commitment: {unspendable}"
+    );
+    assert!(
+        unspendable["utxo_size_inc"].as_i64().unwrap() > 10_000,
+        "{unspendable}"
+    );
+    assert_eq!(
+        core_stats("coinbase_only")["total_out"],
+        serde_json::json!(0)
+    );
 
     satd.stop();
-    assert!(failures.is_empty(), "getblockstats divergences:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "getblockstats divergences:\n{}",
+        failures.join("\n")
+    );
 }

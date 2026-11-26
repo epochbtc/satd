@@ -73,7 +73,11 @@ impl Default for IbdStoreQueue {
 
 impl IbdStoreQueue {
     pub fn new(max_bytes: usize) -> Self {
-        Self { state: Mutex::new(State::default()), cvar: Condvar::new(), max_bytes }
+        Self {
+            state: Mutex::new(State::default()),
+            cvar: Condvar::new(),
+            max_bytes,
+        }
     }
 
     /// Queue `job` for the store thread, or hand it back when it would take
@@ -165,8 +169,14 @@ mod tests {
     #[test]
     fn the_byte_bound_refuses_overflow_but_never_an_empty_queue() {
         let q = IbdStoreQueue::new(100);
-        assert!(q.try_push(job(150)).is_ok(), "an empty queue takes an oversized block");
-        assert!(q.try_push(job(1)).is_err(), "a full queue refuses the next block");
+        assert!(
+            q.try_push(job(150)).is_ok(),
+            "an empty queue takes an oversized block"
+        );
+        assert!(
+            q.try_push(job(1)).is_err(),
+            "a full queue refuses the next block"
+        );
         let first = q.pop(Duration::ZERO).unwrap();
         assert_eq!(first.size, 150);
         assert_eq!(q.queued_bytes(), 0);

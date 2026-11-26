@@ -43,7 +43,10 @@ fn an_inline_comment_is_not_part_of_the_value() {
     assert_eq!(global(&cf, "uacomment"), ["abc"]);
     assert_eq!(global(&cf, "includeconf"), ["extra.conf"]);
     assert_eq!(
-        cf.sections.get("test").and_then(|s| s.get("rpcport")).cloned(),
+        cf.sections
+            .get("test")
+            .and_then(|s| s.get("rpcport"))
+            .cloned(),
         Some(vec!["18332".to_string()]),
         "a section header followed by a comment still opens the section"
     );
@@ -109,7 +112,8 @@ fn a_hash_on_an_rpcpassword_line_is_refused_with_cores_message() {
 /// the value.
 #[test]
 fn whitespace_is_trimmed_as_core_trims_it() {
-    let cf = ConfigFile::parse(" \t rpcuser \t=\t alice \t\r\nuacomment=x\u{b}\nrpcbind=\u{c}y\n").unwrap();
+    let cf = ConfigFile::parse(" \t rpcuser \t=\t alice \t\r\nuacomment=x\u{b}\nrpcbind=\u{c}y\n")
+        .unwrap();
     assert_eq!(global(&cf, "rpcuser"), ["alice"]);
     assert_eq!(global(&cf, "uacomment"), ["x\u{b}"]);
     assert_eq!(global(&cf, "rpcbind"), ["\u{c}y"]);
@@ -145,21 +149,33 @@ fn config_debug_output_carries_no_secrets() {
         "WebhookSecretMarker",
         "9383f6d2",
     ] {
-        assert!(!shown.contains(secret), "Config Debug shows {secret}: {shown}");
+        assert!(
+            !shown.contains(secret),
+            "Config Debug shows {secret}: {shown}"
+        );
     }
     let shown_alt = format!("{cfg:#?}");
     assert!(!shown_alt.contains("RpcPasswordMarker"), "{shown_alt}");
-    assert!(shown.contains("Regtest"), "Config Debug still names the network: {shown}");
+    assert!(
+        shown.contains("Regtest"),
+        "Config Debug still names the network: {shown}"
+    );
 
     let entry = &cfg.rpcauth[0];
     let shown = format!("{entry:?}");
     assert!(shown.contains("authuser"), "{shown}");
-    assert!(!shown.contains(&format!("{:?}", entry.hash)), "rpcauth hash shown: {shown}");
+    assert!(
+        !shown.contains(&format!("{:?}", entry.hash)),
+        "rpcauth hash shown: {shown}"
+    );
 
     let hook = crate::reload::webhook_target_from(&cfg).unwrap();
     let shown = format!("{hook:?}");
     assert!(shown.contains("127.0.0.1:9/hook"), "{shown}");
-    assert!(!shown.contains("WebhookSecretMarker"), "webhook secret shown: {shown}");
+    assert!(
+        !shown.contains("WebhookSecretMarker"),
+        "webhook secret shown: {shown}"
+    );
 }
 
 /// A callsite for metadata built by hand: the filters only read the metadata
@@ -214,10 +230,8 @@ fn trace_logging_leaves_out_the_request_dumps() {
         "tungstenite::protocol::frame",
     ];
 
-    let cfg = Config::from_cli(
-        parse_cli(["satd", "--regtest", "--loglevel=trace"]).unwrap(),
-    )
-    .unwrap();
+    let cfg =
+        Config::from_cli(parse_cli(["satd", "--regtest", "--loglevel=trace"]).unwrap()).unwrap();
     for target in dumps {
         assert!(
             !would_log(build_env_filter(&cfg), target, Level::TRACE),
@@ -228,7 +242,11 @@ fn trace_logging_leaves_out_the_request_dumps() {
             "{target} DEBUG must still be logged under -loglevel=trace"
         );
     }
-    assert!(would_log(build_env_filter(&cfg), "node::rpc::server", Level::TRACE));
+    assert!(would_log(
+        build_env_filter(&cfg),
+        "node::rpc::server",
+        Level::TRACE
+    ));
 
     // Directives naming the targets, more specifically than the guard's
     // prefixes, cannot turn them back on.
@@ -236,9 +254,17 @@ fn trace_logging_leaves_out_the_request_dumps() {
                     tungstenite::protocol=trace";
     for target in dumps {
         assert!(
-            !would_log(tracing_subscriber::EnvFilter::new(explicit), target, Level::TRACE),
+            !would_log(
+                tracing_subscriber::EnvFilter::new(explicit),
+                target,
+                Level::TRACE
+            ),
             "{target} TRACE is logged when a directive names it"
         );
     }
-    assert!(would_log(tracing_subscriber::EnvFilter::new(explicit), "node::net", Level::TRACE));
+    assert!(would_log(
+        tracing_subscriber::EnvFilter::new(explicit),
+        "node::net",
+        Level::TRACE
+    ));
 }

@@ -431,7 +431,6 @@ pub fn spawn_health_detectors(
     state
 }
 
-
 async fn run_detectors(
     inputs: HealthInputs,
     mut chain_rx: broadcast::Receiver<ChainEvent>,
@@ -609,7 +608,12 @@ pub struct AlertSink {
 impl AlertSink {
     /// [`report_external`] through this sink.
     pub fn report(&self, event: StatusEvent) {
-        report_external(self.health.as_deref(), &self.warnings, &self.publisher, event);
+        report_external(
+            self.health.as_deref(),
+            &self.warnings,
+            &self.publisher,
+            event,
+        );
     }
 }
 
@@ -683,8 +687,8 @@ pub fn mirror_into_warnings(warnings: &NodeWarnings, event: &StatusEvent) {
                         edge_magnitude(event),
                     );
                 } else {
-                    let context = serde_json::to_value(&event.details)
-                        .unwrap_or(serde_json::Value::Null);
+                    let context =
+                        serde_json::to_value(&event.details).unwrap_or(serde_json::Value::Null);
                     warnings.record(&id, severity, event.message.clone(), context);
                 }
             }
@@ -737,12 +741,18 @@ fn raise_if_new(
     // raised, so an edge-only store keeps 90), ease to 78% — below the new
     // raise line, above the new clear line — and the stale 90 ≠ 80 clears an
     // alert that both the old and new hysteresis lines say to hold.
-    state.threshold_slot(kind).store(threshold, Ordering::Relaxed);
+    state
+        .threshold_slot(kind)
+        .store(threshold, Ordering::Relaxed);
     if state.is_active(kind) {
         return;
     }
     state.set_active(kind, true);
-    emit(warnings, publisher, details(StatusEvent::raised(kind, message)));
+    emit(
+        warnings,
+        publisher,
+        details(StatusEvent::raised(kind, message)),
+    );
 }
 
 /// Clear a standing condition whose **threshold moved** rather than whose
@@ -798,7 +808,11 @@ fn clear_if_active(
         return;
     }
     state.set_active(kind, false);
-    emit(warnings, publisher, details(StatusEvent::cleared(kind, message)));
+    emit(
+        warnings,
+        publisher,
+        details(StatusEvent::cleared(kind, message)),
+    );
 }
 
 /// A disabled detector must not leave a previously-raised condition standing
@@ -834,14 +848,9 @@ fn clear_with_reason(
     message: String,
     reason: &'static str,
 ) {
-    clear_if_active(
-        state,
-        warnings,
-        publisher,
-        kind,
-        message,
-        |e| e.with_detail("reason", reason),
-    );
+    clear_if_active(state, warnings, publisher, kind, message, |e| {
+        e.with_detail("reason", reason)
+    });
 }
 
 /// Advance the tip-stall clock if the chain moved, and return its age.
@@ -1140,9 +1149,8 @@ fn check_disk_values(
     let Some(free) = free else {
         return;
     };
-    let clear_at = floor
-        .saturating_mul(hysteresis::DISK_CLEAR_RATIO_NUM)
-        / hysteresis::DISK_CLEAR_RATIO_DEN;
+    let clear_at =
+        floor.saturating_mul(hysteresis::DISK_CLEAR_RATIO_NUM) / hysteresis::DISK_CLEAR_RATIO_DEN;
     if free < floor {
         raise_if_new(
             state,
@@ -1260,7 +1268,11 @@ fn check_mempool_values(
             publisher,
             StatusKind::MempoolCongested,
             pct,
-            format!("mempool at {}% of its {} MiB cap", used * 100 / cap, cap / (1024 * 1024)),
+            format!(
+                "mempool at {}% of its {} MiB cap",
+                used * 100 / cap,
+                cap / (1024 * 1024)
+            ),
             |e| {
                 e.with_detail("bytes_used", used)
                     .with_detail("bytes_cap", cap)
@@ -1564,14 +1576,11 @@ fn report_reorgs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
     use crate::events::{EdgeIdentity, NodeEventBody};
+    use bitcoin::hashes::Hash as _;
 
     fn publisher() -> Arc<EventPublisher> {
-        EventPublisher::new(
-            EdgeIdentity::new([0x11; 16], None).unwrap(),
-            64,
-        )
+        EventPublisher::new(EdgeIdentity::new([0x11; 16], None).unwrap(), 64)
     }
 
     /// Drain the published status events from a receiver, as `(kind, state)`.
@@ -1619,9 +1628,18 @@ mod tests {
         // A stall is not an ordinary property of a thin-hashrate chain the way
         // a shallow reorg is, so unlike `reorg_depth_for` the test networks are
         // not relaxed — they are simply expected to make blocks.
-        assert_eq!(defaults::tip_stall_for(Network::Bitcoin), defaults::TIP_STALL_SECS);
-        assert_eq!(defaults::tip_stall_for(Network::Signet), defaults::TIP_STALL_SECS);
-        assert_eq!(defaults::tip_stall_for(Network::Testnet4), defaults::TIP_STALL_SECS);
+        assert_eq!(
+            defaults::tip_stall_for(Network::Bitcoin),
+            defaults::TIP_STALL_SECS
+        );
+        assert_eq!(
+            defaults::tip_stall_for(Network::Signet),
+            defaults::TIP_STALL_SECS
+        );
+        assert_eq!(
+            defaults::tip_stall_for(Network::Testnet4),
+            defaults::TIP_STALL_SECS
+        );
     }
 
     #[test]
@@ -1635,9 +1653,18 @@ mod tests {
         // node is broken in exactly the way this alert reports, and defaulting
         // it off would make the detector's silence indistinguishable from
         // health.
-        assert_eq!(defaults::peer_floor_for(Network::Signet, 0), defaults::PEER_FLOOR);
-        assert_eq!(defaults::peer_floor_for(Network::Bitcoin, 0), defaults::PEER_FLOOR);
-        assert_eq!(defaults::peer_floor_for(Network::Testnet4, 0), defaults::PEER_FLOOR);
+        assert_eq!(
+            defaults::peer_floor_for(Network::Signet, 0),
+            defaults::PEER_FLOOR
+        );
+        assert_eq!(
+            defaults::peer_floor_for(Network::Bitcoin, 0),
+            defaults::PEER_FLOOR
+        );
+        assert_eq!(
+            defaults::peer_floor_for(Network::Testnet4, 0),
+            defaults::PEER_FLOOR
+        );
 
         // `-connect=` is the same trap as regtest: it suppresses DNS and fixed
         // seeds, so the node can never hold more peers than were named and a
@@ -1646,7 +1673,10 @@ mod tests {
         assert_eq!(defaults::peer_floor_for(Network::Signet, 2), 2);
         // Capped, not mirrored — past the stock floor the ordinary threshold
         // governs, so a node wired to eight peers is not held to needing eight.
-        assert_eq!(defaults::peer_floor_for(Network::Bitcoin, 8), defaults::PEER_FLOOR);
+        assert_eq!(
+            defaults::peer_floor_for(Network::Bitcoin, 8),
+            defaults::PEER_FLOOR
+        );
         // Regtest stays off; the network already answered this.
         assert_eq!(defaults::peer_floor_for(Network::Regtest, 1), 0);
     }
@@ -1777,7 +1807,12 @@ mod tests {
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
 
         state.set_active(StatusKind::DiskLow, true);
-        warnings.record("alert.disk_low", Severity::Error, "low", serde_json::Value::Null);
+        warnings.record(
+            "alert.disk_low",
+            Severity::Error,
+            "low",
+            serde_json::Value::Null,
+        );
 
         // Two polls: the probe is started on the first and collected on the
         // second (see `check_disk` on why it is never awaited inline).
@@ -1818,7 +1853,10 @@ mod tests {
         // 10 MiB floor, 5 MiB free ⇒ raised.
         let thresholds = AlertThresholds::new(0, 10, 0, 0, 0);
         sample_disk(&state, &warnings, &pubr, &thresholds, 5 * 1024 * 1024);
-        assert_eq!(drained(&mut rx), vec![(StatusKind::DiskLow, StatusState::Raised)]);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::DiskLow, StatusState::Raised)]
+        );
 
         // Retune the floor down to 4 MiB. 5 MiB free is above the new floor but
         // below the new 6 MiB clear line: the dead band.
@@ -1877,14 +1915,23 @@ mod tests {
 
         // Just below the floor raises.
         sample_disk(&state, &warnings, &pubr, &thresholds, floor - 1);
-        assert_eq!(drained(&mut rx), vec![(StatusKind::DiskLow, StatusState::Raised)]);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::DiskLow, StatusState::Raised)]
+        );
         // Just *above* the floor does NOT clear — that is the hysteresis gap.
         sample_disk(&state, &warnings, &pubr, &thresholds, floor + 1);
-        assert!(drained(&mut rx).is_empty(), "clearing at the raise line would flap");
+        assert!(
+            drained(&mut rx).is_empty(),
+            "clearing at the raise line would flap"
+        );
         assert!(state.is_active(StatusKind::DiskLow));
         // Above 1.5× clears.
         sample_disk(&state, &warnings, &pubr, &thresholds, floor * 3 / 2 + 1);
-        assert_eq!(drained(&mut rx), vec![(StatusKind::DiskLow, StatusState::Cleared)]);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::DiskLow, StatusState::Cleared)]
+        );
     }
 
     /// Drive the real disk detector at a synthetic free-space reading.
@@ -1993,7 +2040,9 @@ mod tests {
         );
 
         check_mempool_values(&state, &warnings, &pubr, &thresholds, 0, 0, 1);
-        let env = rx.try_recv().expect("a zero cap must clear the standing alert");
+        let env = rx
+            .try_recv()
+            .expect("a zero cap must clear the standing alert");
         let NodeEventBody::Status(s) = env.body else {
             panic!("expected a status event")
         };
@@ -2104,7 +2153,10 @@ mod tests {
             frozen,
             start + Duration::from_secs(3600),
         );
-        assert_eq!(age, 3600, "the tip never moved; the clock must keep running");
+        assert_eq!(
+            age, 3600,
+            "the tip never moved; the clock must keep running"
+        );
         check_tip_stall_values(&state, &warnings, &pubr, &on, true, 100, age);
         assert_eq!(
             drained(&mut rx),
@@ -2142,18 +2194,37 @@ mod tests {
         let at = |d: Duration| started + d;
         let poll = |now: Instant, total: u64, below: &mut _, ok: &mut _| {
             check_peers_values(
-                &state, &warnings, &pubr, &thresholds, total, total, below, ok, &started, now,
+                &state,
+                &warnings,
+                &pubr,
+                &thresholds,
+                total,
+                total,
+                below,
+                ok,
+                &started,
+                now,
             );
         };
 
         // Inside the grace, no peers: silent.
         poll(at(Duration::ZERO), 0, &mut below, &mut ok);
-        poll(at(hysteresis::PEER_STARTUP_GRACE / 2), 0, &mut below, &mut ok);
+        poll(
+            at(hysteresis::PEER_STARTUP_GRACE / 2),
+            0,
+            &mut below,
+            &mut ok,
+        );
         assert!(drained(&mut rx).is_empty(), "still dialing out");
 
         // The instant the grace ends, the hold must start fresh — not already
         // be satisfied by time spent inside the grace.
-        poll(at(hysteresis::PEER_STARTUP_GRACE + Duration::from_secs(1)), 0, &mut below, &mut ok);
+        poll(
+            at(hysteresis::PEER_STARTUP_GRACE + Duration::from_secs(1)),
+            0,
+            &mut below,
+            &mut ok,
+        );
         assert!(
             drained(&mut rx).is_empty(),
             "the grace must not merely delay the raise to t=GRACE"
@@ -2166,7 +2237,10 @@ mod tests {
             &mut below,
             &mut ok,
         );
-        assert_eq!(drained(&mut rx), vec![(StatusKind::PeerFloor, StatusState::Raised)]);
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::PeerFloor, StatusState::Raised)]
+        );
     }
 
     /// Latching "we have seen a peer" ends the grace, but must not fire the
@@ -2183,14 +2257,31 @@ mod tests {
         let (mut below, mut ok) = (None, None);
 
         check_peers_values(
-            &state, &warnings, &pubr, &thresholds, 0, 0, &mut below, &mut ok, &started,
+            &state,
+            &warnings,
+            &pubr,
+            &thresholds,
+            0,
+            0,
+            &mut below,
+            &mut ok,
+            &started,
             started,
         );
         // First peer lands late in the grace: 1 < floor of 3, and the latch
         // drops the grace — but the hold has to start here, not at t=0.
         let t = started + hysteresis::PEER_STARTUP_GRACE - Duration::from_secs(1);
         check_peers_values(
-            &state, &warnings, &pubr, &thresholds, 1, 1, &mut below, &mut ok, &started, t,
+            &state,
+            &warnings,
+            &pubr,
+            &thresholds,
+            1,
+            1,
+            &mut below,
+            &mut ok,
+            &started,
+            t,
         );
         assert!(
             drained(&mut rx).is_empty(),
@@ -2212,7 +2303,12 @@ mod tests {
         let mut probe = None;
         let call = async |probe: &mut Option<DiskProbe>| {
             check_disk(
-                &state, &warnings, &pubr, &thresholds, std::path::Path::new("."), probe,
+                &state,
+                &warnings,
+                &pubr,
+                &thresholds,
+                std::path::Path::new("."),
+                probe,
                 DISK_PROBE_BUDGET,
             )
             .await;
@@ -2277,7 +2373,10 @@ mod tests {
             .await
             .expect("check_disk must not block on an unresponsive filesystem");
             assert_eq!(
-                probe.as_ref().expect("the stuck probe is retained").stalled_polls,
+                probe
+                    .as_ref()
+                    .expect("the stuck probe is retained")
+                    .stalled_polls,
                 expected,
                 "the same probe is carried forward, not replaced",
             );
@@ -2317,11 +2416,29 @@ mod tests {
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 3);
         let mut seen = ReorgSeen::default();
 
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 98, 2, 3, 1)], &mut seen);
-        assert!(drained(&mut rx).is_empty(), "a 2-deep reorg is below the floor");
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1000, 98, 2, 3, 1)],
+            &mut seen,
+        );
+        assert!(
+            drained(&mut rx).is_empty(),
+            "a 2-deep reorg is below the floor"
+        );
 
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1001, 97, 3, 4, 2)], &mut seen);
-        assert_eq!(drained(&mut rx), vec![(StatusKind::DeepReorg, StatusState::Edge)]);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1001, 97, 3, 4, 2)],
+            &mut seen,
+        );
+        assert_eq!(
+            drained(&mut rx),
+            vec![(StatusKind::DeepReorg, StatusState::Edge)]
+        );
     }
 
     #[test]
@@ -2333,7 +2450,13 @@ mod tests {
         let mut seen = ReorgSeen::default();
 
         // fork at 896, 4 rolled back (old tip 900), 6 reconnected (new tip 902).
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 896, 4, 6, 1)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1000, 896, 4, 6, 1)],
+            &mut seen,
+        );
         let env = rx.try_recv().unwrap();
         assert_eq!(detail(&env, "depth"), "4");
         assert_eq!(detail(&env, "from_height"), "900");
@@ -2360,15 +2483,27 @@ mod tests {
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
         let mut seen = ReorgSeen::default();
 
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 896, 3, 3, 1)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1000, 896, 3, 3, 1)],
+            &mut seen,
+        );
         let shallow = alerts.try_recv().expect("the first reorg pages");
         assert!(shallow.contains("rolled back 3 blocks"), "{shallow}");
 
         // Same rate-limit window, two orders of magnitude worse.
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1001, 700, 200, 3, 2)], &mut seen);
-        let deep = alerts.try_recv().expect(
-            "a 200-block reorg must not be swallowed by the window a 3-block reorg opened",
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1001, 700, 200, 3, 2)],
+            &mut seen,
         );
+        let deep = alerts
+            .try_recv()
+            .expect("a 200-block reorg must not be swallowed by the window a 3-block reorg opened");
         assert!(deep.contains("rolled back 200 blocks"), "{deep}");
     }
 
@@ -2386,10 +2521,20 @@ mod tests {
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
         let mut seen = ReorgSeen::default();
 
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 100, 3, 4, 1)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1000, 100, 3, 4, 1)],
+            &mut seen,
+        );
         let env = rx.try_recv().unwrap();
         assert_eq!(detail(&env, "to_height"), "104");
-        assert_ne!(detail(&env, "to_height"), "101", "that is the first reconnect");
+        assert_ne!(
+            detail(&env, "to_height"),
+            "101",
+            "that is the first reconnect"
+        );
     }
 
     /// A reorg whose record predates the last one seen must still be reported.
@@ -2414,12 +2559,24 @@ mod tests {
         let mut seen = ReorgSeen::default();
 
         // A reorg at t=2000, reported normally.
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(2000, 100, 4, 2, 1)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(2000, 100, 4, 2, 1)],
+            &mut seen,
+        );
         assert!(rx.try_recv().is_ok(), "the first reorg reports");
 
         // The clock steps back 20 minutes; the next genuine reorg is stamped
         // t=800. It is a different reorg (different tips) and must still page.
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(800, 200, 5, 3, 2)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(800, 200, 5, 3, 2)],
+            &mut seen,
+        );
         let env = rx
             .try_recv()
             .expect("a reorg after a backwards clock step must still be reported");
@@ -2462,7 +2619,13 @@ mod tests {
         report_reorgs(&warnings, &pubr, &thresholds, old, &mut seen);
         assert!(rx.try_recv().is_err(), "a seeded reorg must not re-page");
 
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1001, 300, 9, 2, 3)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1001, 300, 9, 2, 3)],
+            &mut seen,
+        );
         assert!(rx.try_recv().is_ok(), "but a new one still does");
     }
 
@@ -2476,7 +2639,13 @@ mod tests {
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 1);
         let mut seen = ReorgSeen::default();
 
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 99, 6, 0, 1)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1000, 99, 6, 0, 1)],
+            &mut seen,
+        );
         let env = rx.try_recv().unwrap();
         assert_eq!(detail(&env, "depth"), "6");
         assert_eq!(detail(&env, "from_height"), "105");
@@ -2533,11 +2702,26 @@ mod tests {
         let mut seen = ReorgSeen::default();
         let records = vec![rec(1000, 98, 2, 3, 1)];
 
-        report_reorgs(&warnings, &pubr, &AlertThresholds::new(0, 0, 0, 0, 10), records.clone(), &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &AlertThresholds::new(0, 0, 0, 0, 10),
+            records.clone(),
+            &mut seen,
+        );
         assert!(drained(&mut rx).is_empty());
 
-        report_reorgs(&warnings, &pubr, &AlertThresholds::new(0, 0, 0, 0, 1), records, &mut seen);
-        assert!(drained(&mut rx).is_empty(), "already seen at the old threshold");
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &AlertThresholds::new(0, 0, 0, 0, 1),
+            records,
+            &mut seen,
+        );
+        assert!(
+            drained(&mut rx).is_empty(),
+            "already seen at the old threshold"
+        );
     }
 
     #[test]
@@ -2547,7 +2731,13 @@ mod tests {
         let mut rx = pubr.subscribe();
         let thresholds = AlertThresholds::new(0, 0, 0, 0, 0);
         let mut seen = ReorgSeen::default();
-        report_reorgs(&warnings, &pubr, &thresholds, vec![rec(1000, 50, 50, 51, 1)], &mut seen);
+        report_reorgs(
+            &warnings,
+            &pubr,
+            &thresholds,
+            vec![rec(1000, 50, 50, 51, 1)],
+            &mut seen,
+        );
         assert!(drained(&mut rx).is_empty());
     }
 

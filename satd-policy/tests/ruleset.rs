@@ -366,7 +366,10 @@ fn shipped_example_policy_compiles() {
     let rs = parse_ruleset(src).unwrap_or_else(|e| panic!("example.policy:\n{}", e.render(src)));
     assert_eq!(rs.version(), 1);
     assert_eq!(rs.rules().len(), 5);
-    assert!(rs.has_allow(), "the example leads with an `allow own-submissions` rule");
+    assert!(
+        rs.has_allow(),
+        "the example leads with an `allow own-submissions` rule"
+    );
     assert!(
         rs.total_cost().total() <= satd_policy::POLICY_BUDGET,
         "example.policy must stay within the static cost budget"

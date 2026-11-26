@@ -313,7 +313,9 @@ mod tests {
         for (i, output) in decoded.output.iter().enumerate() {
             assert_eq!(
                 script_to_asm_str(output.script_pubkey.as_bytes(), false),
-                tx["core"]["vout"][i]["scriptPubKey"]["asm"].as_str().unwrap(),
+                tx["core"]["vout"][i]["scriptPubKey"]["asm"]
+                    .as_str()
+                    .unwrap(),
                 "vout {i}"
             );
         }
@@ -336,7 +338,9 @@ mod tests {
         let undo: Vec<crate::storage::coinview::Coin> = (0..decoded.input.len())
             .map(|i| crate::storage::coinview::Coin {
                 amount: 1000,
-                script_pubkey: decoded.output[i % decoded.output.len()].script_pubkey.clone(),
+                script_pubkey: decoded.output[i % decoded.output.len()]
+                    .script_pubkey
+                    .clone(),
                 height: 1,
                 coinbase: false,
                 txseq: 0,
@@ -352,7 +356,10 @@ mod tests {
         );
         let core_tx = &tx["core"];
         for i in 0..decoded.input.len() {
-            assert_eq!(got["vin"][i]["scriptSig"]["asm"], core_tx["vin"][i]["scriptSig"]["asm"], "vin {i}");
+            assert_eq!(
+                got["vin"][i]["scriptSig"]["asm"], core_tx["vin"][i]["scriptSig"]["asm"],
+                "vin {i}"
+            );
             assert_eq!(
                 got["vin"][i]["prevout"]["scriptPubKey"]["asm"],
                 core_tx["vout"][i % decoded.output.len()]["scriptPubKey"]["asm"],
@@ -360,12 +367,25 @@ mod tests {
             );
         }
         for i in 0..decoded.output.len() {
-            assert_eq!(got["vout"][i]["scriptPubKey"]["asm"], core_tx["vout"][i]["scriptPubKey"]["asm"], "vout {i}");
-            let spk = crate::rpc::rawtx::script_pubkey_json(&decoded.output[i].script_pubkey, bitcoin::Network::Regtest);
-            assert_eq!(spk["asm"], core_tx["vout"][i]["scriptPubKey"]["asm"], "gettxout {i}");
+            assert_eq!(
+                got["vout"][i]["scriptPubKey"]["asm"], core_tx["vout"][i]["scriptPubKey"]["asm"],
+                "vout {i}"
+            );
+            let spk = crate::rpc::rawtx::script_pubkey_json(
+                &decoded.output[i].script_pubkey,
+                bitcoin::Network::Regtest,
+            );
+            assert_eq!(
+                spk["asm"], core_tx["vout"][i]["scriptPubKey"]["asm"],
+                "gettxout {i}"
+            );
         }
         for (name, v) in core["decodescript"].as_object().unwrap() {
-            let got = crate::rpc::rawtx::decode_script(v["hex"].as_str().unwrap(), bitcoin::Network::Regtest).unwrap();
+            let got = crate::rpc::rawtx::decode_script(
+                v["hex"].as_str().unwrap(),
+                bitcoin::Network::Regtest,
+            )
+            .unwrap();
             assert_eq!(got["asm"], v["core"]["asm"], "decodescript {name}");
         }
     }
@@ -383,7 +403,11 @@ mod tests {
     fn decodescript_matches_core() {
         let core = core();
         for (name, v) in core["decodescript"].as_object().unwrap() {
-            let got = crate::rpc::rawtx::decode_script(v["hex"].as_str().unwrap(), bitcoin::Network::Regtest).unwrap();
+            let got = crate::rpc::rawtx::decode_script(
+                v["hex"].as_str().unwrap(),
+                bitcoin::Network::Regtest,
+            )
+            .unwrap();
             assert_eq!(got, v["core"], "decodescript {name}");
         }
     }
@@ -418,7 +442,10 @@ mod tests {
         );
         let core_tx = &tx["core"];
         for i in 0..n_out {
-            assert_eq!(got["vout"][i]["scriptPubKey"], core_tx["vout"][i]["scriptPubKey"], "vout {i}");
+            assert_eq!(
+                got["vout"][i]["scriptPubKey"], core_tx["vout"][i]["scriptPubKey"],
+                "vout {i}"
+            );
         }
         for i in 0..decoded.input.len() {
             assert_eq!(

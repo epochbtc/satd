@@ -129,7 +129,10 @@ pub fn notify_params(job: &ActiveTemplate, clean_jobs: bool) -> Value {
         stratum_prevhash(&work.prev_hash),
         hex::encode(&job.coinbase_prefix),
         hex::encode(&job.coinbase_suffix),
-        work.merkle_branch.iter().map(hex::encode).collect::<Vec<_>>(),
+        work.merkle_branch
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>(),
         format!("{:08x}", work.version as u32),
         format!("{:08x}", work.bits.to_consensus()),
         format!("{:08x}", work.cur_time),
@@ -159,7 +162,11 @@ pub fn parse_difficulty(v: &Value) -> Option<u64> {
     if !f.is_finite() || f < 0.0 {
         return None;
     }
-    Some(if f >= u64::MAX as f64 { u64::MAX } else { (f as u64).max(1) })
+    Some(if f >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        (f as u64).max(1)
+    })
 }
 
 #[cfg(test)]
@@ -173,12 +180,14 @@ mod tests {
     /// applied the way miners undo it: hex-decode, then reverse each word.
     #[test]
     fn notify_prevhash_word_swap_matches_known_vector() {
-        let genesis = BlockHash::from_str(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
+        let genesis =
+            BlockHash::from_str("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .unwrap();
         let wire = stratum_prevhash(&genesis);
-        assert_eq!(wire, "0a8ce26f72b3f1b646a2a6c14ff763ae65831e939c085ae10019d66800000000");
+        assert_eq!(
+            wire,
+            "0a8ce26f72b3f1b646a2a6c14ff763ae65831e939c085ae10019d66800000000"
+        );
 
         let mut bytes: [u8; 32] = hex::decode(&wire).unwrap().try_into().unwrap();
         for word in bytes.chunks_exact_mut(4) {
@@ -209,7 +218,13 @@ mod tests {
         assert_eq!(r.params.len(), 2);
         assert!(parse_request("[1,2]").is_none());
         assert!(parse_request(r#"{"id":1}"#).is_none());
-        assert_eq!(parse_request(r#"{"method":"mining.ping"}"#).unwrap().params.len(), 0);
+        assert_eq!(
+            parse_request(r#"{"method":"mining.ping"}"#)
+                .unwrap()
+                .params
+                .len(),
+            0
+        );
 
         assert_eq!(parse_hex_u32(&json!("1d00ffff")), Some(0x1d00ffff));
         assert_eq!(parse_hex_u32(&json!("0x0a")), Some(10));

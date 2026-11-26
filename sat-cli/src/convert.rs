@@ -517,7 +517,9 @@ fn from_position(method: &str, pos: usize) -> Option<Format> {
     if !known(method) {
         return Some(JsonOrString);
     }
-    rows().find(|p| p.method == method && p.idx == pos).map(|p| p.format)
+    rows()
+        .find(|p| p.method == method && p.idx == pos)
+        .map(|p| p.format)
 }
 
 /// Core's `rpc_convert::FromName`.
@@ -525,7 +527,9 @@ fn from_name(method: &str, name: &str) -> Option<Format> {
     if !known(method) {
         return Some(JsonOrString);
     }
-    rows().find(|p| p.method == method && p.name == name).map(|p| p.format)
+    rows()
+        .find(|p| p.method == method && p.name == name)
+        .map(|p| p.format)
 }
 
 /// Core's `Parse`: JSON, or for `JsonOrString` the raw string if it does not
@@ -653,12 +657,24 @@ mod tests {
             positional("signmessagewithprivkey", &["cVpF924E", "123"]),
             json!(["cVpF924E", "123"])
         );
-        assert_eq!(positional("signmessagewithprivkey", &["k", "true"]), json!(["k", "true"]));
-        assert_eq!(positional("signmessagewithprivkey", &["k", "null"]), json!(["k", "null"]));
-        assert_eq!(positional("verifymessage", &["a", "s", "true"]), json!(["a", "s", "true"]));
+        assert_eq!(
+            positional("signmessagewithprivkey", &["k", "true"]),
+            json!(["k", "true"])
+        );
+        assert_eq!(
+            positional("signmessagewithprivkey", &["k", "null"]),
+            json!(["k", "null"])
+        );
+        assert_eq!(
+            positional("verifymessage", &["a", "s", "true"]),
+            json!(["a", "s", "true"])
+        );
         // A hex string that happens to be all digits.
         assert_eq!(positional("decodescript", &["5151"]), json!(["5151"]));
-        assert_eq!(positional("getrawtransaction", &["ab", "1", "00cd"]), json!(["ab", 1, "00cd"]));
+        assert_eq!(
+            positional("getrawtransaction", &["ab", "1", "00cd"]),
+            json!(["ab", 1, "00cd"])
+        );
         // Core's `echo` has no conversion; `echojson` converts everything.
         assert_eq!(
             positional("echo", &["1", "true", "null", r#"{"a":1}"#, "", " 1 "]),
@@ -670,18 +686,33 @@ mod tests {
     fn listed_arguments_convert() {
         assert_eq!(positional("getblockhash", &["100"]), json!([100]));
         assert_eq!(positional("getblock", &["00ab", "2"]), json!(["00ab", 2]));
-        assert_eq!(positional("getblockheader", &["ab", "false"]), json!(["ab", false]));
-        assert_eq!(positional("decoderawtransaction", &["0100", "true"]), json!(["0100", true]));
         assert_eq!(
-            positional("createrawtransaction", &["[]", r#"{"data":"00"}"#, "0", "true"]),
+            positional("getblockheader", &["ab", "false"]),
+            json!(["ab", false])
+        );
+        assert_eq!(
+            positional("decoderawtransaction", &["0100", "true"]),
+            json!(["0100", true])
+        );
+        assert_eq!(
+            positional(
+                "createrawtransaction",
+                &["[]", r#"{"data":"00"}"#, "0", "true"]
+            ),
             json!([[], {"data": "00"}, 0, true])
         );
         assert_eq!(
             positional("setban", &["1.2.3.4", "add", "100", "true"]),
             json!(["1.2.3.4", "add", 100, true])
         );
-        assert_eq!(positional("testmempoolaccept", &[r#"["00"]"#, "0.1"]), json!([["00"], 0.1]));
-        assert_eq!(positional("estimatesmartfee", &["6", "economical"]), json!([6, "economical"]));
+        assert_eq!(
+            positional("testmempoolaccept", &[r#"["00"]"#, "0.1"]),
+            json!([["00"], 0.1])
+        );
+        assert_eq!(
+            positional("estimatesmartfee", &["6", "economical"]),
+            json!([6, "economical"])
+        );
         assert_eq!(
             positional("getblocktemplate", &[r#"{"rules":["segwit"]}"#]),
             json!([{"rules": ["segwit"]}])
@@ -700,9 +731,18 @@ mod tests {
     #[test]
     fn json_or_string_falls_back() {
         assert_eq!(positional("getblockstats", &["100"]), json!([100]));
-        assert_eq!(positional("getblockstats", &["0000abcd"]), json!(["0000abcd"]));
-        assert_eq!(positional("getblockstats", &[r#""0000abcd""#]), json!(["0000abcd"]));
-        assert_eq!(positional("gettxoutsetinfo", &["muhash", "100"]), json!(["muhash", 100]));
+        assert_eq!(
+            positional("getblockstats", &["0000abcd"]),
+            json!(["0000abcd"])
+        );
+        assert_eq!(
+            positional("getblockstats", &[r#""0000abcd""#]),
+            json!(["0000abcd"])
+        );
+        assert_eq!(
+            positional("gettxoutsetinfo", &["muhash", "100"]),
+            json!(["muhash", 100])
+        );
     }
 
     #[test]
@@ -742,10 +782,16 @@ mod tests {
             r#"{"nblocks":120,"height":-1}"#
         );
         assert_eq!(
-            named("getblocktemplate", &[r#"template_request={"rules":["segwit"]}"#]),
+            named(
+                "getblocktemplate",
+                &[r#"template_request={"rules":["segwit"]}"#]
+            ),
             r#"{"template_request":{"rules":["segwit"]}}"#
         );
-        assert_eq!(named("echo", &["arg0=1", "arg1=true"]), r#"{"arg0":"1","arg1":"true"}"#);
+        assert_eq!(
+            named("echo", &["arg0=1", "arg1=true"]),
+            r#"{"arg0":"1","arg1":"true"}"#
+        );
         assert_eq!(named("echo", &["a=b=c"]), r#"{"a":"b=c"}"#);
         assert_eq!(named("echo", &["=x"]), r#"{"":"x"}"#);
     }
@@ -757,7 +803,10 @@ mod tests {
         assert_eq!(named("echojson", &["x=1", "2"]), r#"{"x":"1","args":[2]}"#);
         // An unknown name before a string slot is the whole positional string.
         assert_eq!(named("getnewaddress", &["a=b"]), r#"{"args":["a=b"]}"#);
-        assert_eq!(named("createwallet", &["my=wallet"]), r#"{"args":["my=wallet"]}"#);
+        assert_eq!(
+            named("createwallet", &["my=wallet"]),
+            r#"{"args":["my=wallet"]}"#
+        );
         // ...and before a JSON slot, if the whole argument parses.
         assert_eq!(
             named("createrawtransaction", &[r#"[{"txid":"a=b"}]"#]),
@@ -781,9 +830,18 @@ mod tests {
     #[test]
     fn satd_rpcs_convert_by_their_own_rows() {
         assert_eq!(positional("getreorghistory", &["3600"]), json!([3600]));
-        assert_eq!(positional("listquarantine", &["123", "5", "0"]), json!(["123", 5, 0]));
-        assert_eq!(positional("estimatefees", &["[1,6]", "economy"]), json!([[1, 6], "economy"]));
-        assert_eq!(positional("getaddressbalance", &["bcrt1qxyz"]), json!(["bcrt1qxyz"]));
+        assert_eq!(
+            positional("listquarantine", &["123", "5", "0"]),
+            json!(["123", 5, 0])
+        );
+        assert_eq!(
+            positional("estimatefees", &["[1,6]", "economy"]),
+            json!([[1, 6], "economy"])
+        );
+        assert_eq!(
+            positional("getaddressbalance", &["bcrt1qxyz"]),
+            json!(["bcrt1qxyz"])
+        );
         assert_eq!(
             positional("getaddressbalance", &[r#"{"scripthash":"00"}"#]),
             json!([{"scripthash": "00"}])
@@ -794,7 +852,10 @@ mod tests {
         );
         // `getcrawlnodes true` asks for the verbose rows: a bool, not "true".
         assert_eq!(positional("getcrawlnodes", &["true"]), json!([true]));
-        assert_eq!(named("getcrawlnodes", &["verbose=true"]), r#"{"verbose":true}"#);
+        assert_eq!(
+            named("getcrawlnodes", &["verbose=true"]),
+            r#"{"verbose":true}"#
+        );
         // `dumpcrawlsnapshot raw=true` asks for raw addresses: a bool.
         assert_eq!(positional("dumpcrawlsnapshot", &["true"]), json!([true]));
         assert_eq!(named("dumpcrawlsnapshot", &["raw=true"]), r#"{"raw":true}"#);
@@ -802,7 +863,10 @@ mod tests {
         assert_eq!(positional("getquarantineentry", &["0011"]), json!(["0011"]));
         // The Operator Manual's `sendrawtransaction hexstring allowquarantined=true`.
         assert_eq!(
-            named("sendrawtransaction", &["hexstring=00", "allowquarantined=true"]),
+            named(
+                "sendrawtransaction",
+                &["hexstring=00", "allowquarantined=true"]
+            ),
             r#"{"hexstring":"00","allowquarantined":true}"#
         );
         // A base64 signature with `=` padding is not split (the Operator
@@ -819,8 +883,14 @@ mod tests {
 
     #[test]
     fn unknown_methods_keep_the_guess() {
-        assert_eq!(positional("notarealrpc", &["1", "true", "x"]), json!([1, true, "x"]));
-        assert_eq!(named("notarealrpc", &["a=1", "b=x", "5"]), r#"{"a":1,"b":"x","args":[5]}"#);
+        assert_eq!(
+            positional("notarealrpc", &["1", "true", "x"]),
+            json!([1, true, "x"])
+        );
+        assert_eq!(
+            named("notarealrpc", &["a=1", "b=x", "5"]),
+            r#"{"a":1,"b":"x","args":[5]}"#
+        );
     }
 
     #[test]
@@ -833,10 +903,17 @@ mod tests {
             );
         }
         for p in SATD_CONVERT_PARAMS {
-            assert!(known(p.method), "{} has a satd row but is not a known method", p.method);
+            assert!(
+                known(p.method),
+                "{} has a satd row but is not a known method",
+                p.method
+            );
         }
         for m in SATD_METHODS {
-            assert!(!CORE_METHODS.contains(m), "{m} is listed as satd-only but Core has it");
+            assert!(
+                !CORE_METHODS.contains(m),
+                "{m} is listed as satd-only but Core has it"
+            );
         }
     }
 
@@ -844,7 +921,10 @@ mod tests {
     /// lists every RPC satd registers (a startup audit enforces it). Each must
     /// be known here, or `sat-cli` would guess its argument types.
     fn named_params_source() -> String {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../node/src/rpc/named_params.rs");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../node/src/rpc/named_params.rs"
+        );
         std::fs::read_to_string(path).unwrap()
     }
 

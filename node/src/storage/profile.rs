@@ -239,10 +239,22 @@ mod tests {
 
     #[test]
     fn profile_parses_aliases() {
-        assert_eq!("ssd".parse::<StorageProfile>().unwrap(), StorageProfile::Ssd);
-        assert_eq!("NVME".parse::<StorageProfile>().unwrap(), StorageProfile::Ssd);
-        assert_eq!("hdd".parse::<StorageProfile>().unwrap(), StorageProfile::Hdd);
-        assert_eq!("Rotational".parse::<StorageProfile>().unwrap(), StorageProfile::Hdd);
+        assert_eq!(
+            "ssd".parse::<StorageProfile>().unwrap(),
+            StorageProfile::Ssd
+        );
+        assert_eq!(
+            "NVME".parse::<StorageProfile>().unwrap(),
+            StorageProfile::Ssd
+        );
+        assert_eq!(
+            "hdd".parse::<StorageProfile>().unwrap(),
+            StorageProfile::Hdd
+        );
+        assert_eq!(
+            "Rotational".parse::<StorageProfile>().unwrap(),
+            StorageProfile::Hdd
+        );
         assert!("garbage".parse::<StorageProfile>().is_err());
     }
 
@@ -277,8 +289,16 @@ mod tests {
 
     #[test]
     fn default_profiles_produce_no_warnings() {
-        assert!(StorageTuning::for_profile(StorageProfile::Ssd).validate().is_empty());
-        assert!(StorageTuning::for_profile(StorageProfile::Hdd).validate().is_empty());
+        assert!(
+            StorageTuning::for_profile(StorageProfile::Ssd)
+                .validate()
+                .is_empty()
+        );
+        assert!(
+            StorageTuning::for_profile(StorageProfile::Hdd)
+                .validate()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -302,7 +322,9 @@ mod tests {
         // spurious warnings on every restart.
         let t = StorageTuning::for_profile(StorageProfile::Hdd);
         assert!(
-            t.validate().iter().all(|w| !w.contains("max_total_wal_size")),
+            t.validate()
+                .iter()
+                .all(|w| !w.contains("max_total_wal_size")),
             "HDD default must not produce a WAL warning"
         );
     }

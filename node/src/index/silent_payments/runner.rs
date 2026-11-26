@@ -223,7 +223,10 @@ impl BackfillRunner {
                 .get_block_index(&current)
                 .ok_or_else(|| BackfillError::ReorgInvalidated {
                     height: snapshot_height,
-                    detail: format!("missing block-index entry walking back from tip {}", current),
+                    detail: format!(
+                        "missing block-index entry walking back from tip {}",
+                        current
+                    ),
                 })?;
             current = entry.header.prev_blockhash;
             h -= 1;
@@ -416,12 +419,10 @@ impl BackfillRunner {
             }
 
             let mut batch = StoreBatch::default();
-            if let Some(row) =
-                build_sp_row(&self.cfg, &block, block_hash, Some(&txids), &prev_map).map_err(|e| {
-                    BackfillError::Emit {
-                        height: h,
-                        detail: e.to_string(),
-                    }
+            if let Some(row) = build_sp_row(&self.cfg, &block, block_hash, Some(&txids), &prev_map)
+                .map_err(|e| BackfillError::Emit {
+                    height: h,
+                    detail: e.to_string(),
                 })?
             {
                 batch.sp_tweak_puts.push((h, row));
@@ -536,4 +537,3 @@ fn debug_delay_ms() -> u64 {
         .map(|v| v.min(5_000))
         .unwrap_or(0)
 }
-

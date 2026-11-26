@@ -38,9 +38,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use bitcoin::hashes::Hash;
+use node::chain::events::ChainEvent;
 use node::events::{EventSink, NodeEvent, NodeEventBody};
 use node::mempool::events::MempoolEvent;
-use node::chain::events::ChainEvent;
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, warn};
 use zeromq::{Socket, SocketSend, ZmqMessage};
@@ -229,8 +229,7 @@ async fn publish(
     // Status is served on the three mask-bearing transports, on webhooks, and
     // through `-alertnotify`. If a ZMQ-only consumer ever needs it, the additive
     // fix is an opt-in `eventszmqstatus` topic, not widening this one.
-    let explicit_only_on_unmasked_transport =
-        env.category_bit() == node::events::CATEGORY_STATUS;
+    let explicit_only_on_unmasked_transport = env.category_bit() == node::events::CATEGORY_STATUS;
     if ZmqTopicConfig::enabled(topics.nodeevent) && !explicit_only_on_unmasked_transport {
         match serde_json::to_vec(env) {
             Ok(payload) => {
@@ -261,32 +260,17 @@ async fn publish(
         }
         NodeEventBody::Mempool(ev @ MempoolEvent::LeaveEvicted { .. }) => {
             if ZmqTopicConfig::enabled(topics.mpevict) {
-                publish_json(socket, topics::MPEVICT, ev, &counters.mpevict, counters)
-                    .await?;
+                publish_json(socket, topics::MPEVICT, ev, &counters.mpevict, counters).await?;
             }
         }
         NodeEventBody::Mempool(ev @ MempoolEvent::LeaveReplaced { .. }) => {
             if ZmqTopicConfig::enabled(topics.mpreplace) {
-                publish_json(
-                    socket,
-                    topics::MPREPLACE,
-                    ev,
-                    &counters.mpreplace,
-                    counters,
-                )
-                .await?;
+                publish_json(socket, topics::MPREPLACE, ev, &counters.mpreplace, counters).await?;
             }
         }
         NodeEventBody::Mempool(ev @ MempoolEvent::LeaveConfirmed { .. }) => {
             if ZmqTopicConfig::enabled(topics.mpconfirm) {
-                publish_json(
-                    socket,
-                    topics::MPCONFIRM,
-                    ev,
-                    &counters.mpconfirm,
-                    counters,
-                )
-                .await?;
+                publish_json(socket, topics::MPCONFIRM, ev, &counters.mpconfirm, counters).await?;
             }
         }
         NodeEventBody::Chain(ChainEvent::BlockConnected { hash, .. }) => {
@@ -398,9 +382,7 @@ mod tests {
 
     fn enter_event(byte: u8) -> MempoolEvent {
         MempoolEvent::Enter {
-            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-                [byte; 32],
-            )),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32])),
             fee: 100,
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
@@ -424,9 +406,7 @@ mod tests {
 
     fn enter_event_with_hash(bytes: [u8; 32]) -> MempoolEvent {
         MempoolEvent::Enter {
-            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-                bytes,
-            )),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bytes)),
             fee: 100,
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
@@ -455,10 +435,7 @@ mod tests {
         shutdown_rx: watch::Receiver<bool>,
     ) {
         let sink = ZmqEventSink::bind(endpoint, topics).await.expect("bind");
-        publisher.attach_sinks(
-            vec![Box::new(sink) as Box<dyn EventSink>],
-            shutdown_rx,
-        );
+        publisher.attach_sinks(vec![Box::new(sink) as Box<dyn EventSink>], shutdown_rx);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -467,11 +444,7 @@ mod tests {
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        publisher.spawn_bridges(
-            mp_tx.subscribe(),
-            ch_tx.subscribe(),
-            shutdown_rx.clone(),
-        );
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
 
         let (endpoint, _port) = ephemeral_endpoint().await;
         spin_up_sink(
@@ -524,11 +497,7 @@ mod tests {
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        publisher.spawn_bridges(
-            mp_tx.subscribe(),
-            ch_tx.subscribe(),
-            shutdown_rx.clone(),
-        );
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
 
         let (endpoint, _) = ephemeral_endpoint().await;
         spin_up_sink(
@@ -555,9 +524,7 @@ mod tests {
                 .expect("recv timeout")
                 .expect("recv");
             let frames: Vec<_> = msg.into_vec().into_iter().map(|b| b.to_vec()).collect();
-            seqs.push(u32::from_le_bytes(
-                frames[2].as_slice().try_into().unwrap(),
-            ));
+            seqs.push(u32::from_le_bytes(frames[2].as_slice().try_into().unwrap()));
         }
         assert_eq!(seqs, vec![0u32, 1, 2]);
 
@@ -570,11 +537,7 @@ mod tests {
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        publisher.spawn_bridges(
-            mp_tx.subscribe(),
-            ch_tx.subscribe(),
-            shutdown_rx.clone(),
-        );
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
 
         let (endpoint, _) = ephemeral_endpoint().await;
         spin_up_sink(
@@ -594,9 +557,9 @@ mod tests {
         let raw = ramped_bytes();
         ch_tx
             .send(ChainEvent::BlockConnected {
-                hash: BlockHash::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array(raw),
-                ),
+                hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    raw,
+                )),
                 height: 42,
             })
             .unwrap();
@@ -627,11 +590,7 @@ mod tests {
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        publisher.spawn_bridges(
-            mp_tx.subscribe(),
-            ch_tx.subscribe(),
-            shutdown_rx.clone(),
-        );
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
 
         let (endpoint, _) = ephemeral_endpoint().await;
         spin_up_sink(
@@ -649,9 +608,9 @@ mod tests {
 
         mp_tx
             .send(MempoolEvent::LeaveEvicted {
-                txid: Txid::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32]),
-                ),
+                txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    [1u8; 32],
+                )),
                 reason: node::mempool::events::EvictReason::FullPool,
                 mempool_sequence: 1,
             })
@@ -727,11 +686,7 @@ mod tests {
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        publisher.spawn_bridges(
-            mp_tx.subscribe(),
-            ch_tx.subscribe(),
-            shutdown_rx.clone(),
-        );
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
 
         let (endpoint, _) = ephemeral_endpoint().await;
         spin_up_sink(
@@ -778,11 +733,7 @@ mod tests {
         let (mp_tx, _) = broadcast::channel::<MempoolEvent>(16);
         let (ch_tx, _) = broadcast::channel::<ChainEvent>(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        publisher.spawn_bridges(
-            mp_tx.subscribe(),
-            ch_tx.subscribe(),
-            shutdown_rx.clone(),
-        );
+        publisher.spawn_bridges(mp_tx.subscribe(), ch_tx.subscribe(), shutdown_rx.clone());
 
         let (endpoint, _) = ephemeral_endpoint().await;
         // Disable hashtx; nodeevent stays on.
@@ -813,8 +764,7 @@ mod tests {
         assert_eq!(frames[0], topics::NODEEVENT.as_bytes());
 
         // No second message within a short window.
-        let second =
-            tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let second = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(second.is_err(), "should not receive hashtx when disabled");
 
         let _ = shutdown_tx.send(true);

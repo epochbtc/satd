@@ -124,7 +124,9 @@ async fn follow_tip_with(
 async fn judge_at<T: Copy, F: FnOnce() + Send + 'static>(tip: T, judged: &mut T, pass: F) {
     match tokio::task::spawn_blocking(pass).await {
         Ok(()) => *judged = tip,
-        Err(_) => tracing::error!(target: "nap", "NAP: judging attestations at the new tip panicked; will retry"),
+        Err(_) => {
+            tracing::error!(target: "nap", "NAP: judging attestations at the new tip panicked; will retry")
+        }
     }
 }
 

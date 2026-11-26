@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
-use crate::nap::{ppm, ppm_percent, sat_btc, Bucket, Half, Published, Report, ReportValue};
+use crate::nap::{Bucket, Half, Published, Report, ReportValue, ppm, ppm_percent, sat_btc};
 use crate::state::AppState;
 use crate::ui::{format_hash, format_num, render_loading_panel};
 
@@ -36,7 +36,12 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             draw_breakdown(f, chunks[3], r, state.selected_nap_row);
         }
         Half::Off => {
-            message_panel(f, chunks[2], " Report ", "The aggregator is off: set napaggregator=1 to collect attestations from peers.");
+            message_panel(
+                f,
+                chunks[2],
+                " Report ",
+                "The aggregator is off: set napaggregator=1 to collect attestations from peers.",
+            );
             message_panel(f, chunks[3], " Breakdown ", "");
         }
         Half::Unknown => {
@@ -46,7 +51,12 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     }
     match &state.nap_publisher {
         Half::On(p) => draw_published(f, chunks[4], p),
-        Half::Off => message_panel(f, chunks[4], " Published ", "Publishing is off: set nap=1 to serve attestations."),
+        Half::Off => message_panel(
+            f,
+            chunks[4],
+            " Published ",
+            "Publishing is off: set nap=1 to serve attestations.",
+        ),
         Half::Unknown => render_loading_panel(f, chunks[4], " Published "),
     }
     draw_footer(f, chunks[5], state);
@@ -54,11 +64,27 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
 fn draw_title(f: &mut Frame, area: Rect, state: &AppState) {
     let mut spans = vec![
-        Span::styled(" satd ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {} ", state.chain_name), Style::default().fg(Color::White)),
+        Span::styled(
+            " satd ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {} ", state.chain_name),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(state.version_line(), Style::default().fg(Color::DarkGray)),
-        Span::styled(" NAP ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" @ #{}", format_num(state.blocks as u64)), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " NAP ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" @ #{}", format_num(state.blocks as u64)),
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
     if let Some(line) = state.rpc_failure_line() {
         spans.push(Span::styled(line, Style::default().fg(Color::Red)));
@@ -78,12 +104,31 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
     let mut lines = vec![info_line("Publisher:", &publisher)];
     match &state.nap_report {
         Half::On(r) => {
-            lines.push(info_line("Aggregator:", &format!("on   report at #{} {}", format_num(r.height), format_hash(&r.hash))));
+            lines.push(info_line(
+                "Aggregator:",
+                &format!(
+                    "on   report at #{} {}",
+                    format_num(r.height),
+                    format_hash(&r.hash)
+                ),
+            ));
             lines.push(info_line(
                 "Held:",
-                &format!("{}   counting {}   invalid {}", format_num(r.attestations), format_num(r.counting), format_num(r.invalid)),
+                &format!(
+                    "{}   counting {}   invalid {}",
+                    format_num(r.attestations),
+                    format_num(r.counting),
+                    format_num(r.invalid)
+                ),
             ));
-            lines.push(info_line("UTXO total:", &format!("{}   digest {}", sat_btc(r.utxo_total_sat), format_hash(&r.digest))));
+            lines.push(info_line(
+                "UTXO total:",
+                &format!(
+                    "{}   digest {}",
+                    sat_btc(r.utxo_total_sat),
+                    format_hash(&r.digest)
+                ),
+            ));
         }
         Half::Off => lines.push(info_line("Aggregator:", "off")),
         Half::Unknown => lines.push(info_line("Aggregator:", "...")),
@@ -94,16 +139,32 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
 /// Each key, then its values, heaviest first. Only value rows are selectable.
 fn draw_keys(f: &mut Frame, area: Rect, r: &Report, selected: usize) {
     if r.keys.is_empty() {
-        message_panel(f, area, " Report ", "No attestations count yet: the aggregator collects them from publishing peers.");
+        message_panel(
+            f,
+            area,
+            " Report ",
+            "No attestations count yet: the aggregator collects them from publishing peers.",
+        );
         return;
     }
-    let header = Row::new(vec!["Key / value", "Share", "Weight", "Coverage", "Coins", "Withdrawn"])
-        .style(Style::default().fg(Color::Cyan));
+    let header = Row::new(vec![
+        "Key / value",
+        "Share",
+        "Weight",
+        "Coverage",
+        "Coins",
+        "Withdrawn",
+    ])
+    .style(Style::default().fg(Color::Cyan));
     let mut rows = Vec::new();
     let mut selected_row = None;
     let mut value_index = 0;
     for key in &r.keys {
-        let withdrawn = if key.withdrawn.outpoints == 0 { "-".into() } else { sat_btc(key.withdrawn.weight_sat) };
+        let withdrawn = if key.withdrawn.outpoints == 0 {
+            "-".into()
+        } else {
+            sat_btc(key.withdrawn.weight_sat)
+        };
         rows.push(
             Row::new(vec![
                 Cell::from(key.key.clone()),
@@ -183,14 +244,24 @@ fn draw_breakdown(f: &mut Frame, area: Rect, r: &Report, selected: usize) {
         ("Script", &value.script_types),
     ];
     for (area, (title, buckets)) in cols.iter().zip(columns) {
-        let mut lines = vec![Line::from(Span::styled(title, Style::default().fg(Color::Cyan)))];
+        let mut lines = vec![Line::from(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan),
+        ))];
         lines.extend(buckets.iter().map(|b| {
             let share = ppm(b.sum.weight_sat, value.sum.weight_sat);
-            let style = if b.sum.outpoints == 0 { Style::default().fg(Color::DarkGray) } else { Style::default() };
+            let style = if b.sum.outpoints == 0 {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
             Line::from(vec![
                 Span::styled(format!("{:<9}", b.label), Style::default().fg(Color::Gray)),
                 Span::styled(format!("{:>8}", ppm_percent(share)), style),
-                Span::styled(format!(" {:>5}", format_num(b.sum.outpoints)), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(" {:>5}", format_num(b.sum.outpoints)),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ])
         }));
         f.render_widget(Paragraph::new(lines), *area);
@@ -199,16 +270,27 @@ fn draw_breakdown(f: &mut Frame, area: Rect, r: &Report, selected: usize) {
 
 fn draw_published(f: &mut Frame, area: Rect, published: &[Published]) {
     if published.is_empty() {
-        message_panel(f, area, " Published ", "Nothing published yet: submitnapattestation adds a signed attestation.");
+        message_panel(
+            f,
+            area,
+            " Published ",
+            "Nothing published yet: submitnapattestation adds a signed attestation.",
+        );
         return;
     }
-    let header = Row::new(vec!["Outpoint", "Key", "Value", "Anchor", "Amount", "Status"])
-        .style(Style::default().fg(Color::Cyan));
+    let header = Row::new(vec![
+        "Outpoint", "Key", "Value", "Anchor", "Amount", "Status",
+    ])
+    .style(Style::default().fg(Color::Cyan));
     let rows: Vec<Row> = published
         .iter()
         .take(PUBLISHED_ROWS)
         .map(|a| {
-            let status = if a.status == "valid" { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Yellow) };
+            let status = if a.status == "valid" {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
             Row::new(vec![
                 Cell::from(format_hash(&a.outpoint)),
                 Cell::from(a.key.clone()),
@@ -221,7 +303,10 @@ fn draw_published(f: &mut Frame, area: Rect, published: &[Published]) {
         .collect();
     let more = published.len().saturating_sub(PUBLISHED_ROWS);
     let title = if more > 0 {
-        format!(" Published ({}, first {PUBLISHED_ROWS} shown) ", published.len())
+        format!(
+            " Published ({}, first {PUBLISHED_ROWS} shown) ",
+            published.len()
+        )
     } else {
         format!(" Published ({}) ", published.len())
     };
@@ -233,7 +318,10 @@ fn draw_published(f: &mut Frame, area: Rect, published: &[Published]) {
         Constraint::Length(22),
         Constraint::Min(8),
     ];
-    f.render_widget(Table::new(rows, widths).header(header).block(panel(&title)), area);
+    f.render_widget(
+        Table::new(rows, widths).header(header).block(panel(&title)),
+        area,
+    );
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
@@ -244,7 +332,10 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
         Span::styled("r", Style::default().fg(Color::White)),
         Span::styled(": reorgs  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
+        Span::styled(
+            crate::ui::view_keys(state),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(": view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": value", Style::default().fg(Color::DarkGray)),
@@ -256,11 +347,19 @@ fn panel(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(title.to_string(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
 }
 
 fn message_panel(f: &mut Frame, area: Rect, title: &str, text: &str) {
-    let line = Line::from(Span::styled(format!("  {text}"), Style::default().fg(Color::DarkGray)));
+    let line = Line::from(Span::styled(
+        format!("  {text}"),
+        Style::default().fg(Color::DarkGray),
+    ));
     f.render_widget(Paragraph::new(line).block(panel(title)), area);
 }
 
@@ -274,7 +373,7 @@ fn info_line<'a>(label: &'a str, value: &str) -> Line<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nap::{parse_published, parse_report, Poll};
+    use crate::nap::{Poll, parse_published, parse_report};
     use crate::state::ViewMode;
     use serde_json::json;
 
@@ -284,7 +383,11 @@ mod tests {
         terminal.draw(|f| draw(f, state)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
-            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -311,8 +414,14 @@ mod tests {
         assert!(screen.contains("fork.x"), "{screen}");
         assert!(screen.contains("3.00000000 BTC"), "{screen}");
         assert!(screen.contains("15.00%"), "{screen}");
-        assert!(screen.find("  yes").unwrap() < screen.find("  no").unwrap(), "{screen}");
-        assert!(screen.contains("66.66%") && screen.contains("33.33%"), "{screen}");
+        assert!(
+            screen.find("  yes").unwrap() < screen.find("  no").unwrap(),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("66.66%") && screen.contains("33.33%"),
+            "{screen}"
+        );
         // Withdrawals apart, in their own column.
         assert!(screen.contains("0.00050000 BTC"), "{screen}");
         // The first value is selected, and its breakdown is drawn.
@@ -361,10 +470,13 @@ mod tests {
     #[test]
     fn an_empty_report_and_a_disabled_half_say_so() {
         let mut st = AppState::new();
-        st.update_nap_report(Poll::On(parse_report(&json!({
-            "height": 1, "hash": "00", "utxo_total_sat": 0, "digest": "e3", "attestations": 0,
-            "invalid": 0, "counting": 0, "keys": [],
-        })).unwrap()));
+        st.update_nap_report(Poll::On(
+            parse_report(&json!({
+                "height": 1, "hash": "00", "utxo_total_sat": 0, "digest": "e3", "attestations": 0,
+                "invalid": 0, "counting": 0, "keys": [],
+            }))
+            .unwrap(),
+        ));
         st.update_nap_publisher(Poll::Off);
         let screen = render(140, 45, &st).join("\n");
         assert!(screen.contains("No attestations count yet"), "{screen}");
@@ -415,7 +527,11 @@ mod tests {
             terminal.draw(|f| crate::ui::help::draw(f, st)).unwrap();
             let buffer = terminal.backend().buffer();
             (0..60u16)
-                .map(|y| (0..120u16).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .map(|y| {
+                    (0..120u16)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -424,7 +540,9 @@ mod tests {
         st.update_nap_report(Poll::Off);
         assert!(!help(&st).contains("Force the NAP view"));
         assert_eq!(crate::ui::view_keys(&st), "1/2/3/4");
-        st.update_nap_report(Poll::On(parse_report(&crate::nap::tests::sample_report()).unwrap()));
+        st.update_nap_report(Poll::On(
+            parse_report(&crate::nap::tests::sample_report()).unwrap(),
+        ));
         assert!(help(&st).contains("Force the NAP view"));
         assert_eq!(crate::ui::view_keys(&st), "1/2/3/4/5");
         st.press_nap_key();

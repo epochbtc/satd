@@ -688,7 +688,10 @@ mod tests {
     #[test]
     fn plan_rescan_rejects_inverted_range() {
         let src = FlatChain { tip: 100 };
-        assert_eq!(plan_rescan(&src, 50, 40), Err(RescanRejectReason::InvalidRange));
+        assert_eq!(
+            plan_rescan(&src, 50, 40),
+            Err(RescanRejectReason::InvalidRange)
+        );
     }
 
     #[test]
@@ -777,7 +780,10 @@ mod tests {
         // category bit (2) is masked off (mask = 1, mempool only). No confirmed
         // blocks replay, so the report must be "nothing skipped".
         let r = build_cursor_replay(&src, &pubr, cursor(2), 1, 10, None);
-        assert!(!r.clamped, "no clamp reported when chain replay is masked off");
+        assert!(
+            !r.clamped,
+            "no clamp reported when chain replay is masked off"
+        );
         assert_eq!(r.earliest_replayed, 3, "earliest = from.height + 1");
         assert!(
             r.events.is_empty(),
@@ -829,9 +835,16 @@ mod tests {
         // `[start, tip]` range to page lazily (rows are NOT materialized here).
         let src = FlatChain { tip: 50 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let sp = MockSp {
+            complete: true,
+            activation: 1,
+            tip: 50,
+        };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10, Some(&sp));
-        assert!(!r.clamped, "tweaks-only + complete index is exempt from the clamp");
+        assert!(
+            !r.clamped,
+            "tweaks-only + complete index is exempt from the clamp"
+        );
         assert_eq!(r.earliest_replayed, 1);
         assert_eq!(
             r.deep_tweak_range,
@@ -839,7 +852,10 @@ mod tests {
             "the full span is deferred to the carrier, unclamped"
         );
         // Nothing is eagerly materialized on the deep path — no memory blowup.
-        assert!(r.events.is_empty(), "deep tweaks are streamed lazily, not buffered");
+        assert!(
+            r.events.is_empty(),
+            "deep tweaks are streamed lazily, not buffered"
+        );
     }
 
     #[test]
@@ -853,7 +869,11 @@ mod tests {
         // silently miss every earlier block.
         let src = FlatChain { tip: 50 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let sp = MockSp {
+            complete: true,
+            activation: 1,
+            tip: 50,
+        };
         let r = build_cursor_replay(
             &src,
             &pubr,
@@ -873,10 +893,18 @@ mod tests {
         // such a replay in-band, but the builder itself must stay bounded).
         let src = FlatChain { tip: 50 };
         let pubr = publisher();
-        let sp = MockSp { complete: false, activation: 1, tip: 50 };
+        let sp = MockSp {
+            complete: false,
+            activation: 1,
+            tip: 50,
+        };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10, Some(&sp));
         assert!(r.clamped, "incomplete index → clamped, not exempt");
-        assert_eq!(tweaks_count(&r), 10, "clamped to the most recent max_blocks");
+        assert_eq!(
+            tweaks_count(&r),
+            10,
+            "clamped to the most recent max_blocks"
+        );
     }
 
     #[test]
@@ -886,7 +914,11 @@ mod tests {
         // monotonic.
         let src = FlatChain { tip: 50 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let sp = MockSp {
+            complete: true,
+            activation: 1,
+            tip: 50,
+        };
         let mask = CATEGORY_CHAIN | CATEGORY_TWEAKS;
         let r = build_cursor_replay(&src, &pubr, cursor(0), mask, 10, Some(&sp));
         assert!(r.clamped, "mixed subscription keeps the clamp");
@@ -899,8 +931,15 @@ mod tests {
         ));
         assert!(matches!(&r.events[1].body, NodeEventBody::BlockTweaks(bt) if bt.height == 41));
         // Cursors are non-decreasing in height across the interleave.
-        let heights: Vec<u32> = r.events.iter().filter_map(|e| e.cursor.map(|c| c.height)).collect();
-        assert!(heights.windows(2).all(|w| w[0] <= w[1]), "cursor heights monotonic");
+        let heights: Vec<u32> = r
+            .events
+            .iter()
+            .filter_map(|e| e.cursor.map(|c| c.height))
+            .collect();
+        assert!(
+            heights.windows(2).all(|w| w[0] <= w[1]),
+            "cursor heights monotonic"
+        );
     }
 
     #[test]
@@ -913,10 +952,18 @@ mod tests {
         // The builder itself materializes nothing.
         let src = FlatChain { tip: 30 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 20, tip: 30 };
+        let sp = MockSp {
+            complete: true,
+            activation: 20,
+            tip: 30,
+        };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10_000, Some(&sp));
         assert_eq!(r.deep_tweak_range, Some((20, 30)));
-        assert_eq!(tweaks_count(&r), 0, "deep rows are not buffered in the builder");
+        assert_eq!(
+            tweaks_count(&r),
+            0,
+            "deep rows are not buffered in the builder"
+        );
     }
 
     #[test]
@@ -925,7 +972,11 @@ mod tests {
         // the tip and there is nothing to defer.
         let src = FlatChain { tip: 15 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 20, tip: 15 };
+        let sp = MockSp {
+            complete: true,
+            activation: 20,
+            tip: 15,
+        };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_TWEAKS, 10_000, Some(&sp));
         assert_eq!(r.deep_tweak_range, None);
     }
@@ -937,10 +988,19 @@ mod tests {
         // is not lost when the main loop starts at h+1.
         let src = FlatChain { tip: 50 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let sp = MockSp {
+            complete: true,
+            activation: 1,
+            tip: 50,
+        };
         let mask = CATEGORY_CHAIN | CATEGORY_TWEAKS;
         // Resume from (40, 0): last delivered was BlockConnected(40).
-        let from = Cursor { height: 40, tx_index: 0, mempool_seq: 0, instance_id: 0 };
+        let from = Cursor {
+            height: 40,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 0,
+        };
         let r = build_cursor_replay(&src, &pubr, from, mask, 10_000, Some(&sp));
         // The very first replayed event is block 40's pending tweak.
         assert!(
@@ -972,11 +1032,24 @@ mod tests {
         // permanently; now it is re-emitted.
         let src = FlatChain { tip: 50 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 1, tip: 50 };
+        let sp = MockSp {
+            complete: true,
+            activation: 1,
+            tip: 50,
+        };
         let mask = CATEGORY_CHAIN | CATEGORY_TWEAKS;
-        let from = Cursor { height: 50, tx_index: 0, mempool_seq: 0, instance_id: 0 };
+        let from = Cursor {
+            height: 50,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 0,
+        };
         let r = build_cursor_replay(&src, &pubr, from, mask, 10_000, Some(&sp));
-        assert_eq!(tweaks_count(&r), 1, "the tip's pending tweak is re-emitted at-tip");
+        assert_eq!(
+            tweaks_count(&r),
+            1,
+            "the tip's pending tweak is re-emitted at-tip"
+        );
         assert!(
             matches!(&r.events[0].body, NodeEventBody::BlockTweaks(bt) if bt.height == 50),
             "block 50's pending tweak is delivered even though start > snapshot_tip"
@@ -989,10 +1062,18 @@ mod tests {
             "no confirmed chain events beyond the tip"
         );
         // And a client that already saw the tip tweak is not re-sent it.
-        let from_after =
-            Cursor { height: 50, tx_index: TWEAKS_TX_INDEX, mempool_seq: 0, instance_id: 0 };
+        let from_after = Cursor {
+            height: 50,
+            tx_index: TWEAKS_TX_INDEX,
+            mempool_seq: 0,
+            instance_id: 0,
+        };
         let r2 = build_cursor_replay(&src, &pubr, from_after, mask, 10_000, Some(&sp));
-        assert_eq!(tweaks_count(&r2), 0, "no re-emit once the tweak cursor passed the tip");
+        assert_eq!(
+            tweaks_count(&r2),
+            0,
+            "no re-emit once the tweak cursor passed the tip"
+        );
     }
 
     #[test]
@@ -1000,8 +1081,16 @@ mod tests {
         // A chain-only subscription never consults the tweak source.
         let src = FlatChain { tip: 5 };
         let pubr = publisher();
-        let sp = MockSp { complete: true, activation: 1, tip: 5 };
+        let sp = MockSp {
+            complete: true,
+            activation: 1,
+            tip: 5,
+        };
         let r = build_cursor_replay(&src, &pubr, cursor(0), CATEGORY_CHAIN, 10_000, Some(&sp));
-        assert_eq!(tweaks_count(&r), 0, "no tweak events without the tweaks bit");
+        assert_eq!(
+            tweaks_count(&r),
+            0,
+            "no tweak events without the tweaks bit"
+        );
     }
 }

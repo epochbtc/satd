@@ -66,9 +66,10 @@ async fn connect(addr: SocketAddr) -> BufReader<TcpStream> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_past_the_timeout_is_answered_with_an_error_and_the_connection_closed() {
-    let server = ElectrumServer::bind_with_factory(config(Duration::from_millis(300), 4), slow_factory())
-        .await
-        .unwrap();
+    let server =
+        ElectrumServer::bind_with_factory(config(Duration::from_millis(300), 4), slow_factory())
+            .await
+            .unwrap();
     let addr = server.local_addr().unwrap();
     let (sd_tx, sd_rx) = watch::channel(false);
     let join = tokio::spawn(server.serve(sd_rx));
@@ -76,12 +77,17 @@ async fn request_past_the_timeout_is_answered_with_an_error_and_the_connection_c
     // A request inside the timeout is answered and the connection stays open.
     let mut fast = connect(addr).await;
     send(&mut fast, 1, "server.ping").await;
-    assert_eq!(recv(&mut fast).await.expect("answer")["result"], "server.ping");
+    assert_eq!(
+        recv(&mut fast).await.expect("answer")["result"],
+        "server.ping"
+    );
 
     let mut conn = connect(addr).await;
     let started = Instant::now();
     send(&mut conn, 2, "slow").await;
-    let answer = recv(&mut conn).await.expect("an answer to the slow request");
+    let answer = recv(&mut conn)
+        .await
+        .expect("an answer to the slow request");
     let waited = started.elapsed();
     assert!(
         answer["error"]["message"]
@@ -95,7 +101,11 @@ async fn request_past_the_timeout_is_answered_with_an_error_and_the_connection_c
     );
     // The handler's work cannot be stopped and the connection's state is
     // still inside it, so the connection ends after the error.
-    assert_eq!(recv(&mut conn).await, None, "the connection must close after a timeout");
+    assert_eq!(
+        recv(&mut conn).await,
+        None,
+        "the connection must close after a timeout"
+    );
 
     // The other connection is unaffected.
     send(&mut fast, 3, "server.ping").await;
@@ -112,7 +122,9 @@ struct SyncClient(std::io::BufReader<std::net::TcpStream>);
 impl SyncClient {
     fn connect(addr: SocketAddr) -> Self {
         let stream = std::net::TcpStream::connect(addr).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         Self(std::io::BufReader::new(stream))
     }
 
@@ -138,9 +150,10 @@ impl SyncClient {
 /// connection (and Esplora, gRPC and `/metrics`) runs on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_slow_request_does_not_hold_up_other_connections() {
-    let server = ElectrumServer::bind_with_factory(config(Duration::from_secs(30), 4), slow_factory())
-        .await
-        .unwrap();
+    let server =
+        ElectrumServer::bind_with_factory(config(Duration::from_secs(30), 4), slow_factory())
+            .await
+            .unwrap();
     let addr = server.local_addr().unwrap();
     let (sd_tx, sd_rx) = watch::channel(false);
     let join = tokio::spawn(server.serve(sd_rx));
@@ -167,7 +180,9 @@ async fn a_slow_request_does_not_hold_up_other_connections() {
         slow.send(3, "server.ping");
         assert_eq!(slow.recv()["id"], 3);
     });
-    let outcome = tokio::task::spawn_blocking(move || client.join()).await.unwrap();
+    let outcome = tokio::task::spawn_blocking(move || client.join())
+        .await
+        .unwrap();
 
     sd_tx.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
@@ -182,9 +197,10 @@ async fn a_slow_request_does_not_hold_up_other_connections() {
 /// `--electrummaxconns`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_timed_out_request_keeps_its_connection_slot_until_its_work_ends() {
-    let server = ElectrumServer::bind_with_factory(config(Duration::from_millis(200), 1), slow_factory())
-        .await
-        .unwrap();
+    let server =
+        ElectrumServer::bind_with_factory(config(Duration::from_millis(200), 1), slow_factory())
+            .await
+            .unwrap();
     let addr = server.local_addr().unwrap();
     let (sd_tx, sd_rx) = watch::channel(false);
     let join = tokio::spawn(server.serve(sd_rx));
@@ -193,7 +209,11 @@ async fn a_timed_out_request_keeps_its_connection_slot_until_its_work_ends() {
     let mut first = connect(addr).await;
     send(&mut first, 1, "slow").await;
     let answer = recv(&mut first).await.expect("the timeout answer");
-    assert!(answer["error"]["message"].as_str().is_some_and(|m| m.contains("timed out")));
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("timed out"))
+    );
     assert_eq!(recv(&mut first).await, None);
 
     // The handler is still sleeping: the only slot is still taken.
@@ -222,15 +242,21 @@ async fn a_timed_out_request_keeps_its_connection_slot_until_its_work_ends() {
 /// serves: the cap is clamped, not handed through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_oversized_connection_cap_is_clamped_not_panicking() {
-    let server = ElectrumServer::bind_with_factory(config(Duration::from_secs(30), usize::MAX), slow_factory())
-        .await
-        .unwrap();
+    let server = ElectrumServer::bind_with_factory(
+        config(Duration::from_secs(30), usize::MAX),
+        slow_factory(),
+    )
+    .await
+    .unwrap();
     let addr = server.local_addr().unwrap();
     let (sd_tx, sd_rx) = watch::channel(false);
     let join = tokio::spawn(server.serve(sd_rx));
     let mut conn = connect(addr).await;
     send(&mut conn, 1, "server.ping").await;
-    assert_eq!(recv(&mut conn).await.expect("answer")["result"], "server.ping");
+    assert_eq!(
+        recv(&mut conn).await.expect("answer")["result"],
+        "server.ping"
+    );
     let _ = sd_tx.send(true);
     drop(conn);
     let _ = join.await;

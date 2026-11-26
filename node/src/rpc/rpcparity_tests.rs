@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, TxOut, Txid};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::chain::state::tests::{
     build_test_block, build_test_block_spending, grind_test_pow, make_chain_state,
@@ -95,11 +95,18 @@ fn difficulty_has_cores_sixteen_significant_digits_everywhere() {
     let (cs, dir, blocks) = chain(1, spaced);
     let tip = blocks[0].block_hash().to_string();
 
-    assert_eq!(blockchain::get_difficulty(&cs).to_string(), REGTEST_DIFFICULTY);
+    assert_eq!(
+        blockchain::get_difficulty(&cs).to_string(),
+        REGTEST_DIFFICULTY
+    );
     let info = blockchain::get_blockchain_info(&cs, PruneMode::Off);
     assert_eq!(info["difficulty"].to_string(), REGTEST_DIFFICULTY, "{info}");
     let header = blockchain::get_block_header(&cs, &tip, true).unwrap();
-    assert_eq!(header["difficulty"].to_string(), REGTEST_DIFFICULTY, "{header}");
+    assert_eq!(
+        header["difficulty"].to_string(),
+        REGTEST_DIFFICULTY,
+        "{header}"
+    );
     let block = blockchain::get_block(&cs, &tip, 1).unwrap();
     assert_eq!(block["difficulty"].to_string(), REGTEST_DIFFICULTY);
     let states = blockchain::get_chain_states(&cs);
@@ -109,8 +116,16 @@ fn difficulty_has_cores_sixteen_significant_digits_everywhere() {
         "{states}"
     );
     let mining = mining::get_mining_info(&cs, &pool());
-    assert_eq!(mining["difficulty"].to_string(), REGTEST_DIFFICULTY, "{mining}");
-    assert_eq!(mining["next"]["difficulty"].to_string(), REGTEST_DIFFICULTY, "{mining}");
+    assert_eq!(
+        mining["difficulty"].to_string(),
+        REGTEST_DIFFICULTY,
+        "{mining}"
+    );
+    assert_eq!(
+        mining["next"]["difficulty"].to_string(),
+        REGTEST_DIFFICULTY,
+        "{mining}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -190,7 +205,13 @@ fn getnetworkinfo_networks_follow_the_reachable_set() {
     let info = network::get_network_info(&pm, 100, 1_000, Vec::new());
     assert_eq!(
         flags(&info),
-        vec![row("ipv4", true), row("ipv6", true), row("onion", false), row("i2p", false), row("cjdns", false)],
+        vec![
+            row("ipv4", true),
+            row("ipv6", true),
+            row("onion", false),
+            row("i2p", false),
+            row("cjdns", false)
+        ],
         "{info}"
     );
 
@@ -212,11 +233,23 @@ fn getnetworkinfo_networks_follow_the_reachable_set() {
         0,
         None,
     );
-    pm.set_reachable(ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false });
+    pm.set_reachable(ReachableNets {
+        ipv4: false,
+        ipv6: false,
+        onion: true,
+        cjdns: false,
+        cjdns_flip: false,
+    });
     let info = network::get_network_info(&pm, 100, 1_000, Vec::new());
     assert_eq!(
         flags(&info),
-        vec![row("ipv4", false), row("ipv6", false), row("onion", true), row("i2p", false), row("cjdns", false)],
+        vec![
+            row("ipv4", false),
+            row("ipv6", false),
+            row("onion", true),
+            row("i2p", false),
+            row("cjdns", false)
+        ],
         "{info}"
     );
     assert_eq!(info["networks"][2]["proxy"], "127.0.0.1:9050", "{info}");
@@ -238,7 +271,11 @@ fn psbt_v2_fee_is_an_amount() {
     let mut fees = 0;
     for v in doc["valid"].as_array().expect("valid vectors") {
         let b64 = v["psbt"].as_str().expect("base64");
-        assert!(base64::engine::general_purpose::STANDARD.decode(b64).is_ok());
+        assert!(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .is_ok()
+        );
         for out in [psbt::decode_psbt(b64, None), psbt::analyze_psbt(b64, None)] {
             let out = out.unwrap_or_else(|e| panic!("{}: {e:?}", v["description"]));
             if out["fee"].is_null() {
@@ -250,7 +287,10 @@ fn psbt_v2_fee_is_an_amount() {
             fees += 1;
         }
     }
-    assert!(fees > 0, "no vector carried every input's UTXO, so nothing was checked");
+    assert!(
+        fees > 0,
+        "no vector carried every input's UTXO, so nothing was checked"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +315,10 @@ fn networkhashps_since_the_last_retarget_uses_regtests_interval() {
     let since_retarget = mining::get_network_hash_ps(&cs, -1, -1).unwrap();
     let seven = mining::get_network_hash_ps(&cs, 150 % 144 + 1, -1).unwrap();
     let whole_chain = mining::get_network_hash_ps(&cs, 150, -1).unwrap();
-    assert_ne!(seven, whole_chain, "the fixture must tell the windows apart");
+    assert_ne!(
+        seven, whole_chain,
+        "the fixture must tell the windows apart"
+    );
     assert_eq!(since_retarget, seven);
 
     // At an explicit height the window is that height's, still mod 144.
@@ -301,7 +344,10 @@ fn submitblock_decode_failure_is_an_rpc_error() {
     let decode_failed = Err((-22, "Block decode failed".to_string()));
 
     assert_eq!(mining::submit_block(&cs, &pool(), "not hex"), decode_failed);
-    assert_eq!(mining::submit_block(&cs, &pool(), &hex[..hex.len() - 30]), decode_failed);
+    assert_eq!(
+        mining::submit_block(&cs, &pool(), &hex[..hex.len() - 30]),
+        decode_failed
+    );
     // The whole block connects.
     assert_eq!(mining::submit_block(&cs, &pool(), &hex), Ok(Value::Null));
     let _ = std::fs::remove_dir_all(&dir);
@@ -319,7 +365,9 @@ fn submitblock_reads_a_transaction_with_no_inputs_as_core_does() {
     let mut block = build_test_block(genesis_hash(), 1, spaced(1));
     let empty_txid = Txid::hash(&EMPTY);
     block.header.merkle_root = bitcoin::merkle_tree::calculate_root(
-        [block.txdata[0].compute_txid(), empty_txid].into_iter().map(bitcoin::TxMerkleNode::from),
+        [block.txdata[0].compute_txid(), empty_txid]
+            .into_iter()
+            .map(bitcoin::TxMerkleNode::from),
     )
     .unwrap();
     // The grind reads only the header, whose root now covers the empty tx.
@@ -330,9 +378,15 @@ fn submitblock_reads_a_transaction_with_no_inputs_as_core_does() {
     raw.extend(bitcoin::consensus::serialize(&block.txdata[0]));
     raw.extend_from_slice(&EMPTY);
 
-    assert_eq!(mining::submit_block(&cs, &pool(), &hex::encode(&raw)), Ok(json!("bad-txns-vin-empty")));
+    assert_eq!(
+        mining::submit_block(&cs, &pool(), &hex::encode(&raw)),
+        Ok(json!("bad-txns-vin-empty"))
+    );
     assert_eq!(cs.tip_height(), 0);
-    assert!(cs.get_block(&block.block_hash()).is_none(), "a block CheckBlock refuses is never stored");
+    assert!(
+        cs.get_block(&block.block_hash()).is_none(),
+        "a block CheckBlock refuses is never stored"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -346,17 +400,26 @@ fn submitblock_answers_duplicate_invalid_for_a_block_marked_invalid() {
 
     // A known header whose body fails at connect: it spends a coin that does
     // not exist. The failure marks the header's index entry.
-    let missing = OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 };
+    let missing = OutPoint {
+        txid: Txid::from_byte_array([0xab; 32]),
+        vout: 0,
+    };
     let bad = build_test_block_spending(tip, 2, spaced(2), missing);
     cs.accept_header(&bad.header).unwrap();
     assert_eq!(
         mining::submit_block(&cs, &pool(), &hex_of(&bad)),
         Ok(json!("bad-txns-inputs-missingorspent"))
     );
-    assert_eq!(mining::submit_block(&cs, &pool(), &hex_of(&bad)), Ok(json!("duplicate-invalid")));
+    assert_eq!(
+        mining::submit_block(&cs, &pool(), &hex_of(&bad)),
+        Ok(json!("duplicate-invalid"))
+    );
 
     // A block already held as valid.
-    assert_eq!(mining::submit_block(&cs, &pool(), &hex_of(&blocks[0])), Ok(json!("duplicate")));
+    assert_eq!(
+        mining::submit_block(&cs, &pool(), &hex_of(&blocks[0])),
+        Ok(json!("duplicate"))
+    );
 
     // `invalidateblock` marks it too.
     cs.invalidate_block(tip).unwrap();
@@ -415,7 +478,10 @@ fn coinbase_only_commitment() -> TxOut {
     let commitment = bitcoin::hashes::sha256d::Hash::hash(&[0u8; 64]).to_byte_array();
     let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     spk.extend_from_slice(&commitment);
-    TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) }
+    TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    }
 }
 
 /// Core's `submitblock` runs `UpdateUncommittedBlockStructures` first: a
@@ -431,7 +497,10 @@ fn submitblock_fills_in_the_witness_reserved_value() {
     grind_test_pow(&mut block);
     assert!(block.txdata[0].input[0].witness.is_empty());
 
-    assert_eq!(mining::submit_block(&cs, &pool(), &hex_of(&block)), Ok(Value::Null));
+    assert_eq!(
+        mining::submit_block(&cs, &pool(), &hex_of(&block)),
+        Ok(Value::Null)
+    );
     assert_eq!(cs.tip_hash(), block.block_hash());
     // The block stored is the completed one.
     let stored = blockchain::get_block(&cs, &block.block_hash().to_string(), 0).unwrap();
@@ -479,7 +548,10 @@ fn getblockfilter_refusals_match_core() {
     let index = |enabled: bool| -> Arc<dyn FilterIndex> {
         Arc::new(crate::index::filter::RocksFilterIndex::new(
             cs.store_ref().clone(),
-            FilterIndexConfig { enabled, peer_serve: false },
+            FilterIndexConfig {
+                enabled,
+                peer_serve: false,
+            },
         ))
     };
     let (on, off) = (index(true), index(false));
@@ -500,11 +572,23 @@ fn getblockfilter_refusals_match_core() {
         err(-5, "Block not found")
     );
     let not_enabled = err(-1, "Index is not enabled for filtertype basic");
-    assert_eq!(get_block_filter(&cs, Some(&off), false, &genesis, Some("basic")), not_enabled);
-    assert_eq!(get_block_filter(&cs, Some(&off), false, &genesis, None), not_enabled);
+    assert_eq!(
+        get_block_filter(&cs, Some(&off), false, &genesis, Some("basic")),
+        not_enabled
+    );
+    assert_eq!(
+        get_block_filter(&cs, Some(&off), false, &genesis, None),
+        not_enabled
+    );
     // The index is checked before the block is looked up.
-    assert_eq!(get_block_filter(&cs, Some(&off), false, &unknown, None), not_enabled);
-    assert_eq!(get_block_filter(&cs, None, false, &genesis, None), not_enabled);
+    assert_eq!(
+        get_block_filter(&cs, Some(&off), false, &unknown, None),
+        not_enabled
+    );
+    assert_eq!(
+        get_block_filter(&cs, None, false, &genesis, None),
+        not_enabled
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -531,7 +615,9 @@ fn getrawtransaction_refuses_the_genesis_coinbase_in_cores_words() {
     let hash = blocks[0].block_hash().to_string();
     assert_eq!(
         rawtx::get_raw_transaction(&cs, &pool(), &coinbase, false, 0, Some(&hash)),
-        Ok(json!(hex::encode(bitcoin::consensus::serialize(&blocks[0].txdata[0]))))
+        Ok(json!(hex::encode(bitcoin::consensus::serialize(
+            &blocks[0].txdata[0]
+        ))))
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -54,7 +54,10 @@ mod tests {
             let kept = sanitize_string(&c.to_string());
             assert_eq!(kept.is_empty(), !core_safe.contains(c), "byte {b:#04x}");
         }
-        assert_eq!(sanitize_string("/Satoshi:27.0.0/\nfake log line\x1b[31m"), "/Satoshi:27.0.0/fake log line31m");
+        assert_eq!(
+            sanitize_string("/Satoshi:27.0.0/\nfake log line\x1b[31m"),
+            "/Satoshi:27.0.0/fake log line31m"
+        );
         assert_eq!(sanitize_string("caf\u{e9}"), "caf");
     }
 }

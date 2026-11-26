@@ -14,7 +14,13 @@ fn peer_manager_over(chain_state: Arc<ChainState>) -> Arc<PeerManager> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // Leak the sender so the channel stays open for the manager's life.
     std::mem::forget(shutdown_tx);
-    PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    )
 }
 
 fn tip_reaches(cs: &ChainState, hash: bitcoin::BlockHash, within: Duration) -> bool {
@@ -43,7 +49,10 @@ fn an_empty_body_buffered_before_its_parent_does_not_bar_the_real_block() {
     }
     let b4 = build_test_block(parent, 4, 1_707_000_004);
     let b5 = build_test_block(b4.block_hash(), 5, 1_707_000_005);
-    let empty5 = bitcoin::Block { header: b5.header, txdata: Vec::new() };
+    let empty5 = bitcoin::Block {
+        header: b5.header,
+        txdata: Vec::new(),
+    };
 
     let cs = Arc::new(cs);
     let pm = peer_manager_over(cs.clone());
@@ -54,7 +63,11 @@ fn an_empty_body_buffered_before_its_parent_does_not_bar_the_real_block() {
     // fetched after an `inv` does.
     pm.note_blocks_requested(7, &[b5.block_hash()]);
     pm.handle_message(7, NetworkMessage::Block(empty5), in_flight());
-    pm.handle_message(7, NetworkMessage::Headers(vec![b4.header, b5.header]), in_flight());
+    pm.handle_message(
+        7,
+        NetworkMessage::Headers(vec![b4.header, b5.header]),
+        in_flight(),
+    );
     pm.handle_message(7, NetworkMessage::Block(b4.clone()), in_flight());
     assert!(
         tip_reaches(&cs, b4.block_hash(), Duration::from_secs(10)),

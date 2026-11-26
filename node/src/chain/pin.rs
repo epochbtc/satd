@@ -195,7 +195,11 @@ mod tests {
             extend(&cs, 1_708_001_200);
             *pin
         });
-        let want = Pin { hash: one, height: 1, mempool: true };
+        let want = Pin {
+            hash: one,
+            height: 1,
+            mempool: true,
+        };
         assert_eq!(got, Pinned::Answered(want, want));
         assert_eq!(runs.get(), 1, "an extension does not rerun");
         let _ = std::fs::remove_dir_all(&dir);
@@ -216,7 +220,11 @@ mod tests {
             }
             pin.hash
         });
-        let want = Pin { hash: one, height: 1, mempool: true };
+        let want = Pin {
+            hash: one,
+            height: 1,
+            mempool: true,
+        };
         assert_eq!(got, Pinned::Answered(one, want));
         assert_eq!(runs.get(), 2, "the first run was discarded");
         let _ = std::fs::remove_dir_all(&dir);
@@ -244,7 +252,11 @@ mod tests {
                 *pin
             })
         });
-        let want = Pin { hash: one, height: 1, mempool: true };
+        let want = Pin {
+            hash: one,
+            height: 1,
+            mempool: true,
+        };
         assert_eq!(got, Pinned::Answered(want, want));
         assert_eq!(runs.get(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -278,7 +290,11 @@ mod tests {
         let one = extend(&cs, 1_708_000_600);
         let two = extend(&cs, 1_708_001_200);
         let got = run_pinned(&cs, Some(one), |pin| *pin);
-        let want = Pin { hash: one, height: 1, mempool: false };
+        let want = Pin {
+            hash: one,
+            height: 1,
+            mempool: false,
+        };
         assert_eq!(got, Pinned::Answered(want, want));
 
         let unknown = build_test_block(two, 3, 1_708_001_800).block_hash();
@@ -289,7 +305,11 @@ mod tests {
             runs.set(runs.get() + 1);
             cs.invalidate_block(two).unwrap();
         });
-        assert_eq!(got, Pinned::NotOnChain, "a disconnected asof block is not retried");
+        assert_eq!(
+            got,
+            Pinned::NotOnChain,
+            "a disconnected asof block is not retried"
+        );
         assert_eq!(runs.get(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

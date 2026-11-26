@@ -1,10 +1,10 @@
 //! sighash.json test vectors: verify legacy sighash computation matches
 //! Bitcoin Core's SignatureHash output for 500 random transactions.
 
+use bitcoin::Transaction;
 use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash;
 use bitcoin::sighash::SighashCache;
-use bitcoin::Transaction;
 use serde_json::Value;
 
 /// Strip OP_CODESEPARATOR (0xab) from a script at instruction boundaries.

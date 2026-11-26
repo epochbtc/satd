@@ -107,7 +107,10 @@ fn a_low_work_chain_is_never_released() {
     assert!(released.is_empty());
     assert!(results[0].success && results[0].request_more);
     assert!(results[1].success && results[1].request_more);
-    assert!(results[2].success && !results[2].request_more, "a short message ends the sync");
+    assert!(
+        results[2].success && !results[2].request_more,
+        "a short message ends the sync"
+    );
     assert_eq!(sync.state(), State::Final);
 }
 
@@ -123,7 +126,11 @@ fn a_chain_that_reaches_the_threshold_is_released_on_redownload() {
     assert!(released.is_empty(), "nothing is released in PRESYNC");
     assert!(results.iter().all(|r| r.success && r.request_more));
     assert_eq!(sync.state(), State::Redownload);
-    assert_eq!(sync.next_request_start(), Some(chain_start().hash), "redownload starts over");
+    assert_eq!(
+        sync.next_request_start(),
+        Some(chain_start().hash),
+        "redownload starts over"
+    );
 
     let mut all = Vec::new();
     for (i, batch) in chain.chunks(2000).enumerate() {
@@ -133,7 +140,10 @@ fn a_chain_that_reaches_the_threshold_is_released_on_redownload() {
         // behind the newest one come out.
         let received = (i + 1) * 2000;
         if received < 9_000 {
-            assert_eq!(all.len() + r.pow_validated_headers.len(), received.saturating_sub(7017));
+            assert_eq!(
+                all.len() + r.pow_validated_headers.len(),
+                received.saturating_sub(7017)
+            );
         }
         all.extend(r.pow_validated_headers);
     }
@@ -189,7 +199,11 @@ fn presync_memory_stays_bounded() {
     assert_eq!(sync.state(), State::Presync);
     assert_eq!(sync.presync_height(), 20_000);
     // 20,000 / 275 = 72 bits: two words.
-    assert!(sync.heap_bytes() <= 64, "presync holds {} bytes", sync.heap_bytes());
+    assert!(
+        sync.heap_bytes() <= 64,
+        "presync holds {} bytes",
+        sync.heap_bytes()
+    );
 }
 
 /// A chain longer than the MTP rule lets one exist since the chain start
@@ -223,7 +237,19 @@ fn a_clock_far_behind_the_chain_start_is_an_error() {
     let start = chain_start();
     let mtp = u64::from(start.median_time_past);
     let params = HeadersSyncParams::for_network(Network::Regtest);
-    let err = HeadersSyncState::new(1, Network::Regtest, params, start.clone(), [0; 32], mtp - 7201).unwrap_err();
-    assert!(err.to_string().starts_with("System clock is more than 120 minutes behind chain start MTP"), "{err}");
+    let err = HeadersSyncState::new(
+        1,
+        Network::Regtest,
+        params,
+        start.clone(),
+        [0; 32],
+        mtp - 7201,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("System clock is more than 120 minutes behind chain start MTP"),
+        "{err}"
+    );
     assert!(HeadersSyncState::new(1, Network::Regtest, params, start, [0; 32], mtp - 7200).is_ok());
 }

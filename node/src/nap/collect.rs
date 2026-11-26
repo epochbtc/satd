@@ -134,7 +134,12 @@ impl Budget {
                 w.used += 1;
             }
             _ if per_window == 0 => return false,
-            _ => self.window = Some(Window { start: now, used: 1 }),
+            _ => {
+                self.window = Some(Window {
+                    start: now,
+                    used: 1,
+                })
+            }
         }
         true
     }
@@ -165,7 +170,9 @@ impl Collector {
         Collector {
             aggregate,
             limits,
-            verified: Mutex::new(LruCache::new(NonZeroUsize::new(VERIFIED_CACHE_SIZE).expect("nonzero"))),
+            verified: Mutex::new(LruCache::new(
+                NonZeroUsize::new(VERIFIED_CACHE_SIZE).expect("nonzero"),
+            )),
             budget: Mutex::new(Budget { window: None }),
             deferred: Mutex::new((VecDeque::new(), 0)),
         }
@@ -221,7 +228,11 @@ impl Collector {
     /// Verify deferred attestations, oldest first, while the hourly budget
     /// allows. Returns the peers whose deferred attestations failed their
     /// signature, with the failure, for the caller to discourage.
-    pub fn drain_deferred(&self, chain: &impl ChainSource, now: Instant) -> Vec<(String, Rejection)> {
+    pub fn drain_deferred(
+        &self,
+        chain: &impl ChainSource,
+        now: Instant,
+    ) -> Vec<(String, Rejection)> {
         let mut bad = Vec::new();
         loop {
             let next = {
@@ -299,7 +310,11 @@ impl Collector {
         if pull.as_ref().is_some_and(|p| p.0 == 0) {
             return Checked::OverBudget;
         }
-        if !self.budget.lock().take(self.limits.hourly_verifications, now) {
+        if !self
+            .budget
+            .lock()
+            .take(self.limits.hourly_verifications, now)
+        {
             return Checked::OverBudget;
         }
         if let Some(p) = pull {
@@ -314,7 +329,11 @@ impl Collector {
         let size = att.to_bytes().len();
         let mut q = self.deferred.lock();
         q.1 += size;
-        q.0.push_back(Deferred { att, source: source.to_owned(), size });
+        q.0.push_back(Deferred {
+            att,
+            source: source.to_owned(),
+            size,
+        });
         Taken::Deferred
     }
 }

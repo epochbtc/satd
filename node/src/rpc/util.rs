@@ -1,6 +1,6 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::rpc::address_decode::{decode_destination, Decoded};
+use crate::rpc::address_decode::{Decoded, decode_destination};
 
 /// `validateaddress` — Core's `src/rpc/output_script.cpp`.
 ///
@@ -33,15 +33,11 @@ pub fn validate_address(address: &str, network: bitcoin::Network) -> Value {
                 None if script.is_p2pkh() => ("pubkeyhash", Some(false), false),
                 None if script.is_p2sh() => ("scripthash", Some(true), false),
                 None => ("nonstandard", Some(false), false),
-                Some(0) if witness_program.len() == 20 => {
-                    ("witness_v0_keyhash", Some(false), true)
-                }
+                Some(0) if witness_program.len() == 20 => ("witness_v0_keyhash", Some(false), true),
                 Some(0) if witness_program.len() == 32 => {
                     ("witness_v0_scripthash", Some(true), true)
                 }
-                Some(1) if witness_program.len() == 32 => {
-                    ("witness_v1_taproot", Some(true), true)
-                }
+                Some(1) if witness_program.len() == 32 => ("witness_v1_taproot", Some(true), true),
                 Some(1) if witness_program == P2A_PROGRAM => ("anchor", Some(true), false),
                 _ => ("witness_unknown", None, true),
             };
@@ -93,7 +89,10 @@ pub fn parse_hash_v<T: std::str::FromStr>(s: &str, name: &str) -> Result<T, (i32
         return Ok(v);
     }
     if s.len() != 64 {
-        return Err((-8, format!("{name} must be of length 64 (not {}, for '{s}')", s.len())));
+        return Err((
+            -8,
+            format!("{name} must be of length 64 (not {}, for '{s}')", s.len()),
+        ));
     }
     Err((-8, format!("{name} must be hexadecimal string (not '{s}')")))
 }
@@ -174,8 +173,20 @@ mod tests {
 
         let cases: &[Case] = &[
             // P2PKH and P2SH: no witness fields at all.
-            ("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", Some(false), false, None, "pubkeyhash"),
-            ("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", Some(true), false, None, "scripthash"),
+            (
+                "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+                Some(false),
+                false,
+                None,
+                "pubkeyhash",
+            ),
+            (
+                "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy",
+                Some(true),
+                false,
+                None,
+                "scripthash",
+            ),
             (
                 "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
                 Some(false),
@@ -236,7 +247,10 @@ mod tests {
         let sixty_four_z = "z".repeat(64);
         let err = parse_hash_v::<bitcoin::BlockHash>(&sixty_four_z, "blockhash").unwrap_err();
         assert_eq!(err.0, -8);
-        assert_eq!(err.1, format!("blockhash must be hexadecimal string (not '{sixty_four_z}')"));
+        assert_eq!(
+            err.1,
+            format!("blockhash must be hexadecimal string (not '{sixty_four_z}')")
+        );
 
         let short = "abc";
         let err = parse_hash_v::<bitcoin::BlockHash>(short, "blockhash").unwrap_err();

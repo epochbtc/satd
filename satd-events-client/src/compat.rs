@@ -77,7 +77,10 @@ pub(crate) fn classify(sdk: Version, node: Version) -> Compat {
 /// compare: the parsed header, or [`HEADERLESS_NODE`] when it is missing or
 /// unparseable.
 pub(crate) fn node_version_from(md: &MetadataMap) -> (Option<String>, Version) {
-    let raw = md.get(VERSION_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let raw = md
+        .get(VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let parsed = raw.as_deref().and_then(parse).unwrap_or(HEADERLESS_NODE);
     (raw, parsed)
 }
@@ -88,7 +91,11 @@ pub(crate) fn node_version_from(md: &MetadataMap) -> (Option<String>, Version) {
 pub(crate) fn schema_from(md: &MetadataMap) -> u32 {
     match md.get(SCHEMA_HEADER) {
         None => 1,
-        Some(v) => v.to_str().ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+        Some(v) => v
+            .to_str()
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0),
     }
 }
 
@@ -110,7 +117,12 @@ pub(crate) fn head_cursor_from(md: &MetadataMap) -> Option<crate::event::Cursor>
     if it.next().is_some() {
         return None;
     }
-    Some(crate::event::Cursor { height, tx_index, mempool_seq, instance_id })
+    Some(crate::event::Cursor {
+        height,
+        tx_index,
+        mempool_seq,
+        instance_id,
+    })
 }
 
 /// How a node version is shown in the warning and the `NodeTooOld` error.
@@ -153,7 +165,13 @@ mod tests {
         assert_eq!(parse("1.0"), Some(Version { major: 1, minor: 0 }));
         assert_eq!(parse("0.6"), Some(Version { major: 0, minor: 6 }));
         assert_eq!(parse("0.6.0+build"), Some(Version { major: 0, minor: 6 }));
-        assert_eq!(parse("0.12.3-rc.1"), Some(Version { major: 0, minor: 12 }));
+        assert_eq!(
+            parse("0.12.3-rc.1"),
+            Some(Version {
+                major: 0,
+                minor: 12
+            })
+        );
     }
 
     #[test]
@@ -173,7 +191,10 @@ mod tests {
         assert_eq!(classify_header("0.6.0", Some("0.6.0-pre")), Compat::Ok);
         assert_eq!(classify_header("0.6.0-pre", Some("0.7.3")), Compat::Ok);
         assert_eq!(classify_header("0.6.0", Some("1.0.0")), Compat::Ok);
-        assert_eq!(classify_header("0.6.0-pre", Some("0.5.2")), Compat::OneBehind);
+        assert_eq!(
+            classify_header("0.6.0-pre", Some("0.5.2")),
+            Compat::OneBehind
+        );
         assert_eq!(classify_header("0.6.0", None), Compat::OneBehind);
         assert_eq!(classify_header("0.7.0", Some("0.5.2")), Compat::TooOld);
         assert_eq!(classify_header("0.7.0", None), Compat::TooOld);

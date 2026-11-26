@@ -22,7 +22,7 @@ use bitcoin::bip158::{BlockFilter, Error as Bip158Error};
 use bitcoin::{Block, OutPoint, ScriptBuf};
 
 use node_filter_index::{
-    FilterHeaderRow, FilterIndexConfig, FilterKey, FilterRow, FILTER_TYPE_BASIC,
+    FILTER_TYPE_BASIC, FilterHeaderRow, FilterIndexConfig, FilterKey, FilterRow,
 };
 
 /// Genesis previous-filter-header per BIP 157.

@@ -130,7 +130,7 @@ impl TorController {
                 Some(path) => return self.authenticate_safecookie(path).await,
                 None => {
                     return Err(
-                        "Tor offers SAFECOOKIE but PROTOCOLINFO gave no COOKIEFILE".to_string(),
+                        "Tor offers SAFECOOKIE but PROTOCOLINFO gave no COOKIEFILE".to_string()
                     );
                 }
             }
@@ -304,9 +304,7 @@ impl TorController {
         }
         let cmd = format!(
             "ADD_ONION {} Port={},{}\r\n",
-            key,
-            virtual_port,
-            target_addr
+            key, virtual_port, target_addr
         );
 
         self.writer
@@ -352,9 +350,7 @@ impl TorController {
     /// Remove a previously created hidden service.
     pub async fn remove_hidden_service(&mut self, onion_host: &str) -> Result<(), String> {
         // Strip .onion suffix for the DEL_ONION command
-        let service_id = onion_host
-            .strip_suffix(".onion")
-            .unwrap_or(onion_host);
+        let service_id = onion_host.strip_suffix(".onion").unwrap_or(onion_host);
 
         let cmd = format!("DEL_ONION {}\r\n", service_id);
 
@@ -389,10 +385,13 @@ impl TorController {
     /// timeout also caps an unterminated slowloris dribble of bytes).
     async fn read_response(&mut self) -> Result<String, String> {
         let mut line = String::new();
-        let n = tokio::time::timeout(CONTROL_TIMEOUT, read_bounded_line(&mut self.reader, &mut line))
-            .await
-            .map_err(|_| "Tor control read timed out".to_string())?
-            .map_err(|e| format!("Tor control read failed: {}", e))?;
+        let n = tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            read_bounded_line(&mut self.reader, &mut line),
+        )
+        .await
+        .map_err(|_| "Tor control read timed out".to_string())?
+        .map_err(|e| format!("Tor control read failed: {}", e))?;
         if n == 0 {
             return Err("Tor control port closed the connection".to_string());
         }
@@ -485,7 +484,9 @@ fn read_cookie_file(cookie_path: &str) -> Result<Vec<u8>, String> {
 fn read_cookie_bytes(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut cookie = Vec::with_capacity(COOKIE_LEN + 1);
-    reader.take(COOKIE_LEN as u64 + 1).read_to_end(&mut cookie)?;
+    reader
+        .take(COOKIE_LEN as u64 + 1)
+        .read_to_end(&mut cookie)?;
     Ok(cookie)
 }
 
@@ -759,7 +760,8 @@ mod tests {
 
     #[test]
     fn token_value_handles_quoted_path_with_space() {
-        let line = r#"250-AUTH METHODS=SAFECOOKIE COOKIEFILE="/var/lib/tor data/control.authcookie""#;
+        let line =
+            r#"250-AUTH METHODS=SAFECOOKIE COOKIEFILE="/var/lib/tor data/control.authcookie""#;
         assert_eq!(
             unquote(token_value(line, "COOKIEFILE=").unwrap()),
             "/var/lib/tor data/control.authcookie"
@@ -805,7 +807,10 @@ mod tests {
 
         // AUTHCHALLENGE SAFECOOKIE <client_nonce>
         let mut chal = String::new();
-        reader.read_line(&mut chal).await.map_err(|e| e.to_string())?;
+        reader
+            .read_line(&mut chal)
+            .await
+            .map_err(|e| e.to_string())?;
         let chal = chal.trim_end();
         let client_nonce_hex = chal
             .strip_prefix("AUTHCHALLENGE SAFECOOKIE ")
@@ -834,7 +839,10 @@ mod tests {
 
         // AUTHENTICATE <client_hash>  (only sent if the client accepted us)
         let mut auth = String::new();
-        let n = reader.read_line(&mut auth).await.map_err(|e| e.to_string())?;
+        let n = reader
+            .read_line(&mut auth)
+            .await
+            .map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&cookie_path);
         if n == 0 {
             return Ok(Vec::new()); // client hung up (rejected our SERVERHASH)
@@ -846,7 +854,9 @@ mod tests {
         let got = hex::decode(client_hash_hex).map_err(|e| e.to_string())?;
         let expected = hmac(CLIENT_HASH_KEY, &msg);
         if got == expected {
-            wh.write_all(b"250 OK\r\n").await.map_err(|e| e.to_string())?;
+            wh.write_all(b"250 OK\r\n")
+                .await
+                .map_err(|e| e.to_string())?;
         } else {
             wh.write_all(b"515 Bad authentication\r\n")
                 .await
@@ -869,7 +879,9 @@ mod tests {
         let mut reader = BufReader::new(rh);
         let mut l = String::new();
         reader.read_line(&mut l).await.unwrap();
-        let mut reply = "250-ServiceID=a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad\r\n".to_string();
+        let mut reply =
+            "250-ServiceID=a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad\r\n"
+                .to_string();
         if l.contains("NEW:ED25519-V3") {
             reply.push_str("250-PrivateKey=ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\r\n");
         }
@@ -887,11 +899,19 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(fake_tor_add_onion(listener));
         let mut ctrl = TorController::connect(&addr).await.unwrap();
-        let (onion, key) = ctrl.create_hidden_service(8333, "127.0.0.1:8334", None).await.unwrap();
+        let (onion, key) = ctrl
+            .create_hidden_service(8333, "127.0.0.1:8334", None)
+            .await
+            .unwrap();
         let sent = server.await.unwrap();
         assert_eq!(sent, "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8334");
         assert!(onion.ends_with(".onion"));
-        assert_eq!(key.as_deref(), Some("ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="));
+        assert_eq!(
+            key.as_deref(),
+            Some(
+                "ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="
+            )
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -901,7 +921,10 @@ mod tests {
             .create_hidden_service(8333, "127.0.0.1:8334", Some("ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="))
             .await
             .unwrap();
-        assert_eq!(server.await.unwrap(), "ADD_ONION ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw== Port=8333,127.0.0.1:8334");
+        assert_eq!(
+            server.await.unwrap(),
+            "ADD_ONION ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw== Port=8333,127.0.0.1:8334"
+        );
         assert_eq!(again, onion);
         assert_eq!(key, None, "Tor returns no key for an existing one");
     }
@@ -923,7 +946,9 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(fake_tor_add_onion_replying(listener, reply));
         let mut ctrl = TorController::connect(&addr).await.unwrap();
-        let out = ctrl.create_hidden_service(8333, "127.0.0.1:8334", None).await;
+        let out = ctrl
+            .create_hidden_service(8333, "127.0.0.1:8334", None)
+            .await;
         drop(ctrl);
         let _ = server.await;
         out
@@ -971,7 +996,11 @@ mod tests {
         .expect_err("a malformed key");
         assert!(err.contains("malformed private key"), "{err}");
 
-        for id in ["abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx", "evil.example", "x"] {
+        for id in [
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx",
+            "evil.example",
+            "x",
+        ] {
             let err = add_onion_against(format!(
                 "250-ServiceID={id}\r\n250-PrivateKey={GOOD_KEY}\r\n250 OK\r\n"
             ))
@@ -990,12 +1019,20 @@ mod tests {
         let server = tokio::spawn(fake_tor_add_onion_replying(listener, String::new()));
         let mut ctrl = TorController::connect(&addr).await.unwrap();
         let err = ctrl
-            .create_hidden_service(8333, "127.0.0.1:8334", Some("ED25519-V3:x Port=1,6.6.6.6:1"))
+            .create_hidden_service(
+                8333,
+                "127.0.0.1:8334",
+                Some("ED25519-V3:x Port=1,6.6.6.6:1"),
+            )
             .await
             .expect_err("a malformed key");
         assert!(err.contains("malformed private key"), "{err}");
         drop(ctrl);
-        assert_eq!(server.await.unwrap(), "", "nothing reached the control port");
+        assert_eq!(
+            server.await.unwrap(),
+            "",
+            "nothing reached the control port"
+        );
     }
 
     /// Core's `MAX_LINE_LENGTH`: a reply line with no end is refused once it
@@ -1006,13 +1043,20 @@ mod tests {
         let at_cap = format!("{}\n", "a".repeat(MAX_LINE_LEN - 1));
         let mut r = BufReader::new(at_cap.as_bytes());
         let mut line = String::new();
-        assert_eq!(read_bounded_line(&mut r, &mut line).await.unwrap(), MAX_LINE_LEN);
+        assert_eq!(
+            read_bounded_line(&mut r, &mut line).await.unwrap(),
+            MAX_LINE_LEN
+        );
 
         let over = "a".repeat(MAX_LINE_LEN + 10);
         let mut r = BufReader::new(over.as_bytes());
         let mut line = String::new();
         assert!(read_bounded_line(&mut r, &mut line).await.is_err());
-        assert!(line.len() <= MAX_LINE_LEN + 1, "buffered {} bytes", line.len());
+        assert!(
+            line.len() <= MAX_LINE_LEN + 1,
+            "buffered {} bytes",
+            line.len()
+        );
     }
 
     /// One control connection of a Tor with null authentication: answers
@@ -1020,10 +1064,11 @@ mod tests {
     /// for a new service). Returns the `ADD_ONION` line and the connection,
     /// whose drop is Tor going away.
     async fn fake_tor_session(listener: &TcpListener) -> (String, TcpStream) {
-        let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
-            .await
-            .expect("satd did not connect to the control port again")
-            .unwrap();
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
+                .await
+                .expect("satd did not connect to the control port again")
+                .unwrap();
         let mut reader = BufReader::new(stream);
         let mut add_onion = String::new();
         loop {
@@ -1035,7 +1080,9 @@ mod tests {
                 "250 OK\r\n".to_string()
             } else if l.starts_with("ADD_ONION") {
                 add_onion = l.trim_end().to_string();
-                let mut r = "250-ServiceID=a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad\r\n".to_string();
+                let mut r =
+                    "250-ServiceID=a4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dwc6ad\r\n"
+                        .to_string();
                 if l.contains("NEW:ED25519-V3") {
                     r.push_str("250-PrivateKey=ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==\r\n");
                 }
@@ -1115,7 +1162,10 @@ mod tests {
         assert_eq!(events, [up.clone(), "withdrawn".to_string(), up]);
         let (first, second, _conn) = tor.await.unwrap();
         assert_eq!(first, "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8334");
-        assert_eq!(second, "ADD_ONION ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw== Port=8333,127.0.0.1:8334");
+        assert_eq!(
+            second,
+            "ADD_ONION ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw== Port=8333,127.0.0.1:8334"
+        );
     }
 
     /// #973: an `-externalip` onion is advertised while the node's own
@@ -1124,7 +1174,11 @@ mod tests {
     #[tokio::test]
     async fn the_externalip_onion_stands_in_while_the_service_is_down() {
         // A port nothing listens on yet: Tor is not up at startup.
-        let addr = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let sink = std::sync::Arc::new(Recorder::default());
         let manual = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion".to_string();
@@ -1151,11 +1205,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load_onion_key(dir.path()), None);
         save_onion_key(dir.path(), "ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==").unwrap();
-        assert_eq!(load_onion_key(dir.path()).as_deref(), Some("ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="));
+        assert_eq!(
+            load_onion_key(dir.path()).as_deref(),
+            Some(
+                "ED25519-V3:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="
+            )
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(onion_key_path(dir.path())).unwrap().permissions().mode();
+            let mode = std::fs::metadata(onion_key_path(dir.path()))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }
@@ -1178,7 +1240,11 @@ mod tests {
             .expect("fake-tor server task timed out")
             .unwrap()
             .unwrap();
-        assert_eq!(client_hash.len(), 32, "server received a 32-byte client proof");
+        assert_eq!(
+            client_hash.len(),
+            32,
+            "server received a 32-byte client proof"
+        );
     }
 
     #[tokio::test]
@@ -1336,11 +1402,12 @@ mod tests {
             listener,
             path.to_str().unwrap().to_string(),
         ));
-        let err = tokio::time::timeout(std::time::Duration::from_secs(10), spawn_authenticate(addr))
-            .await
-            .expect("authenticate timed out")
-            .unwrap()
-            .unwrap_err();
+        let err =
+            tokio::time::timeout(std::time::Duration::from_secs(10), spawn_authenticate(addr))
+                .await
+                .expect("authenticate timed out")
+                .unwrap()
+                .unwrap_err();
         assert!(err.contains("is more than 32 bytes"), "got: {err}");
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
     }

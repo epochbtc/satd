@@ -149,7 +149,11 @@ fn print_danger(rs: &CompiledRuleset, allow_dangerous: bool) -> i32 {
         };
         println!("  [{name}] {sev} — scope: {scope}");
         for f in fs {
-            println!("      • matches {} — {}", f.shape.label(), f.class.headline());
+            println!(
+                "      • matches {} — {}",
+                f.shape.label(),
+                f.class.headline()
+            );
         }
     }
     println!();

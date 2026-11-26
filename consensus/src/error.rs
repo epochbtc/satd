@@ -82,7 +82,9 @@ impl ScriptError {
         match self {
             Self::Ok => "No error",
             Self::UnknownError => "unknown error",
-            Self::EvalFalse => "Script evaluated without error but finished with a false/empty top stack element",
+            Self::EvalFalse => {
+                "Script evaluated without error but finished with a false/empty top stack element"
+            }
             Self::OpReturn => "OP_RETURN was encountered",
             Self::ScriptNum => "Script number overflow",
             Self::ScriptSize => "Script is too big",
@@ -114,10 +116,16 @@ impl ScriptError {
             Self::MinimalIf => "OP_IF/NOTIF argument must be minimal",
             Self::SigNullFail => "Signature must be zero for failed CHECK(MULTI)SIG operation",
             Self::DiscourageUpgradableNops => "NOPx reserved for soft-fork upgrades",
-            Self::DiscourageUpgradableWitnessProgram => "Witness version reserved for soft-fork upgrades",
-            Self::DiscourageUpgradableTaprootVersion => "Taproot version reserved for soft-fork upgrades",
+            Self::DiscourageUpgradableWitnessProgram => {
+                "Witness version reserved for soft-fork upgrades"
+            }
+            Self::DiscourageUpgradableTaprootVersion => {
+                "Taproot version reserved for soft-fork upgrades"
+            }
             Self::DiscourageOpSuccess => "OP_SUCCESSx reserved for soft-fork upgrades",
-            Self::DiscourageUpgradablePubkeyType => "Public key version reserved for soft-fork upgrades",
+            Self::DiscourageUpgradablePubkeyType => {
+                "Public key version reserved for soft-fork upgrades"
+            }
             Self::WitnessProgramWrongLength => "Witness program has incorrect length",
             Self::WitnessProgramWitnessEmpty => "Witness program was passed an empty witness",
             Self::WitnessProgramMismatch => "Witness program hash mismatch",
@@ -129,8 +137,12 @@ impl ScriptError {
             Self::SchnorrSigHashtype => "Invalid Schnorr signature hash type",
             Self::SchnorrSig => "Invalid Schnorr signature",
             Self::TaprootWrongControlSize => "Invalid Taproot control block size",
-            Self::TapscriptValidationWeight => "Too much signature validation relative to witness weight",
-            Self::TapscriptCheckMultiSig => "OP_CHECKMULTISIG(VERIFY) is not available in tapscript",
+            Self::TapscriptValidationWeight => {
+                "Too much signature validation relative to witness weight"
+            }
+            Self::TapscriptCheckMultiSig => {
+                "OP_CHECKMULTISIG(VERIFY) is not available in tapscript"
+            }
             Self::TapscriptMinimalIf => "OP_IF/NOTIF argument must be minimal in tapscript",
             Self::TapscriptEmptyPubkey => "Public key is empty in tapscript",
             Self::OpCodeSeparator => "Using OP_CODESEPARATOR in non-witness script",
@@ -240,8 +252,12 @@ impl ScriptError {
             "MINIMALIF" => Some(Self::MinimalIf),
             "SIG_NULLFAIL" | "NULLFAIL" => Some(Self::SigNullFail),
             "DISCOURAGE_UPGRADABLE_NOPS" => Some(Self::DiscourageUpgradableNops),
-            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => Some(Self::DiscourageUpgradableWitnessProgram),
-            "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => Some(Self::DiscourageUpgradableTaprootVersion),
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => {
+                Some(Self::DiscourageUpgradableWitnessProgram)
+            }
+            "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => {
+                Some(Self::DiscourageUpgradableTaprootVersion)
+            }
             "DISCOURAGE_OP_SUCCESS" => Some(Self::DiscourageOpSuccess),
             "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => Some(Self::DiscourageUpgradablePubkeyType),
             "WITNESS_PROGRAM_WRONG_LENGTH" => Some(Self::WitnessProgramWrongLength),
@@ -283,23 +299,65 @@ mod tests {
     #[test]
     fn test_name_round_trips_through_from_test_name() {
         let names = [
-            "OK", "UNKNOWN_ERROR", "EVAL_FALSE", "OP_RETURN", "SCRIPTNUM", "SCRIPT_SIZE", "PUSH_SIZE",
-            "OP_COUNT", "STACK_SIZE", "SIG_COUNT", "PUBKEY_COUNT", "VERIFY", "EQUALVERIFY",
-            "CHECKMULTISIGVERIFY", "CHECKSIGVERIFY", "NUMEQUALVERIFY", "BAD_OPCODE", "DISABLED_OPCODE",
-            "INVALID_STACK_OPERATION", "INVALID_ALTSTACK_OPERATION", "UNBALANCED_CONDITIONAL",
-            "NEGATIVE_LOCKTIME", "UNSATISFIED_LOCKTIME", "SIG_HASHTYPE", "SIG_DER", "MINIMALDATA",
-            "SIG_PUSHONLY", "SIG_HIGH_S", "SIG_NULLDUMMY", "PUBKEYTYPE", "CLEANSTACK", "MINIMALIF",
-            "NULLFAIL", "DISCOURAGE_UPGRADABLE_NOPS", "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
-            "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION", "DISCOURAGE_OP_SUCCESS",
-            "DISCOURAGE_UPGRADABLE_PUBKEYTYPE", "WITNESS_PROGRAM_WRONG_LENGTH",
-            "WITNESS_PROGRAM_WITNESS_EMPTY", "WITNESS_PROGRAM_MISMATCH", "WITNESS_MALLEATED",
-            "WITNESS_MALLEATED_P2SH", "WITNESS_UNEXPECTED", "WITNESS_PUBKEYTYPE", "SCHNORR_SIG_SIZE",
-            "SCHNORR_SIG_HASHTYPE", "SCHNORR_SIG", "TAPROOT_WRONG_CONTROL_SIZE",
-            "TAPSCRIPT_VALIDATION_WEIGHT", "TAPSCRIPT_CHECKMULTISIG", "TAPSCRIPT_MINIMALIF",
-            "TAPSCRIPT_EMPTY_PUBKEY", "OP_CODESEPARATOR", "SIG_FINDANDDELETE",
+            "OK",
+            "UNKNOWN_ERROR",
+            "EVAL_FALSE",
+            "OP_RETURN",
+            "SCRIPTNUM",
+            "SCRIPT_SIZE",
+            "PUSH_SIZE",
+            "OP_COUNT",
+            "STACK_SIZE",
+            "SIG_COUNT",
+            "PUBKEY_COUNT",
+            "VERIFY",
+            "EQUALVERIFY",
+            "CHECKMULTISIGVERIFY",
+            "CHECKSIGVERIFY",
+            "NUMEQUALVERIFY",
+            "BAD_OPCODE",
+            "DISABLED_OPCODE",
+            "INVALID_STACK_OPERATION",
+            "INVALID_ALTSTACK_OPERATION",
+            "UNBALANCED_CONDITIONAL",
+            "NEGATIVE_LOCKTIME",
+            "UNSATISFIED_LOCKTIME",
+            "SIG_HASHTYPE",
+            "SIG_DER",
+            "MINIMALDATA",
+            "SIG_PUSHONLY",
+            "SIG_HIGH_S",
+            "SIG_NULLDUMMY",
+            "PUBKEYTYPE",
+            "CLEANSTACK",
+            "MINIMALIF",
+            "NULLFAIL",
+            "DISCOURAGE_UPGRADABLE_NOPS",
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
+            "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION",
+            "DISCOURAGE_OP_SUCCESS",
+            "DISCOURAGE_UPGRADABLE_PUBKEYTYPE",
+            "WITNESS_PROGRAM_WRONG_LENGTH",
+            "WITNESS_PROGRAM_WITNESS_EMPTY",
+            "WITNESS_PROGRAM_MISMATCH",
+            "WITNESS_MALLEATED",
+            "WITNESS_MALLEATED_P2SH",
+            "WITNESS_UNEXPECTED",
+            "WITNESS_PUBKEYTYPE",
+            "SCHNORR_SIG_SIZE",
+            "SCHNORR_SIG_HASHTYPE",
+            "SCHNORR_SIG",
+            "TAPROOT_WRONG_CONTROL_SIZE",
+            "TAPSCRIPT_VALIDATION_WEIGHT",
+            "TAPSCRIPT_CHECKMULTISIG",
+            "TAPSCRIPT_MINIMALIF",
+            "TAPSCRIPT_EMPTY_PUBKEY",
+            "OP_CODESEPARATOR",
+            "SIG_FINDANDDELETE",
         ];
         for name in names {
-            let err = ScriptError::from_test_name(name).unwrap_or_else(|| panic!("{name} does not parse"));
+            let err = ScriptError::from_test_name(name)
+                .unwrap_or_else(|| panic!("{name} does not parse"));
             assert_eq!(err.test_name(), name);
         }
     }

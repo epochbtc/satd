@@ -99,8 +99,7 @@ pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 600;
 /// parse time. The body is last, so its content cannot be confused with a
 /// preceding field however it is shaped.
 pub fn v2_signing_string(timestamp: u64, delivery_id: &str, hook_id: &str, body: &[u8]) -> Vec<u8> {
-    let mut buf =
-        Vec::with_capacity(body.len() + delivery_id.len() + hook_id.len() + 32);
+    let mut buf = Vec::with_capacity(body.len() + delivery_id.len() + hook_id.len() + 32);
     buf.extend_from_slice(b"2\n");
     buf.extend_from_slice(timestamp.to_string().as_bytes());
     buf.push(b'\n');
@@ -157,7 +156,13 @@ mod tests {
         let did = delivery_id(&node, 7, 42);
         assert_eq!(did, "abababababababababababababababab-7-42");
         assert_eq!(
-            sign_v2("hunter2", 1_753_400_000, &did, "pager", br#"{"hello":"world"}"#),
+            sign_v2(
+                "hunter2",
+                1_753_400_000,
+                &did,
+                "pager",
+                br#"{"hello":"world"}"#
+            ),
             "sha256=0dcd7bcc563327beab8a0ec4464a261288b43825415ae4c1ebdc91e79c83e031",
         );
         assert_eq!(
@@ -173,7 +178,11 @@ mod tests {
         let base = sign_v2("s", 1_000, &did, "pager", b"body");
         // Each of these is a field v1 left unauthenticated. Changing any one
         // must change the signature, or the field is not really covered.
-        assert_ne!(base, sign_v2("s", 1_001, &did, "pager", b"body"), "timestamp");
+        assert_ne!(
+            base,
+            sign_v2("s", 1_001, &did, "pager", b"body"),
+            "timestamp"
+        );
         assert_ne!(
             base,
             sign_v2("s", 1_000, &delivery_id(&node, 7, 43), "pager", b"body"),
@@ -210,7 +219,11 @@ mod tests {
                 "sha256=b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
             ),
         ] {
-            assert_eq!(sign_body(secret, body.as_bytes()), expected, "secret={secret:?}");
+            assert_eq!(
+                sign_body(secret, body.as_bytes()),
+                expected,
+                "secret={secret:?}"
+            );
         }
     }
 
@@ -222,7 +235,10 @@ mod tests {
         let b = sign_body("k", br#"{"a":2}"#);
         assert_ne!(a, b);
         // And whitespace is not normalized away.
-        assert_ne!(sign_body("k", br#"{"a":1}"#), sign_body("k", br#"{"a": 1}"#));
+        assert_ne!(
+            sign_body("k", br#"{"a":1}"#),
+            sign_body("k", br#"{"a": 1}"#)
+        );
     }
 
     #[test]

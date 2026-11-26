@@ -126,11 +126,19 @@ pub fn list_mempool_transactions(
         _ => {
             // fee_rate (default) — highest first
             entries.sort_by(|a, b| {
-                let rate_a =
-                    if a.1.weight > 0 { a.1.fee as f64 / (a.1.weight as f64 / 4.0) } else { 0.0 };
-                let rate_b =
-                    if b.1.weight > 0 { b.1.fee as f64 / (b.1.weight as f64 / 4.0) } else { 0.0 };
-                rate_b.partial_cmp(&rate_a).unwrap_or(std::cmp::Ordering::Equal)
+                let rate_a = if a.1.weight > 0 {
+                    a.1.fee as f64 / (a.1.weight as f64 / 4.0)
+                } else {
+                    0.0
+                };
+                let rate_b = if b.1.weight > 0 {
+                    b.1.fee as f64 / (b.1.weight as f64 / 4.0)
+                } else {
+                    0.0
+                };
+                rate_b
+                    .partial_cmp(&rate_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
     }
@@ -175,10 +183,9 @@ pub fn get_mempool_entry(ctx: &McpContext, txid: &str, include_relatives: bool) 
         return serde_json::to_string_pretty(&entry).unwrap_or_else(|_| "{}".to_string());
     }
 
-    let ancestors = rpc_bc::get_mempool_ancestors(&ctx.mempool, txid, false)
-        .unwrap_or(json!([]));
-    let descendants = rpc_bc::get_mempool_descendants(&ctx.mempool, txid, false)
-        .unwrap_or(json!([]));
+    let ancestors = rpc_bc::get_mempool_ancestors(&ctx.mempool, txid, false).unwrap_or(json!([]));
+    let descendants =
+        rpc_bc::get_mempool_descendants(&ctx.mempool, txid, false).unwrap_or(json!([]));
 
     let result = json!({
         "entry": entry,

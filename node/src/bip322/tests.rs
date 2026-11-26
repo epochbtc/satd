@@ -30,7 +30,11 @@ fn json(s: &str) -> Value {
 }
 
 fn challenge(address: &str) -> ScriptBuf {
-    Address::from_str(address).unwrap().require_network(Network::Bitcoin).unwrap().script_pubkey()
+    Address::from_str(address)
+        .unwrap()
+        .require_network(Network::Bitcoin)
+        .unwrap()
+        .script_pubkey()
 }
 
 /// Decode and verify, folding a decode error into `Invalid` as the BIP's
@@ -49,13 +53,21 @@ fn message_hash_and_virtual_transactions_match_the_bip() {
     let v = json(BASIC);
     for case in v["tx_hashes"].as_array().unwrap() {
         let msg = case["message"].as_str().unwrap().as_bytes();
-        assert_eq!(hex::encode(message_hash(msg)), case["message_hash"].as_str().unwrap());
-        let Some(to_spend_hash) = case["to_spend_tx_hash"].as_str() else { continue };
+        assert_eq!(
+            hex::encode(message_hash(msg)),
+            case["message_hash"].as_str().unwrap()
+        );
+        let Some(to_spend_hash) = case["to_spend_tx_hash"].as_str() else {
+            continue;
+        };
         let spk = challenge(case["address"].as_str().unwrap());
         let tx = to_spend(&spk, msg);
         assert_eq!(tx.compute_txid().to_string(), to_spend_hash);
         let sign = to_sign(tx.compute_txid(), Witness::new());
-        assert_eq!(sign.compute_txid().to_string(), case["to_sign_tx_hash"].as_str().unwrap());
+        assert_eq!(
+            sign.compute_txid().to_string(),
+            case["to_sign_tx_hash"].as_str().unwrap()
+        );
     }
 }
 
@@ -65,7 +77,9 @@ fn every_simple_and_full_vector_is_valid() {
     for file in [BASIC, GENERATED] {
         let v = json(file);
         for section in ["simple", "full"] {
-            let Some(cases) = v[section].as_array() else { continue };
+            let Some(cases) = v[section].as_array() else {
+                continue;
+            };
             for case in cases {
                 let address = case["address"].as_str().unwrap();
                 let message = case["message"].as_str().unwrap();
@@ -92,7 +106,10 @@ fn proof_of_funds_vectors_are_refused() {
     for case in v["proof_of_funds"].as_array().unwrap() {
         let spk = challenge(case["address"].as_str().unwrap());
         for sig in case["bip322_signatures"].as_array().unwrap() {
-            assert_eq!(decode(sig.as_str().unwrap(), &spk), Err(DecodeError::ProofOfFunds));
+            assert_eq!(
+                decode(sig.as_str().unwrap(), &spk),
+                Err(DecodeError::ProofOfFunds)
+            );
         }
     }
 }
@@ -106,7 +123,11 @@ fn every_error_vector_fails() {
                 case["message"].as_str().unwrap(),
                 case["signature"].as_str().unwrap(),
             );
-            assert!(matches!(got, Verification::Invalid(_)), "{}: {got:?}", case["description"]);
+            assert!(
+                matches!(got, Verification::Invalid(_)),
+                "{}: {got:?}",
+                case["description"]
+            );
         }
     }
 }
@@ -133,7 +154,9 @@ fn btcd_negative_vectors_get_their_expected_result() {
         );
         match case["expected_result"].as_str().unwrap() {
             "invalid" => {
-                let Verification::Invalid(reason) = &got else { panic!("{desc}: {got:?}") };
+                let Verification::Invalid(reason) = &got else {
+                    panic!("{desc}: {got:?}")
+                };
                 // The rules the BIP's own vectors leave out fail for the
                 // stated reason, not by accident.
                 if desc.contains("SIGHASH") {
@@ -143,11 +166,17 @@ fn btcd_negative_vectors_get_their_expected_result() {
                     assert!(reason.contains("OP_CODESEPARATOR"), "{desc}: {reason}");
                 }
                 if desc.contains("non-minimal true") {
-                    assert!(reason.contains(ScriptError::MinimalIf.as_str()), "{desc}: {reason}");
+                    assert!(
+                        reason.contains(ScriptError::MinimalIf.as_str()),
+                        "{desc}: {reason}"
+                    );
                 }
             }
             "inconclusive" => {
-                assert!(matches!(got, Verification::Inconclusive(_)), "{desc}: {got:?}");
+                assert!(
+                    matches!(got, Verification::Inconclusive(_)),
+                    "{desc}: {got:?}"
+                );
             }
             other => panic!("{desc}: unknown expected_result {other}"),
         }
@@ -176,7 +205,10 @@ fn p2wpkh_proof(hash_type: EcdsaSighashType) -> (ScriptBuf, Proof) {
         .p2wpkh_signature_hash(0, &spk, Amount::ZERO, hash_type)
         .unwrap();
     let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &sk);
-    let sig = bitcoin::ecdsa::Signature { signature: sig, sighash_type: hash_type };
+    let sig = bitcoin::ecdsa::Signature {
+        signature: sig,
+        sighash_type: hash_type,
+    };
     (spk, Proof::Simple(Witness::p2wpkh(&sig, &pk.0)))
 }
 
@@ -190,7 +222,11 @@ fn tapscript_proof(
     let kp = Keypair::from_secret_key(&secp, &secret(2));
     let (xonly, _) = kp.x_only_public_key();
     let script = leaf(xonly);
-    let info = TaprootBuilder::new().add_leaf(0, script.clone()).unwrap().finalize(&secp, xonly).unwrap();
+    let info = TaprootBuilder::new()
+        .add_leaf(0, script.clone())
+        .unwrap()
+        .finalize(&secp, xonly)
+        .unwrap();
     let spk = ScriptBuf::new_p2tr_tweaked(info.output_key());
     let spend = to_spend(&spk, MESSAGE);
     let tx = to_sign(spend.compute_txid(), Witness::new());
@@ -200,8 +236,13 @@ fn tapscript_proof(
         .taproot_script_spend_signature_hash(0, &Prevouts::All(&spend.output), leaf_hash, ty)
         .unwrap();
     let sig = secp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash.to_byte_array()), &kp);
-    let sig = bitcoin::taproot::Signature { signature: sig, sighash_type: ty };
-    let control = info.control_block(&(script.clone(), LeafVersion::TapScript)).unwrap();
+    let sig = bitcoin::taproot::Signature {
+        signature: sig,
+        sighash_type: ty,
+    };
+    let control = info
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .unwrap();
     let mut w = Witness::new();
     w.push(sig.to_vec());
     w.push(script.as_bytes());
@@ -219,11 +260,27 @@ fn checksig_leaf(xonly: bitcoin::XOnlyPublicKey) -> ScriptBuf {
 #[test]
 fn signed_p2wpkh_is_valid_only_with_sighash_all() {
     let (spk, proof) = p2wpkh_proof(EcdsaSighashType::All);
-    assert_eq!(verify(&spk, MESSAGE, &proof), Verification::Valid { version: 0, lock_time: 0, sequence: 0 });
-    assert!(matches!(verify(&spk, b"other", &proof), Verification::Invalid(_)));
-    for ty in [EcdsaSighashType::None, EcdsaSighashType::Single, EcdsaSighashType::AllPlusAnyoneCanPay] {
+    assert_eq!(
+        verify(&spk, MESSAGE, &proof),
+        Verification::Valid {
+            version: 0,
+            lock_time: 0,
+            sequence: 0
+        }
+    );
+    assert!(matches!(
+        verify(&spk, b"other", &proof),
+        Verification::Invalid(_)
+    ));
+    for ty in [
+        EcdsaSighashType::None,
+        EcdsaSighashType::Single,
+        EcdsaSighashType::AllPlusAnyoneCanPay,
+    ] {
         let (spk, proof) = p2wpkh_proof(ty);
-        let Verification::Invalid(reason) = verify(&spk, MESSAGE, &proof) else { panic!("{ty:?}") };
+        let Verification::Invalid(reason) = verify(&spk, MESSAGE, &proof) else {
+            panic!("{ty:?}")
+        };
         assert!(reason.contains("sighash"), "{ty:?}: {reason}");
     }
 }
@@ -248,7 +305,11 @@ fn a_valid_proof_runs_its_scripts_once() {
     assert_eq!(n, 2, "an invalid proof");
     let mut v2 = spk.to_bytes();
     v2[0] = 0x52;
-    let (got, n) = runs(&ScriptBuf::from_bytes(v2), MESSAGE, &Proof::Simple(Witness::from_slice(&[vec![1u8]])));
+    let (got, n) = runs(
+        &ScriptBuf::from_bytes(v2),
+        MESSAGE,
+        &Proof::Simple(Witness::from_slice(&[vec![1u8]])),
+    );
     assert!(matches!(got, Verification::Inconclusive(_)), "{got:?}");
     assert_eq!(n, 2, "an inconclusive proof");
 }
@@ -259,11 +320,25 @@ fn a_valid_proof_runs_its_scripts_once() {
 fn signed_tapscript_is_valid_with_default_or_all_only() {
     for ty in [None, Some(TapSighashType::All)] {
         let (spk, proof) = tapscript_proof(checksig_leaf, ty);
-        assert_eq!(verify(&spk, MESSAGE, &proof), Verification::Valid { version: 0, lock_time: 0, sequence: 0 }, "{ty:?}");
+        assert_eq!(
+            verify(&spk, MESSAGE, &proof),
+            Verification::Valid {
+                version: 0,
+                lock_time: 0,
+                sequence: 0
+            },
+            "{ty:?}"
+        );
     }
-    for ty in [TapSighashType::None, TapSighashType::Single, TapSighashType::AllPlusAnyoneCanPay] {
+    for ty in [
+        TapSighashType::None,
+        TapSighashType::Single,
+        TapSighashType::AllPlusAnyoneCanPay,
+    ] {
         let (spk, proof) = tapscript_proof(checksig_leaf, Some(ty));
-        let Verification::Invalid(reason) = verify(&spk, MESSAGE, &proof) else { panic!("{ty:?}") };
+        let Verification::Invalid(reason) = verify(&spk, MESSAGE, &proof) else {
+            panic!("{ty:?}")
+        };
         assert!(reason.contains("sighash"), "{ty:?}: {reason}");
     }
 }
@@ -284,7 +359,9 @@ fn codeseparator_in_a_tapscript_leaf_is_invalid() {
             .into_script()
     };
     let (spk, proof) = tapscript_proof(leaf, None);
-    let Verification::Invalid(reason) = verify(&spk, MESSAGE, &proof) else { panic!() };
+    let Verification::Invalid(reason) = verify(&spk, MESSAGE, &proof) else {
+        panic!()
+    };
     assert!(reason.contains("OP_CODESEPARATOR"), "{reason}");
 }
 
@@ -297,11 +374,20 @@ fn op_success_leaf_is_inconclusive() {
     let kp = Keypair::from_secret_key(&secp, &secret(3));
     let (xonly, _) = kp.x_only_public_key();
     let script = leaf(xonly);
-    let info = TaprootBuilder::new().add_leaf(0, script.clone()).unwrap().finalize(&secp, xonly).unwrap();
+    let info = TaprootBuilder::new()
+        .add_leaf(0, script.clone())
+        .unwrap()
+        .finalize(&secp, xonly)
+        .unwrap();
     let spk = ScriptBuf::new_p2tr_tweaked(info.output_key());
-    let control = info.control_block(&(script.clone(), LeafVersion::TapScript)).unwrap();
+    let control = info
+        .control_block(&(script.clone(), LeafVersion::TapScript))
+        .unwrap();
     let w = Witness::from_slice(&[script.to_bytes(), control.serialize()]);
-    assert!(matches!(verify(&spk, MESSAGE, &Proof::Simple(w)), Verification::Inconclusive(_)));
+    assert!(matches!(
+        verify(&spk, MESSAGE, &Proof::Simple(w)),
+        Verification::Inconclusive(_)
+    ));
 }
 
 #[test]
@@ -311,52 +397,79 @@ fn unknown_witness_version_is_inconclusive() {
     spk.extend_from_slice(&[7; 32]);
     let spk = ScriptBuf::from_bytes(spk);
     let proof = Proof::Simple(Witness::from_slice(&[vec![1u8]]));
-    assert!(matches!(verify(&spk, MESSAGE, &proof), Verification::Inconclusive(_)));
+    assert!(matches!(
+        verify(&spk, MESSAGE, &proof),
+        Verification::Inconclusive(_)
+    ));
 }
 
 #[test]
 fn full_structure_rules() {
-    let (spk, Proof::Simple(w)) = p2wpkh_proof(EcdsaSighashType::All) else { unreachable!() };
+    let (spk, Proof::Simple(w)) = p2wpkh_proof(EcdsaSighashType::All) else {
+        unreachable!()
+    };
     let txid = to_spend(&spk, MESSAGE).compute_txid();
     let good = to_sign(txid, w);
-    assert!(matches!(verify(&spk, MESSAGE, &Proof::Full(good.clone())), Verification::Valid { .. }));
+    assert!(matches!(
+        verify(&spk, MESSAGE, &Proof::Full(good.clone())),
+        Verification::Valid { .. }
+    ));
 
     let mut two_inputs = good.clone();
     two_inputs.input.push(two_inputs.input[0].clone());
-    assert!(matches!(verify(&spk, MESSAGE, &Proof::Full(two_inputs)), Verification::Invalid(_)));
+    assert!(matches!(
+        verify(&spk, MESSAGE, &Proof::Full(two_inputs)),
+        Verification::Invalid(_)
+    ));
 
     let mut paying = good.clone();
     paying.output[0].value = Amount::from_sat(1);
-    assert!(matches!(verify(&spk, MESSAGE, &Proof::Full(paying)), Verification::Invalid(_)));
+    assert!(matches!(
+        verify(&spk, MESSAGE, &Proof::Full(paying)),
+        Verification::Invalid(_)
+    ));
 
     let mut wrong_prevout = good.clone();
     wrong_prevout.input[0].previous_output.vout = 1;
-    assert!(matches!(verify(&spk, MESSAGE, &Proof::Full(wrong_prevout)), Verification::Invalid(_)));
+    assert!(matches!(
+        verify(&spk, MESSAGE, &Proof::Full(wrong_prevout)),
+        Verification::Invalid(_)
+    ));
 
     // Version 1 or 3 is upgradeable: the signature itself is checked first,
     // and this one (made for version 0) fails before the version is read.
     let mut v3 = good;
     v3.version = Version(3);
-    assert!(matches!(verify(&spk, MESSAGE, &Proof::Full(v3)), Verification::Invalid(_)));
+    assert!(matches!(
+        verify(&spk, MESSAGE, &Proof::Full(v3)),
+        Verification::Invalid(_)
+    ));
 }
 
 #[test]
 fn simple_is_refused_for_non_native_segwit() {
     let (_, proof) = p2wpkh_proof(EcdsaSighashType::All);
     let p2sh = ScriptBuf::new_p2sh(&ScriptBuf::from_bytes(vec![0x51]).script_hash());
-    let Verification::Invalid(reason) = verify(&p2sh, MESSAGE, &proof) else { panic!() };
+    let Verification::Invalid(reason) = verify(&p2sh, MESSAGE, &proof) else {
+        panic!()
+    };
     assert!(reason.contains("native segwit"), "{reason}");
 }
 
 #[test]
 fn decode_reads_prefixes_and_the_unprefixed_fallback() {
-    let (spk, Proof::Simple(w)) = p2wpkh_proof(EcdsaSighashType::All) else { unreachable!() };
+    let (spk, Proof::Simple(w)) = p2wpkh_proof(EcdsaSighashType::All) else {
+        unreachable!()
+    };
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(bitcoin::consensus::serialize(&w));
     let want = Signature::Bip322(Proof::Simple(w));
     assert_eq!(decode(&format!("smp{b64}"), &spk), Ok(want.clone()));
     assert_eq!(decode(&b64, &spk), Ok(want));
-    assert_eq!(decode(&format!("pof{b64}"), &spk), Err(DecodeError::ProofOfFunds));
+    assert_eq!(
+        decode(&format!("pof{b64}"), &spk),
+        Err(DecodeError::ProofOfFunds)
+    );
     assert_eq!(decode("smp!!!", &spk), Err(DecodeError::Base64));
 
     // Unprefixed for a P2PKH challenge is Core's legacy format.

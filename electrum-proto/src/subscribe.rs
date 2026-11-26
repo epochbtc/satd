@@ -380,7 +380,10 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert!(!subs.tweaks_running(), "a finished stream must not block one");
+        assert!(
+            !subs.tweaks_running(),
+            "a finished stream must not block one"
+        );
     }
 
     use super::*;
@@ -697,7 +700,10 @@ mod tests {
             index_cfg.per_channel_capacity,
         ));
         let (tx, _rx) = mpsc::channel::<String>(NOTIFY_CHANNEL_CAP);
-        let mut subs = Subscriptions::new(tx, crate::config::ElectrumConfig::default().max_subs_per_conn);
+        let mut subs = Subscriptions::new(
+            tx,
+            crate::config::ElectrumConfig::default().max_subs_per_conn,
+        );
         for i in 0u32..5_000 {
             let mut sh = [0u8; 32];
             sh[..4].copy_from_slice(&i.to_le_bytes());

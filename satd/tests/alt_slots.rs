@@ -31,7 +31,13 @@ fn core() -> Shape {
     Shape {
         user_agent: "/Satoshi:32.1.0/",
         negotiation: vec![NetworkMessage::WtxidRelay, NetworkMessage::SendAddrV2],
-        after_verack: vec![NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }), NetworkMessage::Ping(7)],
+        after_verack: vec![
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            }),
+            NetworkMessage::Ping(7),
+        ],
     }
 }
 
@@ -58,7 +64,8 @@ fn recv(stream: &mut TcpStream) -> io::Result<NetworkMessage> {
     let mut buf = header.to_vec();
     buf.resize(24 + len, 0);
     stream.read_exact(&mut buf[24..])?;
-    let raw: RawNetworkMessage = deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let raw: RawNetworkMessage =
+        deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     Ok(raw.into_payload())
 }
 
@@ -117,13 +124,21 @@ fn scripted(shape: Shape) -> u16 {
 const ADDR: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
 
 fn sighup(node: &TestNode) {
-    let status = Command::new("kill").arg("-HUP").arg(node.process.id().to_string()).status().expect("kill -HUP");
+    let status = Command::new("kill")
+        .arg("-HUP")
+        .arg(node.process.id().to_string())
+        .status()
+        .expect("kill -HUP");
     assert!(status.success());
 }
 
 /// Rewrite the config file and reload it.
 fn reload(node: &TestNode, conf: &str) {
-    std::fs::write(node.datadir.join("bitcoin.conf"), format!("[regtest]\n{conf}")).unwrap();
+    std::fs::write(
+        node.datadir.join("bitcoin.conf"),
+        format!("[regtest]\n{conf}"),
+    )
+    .unwrap();
     sighup(node);
 }
 
@@ -140,7 +155,11 @@ fn node_with_one_alt_slot(conf: &str, extra: &[&str]) -> TestNode {
     let node = TestNode::start(&args);
     node.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
     reload(&node, conf);
-    poll_until_json(|| alt_slots(&node), |v| v["configured"] == 1, test_timeout(30).as_secs());
+    poll_until_json(
+        || alt_slots(&node),
+        |v| v["configured"] == 1,
+        test_timeout(30).as_secs(),
+    );
     node
 }
 
@@ -160,34 +179,78 @@ fn the_alt_slot_fills_with_the_matching_peer() {
 
     let behavior = poll_until_json(
         || node.rpc_ok("getpeerbehavior", vec![]),
-        |v| v.as_array().is_some_and(|a| a.iter().any(|p| p["alt_slot"]["rule"] == "family:btcd")),
+        |v| {
+            v.as_array()
+                .is_some_and(|a| a.iter().any(|p| p["alt_slot"]["rule"] == "family:btcd"))
+        },
         test_timeout(240).as_secs(),
     );
-    let peer = behavior.as_array().unwrap().iter().find(|p| p["alt_slot"].is_object()).unwrap().clone();
-    assert_eq!(peer["alt_slot"], json!({"rule": "family:btcd", "trust": "verified", "fallback": false}));
+    let peer = behavior
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["alt_slot"].is_object())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        peer["alt_slot"],
+        json!({"rule": "family:btcd", "trust": "verified", "fallback": false})
+    );
     let id = peer["id"].clone();
     let info = node.rpc_ok("getpeerinfo", vec![]);
-    let row = info.as_array().unwrap().iter().find(|p| p["id"] == id).expect("in getpeerinfo").clone();
+    let row = info
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .expect("in getpeerinfo")
+        .clone();
     assert_eq!(row["connection_type"], "outbound-full-relay");
     assert_eq!(row["addr"], format!("127.0.0.1:{btcd_port}"));
-    assert_eq!(alt_slots(&node), json!({"configured": 1, "matched": 1, "fallback": 0, "empty": 0}));
-    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics")).unwrap().text().unwrap();
-    assert!(body.lines().any(|l| l == "satd_peer_alt_slots{state=\"matched\"} 1"), "{body}");
+    assert_eq!(
+        alt_slots(&node),
+        json!({"configured": 1, "matched": 1, "fallback": 0, "empty": 0})
+    );
+    let body = reqwest::blocking::get(format!("http://127.0.0.1:{metrics_port}/metrics"))
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        body.lines()
+            .any(|l| l == "satd_peer_alt_slots{state=\"matched\"} 1"),
+        "{body}"
+    );
     assert!(!body.contains("127.0.0.1:"), "no address in the metrics");
 
     // Past the limits: the reload is refused and the running values kept.
-    reload(&node, "maxoutboundfullrelay=1\naltslots=2\naltprefer=family:btcd\n");
+    reload(
+        &node,
+        "maxoutboundfullrelay=1\naltslots=2\naltprefer=family:btcd\n",
+    );
     std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(alt_slots(&node)["configured"], 1, "a reload past the limits is refused");
+    assert_eq!(
+        alt_slots(&node)["configured"],
+        1,
+        "a reload past the limits is refused"
+    );
     reload(&node, "maxoutboundfullrelay=17\n");
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(alt_slots(&node)["configured"], 1, "17 needs the override");
 
     // Lowered to none: the peer stays, as an ordinary outbound.
     reload(&node, "maxoutboundfullrelay=1\naltslots=0\n");
-    poll_until_json(|| alt_slots(&node), |v| v["configured"] == 0, test_timeout(30).as_secs());
+    poll_until_json(
+        || alt_slots(&node),
+        |v| v["configured"] == 0,
+        test_timeout(30).as_secs(),
+    );
     let behavior = node.rpc_ok("getpeerbehavior", vec![]);
-    let same = behavior.as_array().unwrap().iter().find(|p| p["id"] == id).expect("still connected");
+    let same = behavior
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .expect("still connected");
     assert!(same.get("alt_slot").is_none(), "{same}");
     node.stop();
 }
@@ -201,10 +264,18 @@ fn a_fallback_takes_the_slot_when_nothing_matches() {
     for _ in 0..3 {
         add_address(&node, scripted(core()));
     }
-    poll_until_json(|| alt_slots(&node), |v| v["fallback"] == 1, test_timeout(240).as_secs());
+    poll_until_json(
+        || alt_slots(&node),
+        |v| v["fallback"] == 1,
+        test_timeout(240).as_secs(),
+    );
     let behavior = node.rpc_ok("getpeerbehavior", vec![]);
     assert!(
-        behavior.as_array().unwrap().iter().any(|p| p["alt_slot"] == json!({"rule": null, "trust": null, "fallback": true})),
+        behavior
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["alt_slot"] == json!({"rule": null, "trust": null, "fallback": true})),
         "{behavior}"
     );
     node.stop();

@@ -80,7 +80,10 @@ fn take_snapshot() -> Value {
 
     for (name, b64) in fixtures() {
         record(&format!("decodepsbt/{name}"), psbt::decode_psbt(&b64, None));
-        record(&format!("analyzepsbt/{name}"), psbt::analyze_psbt(&b64, None));
+        record(
+            &format!("analyzepsbt/{name}"),
+            psbt::analyze_psbt(&b64, None),
+        );
         record(
             &format!("finalizepsbt-extract/{name}"),
             psbt::finalize_psbt(&b64, true, None),
@@ -123,8 +126,14 @@ fn take_snapshot() -> Value {
         ),
     );
     let raw_tx = hex::encode(bitcoin::consensus::serialize(&unsigned_tx()));
-    record("converttopsbt/unsigned", psbt::convert_to_psbt(&raw_tx, false, None));
-    record("converttopsbt/not-hex", psbt::convert_to_psbt("zz", false, None));
+    record(
+        "converttopsbt/unsigned",
+        psbt::convert_to_psbt(&raw_tx, false, None),
+    );
+    record(
+        "converttopsbt/not-hex",
+        psbt::convert_to_psbt("zz", false, None),
+    );
 
     // Error paths shared by every method that takes a PSBT.
     record("decodepsbt/not-base64", psbt::decode_psbt("!!!", None));
@@ -201,9 +210,15 @@ fn fixtures() -> Vec<(String, String)> {
         type_value: 0x7a,
         key: b"satd".to_vec(),
     };
-    with_unknowns.unknown.insert(key.clone(), b"global".to_vec());
-    with_unknowns.inputs[0].unknown.insert(key.clone(), b"input".to_vec());
-    with_unknowns.outputs[0].unknown.insert(key, b"output".to_vec());
+    with_unknowns
+        .unknown
+        .insert(key.clone(), b"global".to_vec());
+    with_unknowns.inputs[0]
+        .unknown
+        .insert(key.clone(), b"input".to_vec());
+    with_unknowns.outputs[0]
+        .unknown
+        .insert(key, b"output".to_vec());
     out.push((
         "with-unknowns".to_string(),
         B64.encode(with_unknowns.serialize()),

@@ -511,7 +511,11 @@ fn vectors() -> Vec<Vector> {
         base(
             LnShape::Bolt3Commitment,
             0,
-            vec![enforcement_in(ScriptType::P2wsh, funding_2of2_script(), 240)],
+            vec![enforcement_in(
+                ScriptType::P2wsh,
+                funding_2of2_script(),
+                240,
+            )],
             vec![
                 out(150_000, ScriptType::P2wsh, p2wsh_spk(), false), // to_local
                 out(40_000, ScriptType::P2wpkh, p2wpkh_spk(), false), // to_remote
@@ -525,7 +529,11 @@ fn vectors() -> Vec<Vector> {
         base(
             LnShape::Bolt3CommitmentEphemeralAnchor,
             0,
-            vec![enforcement_in(ScriptType::P2wsh, funding_2of2_script(), 240)],
+            vec![enforcement_in(
+                ScriptType::P2wsh,
+                funding_2of2_script(),
+                240,
+            )],
             vec![
                 out(150_000, ScriptType::P2wsh, p2wsh_spk(), false), // to_local
                 out(40_000, ScriptType::P2wpkh, p2wpkh_spk(), false), // to_remote
@@ -560,7 +568,11 @@ fn vectors() -> Vec<Vector> {
         base(
             LnShape::TaprootScriptPathJustice,
             0,
-            vec![enforcement_in(ScriptType::P2tr, taproot_justice_leaf(), 180)],
+            vec![enforcement_in(
+                ScriptType::P2tr,
+                taproot_justice_leaf(),
+                180,
+            )],
             vec![out(190_000, ScriptType::P2tr, p2tr_spk(), false)],
         ),
         // Taproot key-path force-close: indistinguishable from a plain keyspend.
@@ -698,11 +710,11 @@ mod tests {
     fn broad_p2tr_keyspend_rule_is_caught_as_breadth() {
         // A rule that quarantines P2TR key-path spends generally sweeps taproot
         // force-closes.
-        let f = findings(
-            "version 1\nquarantine t when any inputs (in.prevout_script_type == p2tr)",
-        );
+        let f =
+            findings("version 1\nquarantine t when any inputs (in.prevout_script_type == p2tr)");
         assert!(
-            f.iter().any(|x| x.class == DangerClass::TaprootKeyspendBreadth),
+            f.iter()
+                .any(|x| x.class == DangerClass::TaprootKeyspendBreadth),
             "{f:?}"
         );
     }
@@ -722,9 +734,12 @@ mod tests {
     fn anti_inscription_witness_rule_does_not_hit_keyspend_forceclose() {
         // The canonical anti-inscription rule (big witness) must not flag the
         // key-path force-close, whose witness is tiny.
-        let f = findings("version 1\nquarantine bigwit on template when tx.total_witness_size > 100000");
+        let f = findings(
+            "version 1\nquarantine bigwit on template when tx.total_witness_size > 100000",
+        );
         assert!(
-            !f.iter().any(|x| x.class == DangerClass::TaprootKeyspendBreadth),
+            !f.iter()
+                .any(|x| x.class == DangerClass::TaprootKeyspendBreadth),
             "{f:?}"
         );
     }
@@ -758,7 +773,10 @@ mod tests {
              allow ln when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n\
              quarantine csv when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n",
         );
-        assert!(f.is_empty(), "first-match allow must shadow the quarantine: {f:?}");
+        assert!(
+            f.is_empty(),
+            "first-match allow must shadow the quarantine: {f:?}"
+        );
 
         // Sanity: without the shielding allow, the same quarantine IS flagged.
         let g = findings(

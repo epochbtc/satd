@@ -50,8 +50,10 @@ fn a_height_locktime_wins_a_tie() {
     let v = common::bip370_locktime()
         .into_iter()
         .find(|v| {
-            v.description.contains("Input 1 has PSBT_IN_REQUIRED_HEIGHT_LOCKTIME of 10000 and")
-                && v.description.contains("Input 2 has PSBT_IN_REQUIRED_HEIGHT_LOCKTIME of 9000")
+            v.description
+                .contains("Input 1 has PSBT_IN_REQUIRED_HEIGHT_LOCKTIME of 10000 and")
+                && v.description
+                    .contains("Input 2 has PSBT_IN_REQUIRED_HEIGHT_LOCKTIME of 9000")
         })
         .expect("the tie-break vector is in the file");
     let raw = RawPsbt::parse(&v.psbt).expect("parses");
@@ -76,19 +78,30 @@ fn unsigned_tx_needs_every_output_script() {
         });
         match view.unsigned_tx() {
             Ok(tx) => {
-                assert!(all_scripts, "{}: built a tx with a missing script", v.description);
+                assert!(
+                    all_scripts,
+                    "{}: built a tx with a missing script",
+                    v.description
+                );
                 assert_eq!(tx.input.len(), view.input_count());
                 assert_eq!(tx.output.len(), view.output_count());
                 finished += 1;
             }
             Err(PsbtError::OutputScriptNotComputed(i)) => {
-                assert!(!all_scripts, "{}: refused output {i} that had a script", v.description);
+                assert!(
+                    !all_scripts,
+                    "{}: refused output {i} that had a script",
+                    v.description
+                );
                 in_progress += 1;
             }
             Err(e) => panic!("{}: {e}", v.description),
         }
     }
-    assert!(finished > 0 && in_progress > 0, "both shapes should be covered");
+    assert!(
+        finished > 0 && in_progress > 0,
+        "both shapes should be covered"
+    );
 }
 
 /// The unique identifier ignores sequence numbers, so an Updater bumping one
@@ -117,8 +130,15 @@ fn unique_id_ignores_sequences_and_survives_an_absent_script() {
                 0xfffffffdu32.to_le_bytes().to_vec(),
             ));
         }
-        let after = V2View::new(&bumped).unwrap().unique_id().expect("still computable");
-        assert_eq!(before, after, "{}: a sequence change moved the id", v.description);
+        let after = V2View::new(&bumped)
+            .unwrap()
+            .unique_id()
+            .expect("still computable");
+        assert_eq!(
+            before, after,
+            "{}: a sequence change moved the id",
+            v.description
+        );
     }
 }
 
@@ -131,7 +151,10 @@ fn unique_id_is_unchanged_by_computing_an_sp_script() {
 
     let v = common::bip375_valid()
         .into_iter()
-        .find(|v| v.description.starts_with("in progress: one P2TR input / one sp output"))
+        .find(|v| {
+            v.description
+                .starts_with("in progress: one P2TR input / one sp output")
+        })
         .expect("the vector is in the file");
     let raw = RawPsbt::parse(&v.psbt).expect("parses");
     let before = V2View::new(&raw).unwrap().unique_id().expect("computable");
@@ -140,11 +163,21 @@ fn unique_id_is_unchanged_by_computing_an_sp_script() {
     let script = hex_bytes("51200000000000000000000000000000000000000000000000000000000000000001");
     for out in &mut filled.outputs {
         if out.contains_type(keys::output::SP_V0_INFO) {
-            out.set(RawPair::new(keys::output::SCRIPT, Vec::new(), script.clone()));
+            out.set(RawPair::new(
+                keys::output::SCRIPT,
+                Vec::new(),
+                script.clone(),
+            ));
         }
     }
-    let after = V2View::new(&filled).unwrap().unique_id().expect("computable");
-    assert_eq!(before, after, "the identifier must ignore the computed script");
+    let after = V2View::new(&filled)
+        .unwrap()
+        .unique_id()
+        .expect("computable");
+    assert_eq!(
+        before, after,
+        "the identifier must ignore the computed script"
+    );
 }
 
 /// `to_v0` is how the version 0 finaliser gets to keep doing its job. The

@@ -171,7 +171,11 @@ mod tests {
 
         let full = RebuildMarker::now(RebuildKind::Full, "0.6.0", 7, None);
         write(dir.path(), &full).unwrap();
-        assert_eq!(read(dir.path()), Some(Found::Marker(full)), "a rewrite replaces it");
+        assert_eq!(
+            read(dir.path()),
+            Some(Found::Marker(full)),
+            "a rewrite replaces it"
+        );
 
         remove(dir.path()).unwrap();
         assert_eq!(read(dir.path()), None);

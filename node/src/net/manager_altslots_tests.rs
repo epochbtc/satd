@@ -34,7 +34,13 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     // Out of IBD: the target is the full-relay count.
     pm.headers_tip.store(1, Ordering::Relaxed);
     assert!(!pm.is_ibd());
@@ -75,7 +81,13 @@ fn learn(pm: &PeerManager, addrs: &[SocketAddr]) {
 
 /// A connected outbound full-relay peer, past the handshake for a minute,
 /// whose fingerprint has settled as `fp` with user agent `ua`.
-fn settled(id: PeerId, addr: SocketAddr, alt: Option<AltRole>, fp: Fingerprint, ua: &str) -> PeerInfo {
+fn settled(
+    id: PeerId,
+    addr: SocketAddr,
+    alt: Option<AltRole>,
+    fp: Fingerprint,
+    ua: &str,
+) -> PeerInfo {
     let mut info = PeerInfo::new(id, addr, Direction::Outbound);
     info.state = PeerState::Connected;
     info.conn_type = ConnType::OutboundFullRelay;
@@ -118,7 +130,10 @@ fn connected(pm: &PeerManager, id: PeerId) -> bool {
 }
 
 fn dialled(pm: &Arc<PeerManager>) -> Vec<PeerAddr> {
-    pm.reserve_automatic_dials(Instant::now(), &[]).into_iter().map(|(a, _slot)| a).collect()
+    pm.reserve_automatic_dials(Instant::now(), &[])
+        .into_iter()
+        .map(|(a, _slot)| a)
+        .collect()
 }
 
 // ---- -altslots=0: exactly as before ----
@@ -138,7 +153,11 @@ fn altslots_zero_leaves_outbound_selection_as_it_was() {
             pm.set_max_connections(mc);
             assert_eq!(pm.automatic_outbound_target(), mc.min(8), "mc={mc}");
             assert_eq!(pm.max_automatic_outbound(), 11usize.min(mc), "mc={mc}");
-            assert_eq!(pm.max_outbound_block_relay(), 2usize.min(mc - mc.min(8)), "mc={mc}");
+            assert_eq!(
+                pm.max_outbound_block_relay(),
+                2usize.min(mc - mc.min(8)),
+                "mc={mc}"
+            );
             assert_eq!(pm.max_inbound(), mc - 11usize.min(mc), "mc={mc}");
         }
         pm.set_max_connections(DEFAULT_MAX_PEER_CONNECTIONS);
@@ -157,7 +176,11 @@ fn maxoutboundfullrelay_sets_the_full_relay_target_and_the_limits_it_drives() {
     let (pm, _dir) = mk_pm();
     pm.set_max_outbound_full_relay(12);
     assert_eq!(pm.automatic_outbound_target(), 12);
-    assert_eq!(pm.max_automatic_outbound(), 15, "12 + 2 block-relay-only + 1 feeler");
+    assert_eq!(
+        pm.max_automatic_outbound(),
+        15,
+        "12 + 2 block-relay-only + 1 feeler"
+    );
     assert_eq!(pm.max_inbound(), DEFAULT_MAX_PEER_CONNECTIONS - 15);
     learn(&pm, &(0..20).map(own_group).collect::<Vec<_>>());
     assert_eq!(dialled(&pm).len(), 12);
@@ -196,18 +219,60 @@ fn one_trial_at_a_time_while_a_slot_is_not_matched() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 2, &[], UaTrust::Consistent);
     assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_ok());
-    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Trial), Fingerprint::Unknown, ""));
-    assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_err(), "a trial is being judged");
+    add_peer(
+        &pm,
+        settled(
+            1,
+            own_group(1),
+            Some(AltRole::Trial),
+            Fingerprint::Unknown,
+            "",
+        ),
+    );
+    assert!(
+        pm.check_alt_trial(&pm.dials_in_flight.lock()).is_err(),
+        "a trial is being judged"
+    );
     pm.peers.write().remove(&1);
-    add_peer(&pm, settled(2, own_group(2), Some(AltRole::Fallback), known(Family::Core), CORE));
-    add_peer(&pm, settled(3, own_group(3), Some(AltRole::Fallback), known(Family::Core), CORE));
-    assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_ok(), "fallbacks leave room for a trial");
+    add_peer(
+        &pm,
+        settled(
+            2,
+            own_group(2),
+            Some(AltRole::Fallback),
+            known(Family::Core),
+            CORE,
+        ),
+    );
+    add_peer(
+        &pm,
+        settled(
+            3,
+            own_group(3),
+            Some(AltRole::Fallback),
+            known(Family::Core),
+            CORE,
+        ),
+    );
+    assert!(
+        pm.check_alt_trial(&pm.dials_in_flight.lock()).is_ok(),
+        "fallbacks leave room for a trial"
+    );
     for (id, a) in [(2, 2), (3, 3)] {
         pm.peers.write().remove(&id);
-        let m = AltRole::Matched { rule: "family:non-core".into(), trust: Trust::Verified };
-        add_peer(&pm, settled(id, own_group(a), Some(m), known(Family::Btcd), BTCD));
+        let m = AltRole::Matched {
+            rule: "family:non-core".into(),
+            trust: Trust::Verified,
+        };
+        add_peer(
+            &pm,
+            settled(id, own_group(a), Some(m), known(Family::Btcd), BTCD),
+        );
     }
-    assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_err(), "every slot is matched");
+    assert!(
+        pm.check_alt_trial(&pm.dials_in_flight.lock()).is_err(),
+        "every slot is matched"
+    );
 }
 
 // ---- Judgement ----
@@ -216,17 +281,53 @@ fn one_trial_at_a_time_while_a_slot_is_not_matched() {
 fn a_trial_that_matches_takes_the_slot_and_one_that_does_not_is_disconnected() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 2, &["family:btcd"], UaTrust::Consistent);
-    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Trial), known(Family::Btcd), BTCD));
-    add_peer(&pm, settled(2, own_group(2), Some(AltRole::Trial), known(Family::Core), CORE));
+    add_peer(
+        &pm,
+        settled(
+            1,
+            own_group(1),
+            Some(AltRole::Trial),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
+    add_peer(
+        &pm,
+        settled(
+            2,
+            own_group(2),
+            Some(AltRole::Trial),
+            known(Family::Core),
+            CORE,
+        ),
+    );
     pm.judge_alt_slot_peers();
-    assert_eq!(role(&pm, 1), Some(AltRole::Matched { rule: "family:btcd".into(), trust: Trust::Verified }));
+    assert_eq!(
+        role(&pm, 1),
+        Some(AltRole::Matched {
+            rule: "family:btcd".into(),
+            trust: Trust::Verified
+        })
+    );
     assert!(!connected(&pm, 2), "no rule matched");
-    assert!(pm.retired_behavior.lock().contains(&(2, Some("alt-slot-no-match"))));
+    assert!(
+        pm.retired_behavior
+            .lock()
+            .contains(&(2, Some("alt-slot-no-match")))
+    );
     // The next trial waits its turn.
     let next = pm.alt_slots_next_trial().expect("set");
     assert!(next > Instant::now() + Duration::from_secs(25));
     let counts = pm.alt_slot_counts();
-    assert_eq!((counts.configured, counts.matched, counts.fallback, counts.empty), (2, 1, 0, 1));
+    assert_eq!(
+        (
+            counts.configured,
+            counts.matched,
+            counts.fallback,
+            counts.empty
+        ),
+        (2, 1, 0, 1)
+    );
 }
 
 /// A trial is judged only once its fingerprint has settled.
@@ -234,7 +335,13 @@ fn a_trial_that_matches_takes_the_slot_and_one_that_does_not_is_disconnected() {
 fn an_unsettled_trial_waits() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 1, &[], UaTrust::Consistent);
-    let mut info = settled(1, own_group(1), Some(AltRole::Trial), Fingerprint::Unknown, "");
+    let mut info = settled(
+        1,
+        own_group(1),
+        Some(AltRole::Trial),
+        Fingerprint::Unknown,
+        "",
+    );
     info.flags.settled = false;
     add_peer(&pm, info);
     pm.judge_alt_slot_peers();
@@ -245,7 +352,10 @@ fn an_unsettled_trial_waits() {
 /// candidate under each `-altuatrust`.
 #[test]
 fn each_ua_trust_mode_against_scripted_peers() {
-    let contradicted = Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd };
+    let contradicted = Fingerprint::Mismatch {
+        claimed: Family::Core,
+        observed: Family::Btcd,
+    };
     for (mode, want) in [
         (UaTrust::Strict, [true, false, false]),
         (UaTrust::Consistent, [true, true, false]),
@@ -253,9 +363,30 @@ fn each_ua_trust_mode_against_scripted_peers() {
     ] {
         let (pm, _dir) = mk_pm();
         alt(&pm, 3, &["ua:*Knots*"], mode);
-        add_peer(&pm, settled(1, own_group(1), Some(AltRole::Trial), known(Family::Core), KNOTS));
-        add_peer(&pm, settled(2, own_group(2), Some(AltRole::Trial), Fingerprint::Unknown, KNOTS));
-        add_peer(&pm, settled(3, own_group(3), Some(AltRole::Trial), contradicted, KNOTS));
+        add_peer(
+            &pm,
+            settled(
+                1,
+                own_group(1),
+                Some(AltRole::Trial),
+                known(Family::Core),
+                KNOTS,
+            ),
+        );
+        add_peer(
+            &pm,
+            settled(
+                2,
+                own_group(2),
+                Some(AltRole::Trial),
+                Fingerprint::Unknown,
+                KNOTS,
+            ),
+        );
+        add_peer(
+            &pm,
+            settled(3, own_group(3), Some(AltRole::Trial), contradicted, KNOTS),
+        );
         pm.judge_alt_slot_peers();
         let got = [1, 2, 3].map(|id| matches!(role(&pm, id), Some(AltRole::Matched { .. })));
         assert_eq!(got, want, "{mode:?}");
@@ -271,15 +402,32 @@ fn each_ua_trust_mode_against_scripted_peers() {
 /// A peer flagged `C`, `S` or `F` never fills a slot, except under `any`.
 #[test]
 fn a_flagged_peer_never_fills() {
-    for flag in [crate::net::flags::Flag::Crawler, crate::net::flags::Flag::Spy] {
-        for (mode, fills) in [(UaTrust::Strict, false), (UaTrust::Consistent, false), (UaTrust::Any, true)] {
+    for flag in [
+        crate::net::flags::Flag::Crawler,
+        crate::net::flags::Flag::Spy,
+    ] {
+        for (mode, fills) in [
+            (UaTrust::Strict, false),
+            (UaTrust::Consistent, false),
+            (UaTrust::Any, true),
+        ] {
             let (pm, _dir) = mk_pm();
             alt(&pm, 1, &["family:btcd"], mode);
-            let mut info = settled(1, own_group(1), Some(AltRole::Trial), known(Family::Btcd), BTCD);
+            let mut info = settled(
+                1,
+                own_group(1),
+                Some(AltRole::Trial),
+                known(Family::Btcd),
+                BTCD,
+            );
             info.flags.flags = vec![(flag, Vec::new())];
             add_peer(&pm, info);
             pm.judge_alt_slot_peers();
-            assert_eq!(matches!(role(&pm, 1), Some(AltRole::Matched { .. })), fills, "{flag:?} {mode:?}");
+            assert_eq!(
+                matches!(role(&pm, 1), Some(AltRole::Matched { .. })),
+                fills,
+                "{flag:?} {mode:?}"
+            );
             assert_eq!(connected(&pm, 1), fills, "{flag:?} {mode:?}");
         }
     }
@@ -288,12 +436,37 @@ fn a_flagged_peer_never_fills() {
 #[test]
 fn caps_and_rule_order_hold() {
     let (pm, _dir) = mk_pm();
-    alt(&pm, 3, &["family:btcd@1", "family:non-core"], UaTrust::Consistent);
-    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Trial), known(Family::Btcd), BTCD));
-    add_peer(&pm, settled(2, own_group(2), Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    alt(
+        &pm,
+        3,
+        &["family:btcd@1", "family:non-core"],
+        UaTrust::Consistent,
+    );
+    add_peer(
+        &pm,
+        settled(
+            1,
+            own_group(1),
+            Some(AltRole::Trial),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
+    add_peer(
+        &pm,
+        settled(
+            2,
+            own_group(2),
+            Some(AltRole::Trial),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
     pm.judge_alt_slot_peers();
     assert!(matches!(role(&pm, 1), Some(AltRole::Matched { rule, .. }) if rule == "family:btcd@1"));
-    assert!(matches!(role(&pm, 2), Some(AltRole::Matched { rule, .. }) if rule == "family:non-core"));
+    assert!(
+        matches!(role(&pm, 2), Some(AltRole::Matched { rule, .. }) if rule == "family:non-core")
+    );
 }
 
 // ---- Fallback ----
@@ -305,20 +478,58 @@ fn caps_and_rule_order_hold() {
 fn a_match_replaces_the_fallback() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
-    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Fallback), known(Family::Core), CORE));
+    add_peer(
+        &pm,
+        settled(
+            1,
+            own_group(1),
+            Some(AltRole::Fallback),
+            known(Family::Core),
+            CORE,
+        ),
+    );
     pm.judge_alt_slot_peers();
-    assert_eq!(role(&pm, 1), Some(AltRole::Fallback), "an unmatched fallback stays");
-    add_peer(&pm, settled(2, own_group(2), Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    assert_eq!(
+        role(&pm, 1),
+        Some(AltRole::Fallback),
+        "an unmatched fallback stays"
+    );
+    add_peer(
+        &pm,
+        settled(
+            2,
+            own_group(2),
+            Some(AltRole::Trial),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
     pm.judge_alt_slot_peers();
     assert!(matches!(role(&pm, 2), Some(AltRole::Matched { .. })));
     assert!(!connected(&pm, 1));
-    assert!(pm.retired_behavior.lock().contains(&(1, Some("alt-slot-fallback-replaced"))));
+    assert!(
+        pm.retired_behavior
+            .lock()
+            .contains(&(1, Some("alt-slot-fallback-replaced")))
+    );
 
     let (pm, _dir) = mk_pm();
     alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
-    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Fallback), known(Family::Btcd), BTCD));
+    add_peer(
+        &pm,
+        settled(
+            1,
+            own_group(1),
+            Some(AltRole::Fallback),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
     pm.judge_alt_slot_peers();
-    assert!(matches!(role(&pm, 1), Some(AltRole::Matched { .. })), "the fallback matched");
+    assert!(
+        matches!(role(&pm, 1), Some(AltRole::Matched { .. })),
+        "the fallback matched"
+    );
 }
 
 /// A trial is dialled at once; the fallback only once a slot has been empty
@@ -331,11 +542,25 @@ async fn the_fallback_waits_for_altfillwait() {
     let now = Instant::now();
     let first = pm.open_alt_slot_peers(now, &[]);
     assert_eq!(first.len(), 1, "a trial, no fallback yet: {first:?}");
-    assert_eq!(pm.alt_slots.state.lock().dials.iter().filter(|(_, r)| *r == AltRole::Fallback).count(), 0);
+    assert_eq!(
+        pm.alt_slots
+            .state
+            .lock()
+            .dials
+            .iter()
+            .filter(|(_, r)| *r == AltRole::Fallback)
+            .count(),
+        0
+    );
     let later = now + Duration::from_secs(601);
     let second = pm.open_alt_slot_peers(later, &first);
     assert!(
-        pm.alt_slots.state.lock().dials.iter().any(|(a, r)| *r == AltRole::Fallback && second.contains(a)),
+        pm.alt_slots
+            .state
+            .lock()
+            .dials
+            .iter()
+            .any(|(a, r)| *r == AltRole::Fallback && second.contains(a)),
         "the fallback is dialled after -altfillwait: {second:?}"
     );
 }
@@ -351,12 +576,26 @@ fn netgroup_rule_holds_with_eight_alt_slots() {
     alt(&pm, 8, &[], UaTrust::Consistent);
     // Seven matched peers in groups 0..7.
     for i in 0..7 {
-        let m = AltRole::Matched { rule: "family:non-core".into(), trust: Trust::Verified };
-        add_peer(&pm, settled(i as PeerId + 1, own_group(i), Some(m), known(Family::Btcd), BTCD));
+        let m = AltRole::Matched {
+            rule: "family:non-core".into(),
+            trust: Trust::Verified,
+        };
+        add_peer(
+            &pm,
+            settled(
+                i as PeerId + 1,
+                own_group(i),
+                Some(m),
+                known(Family::Btcd),
+                BTCD,
+            ),
+        );
     }
     // The store says btcd at another address in each taken group, and at
     // one in a free group; the book holds the same.
-    let taken: Vec<SocketAddr> = (0..7).map(|i| SocketAddr::from(([60, i as u8, 2, 2], 8333))).collect();
+    let taken: Vec<SocketAddr> = (0..7)
+        .map(|i| SocketAddr::from(([60, i as u8, 2, 2], 8333)))
+        .collect();
     let free = own_group(150);
     let now = crate::time::now_secs();
     {
@@ -383,16 +622,26 @@ fn netgroup_rule_holds_with_eight_alt_slots() {
         }
     }
     let config = pm.alt_slot_config();
-    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "records the book no longer holds");
+    assert_eq!(
+        pm.pick_alt_trial(Instant::now(), &[], &config),
+        None,
+        "records the book no longer holds"
+    );
     learn(&pm, &taken);
     learn(&pm, &[free]);
     for _ in 0..20 {
-        assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(free)));
+        assert_eq!(
+            pm.pick_alt_trial(Instant::now(), &[], &config),
+            Some(PeerAddr::Socket(free))
+        );
     }
     // From the book, with the store's records gone.
     pm.alt_slots.state.lock().results = crate::net::survey::SurveyStore::default();
     for _ in 0..20 {
-        assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(free)));
+        assert_eq!(
+            pm.pick_alt_trial(Instant::now(), &[], &config),
+            Some(PeerAddr::Socket(free))
+        );
     }
 }
 
@@ -422,18 +671,42 @@ fn verified_store_candidates_first_and_known_misses_skipped() {
     };
     {
         let mut st = pm.alt_slots.state.lock();
-        st.results.insert(PeerAddr::Socket(unverified), rec(Fingerprint::Unknown, KNOTS), now);
-        st.results.insert(PeerAddr::Socket(verified), rec(known(Family::Core), KNOTS), now);
-        st.results.insert(PeerAddr::Socket(core), rec(known(Family::Core), CORE), now);
+        st.results.insert(
+            PeerAddr::Socket(unverified),
+            rec(Fingerprint::Unknown, KNOTS),
+            now,
+        );
+        st.results.insert(
+            PeerAddr::Socket(verified),
+            rec(known(Family::Core), KNOTS),
+            now,
+        );
+        st.results
+            .insert(PeerAddr::Socket(core), rec(known(Family::Core), CORE), now);
     }
     learn(&pm, &[verified, unverified, core]);
     let config = pm.alt_slot_config();
     for _ in 0..10 {
-        assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(verified)));
+        assert_eq!(
+            pm.pick_alt_trial(Instant::now(), &[], &config),
+            Some(PeerAddr::Socket(verified))
+        );
     }
-    pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(verified), rec(known(Family::Core), CORE), now);
-    pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(unverified), rec(known(Family::Core), CORE), now);
-    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "every book entry is a known miss");
+    pm.alt_slots.state.lock().results.insert(
+        PeerAddr::Socket(verified),
+        rec(known(Family::Core), CORE),
+        now,
+    );
+    pm.alt_slots.state.lock().results.insert(
+        PeerAddr::Socket(unverified),
+        rec(known(Family::Core), CORE),
+        now,
+    );
+    assert_eq!(
+        pm.pick_alt_trial(Instant::now(), &[], &config),
+        None,
+        "every book entry is a known miss"
+    );
 }
 
 /// A fake or closed-early survey record is no family for the alt-slot
@@ -465,20 +738,43 @@ fn fake_and_closed_early_records_match_no_family_rule() {
     {
         let mut st = pm.alt_slots.state.lock();
         let claimed = Fingerprint::Known(Family::Core, Confidence::Claimed);
-        st.results.insert(PeerAddr::Socket(fake), rec(claimed, "/Satoshi:25.0.0/", Verdict::Fake(Family::Core)), now);
-        st.results.insert(PeerAddr::Socket(early), rec(Fingerprint::Unknown, CORE, Verdict::ClosedEarly), now);
-        st.results.insert(PeerAddr::Socket(core), rec(known(Family::Core), CORE, Verdict::Classified), now);
+        st.results.insert(
+            PeerAddr::Socket(fake),
+            rec(claimed, "/Satoshi:25.0.0/", Verdict::Fake(Family::Core)),
+            now,
+        );
+        st.results.insert(
+            PeerAddr::Socket(early),
+            rec(Fingerprint::Unknown, CORE, Verdict::ClosedEarly),
+            now,
+        );
+        st.results.insert(
+            PeerAddr::Socket(core),
+            rec(known(Family::Core), CORE, Verdict::Classified),
+            now,
+        );
     }
     learn(&pm, &[fake, early, core]);
     let config = pm.alt_slot_config();
     for _ in 0..20 {
-        assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(core)));
+        assert_eq!(
+            pm.pick_alt_trial(Instant::now(), &[], &config),
+            Some(PeerAddr::Socket(core))
+        );
     }
     // A closed-early result never replaces a settled one (the store keeps
     // the earlier fingerprint); a fake one does.
     let claimed = Fingerprint::Known(Family::Core, Confidence::Claimed);
-    pm.alt_slots.state.lock().results.insert(PeerAddr::Socket(core), rec(claimed, CORE, Verdict::Fake(Family::Core)), now);
-    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None, "every book entry is a known miss");
+    pm.alt_slots.state.lock().results.insert(
+        PeerAddr::Socket(core),
+        rec(claimed, CORE, Verdict::Fake(Family::Core)),
+        now,
+    );
+    assert_eq!(
+        pm.pick_alt_trial(Instant::now(), &[], &config),
+        None,
+        "every book entry is a known miss"
+    );
 }
 
 // ---- Reload ----
@@ -489,19 +785,50 @@ fn fake_and_closed_early_records_match_no_family_rule() {
 fn lowering_altslots_disconnects_nobody() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 3, &[], UaTrust::Consistent);
-    let m = || Some(AltRole::Matched { rule: "family:non-core".into(), trust: Trust::Verified });
-    add_peer(&pm, settled(1, own_group(1), m(), known(Family::Btcd), BTCD));
-    add_peer(&pm, settled(2, own_group(2), m(), known(Family::Floresta), "/Floresta:0.7.0/"));
-    add_peer(&pm, settled(3, own_group(3), Some(AltRole::Fallback), known(Family::Core), CORE));
+    let m = || {
+        Some(AltRole::Matched {
+            rule: "family:non-core".into(),
+            trust: Trust::Verified,
+        })
+    };
+    add_peer(
+        &pm,
+        settled(1, own_group(1), m(), known(Family::Btcd), BTCD),
+    );
+    add_peer(
+        &pm,
+        settled(
+            2,
+            own_group(2),
+            m(),
+            known(Family::Floresta),
+            "/Floresta:0.7.0/",
+        ),
+    );
+    add_peer(
+        &pm,
+        settled(
+            3,
+            own_group(3),
+            Some(AltRole::Fallback),
+            known(Family::Core),
+            CORE,
+        ),
+    );
     alt(&pm, 2, &[], UaTrust::Consistent);
     assert_eq!(role(&pm, 3), None, "the fallback goes first");
     assert!(role(&pm, 1).is_some() && role(&pm, 2).is_some());
     alt(&pm, 2, &["family:floresta"], UaTrust::Consistent);
     assert_eq!(role(&pm, 1), None, "btcd matches no rule now");
-    assert!(matches!(role(&pm, 2), Some(AltRole::Matched { rule, .. }) if rule == "family:floresta"));
+    assert!(
+        matches!(role(&pm, 2), Some(AltRole::Matched { rule, .. }) if rule == "family:floresta")
+    );
     alt(&pm, 0, &[], UaTrust::Consistent);
     assert_eq!(role(&pm, 2), None);
-    assert!((1..=3).all(|id| connected(&pm, id)), "nobody was disconnected");
+    assert!(
+        (1..=3).all(|id| connected(&pm, id)),
+        "nobody was disconnected"
+    );
 }
 
 // ---- Eviction ----
@@ -513,12 +840,36 @@ fn surplus_eviction_spares_matched_and_trial_peers() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 1, &[], UaTrust::Consistent);
     for i in 0..8 {
-        add_peer(&pm, settled(i as PeerId + 1, own_group(i), None, known(Family::Core), CORE));
+        add_peer(
+            &pm,
+            settled(
+                i as PeerId + 1,
+                own_group(i),
+                None,
+                known(Family::Core),
+                CORE,
+            ),
+        );
     }
-    add_peer(&pm, settled(9, own_group(9), Some(AltRole::Trial), known(Family::Btcd), BTCD));
-    assert_eq!(pm.evict_extra_outbound_peer(), None, "a trial is not surplus");
-    pm.peers.write().get_mut(&9).unwrap().info.alt =
-        Some(AltRole::Matched { rule: "family:non-core".into(), trust: Trust::Verified });
+    add_peer(
+        &pm,
+        settled(
+            9,
+            own_group(9),
+            Some(AltRole::Trial),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
+    assert_eq!(
+        pm.evict_extra_outbound_peer(),
+        None,
+        "a trial is not surplus"
+    );
+    pm.peers.write().get_mut(&9).unwrap().info.alt = Some(AltRole::Matched {
+        rule: "family:non-core".into(),
+        trust: Trust::Verified,
+    });
     let evicted = pm.evict_extra_outbound_peer().expect("one over the target");
     assert_ne!(evicted, 9, "never the matched peer");
 }
@@ -529,7 +880,11 @@ fn surplus_eviction_spares_matched_and_trial_peers() {
 fn spawn_peer_takes_the_role_of_its_dial() {
     let (pm, _dir) = mk_pm();
     let a = own_group(4);
-    pm.alt_slots.state.lock().dials.push((PeerAddr::Socket(a), AltRole::Fallback));
+    pm.alt_slots
+        .state
+        .lock()
+        .dials
+        .push((PeerAddr::Socket(a), AltRole::Fallback));
     assert_eq!(pm.take_alt_dial(&own_group(5), None), None);
     assert_eq!(pm.take_alt_dial(&a, None), Some(AltRole::Fallback));
     assert_eq!(pm.take_alt_dial(&a, None), None, "taken once");
@@ -555,10 +910,25 @@ fn the_extra_network_peer_counts_empty_alt_slots_as_held() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 2, &[], UaTrust::Consistent);
     for i in 0..6 {
-        add_peer(&pm, settled(i as PeerId + 1, own_group(i), None, known(Family::Core), CORE));
+        add_peer(
+            &pm,
+            settled(
+                i as PeerId + 1,
+                own_group(i),
+                None,
+                known(Family::Core),
+                CORE,
+            ),
+        );
     }
     for i in 6..8 {
-        let mut info = settled(i as PeerId + 1, own_group(i), None, known(Family::Core), CORE);
+        let mut info = settled(
+            i as PeerId + 1,
+            own_group(i),
+            None,
+            known(Family::Core),
+            CORE,
+        );
         info.conn_type = ConnType::BlockRelay;
         add_peer(&pm, info);
     }
@@ -578,7 +948,15 @@ fn a_rejected_trial_is_not_drawn_again() {
     add_peer(&pm, info);
     pm.judge_alt_slot_peers();
     assert!(!connected(&pm, 1));
-    assert!(pm.alt_slots.state.lock().results.get(&PeerAddr::Socket(addr)).is_some(), "its record matches");
+    assert!(
+        pm.alt_slots
+            .state
+            .lock()
+            .results
+            .get(&PeerAddr::Socket(addr))
+            .is_some(),
+        "its record matches"
+    );
     let config = pm.alt_slot_config();
     assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None);
 }
@@ -589,7 +967,10 @@ fn no_candidate_waits_the_trial_interval() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 1, &[], UaTrust::Consistent);
     assert!(pm.open_alt_slot_peers(Instant::now(), &[]).is_empty());
-    assert!(pm.alt_slots_next_trial().is_some_and(|t| t > Instant::now() + Duration::from_secs(25)));
+    assert!(
+        pm.alt_slots_next_trial()
+            .is_some_and(|t| t > Instant::now() + Duration::from_secs(25))
+    );
 }
 
 /// A dial's entry goes when the dial ends, however it ends.
@@ -618,7 +999,11 @@ fn a_trial_gone_before_judgement_is_not_drawn_again() {
     pm.disconnect_peer(1, "peer-closed");
     assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), None);
     pm.alt_slots.state.lock().rejected.clear();
-    assert_eq!(pm.pick_alt_trial(Instant::now(), &[], &config), Some(PeerAddr::Socket(addr)), "otherwise drawn");
+    assert_eq!(
+        pm.pick_alt_trial(Instant::now(), &[], &config),
+        Some(PeerAddr::Socket(addr)),
+        "otherwise drawn"
+    );
 }
 
 /// A trial never takes the connection count past `-maxconnections`.
@@ -628,7 +1013,16 @@ fn a_trial_stays_under_maxconnections() {
     pm.set_max_connections(1);
     alt(&pm, 1, &[], UaTrust::Consistent);
     assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_ok());
-    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Fallback), known(Family::Core), CORE));
+    add_peer(
+        &pm,
+        settled(
+            1,
+            own_group(1),
+            Some(AltRole::Fallback),
+            known(Family::Core),
+            CORE,
+        ),
+    );
     assert!(pm.check_alt_trial(&pm.dials_in_flight.lock()).is_err());
 }
 
@@ -638,35 +1032,76 @@ fn a_trial_stays_under_maxconnections() {
 fn a_trial_is_judged_before_a_fallback() {
     let (pm, _dir) = mk_pm();
     alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
-    add_peer(&pm, settled(1, own_group(1), Some(AltRole::Fallback), known(Family::Btcd), BTCD));
-    add_peer(&pm, settled(2, own_group(2), Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    add_peer(
+        &pm,
+        settled(
+            1,
+            own_group(1),
+            Some(AltRole::Fallback),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
+    add_peer(
+        &pm,
+        settled(
+            2,
+            own_group(2),
+            Some(AltRole::Trial),
+            known(Family::Btcd),
+            BTCD,
+        ),
+    );
     pm.judge_alt_slot_peers();
     assert!(matches!(role(&pm, 2), Some(AltRole::Matched { .. })));
     assert!(!connected(&pm, 1), "the fallback is surplus");
 
-    let m = AltRole::Matched { rule: "family:btcd".into(), trust: Trust::Verified };
+    let m = AltRole::Matched {
+        rule: "family:btcd".into(),
+        trust: Trust::Verified,
+    };
     let (pm, _dir) = mk_pm();
     alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
-    add_peer(&pm, settled(1, own_group(1), Some(m), known(Family::Btcd), BTCD));
+    add_peer(
+        &pm,
+        settled(1, own_group(1), Some(m), known(Family::Btcd), BTCD),
+    );
     let addr = own_group(2);
     learn(&pm, &[addr]);
-    add_peer(&pm, settled(2, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    add_peer(
+        &pm,
+        settled(2, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD),
+    );
     pm.judge_alt_slot_peers();
     assert!(!connected(&pm, 2));
-    assert!(pm.retired_behavior.lock().contains(&(2, Some("alt-slot-filled"))));
-    assert!(pm.alt_slots.state.lock().rejected.is_empty(), "not passed over");
+    assert!(
+        pm.retired_behavior
+            .lock()
+            .contains(&(2, Some("alt-slot-filled")))
+    );
+    assert!(
+        pm.alt_slots.state.lock().rejected.is_empty(),
+        "not passed over"
+    );
 }
 
 /// A trial's record keeps the probe outcomes a survey connection stored.
 #[test]
 fn a_trial_result_keeps_the_survey_probes() {
     let (pm, _dir) = mk_pm();
-    pm.enable_survey(SurveyConfig { interval: Duration::from_secs(60), probes: true, path: None });
+    pm.enable_survey(SurveyConfig {
+        interval: Duration::from_secs(60),
+        probes: true,
+        path: None,
+    });
     alt(&pm, 1, &["family:btcd"], UaTrust::Consistent);
     let addr = own_group(1);
     let now = crate::time::now_secs();
     let mut probes = crate::net::survey::ProbeResults::default();
-    probes.set(crate::net::survey::Probe::Ping, crate::net::survey::ProbeOutcome::Answered(12));
+    probes.set(
+        crate::net::survey::Probe::Ping,
+        crate::net::survey::ProbeOutcome::Answered(12),
+    );
     let record = crate::net::survey::SurveyRecord {
         fingerprint: known(Family::Btcd),
         user_agent: BTCD.into(),
@@ -682,8 +1117,13 @@ fn a_trial_result_keeps_the_survey_probes() {
         retry: Default::default(),
     };
     assert!(pm.insert_survey_record(PeerAddr::Socket(addr), record, now));
-    add_peer(&pm, settled(1, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD));
+    add_peer(
+        &pm,
+        settled(1, addr, Some(AltRole::Trial), known(Family::Btcd), BTCD),
+    );
     pm.judge_alt_slot_peers();
-    let kept = pm.read_survey_store(|s| s.get(&PeerAddr::Socket(addr)).map(|r| r.probes)).flatten();
+    let kept = pm
+        .read_survey_store(|s| s.get(&PeerAddr::Socket(addr)).map(|r| r.probes))
+        .flatten();
     assert_eq!(kept, Some(probes));
 }

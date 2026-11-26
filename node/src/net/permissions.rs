@@ -176,9 +176,7 @@ impl NetPermissions {
         if direction == Direction::NONE {
             direction = Direction::IN;
         } else if perms == Self::NONE {
-            return Err(format!(
-                "only direction was set, no permissions: {s:?}"
-            ));
+            return Err(format!("only direction was set, no permissions: {s:?}"));
         }
         Ok((perms, direction))
     }
@@ -433,7 +431,14 @@ mod tests {
         assert_eq!(NetPermissions::NONE.to_strings(), Vec::<&str>::new());
         assert_eq!(
             NetPermissions::all().to_strings(),
-            ["noban", "forcerelay", "relay", "mempool", "download", "addr"]
+            [
+                "noban",
+                "forcerelay",
+                "relay",
+                "mempool",
+                "download",
+                "addr"
+            ]
         );
         // Core's `p2p_permissions.py` asserts this list literally, as the
         // documented default for a bare `-whitelist=<subnet>`.
@@ -457,11 +462,17 @@ mod tests {
     /// nothing.
     #[test]
     fn an_empty_permission_list_grants_nothing() {
-        assert_eq!(NetPermissions::parse_list("").unwrap(), NetPermissions::NONE);
+        assert_eq!(
+            NetPermissions::parse_list("").unwrap(),
+            NetPermissions::NONE
+        );
         let e = WhitelistEntry::parse("@127.0.0.1").unwrap();
         assert_eq!(e.perms, NetPermissions::NONE, "@<subnet> grants nothing");
         assert!(e.perms.to_strings().is_empty());
-        assert!(e.contains("127.0.0.1".parse().unwrap()), "it still matches the range");
+        assert!(
+            e.contains("127.0.0.1".parse().unwrap()),
+            "it still matches the range"
+        );
 
         // A bare subnet never reaches `parse_list`, so it is unaffected.
         let e = WhitelistEntry::parse("127.0.0.1").unwrap();
@@ -515,7 +526,10 @@ mod tests {
         // A bare subnet is the implicit set, inbound only.
         let bare = vec![WhitelistEntry::parse("127.0.0.1").unwrap()];
         assert_eq!(bare[0].direction, Direction::IN);
-        assert_eq!(permissions_for(&bare, ip, Direction::OUT), NetPermissions::NONE);
+        assert_eq!(
+            permissions_for(&bare, ip, Direction::OUT),
+            NetPermissions::NONE
+        );
 
         // An automatic outbound connection asks for nothing and gets nothing,
         // whatever the entries say.
@@ -590,7 +604,10 @@ mod tests {
         let mut e = WhitelistEntry::parse("noban@192.168.0.0/16").unwrap();
         assert!(!e.implicit && !e.perms.relay);
         e.apply_global_relay_defaults(true, true);
-        assert!(!e.perms.relay && !e.perms.force_relay, "explicit entry must be untouched");
+        assert!(
+            !e.perms.relay && !e.perms.force_relay,
+            "explicit entry must be untouched"
+        );
         assert!(e.perms.noban);
     }
 

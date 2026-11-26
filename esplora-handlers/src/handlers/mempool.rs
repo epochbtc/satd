@@ -99,9 +99,7 @@ pub async fn root(
     })
 }
 
-pub async fn mempool_summary(
-    State(state): State<EsploraState>,
-) -> Json<MempoolJson> {
+pub async fn mempool_summary(State(state): State<EsploraState>) -> Json<MempoolJson> {
     // Read in place under the mempool lock: these routes are
     // unauthenticated, and copying every entry (transaction bodies
     // included) per request let any client make the node copy the whole
@@ -132,26 +130,27 @@ pub async fn mempool_summary(
     })
 }
 
-pub async fn mempool_txids(
-    State(state): State<EsploraState>,
-) -> Json<Vec<String>> {
+pub async fn mempool_txids(State(state): State<EsploraState>) -> Json<Vec<String>> {
     let mut txids = Vec::new();
     state.mempool.for_each_acting(|txid, _| txids.push(*txid));
     Json(txids.into_iter().map(|txid| txid.to_string()).collect())
 }
 
-pub async fn mempool_recent(
-    State(state): State<EsploraState>,
-) -> Json<Vec<RecentTxJson>> {
+pub async fn mempool_recent(State(state): State<EsploraState>) -> Json<Vec<RecentTxJson>> {
     // (time, txid) of every entry, then the RECENT_LIMIT newest rendered
     // from a second pass: nothing but the chosen few is read in full.
     let mut stamps: Vec<(u64, Txid)> = Vec::new();
-    state.mempool.for_each_acting(|txid, entry| stamps.push((entry.time, *txid)));
+    state
+        .mempool
+        .for_each_acting(|txid, entry| stamps.push((entry.time, *txid)));
     // Sort by `time` descending (newest first); take up to RECENT_LIMIT.
     stamps.sort_by(|a, b| b.0.cmp(&a.0));
     stamps.truncate(RECENT_LIMIT);
-    let wanted: HashMap<Txid, usize> =
-        stamps.iter().enumerate().map(|(i, (_, txid))| (*txid, i)).collect();
+    let wanted: HashMap<Txid, usize> = stamps
+        .iter()
+        .enumerate()
+        .map(|(i, (_, txid))| (*txid, i))
+        .collect();
     let mut out: Vec<Option<RecentTxJson>> = (0..stamps.len()).map(|_| None).collect();
     state.mempool.for_each_acting(|txid, entry| {
         if let Some(&i) = wanted.get(txid) {
@@ -159,7 +158,12 @@ pub async fn mempool_recent(
                 txid: txid.to_string(),
                 fee: entry.fee,
                 vsize: vsize_of_weight(entry.weight as u64),
-                value: entry.tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>(),
+                value: entry
+                    .tx
+                    .output
+                    .iter()
+                    .map(|o| o.value.to_sat())
+                    .sum::<u64>(),
             });
         }
     });
@@ -167,9 +171,7 @@ pub async fn mempool_recent(
     Json(out.into_iter().flatten().collect())
 }
 
-pub async fn fee_estimates(
-    State(state): State<EsploraState>,
-) -> EsploraResult<Json<Value>> {
+pub async fn fee_estimates(State(state): State<EsploraState>) -> EsploraResult<Json<Value>> {
     // Route through the shared `smart_fees` resolver (blend mode) so
     // `/fee-estimates` agrees with the JSON-RPC `estimatefees`, the TUI and
     // Electrum, with the same monotonicity guarantee across the target set.
@@ -207,9 +209,7 @@ pub async fn fee_estimates(
 /// when it can estimate none; satd does the same. Without fee history the
 /// floored targets are the deepest ones, so the monotone clamp never
 /// carried a floor into a target that is kept.
-fn fee_estimates_map(
-    sf: &node::mempool::estimate::SmartFees,
-) -> serde_json::Map<String, Value> {
+fn fee_estimates_map(sf: &node::mempool::estimate::SmartFees) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::with_capacity(sf.targets.len());
     for tf in &sf.targets {
         if tf.confidence == node::mempool::estimate::Confidence::Low {

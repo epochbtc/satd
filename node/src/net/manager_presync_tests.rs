@@ -31,7 +31,13 @@ fn mk_pm(min_work: Option<[u8; 32]>) -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(Arc::new(cs), mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        Arc::new(cs),
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     (pm, dir)
 }
 
@@ -61,7 +67,12 @@ fn add_peer(pm: &PeerManager, id: PeerId, noban: bool) -> mpsc::Receiver<Network
 }
 
 /// `n` regtest headers on `prev`, one second apart from `time`.
-fn headers_on(prev: bitcoin::BlockHash, n: usize, time: u32, tag: u8) -> Vec<bitcoin::block::Header> {
+fn headers_on(
+    prev: bitcoin::BlockHash,
+    n: usize,
+    time: u32,
+    tag: u8,
+) -> Vec<bitcoin::block::Header> {
     let mut parent = prev;
     (0..n)
         .map(|i| {
@@ -107,7 +118,12 @@ fn getheaders(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<Vec<bitcoin::Block
 
 /// Answer the peer's `getheaders` from `chain` the way Core's
 /// `ProcessGetHeaders` does, until it stops asking.
-fn serve(pm: &PeerManager, id: PeerId, rx: &mut mpsc::Receiver<NetworkMessage>, chain: &[bitcoin::block::Header]) -> usize {
+fn serve(
+    pm: &PeerManager,
+    id: PeerId,
+    rx: &mut mpsc::Receiver<NetworkMessage>,
+    chain: &[bitcoin::block::Header],
+) -> usize {
     let mut answered = 0;
     while let Some(locator) = getheaders(rx).pop() {
         answered += 1;
@@ -118,7 +134,10 @@ fn serve(pm: &PeerManager, id: PeerId, rx: &mut mpsc::Receiver<NetworkMessage>, 
                 if *h == genesis() {
                     return Some(0);
                 }
-                chain.iter().position(|c| c.block_hash() == *h).map(|i| i + 1)
+                chain
+                    .iter()
+                    .position(|c| c.block_hash() == *h)
+                    .map(|i| i + 1)
             })
             .unwrap_or(0);
         pm.handle_headers(id, chain[start..chain.len().min(start + 2000)].to_vec());
@@ -127,7 +146,11 @@ fn serve(pm: &PeerManager, id: PeerId, rx: &mut mpsc::Receiver<NetworkMessage>, 
 }
 
 fn presync_height(pm: &PeerManager, id: PeerId) -> i64 {
-    pm.peers.read().get(&id).map(|h| h.info.presync_height).unwrap()
+    pm.peers
+        .read()
+        .get(&id)
+        .map(|h| h.info.presync_height)
+        .unwrap()
 }
 
 /// A full batch below the threshold starts a presync: nothing is stored,
@@ -140,17 +163,39 @@ fn a_full_low_work_batch_starts_a_presync_and_stores_nothing() {
     let chain = genesis_chain(4000, 1);
 
     pm.handle_headers(1, chain[..2000].to_vec());
-    assert_eq!(pm.chain_state.best_header_hash(), genesis(), "nothing stored");
-    assert!(pm.chain_state.get_block_index(&chain[0].block_hash()).is_none());
+    assert_eq!(
+        pm.chain_state.best_header_hash(),
+        genesis(),
+        "nothing stored"
+    );
+    assert!(
+        pm.chain_state
+            .get_block_index(&chain[0].block_hash())
+            .is_none()
+    );
     assert_eq!(presync_height(&pm, 1), 2000);
     let sent = getheaders(&mut rx);
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0][0], chain[1999].block_hash(), "continues from the last header");
-    assert_eq!(sent[0].last(), Some(&genesis()), "then the chain start's locator");
+    assert_eq!(
+        sent[0][0],
+        chain[1999].block_hash(),
+        "continues from the last header"
+    );
+    assert_eq!(
+        sent[0].last(),
+        Some(&genesis()),
+        "then the chain start's locator"
+    );
 
     pm.handle_headers(1, chain[2000..].to_vec());
     assert_eq!(presync_height(&pm, 1), 4000);
-    let json = pm.peers.read().get(&1).unwrap().info.to_rpc_json(&PeerStats::new(NetTotals::new()));
+    let json = pm
+        .peers
+        .read()
+        .get(&1)
+        .unwrap()
+        .info
+        .to_rpc_json(&PeerStats::new(NetTotals::new()));
     assert_eq!(json["presynced_headers"], 4000);
     assert_eq!(pm.chain_state.best_header_hash(), genesis());
 }
@@ -164,7 +209,11 @@ fn a_short_low_work_batch_is_ignored() {
     let mut rx = add_peer(&pm, 1, false);
     let chain = genesis_chain(100, 2);
     pm.handle_headers(1, chain.clone());
-    assert!(pm.chain_state.get_block_index(&chain[0].block_hash()).is_none());
+    assert!(
+        pm.chain_state
+            .get_block_index(&chain[0].block_hash())
+            .is_none()
+    );
     assert_eq!(presync_height(&pm, 1), -1);
     assert!(!pm.headers_syncs.lock().contains_key(&1));
     assert!(getheaders(&mut rx).is_empty());
@@ -179,10 +228,16 @@ fn a_chain_with_enough_work_is_stored_after_its_redownload() {
     let chain = genesis_chain(10_000, 3);
     pm.handle_headers(1, chain[..2000].to_vec());
     let answered = serve(&pm, 1, &mut rx, &chain);
-    assert_eq!(pm.chain_state.best_header_hash(), chain.last().unwrap().block_hash());
+    assert_eq!(
+        pm.chain_state.best_header_hash(),
+        chain.last().unwrap().block_hash()
+    );
     assert_eq!(pm.chain_state.headers_tip_height(), 10_000);
     assert!(answered >= 9, "both passes: {answered} getheaders answered");
-    assert!(!pm.headers_syncs.lock().contains_key(&1), "the sync is over");
+    assert!(
+        !pm.headers_syncs.lock().contains_key(&1),
+        "the sync is over"
+    );
     assert_eq!(presync_height(&pm, 1), -1);
 }
 
@@ -193,7 +248,10 @@ fn a_noban_peers_low_work_headers_are_stored() {
     let _rx = add_peer(&pm, 1, true);
     let chain = genesis_chain(100, 4);
     pm.handle_headers(1, chain.clone());
-    assert_eq!(pm.chain_state.best_header_hash(), chain.last().unwrap().block_hash());
+    assert_eq!(
+        pm.chain_state.best_header_hash(),
+        chain.last().unwrap().block_hash()
+    );
 }
 
 /// An empty `headers` ends a sync in progress, as in Core.
@@ -223,15 +281,30 @@ fn headers_failing_cores_pow_check_are_refused_whole() {
     }
     chain[9] = bad;
     pm.handle_headers(1, chain.clone());
-    assert!(pm.chain_state.get_block_index(&chain[0].block_hash()).is_none(), "none of the batch is stored");
-    assert!(!pm.peers.read().contains_key(&1), "the peer is disconnected");
+    assert!(
+        pm.chain_state
+            .get_block_index(&chain[0].block_hash())
+            .is_none(),
+        "none of the batch is stored"
+    );
+    assert!(
+        !pm.peers.read().contains_key(&1),
+        "the peer is disconnected"
+    );
 
     let _rx = add_peer(&pm, 2, false);
     let mut gap = genesis_chain(10, 7);
     gap.remove(4);
     pm.handle_headers(2, gap.clone());
-    assert!(pm.chain_state.get_block_index(&gap[0].block_hash()).is_none());
-    assert!(!pm.peers.read().contains_key(&2), "non-continuous headers are punished");
+    assert!(
+        pm.chain_state
+            .get_block_index(&gap[0].block_hash())
+            .is_none()
+    );
+    assert!(
+        !pm.peers.read().contains_key(&2),
+        "non-continuous headers are punished"
+    );
 }
 
 /// The user's ruling on a clock far behind the chain (#1132): Core logs
@@ -253,5 +326,9 @@ fn a_clock_far_behind_the_chain_start_asks_for_shutdown() {
     pm.handle_headers_at(1, batch.clone(), u64::from(now) - 3 * 60 * 60);
     assert!(*rx.borrow(), "shutdown was asked for");
     assert!(!pm.headers_syncs.lock().contains_key(&1), "no sync started");
-    assert!(pm.chain_state.get_block_index(&batch[0].block_hash()).is_none());
+    assert!(
+        pm.chain_state
+            .get_block_index(&batch[0].block_hash())
+            .is_none()
+    );
 }

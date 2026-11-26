@@ -14,11 +14,20 @@ use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, Witness};
 const COIN_VALUE: u64 = 100_000;
 
 fn prev(tag: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
+    OutPoint {
+        txid: Txid::from_byte_array([tag; 32]),
+        vout: 0,
+    }
 }
 
 fn coin(script_pubkey: ScriptBuf) -> Coin {
-    Coin { amount: COIN_VALUE, script_pubkey, height: 0, coinbase: false, txseq: node_index::TXSEQ_UNKNOWN }
+    Coin {
+        amount: COIN_VALUE,
+        script_pubkey,
+        height: 0,
+        coinbase: false,
+        txseq: node_index::TXSEQ_UNKNOWN,
+    }
 }
 
 fn p2wsh(witness_script: &[u8]) -> ScriptBuf {
@@ -63,14 +72,26 @@ fn an_upgrade_hook_spend_is_refused_as_nonstandard() {
     let coins = vec![(prev(1), coin(p2wsh(UPGRADABLE_NOP)))];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     let tx = spend(&[prev(1)], &[UPGRADABLE_NOP]);
-    rust().verify_transaction(&tx, &[TxOut { value: Amount::from_sat(COIN_VALUE), script_pubkey: p2wsh(UPGRADABLE_NOP) }], ScriptContext::unmined(1))
+    rust()
+        .verify_transaction(
+            &tx,
+            &[TxOut {
+                value: Amount::from_sat(COIN_VALUE),
+                script_pubkey: p2wsh(UPGRADABLE_NOP),
+            }],
+            ScriptContext::unmined(1),
+        )
         .expect("valid by consensus");
 
     let want = "mempool-script-verify-flag-failed (NOPx reserved for soft-fork upgrades)";
-    let err = mp.test_accept(&tx, &cs, &rust()).expect_err("testmempoolaccept refuses it");
+    let err = mp
+        .test_accept(&tx, &cs, &rust())
+        .expect_err("testmempoolaccept refuses it");
     assert!(matches!(err, MempoolError::PolicyScript(..)), "{err:?}");
     assert_eq!(err.reject_reason(), want);
-    let err = mp.accept_transaction(tx, &cs, &rust(), TxSource::P2p, false).expect_err("refused");
+    let err = mp
+        .accept_transaction(tx, &cs, &rust(), TxSource::P2p, false)
+        .expect_err("refused");
     assert!(matches!(err, MempoolError::PolicyScript(..)), "{err:?}");
     assert_eq!(err.reject_reason(), want);
     assert_eq!(mp.acting_bytes(), 0, "nothing admitted");
@@ -85,7 +106,13 @@ fn an_invalid_script_is_still_refused_as_invalid() {
     let coins = vec![(prev(1), coin(p2wsh(&script)))];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     let err = mp
-        .accept_transaction(spend(&[prev(1)], &[&script]), &cs, &rust(), TxSource::P2p, false)
+        .accept_transaction(
+            spend(&[prev(1)], &[&script]),
+            &cs,
+            &rust(),
+            TxSource::P2p,
+            false,
+        )
         .expect_err("refused");
     assert!(matches!(err, MempoolError::Script(..)), "{err:?}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -99,7 +126,13 @@ fn acceptnonstdtxn_does_not_lift_the_policy_flags() {
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     mp.config.write().accept_non_std_txn = true;
     let err = mp
-        .accept_transaction(spend(&[prev(1)], &[UPGRADABLE_NOP]), &cs, &rust(), TxSource::Rpc, false)
+        .accept_transaction(
+            spend(&[prev(1)], &[UPGRADABLE_NOP]),
+            &cs,
+            &rust(),
+            TxSource::Rpc,
+            false,
+        )
         .expect_err("refused");
     assert!(matches!(err, MempoolError::PolicyScript(..)), "{err:?}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -109,18 +142,38 @@ fn acceptnonstdtxn_does_not_lift_the_policy_flags() {
 /// `bad-txns-nonstandard-inputs`, which `-acceptnonstdtxn` lifts.
 #[test]
 fn a_spend_of_an_unknown_script_type_is_nonstandard() {
-    let coins = vec![(prev(1), coin(ScriptBuf::from_bytes(vec![0x51]))), (prev(2), coin(ScriptBuf::from_bytes(vec![0x51])))];
+    let coins = vec![
+        (prev(1), coin(ScriptBuf::from_bytes(vec![0x51]))),
+        (prev(2), coin(ScriptBuf::from_bytes(vec![0x51]))),
+    ];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     let err = mp
-        .accept_transaction(spend(&[prev(1)], &[]), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .accept_transaction(
+            spend(&[prev(1)], &[]),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
         .expect_err("refused");
-    assert_eq!(err.state_string(), "bad-txns-nonstandard-inputs, input 0 script unknown");
-    let err = mp.test_accept(&spend(&[prev(1)], &[]), &cs, &NoopVerifier).expect_err("refused");
+    assert_eq!(
+        err.state_string(),
+        "bad-txns-nonstandard-inputs, input 0 script unknown"
+    );
+    let err = mp
+        .test_accept(&spend(&[prev(1)], &[]), &cs, &NoopVerifier)
+        .expect_err("refused");
     assert_eq!(err.reject_reason(), "bad-txns-nonstandard-inputs");
 
     mp.config.write().accept_non_std_txn = true;
-    mp.accept_transaction(spend(&[prev(2)], &[]), &cs, &NoopVerifier, TxSource::Rpc, false)
-        .expect("admitted with -acceptnonstdtxn");
+    mp.accept_transaction(
+        spend(&[prev(2)], &[]),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+    )
+    .expect("admitted with -acceptnonstdtxn");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -131,11 +184,23 @@ fn a_bloated_witness_is_nonstandard() {
     let coins = vec![(prev(1), coin(p2wsh(&script)))];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     let err = mp
-        .accept_transaction(spend(&[prev(1)], &[&[0u8; 81], &script]), &cs, &rust(), TxSource::Rpc, false)
+        .accept_transaction(
+            spend(&[prev(1)], &[&[0u8; 81], &script]),
+            &cs,
+            &rust(),
+            TxSource::Rpc,
+            false,
+        )
         .expect_err("refused");
     assert_eq!(err.reject_reason(), "bad-witness-nonstandard");
-    mp.accept_transaction(spend(&[prev(1)], &[&[0u8; 80], &script]), &cs, &rust(), TxSource::Rpc, false)
-        .expect("80 bytes is standard");
+    mp.accept_transaction(
+        spend(&[prev(1)], &[&[0u8; 80], &script]),
+        &cs,
+        &rust(),
+        TxSource::Rpc,
+        false,
+    )
+    .expect("80 bytes is standard");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -160,13 +225,27 @@ fn the_sigop_cost_of_a_transaction_is_capped_at_16000() {
 
     mp.config.write().accept_non_std_txn = true;
     let err = mp
-        .accept_transaction(spend(&five, &[&ws]), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .accept_transaction(
+            spend(&five, &[&ws]),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
         .expect_err("refused");
     assert_eq!(err.state_string(), "bad-txns-too-many-sigops, 19705");
-    let err = mp.test_accept(&spend(&five, &[&ws]), &cs, &NoopVerifier).expect_err("refused");
+    let err = mp
+        .test_accept(&spend(&five, &[&ws]), &cs, &NoopVerifier)
+        .expect_err("refused");
     assert_eq!(err.reject_reason(), "bad-txns-too-many-sigops");
-    mp.accept_transaction(spend(&four, &[&ws]), &cs, &NoopVerifier, TxSource::Rpc, false)
-        .expect("15764 is under the cap");
+    mp.accept_transaction(
+        spend(&four, &[&ws]),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+    )
+    .expect("15764 is under the cap");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -183,15 +262,26 @@ fn a_dust_parent_admission_applies_the_same_policy() {
     coins.extend((3..=7).map(|t| (prev(t), coin(p2wsh(&ws)))));
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
 
-    let err = mp.admit_dust_parent(spend(&[prev(1)], &[]), &cs, &NoopVerifier, TxSource::Rpc).map(|r| r.0).expect_err("refused");
+    let err = mp
+        .admit_dust_parent(spend(&[prev(1)], &[]), &cs, &NoopVerifier, TxSource::Rpc)
+        .map(|r| r.0)
+        .expect_err("refused");
     assert_eq!(err.reject_reason(), "bad-txns-nonstandard-inputs");
     let err = mp
-        .admit_dust_parent(spend(&[prev(2)], &[UPGRADABLE_NOP]), &cs, &rust(), TxSource::Rpc)
+        .admit_dust_parent(
+            spend(&[prev(2)], &[UPGRADABLE_NOP]),
+            &cs,
+            &rust(),
+            TxSource::Rpc,
+        )
         .map(|r| r.0)
         .expect_err("refused");
     assert!(matches!(err, MempoolError::PolicyScript(..)), "{err:?}");
     let five: Vec<_> = (3..=7).map(prev).collect();
-    let err = mp.admit_dust_parent(spend(&five, &[&ws]), &cs, &NoopVerifier, TxSource::Rpc).map(|r| r.0).expect_err("refused");
+    let err = mp
+        .admit_dust_parent(spend(&five, &[&ws]), &cs, &NoopVerifier, TxSource::Rpc)
+        .map(|r| r.0)
+        .expect_err("refused");
     assert_eq!(err.reject_reason(), "bad-txns-too-many-sigops");
     let _ = std::fs::remove_dir_all(&dir);
 }

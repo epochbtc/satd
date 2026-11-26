@@ -27,8 +27,7 @@ fn test_bip341_key_path_spending() {
     // Deserialize the fully signed transaction
     let tx_hex = kps["auxiliary"]["fullySignedTx"].as_str().unwrap();
     let tx_bytes = hex::decode(tx_hex).unwrap();
-    let tx: Transaction =
-        Transaction::consensus_decode(&mut tx_bytes.as_slice()).unwrap();
+    let tx: Transaction = Transaction::consensus_decode(&mut tx_bytes.as_slice()).unwrap();
 
     // Build UTXOs from the test vector
     let utxos_json = kps["given"]["utxosSpent"].as_array().unwrap();
@@ -46,19 +45,12 @@ fn test_bip341_key_path_spending() {
 
     assert_eq!(prev_outputs.len(), tx.input.len());
 
-    let script_flags = flags::VERIFY_P2SH
-        | flags::VERIFY_WITNESS
-        | flags::VERIFY_TAPROOT;
+    let script_flags = flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT;
 
     // Verify each input
     let mut verified = 0;
     for (i, (input, prev_out)) in tx.input.iter().zip(prev_outputs.iter()).enumerate() {
-        let checker = TxSignatureChecker::new(
-            &tx,
-            i,
-            prev_out.value,
-            &prev_outputs,
-        );
+        let checker = TxSignatureChecker::new(&tx, i, prev_out.value, &prev_outputs);
 
         let witness_stack: Vec<Vec<u8>> = input.witness.iter().map(|w| w.to_vec()).collect();
 
@@ -98,7 +90,11 @@ fn test_bip341_script_pubkey_construction() {
         let expected_spk_bytes = hex::decode(expected_spk).unwrap();
 
         // The scriptPubKey should be: OP_1 <32-byte-tweaked-pubkey>
-        assert_eq!(expected_spk_bytes.len(), 34, "test {i}: wrong scriptPubKey length");
+        assert_eq!(
+            expected_spk_bytes.len(),
+            34,
+            "test {i}: wrong scriptPubKey length"
+        );
         assert_eq!(expected_spk_bytes[0], 0x51, "test {i}: missing OP_1");
         assert_eq!(expected_spk_bytes[1], 0x20, "test {i}: missing push 32");
 
@@ -138,7 +134,7 @@ fn test_bip341_script_pubkey_construction() {
 }
 
 fn compute_tap_tweak(internal_pubkey: &[u8], merkle_root: Option<&[u8]>) -> Vec<u8> {
-    use bitcoin::hashes::{sha256, Hash, HashEngine};
+    use bitcoin::hashes::{Hash, HashEngine, sha256};
     let tag_hash = sha256::Hash::hash(b"TapTweak");
     let mut engine = sha256::Hash::engine();
     engine.input(tag_hash.as_byte_array());
@@ -158,9 +154,9 @@ fn compute_tap_tweak(internal_pubkey: &[u8], merkle_root: Option<&[u8]>) -> Vec<
 // tapscript leaves, then build spending transactions.
 // ---------------------------------------------------------------------------
 
-use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{self, Secp256k1, SecretKey, XOnlyPublicKey, Scalar, Parity, Keypair};
 use bitcoin::absolute::LockTime;
+use bitcoin::hashes::{Hash, HashEngine, sha256};
+use bitcoin::secp256k1::{self, Keypair, Parity, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::transaction::Version;
 use bitcoin::{OutPoint, Sequence, TxIn, Txid, Witness};
 
@@ -200,7 +196,10 @@ impl TaprootTestEnv {
         // Compute tweak
         let tweak = compute_tap_tweak_hash(&self.internal_key.serialize(), &merkle_root);
         let tweak_scalar = Scalar::from_be_bytes(tweak).unwrap();
-        let (tweaked_key, tweaked_parity) = self.internal_key.add_tweak(&self.secp, &tweak_scalar).unwrap();
+        let (tweaked_key, tweaked_parity) = self
+            .internal_key
+            .add_tweak(&self.secp, &tweak_scalar)
+            .unwrap();
 
         // Build scriptPubKey: OP_1 <32-byte tweaked key>
         let mut spk = vec![0x51, 0x20];
@@ -228,8 +227,10 @@ impl TaprootTestEnv {
         let merkle_root = tapleaf_hash; // single leaf
         let tweak = compute_tap_tweak_hash(&self.internal_key.serialize(), &merkle_root);
         let tweak_scalar = Scalar::from_be_bytes(tweak).unwrap();
-        let (tweaked_key, tweaked_parity) =
-            self.internal_key.add_tweak(&self.secp, &tweak_scalar).unwrap();
+        let (tweaked_key, tweaked_parity) = self
+            .internal_key
+            .add_tweak(&self.secp, &tweak_scalar)
+            .unwrap();
         let mut spk = vec![0x51, 0x20];
         spk.extend_from_slice(&tweaked_key.serialize());
         let parity_byte = leaf_version | if tweaked_parity == Parity::Odd { 1 } else { 0 };
@@ -285,9 +286,7 @@ fn build_taproot_spending_tx(
 
     let mut buf = Vec::new();
     bitcoin::consensus::Encodable::consensus_encode(&credit_tx, &mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
 
     // Build witness: [stack items..., leaf_script, control_block]
     let mut w = Witness::new();
@@ -356,7 +355,13 @@ fn script_path_accepts_unknown_leaf_version() {
 
     // Consensus flags (no discourage bit): accepted, anyone-can-spend.
     let consensus_flags = flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT;
-    let ok = verify_script(&[], spk.as_bytes(), &witness_stack, consensus_flags, &checker);
+    let ok = verify_script(
+        &[],
+        spk.as_bytes(),
+        &witness_stack,
+        consensus_flags,
+        &checker,
+    );
     assert!(
         ok.is_ok(),
         "unknown leaf version must be anyone-can-spend under consensus flags: {:?}",
@@ -417,7 +422,11 @@ fn test_tapscript_arithmetic() {
         flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
         &checker,
     );
-    assert!(result.is_ok(), "tapscript arithmetic failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "tapscript arithmetic failed: {:?}",
+        result.err()
+    );
 }
 
 /// Tapscript: OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF with TRUE witness
@@ -428,8 +437,7 @@ fn test_tapscript_if_true() {
     let leaf_script = vec![0x63, 0x51, 0x67, 0x00, 0x68];
     let (spk, control) = env.build_taproot_output(&leaf_script);
     // Push OP_1 (0x01 byte) as witness to satisfy the IF
-    let (tx, prev_outputs) =
-        build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![0x01]]);
+    let (tx, prev_outputs) = build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![0x01]]);
 
     let checker = TxSignatureChecker::new(&tx, 0, prev_outputs[0].value, &prev_outputs);
     let witness_stack: Vec<Vec<u8>> = tx.input[0].witness.iter().map(|w| w.to_vec()).collect();
@@ -441,7 +449,11 @@ fn test_tapscript_if_true() {
         flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
         &checker,
     );
-    assert!(result.is_ok(), "tapscript IF true failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "tapscript IF true failed: {:?}",
+        result.err()
+    );
 }
 
 /// Tapscript: OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF with FALSE witness
@@ -451,8 +463,7 @@ fn test_tapscript_if_false() {
     let leaf_script = vec![0x63, 0x51, 0x67, 0x00, 0x68];
     let (spk, control) = env.build_taproot_output(&leaf_script);
     // Push empty (false) as witness
-    let (tx, prev_outputs) =
-        build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![]]);
+    let (tx, prev_outputs) = build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![]]);
 
     let checker = TxSignatureChecker::new(&tx, 0, prev_outputs[0].value, &prev_outputs);
     let witness_stack: Vec<Vec<u8>> = tx.input[0].witness.iter().map(|w| w.to_vec()).collect();
@@ -475,8 +486,7 @@ fn test_tapscript_empty_pubkey_checksig() {
     let leaf_script = vec![0x00, 0xac]; // OP_0 OP_CHECKSIG
     let (spk, control) = env.build_taproot_output(&leaf_script);
     // Witness: dummy sig
-    let (tx, prev_outputs) =
-        build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![0x00]]);
+    let (tx, prev_outputs) = build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![0x00]]);
 
     let checker = TxSignatureChecker::new(&tx, 0, prev_outputs[0].value, &prev_outputs);
     let witness_stack: Vec<Vec<u8>> = tx.input[0].witness.iter().map(|w| w.to_vec()).collect();
@@ -502,8 +512,7 @@ fn test_tapscript_checkmultisig_forbidden() {
     leaf_script.push(0x51); // OP_1
     leaf_script.push(0xae); // OP_CHECKMULTISIG
     let (spk, control) = env.build_taproot_output(&leaf_script);
-    let (tx, prev_outputs) =
-        build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![]]);
+    let (tx, prev_outputs) = build_taproot_spending_tx(&spk, &leaf_script, &control, &[vec![]]);
 
     let checker = TxSignatureChecker::new(&tx, 0, prev_outputs[0].value, &prev_outputs);
     let witness_stack: Vec<Vec<u8>> = tx.input[0].witness.iter().map(|w| w.to_vec()).collect();
@@ -537,7 +546,11 @@ fn test_tapscript_op_success() {
         flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
         &checker,
     );
-    assert!(result.is_ok(), "OP_SUCCESS should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "OP_SUCCESS should succeed: {:?}",
+        result.err()
+    );
 }
 
 /// Tapscript: OP_SUCCESS with DISCOURAGE_OP_SUCCESS flag
@@ -601,7 +614,11 @@ fn test_tapscript_altstack_hash() {
         flags::VERIFY_P2SH | flags::VERIFY_WITNESS | flags::VERIFY_TAPROOT,
         &checker,
     );
-    assert!(result.is_ok(), "tapscript HASH160 test failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "tapscript HASH160 test failed: {:?}",
+        result.err()
+    );
 }
 
 /// Taproot: wrong control block size
@@ -613,8 +630,7 @@ fn test_taproot_wrong_control_size() {
 
     // Build with a truncated control block (only 10 bytes instead of 33)
     let bad_control = vec![0xc0; 10];
-    let (tx, prev_outputs) =
-        build_taproot_spending_tx(&spk, &leaf_script, &bad_control, &[]);
+    let (tx, prev_outputs) = build_taproot_spending_tx(&spk, &leaf_script, &bad_control, &[]);
 
     let checker = TxSignatureChecker::new(&tx, 0, prev_outputs[0].value, &prev_outputs);
     let witness_stack: Vec<Vec<u8>> = tx.input[0].witness.iter().map(|w| w.to_vec()).collect();
@@ -634,6 +650,12 @@ fn test_taproot_wrong_control_size() {
 /// (interpreter.h TAPROOT_CONTROL_MAX_SIZE); with 128 it spends.
 #[test]
 fn taproot_control_block_129_nodes_is_wrong_size() {
-    assert_eq!(script_edges::taproot_script_path_with_nodes(129).verify(), Err(ScriptError::TaprootWrongControlSize));
-    assert_eq!(script_edges::taproot_script_path_with_nodes(128).verify(), Ok(()));
+    assert_eq!(
+        script_edges::taproot_script_path_with_nodes(129).verify(),
+        Err(ScriptError::TaprootWrongControlSize)
+    );
+    assert_eq!(
+        script_edges::taproot_script_path_with_nodes(128).verify(),
+        Ok(())
+    );
 }

@@ -151,8 +151,11 @@ impl QuarantineView {
     /// A rule holding nothing still gets a row, with its match count, so a
     /// rule that never fires is visible as such.
     pub fn rule_rows(&self) -> Vec<QuarantineRuleRow> {
-        let held: &[QuarantineRuleStat] =
-            self.held.as_ref().map(|h| h.per_rule.as_slice()).unwrap_or(&[]);
+        let held: &[QuarantineRuleStat] = self
+            .held
+            .as_ref()
+            .map(|h| h.per_rule.as_slice())
+            .unwrap_or(&[]);
         let mut rows: Vec<QuarantineRuleRow> = self
             .rules
             .iter()
@@ -170,7 +173,10 @@ impl QuarantineView {
             .collect();
         for s in held {
             if !self.rules.iter().any(|(name, _)| name == &s.name) {
-                rows.push(QuarantineRuleRow { stat: s.clone(), matched: None });
+                rows.push(QuarantineRuleRow {
+                    stat: s.clone(),
+                    matched: None,
+                });
             }
         }
         rows.sort_by(|a, b| {
@@ -256,7 +262,8 @@ impl IbdBitmap {
         }
         let bitmap_b64 = v.get("bitmap")?.as_str()?;
         let bitmap = BASE64.decode(bitmap_b64).ok()?;
-        let peer_stats = v.get("peer_download_stats")?
+        let peer_stats = v
+            .get("peer_download_stats")?
             .as_array()?
             .iter()
             .filter_map(|p| {
@@ -319,14 +326,20 @@ impl OpReturnProgress {
         let o = v.get("opreturn_prune")?;
         let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
         Some(OpReturnProgress {
-            worker: o.get("worker").and_then(|w| w.as_str()).unwrap_or("").to_string(),
+            worker: o
+                .get("worker")
+                .and_then(|w| w.as_str())
+                .unwrap_or("")
+                .to_string(),
             blocks: u(o, "blocks"),
             scan: match (
                 o.get("examined_below_height").and_then(|n| n.as_u64()),
                 o.get("depth").and_then(|n| n.as_u64()),
                 v.get("blocks").and_then(|n| n.as_u64()),
             ) {
-                (Some(examined), Some(depth), Some(tip)) => Some((examined, tip.saturating_sub(depth.saturating_add(2)))),
+                (Some(examined), Some(depth), Some(tip)) => {
+                    Some((examined, tip.saturating_sub(depth.saturating_add(2))))
+                }
                 _ => None,
             },
             restore: o.get("restore").map(|r| RestoreView {
@@ -337,7 +350,9 @@ impl OpReturnProgress {
                     .and_then(|x| x.as_f64())
                     .filter(|x| x.is_finite())
                     .map(|x| x.clamp(0.0, 1.0)),
-                estimated_remaining_seconds: r.get("estimated_remaining_seconds").and_then(|s| s.as_u64()),
+                estimated_remaining_seconds: r
+                    .get("estimated_remaining_seconds")
+                    .and_then(|s| s.as_u64()),
                 peers: u(r, "peers"),
             }),
         })
@@ -534,19 +549,28 @@ fn parse_addressindex(v: Option<&serde_json::Value>) -> ListenerView<AddressInde
         Some(v) if !v.is_null() => v,
         _ => return ListenerView::Unknown,
     };
-    match (v.get("enabled").and_then(|x| x.as_bool()), v.get("complete").and_then(|x| x.as_bool())) {
-        (Some(enabled), Some(complete)) => ListenerView::Bound(AddressIndexStatus { enabled, complete }),
+    match (
+        v.get("enabled").and_then(|x| x.as_bool()),
+        v.get("complete").and_then(|x| x.as_bool()),
+    ) {
+        (Some(enabled), Some(complete)) => {
+            ListenerView::Bound(AddressIndexStatus { enabled, complete })
+        }
         _ => ListenerView::Unknown,
     }
 }
 
 fn parse_listener_view(v: Option<&serde_json::Value>) -> ListenerView<ListenerStatus> {
-    let Some(v) = v else { return ListenerView::Unknown };
+    let Some(v) = v else {
+        return ListenerView::Unknown;
+    };
     if v.is_null() {
         return ListenerView::NotBound;
     }
     match v.get("bind").and_then(|b| b.as_str()) {
-        Some(bind) => ListenerView::Bound(ListenerStatus { bind: bind.to_string() }),
+        Some(bind) => ListenerView::Bound(ListenerStatus {
+            bind: bind.to_string(),
+        }),
         // Object present but no usable bind — treat as unknown rather
         // than guessing at "off."
         None => ListenerView::Unknown,
@@ -560,13 +584,22 @@ impl BackfillProgress {
         Some(BackfillProgress {
             state,
             pass: bf.get("pass").and_then(|p| p.as_u64()).unwrap_or(0) as u8,
-            cursor_height: bf.get("cursor_height").and_then(|h| h.as_u64()).unwrap_or(0) as u32,
-            snapshot_height: bf.get("snapshot_height").and_then(|h| h.as_u64()).unwrap_or(0) as u32,
+            cursor_height: bf
+                .get("cursor_height")
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0) as u32,
+            snapshot_height: bf
+                .get("snapshot_height")
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0) as u32,
             estimated_remaining_seconds: bf
                 .get("estimated_remaining_seconds")
                 .and_then(|s| s.as_u64())
                 .unwrap_or(0),
-            last_error: bf.get("last_error").and_then(|s| s.as_str()).map(str::to_string),
+            last_error: bf
+                .get("last_error")
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
         })
     }
 
@@ -813,13 +846,24 @@ pub struct StartupStatus {
 impl StartupStatus {
     pub fn from_json(v: &serde_json::Value) -> Self {
         Self {
-            phase: v.get("phase").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-            message: v.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            phase: v
+                .get("phase")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            message: v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
             current: v.get("current").and_then(|n| n.as_u64()).unwrap_or(0),
             total: v.get("total").and_then(|n| n.as_u64()).unwrap_or(0),
             stop_height: v.get("stop_height").and_then(|n| n.as_u64()),
             elapsed_secs: v.get("elapsed_secs").and_then(|n| n.as_u64()).unwrap_or(0),
-            total_elapsed_secs: v.get("total_elapsed_secs").and_then(|n| n.as_u64()).unwrap_or(0),
+            total_elapsed_secs: v
+                .get("total_elapsed_secs")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0),
             rate: v.get("rate").and_then(|n| n.as_f64()),
             eta_secs: v.get("eta_secs").and_then(|n| n.as_u64()),
         }
@@ -1018,14 +1062,28 @@ impl AppState {
     /// Update from getblockchaininfo response.
     pub fn update_chain_info(&mut self, v: &serde_json::Value) {
         self.loaded.chain_info = true;
-        self.chain_name = v.get("chain").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        self.chain_name = v
+            .get("chain")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
         let new_blocks = v.get("blocks").and_then(|b| b.as_u64()).unwrap_or(0) as u32;
         let new_headers = v.get("headers").and_then(|h| h.as_u64()).unwrap_or(0) as u32;
-        self.best_block_hash = v.get("bestblockhash").and_then(|h| h.as_str()).unwrap_or("").to_string();
+        self.best_block_hash = v
+            .get("bestblockhash")
+            .and_then(|h| h.as_str())
+            .unwrap_or("")
+            .to_string();
         self.difficulty = v.get("difficulty").and_then(|d| d.as_f64()).unwrap_or(0.0);
         self.chain_time = v.get("time").and_then(|t| t.as_u64()).unwrap_or(0);
-        self.is_ibd = v.get("initialblockdownload").and_then(|b| b.as_bool()).unwrap_or(false);
-        self.verification_progress = v.get("verificationprogress").and_then(|p| p.as_f64()).unwrap_or(0.0);
+        self.is_ibd = v
+            .get("initialblockdownload")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        self.verification_progress = v
+            .get("verificationprogress")
+            .and_then(|p| p.as_f64())
+            .unwrap_or(0.0);
         self.opreturn = OpReturnProgress::from_json(v);
         if let Some(s) = v.get("chainwork").and_then(|c| c.as_str()) {
             self.chainwork_hex = s.to_string();
@@ -1055,7 +1113,8 @@ impl AppState {
                 if self.ibd_bitmap.is_none() {
                     let target = self.network_height.max(new_headers);
                     if self.blocks_per_sec > 0.01 && target > new_blocks {
-                        self.eta_secs = Some(((target - new_blocks) as f64 / self.blocks_per_sec) as u64);
+                        self.eta_secs =
+                            Some(((target - new_blocks) as f64 / self.blocks_per_sec) as u64);
                     } else {
                         self.eta_secs = None;
                     }
@@ -1079,7 +1138,11 @@ impl AppState {
 
         // Auto-detect mode
         if self.force_mode.is_none() {
-            self.mode = if self.is_ibd { ViewMode::Ibd } else { ViewMode::Steady };
+            self.mode = if self.is_ibd {
+                ViewMode::Ibd
+            } else {
+                ViewMode::Steady
+            };
         }
     }
 
@@ -1088,7 +1151,8 @@ impl AppState {
         self.loaded.peers = true;
         if let Some(arr) = v.as_array() {
             // Track max peer height (true network chain tip)
-            let max_height = arr.iter()
+            let max_height = arr
+                .iter()
                 .filter_map(|p| p.get("startingheight").and_then(|h| h.as_u64()))
                 .max()
                 .unwrap_or(0) as u32;
@@ -1106,7 +1170,10 @@ impl AppState {
         self.loaded.mempool = true;
         self.mempool_size = v.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
         self.mempool_bytes = v.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0);
-        self.mempool_min_fee = v.get("mempoolminfee").and_then(|f| f.as_f64()).unwrap_or(0.0);
+        self.mempool_min_fee = v
+            .get("mempoolminfee")
+            .and_then(|f| f.as_f64())
+            .unwrap_or(0.0);
     }
 
     /// Update from getconnectioncount response.
@@ -1137,7 +1204,8 @@ impl AppState {
                     // Download rate (blocks downloaded / sec) from total peer blocks_received
                     let total_dl: u64 = bm.peer_stats.iter().map(|s| s.blocks_received).sum();
                     if self.prev_total_downloaded > 0 {
-                        let raw_dl = total_dl.saturating_sub(self.prev_total_downloaded) as f64 / dt;
+                        let raw_dl =
+                            total_dl.saturating_sub(self.prev_total_downloaded) as f64 / dt;
                         self.dl_blocks_per_sec = 0.2 * raw_dl + 0.8 * self.dl_blocks_per_sec;
                         self.dl_history.push_back(self.dl_blocks_per_sec);
                         if self.dl_history.len() > HISTORY_CAP {
@@ -1194,12 +1262,16 @@ impl AppState {
     ///   High = target 1, Medium = target 3, Low = target 6, None = economy.
     pub fn update_fee_estimates(&mut self, v: &serde_json::Value) {
         self.loaded.fee_estimates = true;
-        let sat_per_vb = v.get("sat_per_vb").and_then(|b| b.as_bool()).unwrap_or(false);
+        let sat_per_vb = v
+            .get("sat_per_vb")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
 
         let parse_rate = |raw: &serde_json::Value| -> Option<f64> {
             // Values may be strings (new default units=btc path annotates them)
             // or numbers. Accept either.
-            let n = raw.as_f64()
+            let n = raw
+                .as_f64()
                 .or_else(|| raw.as_str().and_then(|s| s.parse().ok()))?;
             if sat_per_vb {
                 Some(n)
@@ -1231,7 +1303,10 @@ impl AppState {
             low,
             none,
             confidence: high_conf,
-            mode: v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()),
+            mode: v
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string()),
         };
     }
 
@@ -1240,7 +1315,8 @@ impl AppState {
         self.loaded.utxo = true;
         self.utxo_count = v.get("txouts").and_then(|t| t.as_u64());
         self.utxo_total_amount = v.get("total_amount").and_then(|a| a.as_f64());
-        self.utxo_age_dist = v.get("utxo_age_distribution")
+        self.utxo_age_dist = v
+            .get("utxo_age_distribution")
             .and_then(|d| d.get("counts"))
             .and_then(|c| c.as_array())
             .and_then(|arr| {
@@ -1421,7 +1497,9 @@ impl AppState {
     /// Update from `getquarantineinfo`. Ignored while no policy is loaded:
     /// `getpolicyinfo` decides whether the panel exists.
     pub fn update_quarantine_info(&mut self, v: &serde_json::Value) {
-        let Some(view) = self.quarantine.as_mut() else { return };
+        let Some(view) = self.quarantine.as_mut() else {
+            return;
+        };
         let u = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
         let per_rule = v
             .get("rules")
@@ -1512,9 +1590,16 @@ impl AppState {
         self.loaded.system = true;
         self.rss_bytes = v.get("rss_bytes").and_then(|r| r.as_u64());
         self.thread_count = v.get("threads").and_then(|t| t.as_u64()).map(|t| t as u32);
-        self.cache_dirty = v.get("cache_dirty").and_then(|c| c.as_u64()).map(|c| c as u32);
-        self.cache_clean = v.get("cache_clean").and_then(|c| c.as_u64()).map(|c| c as usize);
-        self.last_shutdown = v.get("last_shutdown")
+        self.cache_dirty = v
+            .get("cache_dirty")
+            .and_then(|c| c.as_u64())
+            .map(|c| c as u32);
+        self.cache_clean = v
+            .get("cache_clean")
+            .and_then(|c| c.as_u64())
+            .map(|c| c as usize);
+        self.last_shutdown = v
+            .get("last_shutdown")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
     }
@@ -1533,11 +1618,13 @@ impl AppState {
                     fork_height: r.get("fork_height")?.as_u64()? as u32,
                     old_tip: r.get("old_tip")?.as_str()?.to_string(),
                     new_tip: r.get("new_tip")?.as_str()?.to_string(),
-                    disconnected_len: r.get("disconnected")
+                    disconnected_len: r
+                        .get("disconnected")
                         .and_then(|a| a.as_array())
                         .map(|a| a.len())
                         .unwrap_or(0),
-                    reconnected_len: r.get("reconnected")
+                    reconnected_len: r
+                        .get("reconnected")
                         .and_then(|a| a.as_array())
                         .map(|a| a.len())
                         .unwrap_or(0),
@@ -1545,7 +1632,8 @@ impl AppState {
             })
             .collect();
         // Most-recent first for display.
-        self.reorg_history.sort_by(|a, b| b.ts_unix_secs.cmp(&a.ts_unix_secs));
+        self.reorg_history
+            .sort_by(|a, b| b.ts_unix_secs.cmp(&a.ts_unix_secs));
     }
 
     /// Cache the difficulty-epoch start anchor (height + header.time).
@@ -1778,7 +1866,11 @@ impl AppState {
     pub fn toggle_mode(&mut self, mode: ViewMode) {
         if self.force_mode == Some(mode) {
             self.force_mode = None;
-            self.mode = if self.is_ibd { ViewMode::Ibd } else { ViewMode::Steady };
+            self.mode = if self.is_ibd {
+                ViewMode::Ibd
+            } else {
+                ViewMode::Steady
+            };
         } else {
             self.force_mode = Some(mode);
             self.mode = mode;
@@ -1869,7 +1961,8 @@ impl AppState {
             .iter()
             .filter(|p| {
                 let id = p.get("id").and_then(|i| i.as_u64());
-                id.and_then(|id| self.behavior_for(id)).is_some_and(|b| b.is_flagged())
+                id.and_then(|id| self.behavior_for(id))
+                    .is_some_and(|b| b.is_flagged())
             })
             .collect()
     }
@@ -1924,7 +2017,11 @@ impl AppState {
     /// screen. A node that stops serving behaviour data closes it
     /// ([`Self::update_peer_behavior`]).
     pub fn shown_peer_detail(&self) -> Option<u64> {
-        if self.peers_view() { self.peer_detail } else { None }
+        if self.peers_view() {
+            self.peer_detail
+        } else {
+            None
+        }
     }
 
     /// Active view mode (respects force override).
@@ -1951,13 +2048,23 @@ impl AppState {
 
     /// Apply one `listnapattestations` poll.
     pub fn update_nap_publisher(&mut self, poll: crate::nap::Poll<Vec<crate::nap::Published>>) {
-        Self::apply_nap(&mut self.rpc_failures, "listnapattestations", &mut self.nap_publisher, poll);
+        Self::apply_nap(
+            &mut self.rpc_failures,
+            "listnapattestations",
+            &mut self.nap_publisher,
+            poll,
+        );
         self.leave_nap_view_if_off();
     }
 
     /// Apply one `getnapreport` poll.
     pub fn update_nap_report(&mut self, poll: crate::nap::Poll<crate::nap::Report>) {
-        Self::apply_nap(&mut self.rpc_failures, "getnapreport", &mut self.nap_report, poll);
+        Self::apply_nap(
+            &mut self.rpc_failures,
+            "getnapreport",
+            &mut self.nap_report,
+            poll,
+        );
         let rows = match &self.nap_report {
             crate::nap::Half::On(r) => r.value_rows().len(),
             _ => 0,
@@ -2018,7 +2125,9 @@ impl AppState {
 
     /// Move the NAP view's value selection by `delta` rows.
     pub fn move_nap_selection(&mut self, delta: isize) {
-        let crate::nap::Half::On(r) = &self.nap_report else { return };
+        let crate::nap::Half::On(r) = &self.nap_report else {
+            return;
+        };
         let last = r.value_rows().len().saturating_sub(1);
         self.selected_nap_row = self.selected_nap_row.saturating_add_signed(delta).min(last);
     }
@@ -2392,7 +2501,9 @@ mod tests {
 
     #[test]
     fn update_utxo_info_reads_the_exact_flag_and_tolerates_its_absence() {
-        let counts = json!([391947, 0, 997122, 2014141, 9811843, 10483379, 70283989, 71216488]);
+        let counts = json!([
+            391947, 0, 997122, 2014141, 9811843, 10483379, 70283989, 71216488
+        ]);
         let mut st = AppState::new();
         st.update_utxo_info(&json!({
             "txouts": 165_198_909u64,
@@ -2457,11 +2568,21 @@ mod tests {
             {"name": "bulk", "action": "quarantine", "matched": 7, "scope": {"relay": true, "template": true}},
             {"name": "friends", "action": "allow", "matched": 3},
         ])));
-        let q = st.quarantine.as_ref().expect("a loaded ruleset shows the panel");
+        let q = st
+            .quarantine
+            .as_ref()
+            .expect("a loaded ruleset shows the panel");
         assert_eq!((q.version, q.rules_count, q.fuel_exhausted), (1, 3, 2));
         assert_eq!((q.count, q.bytes, q.budget_bytes), (5, 1_500, 300_000_000));
-        assert_eq!(q.relay_withholding, 1, "one rule matching two shapes is one rule");
-        assert_eq!(q.rules, vec![("bulk".to_string(), 7)], "allow rules hold nothing and are left out");
+        assert_eq!(
+            q.relay_withholding, 1,
+            "one rule matching two shapes is one rule"
+        );
+        assert_eq!(
+            q.rules,
+            vec![("bulk".to_string(), 7)],
+            "allow rules hold nothing and are left out"
+        );
         assert!(q.held.is_none());
 
         // Removing the ruleset takes the panel away again.
@@ -2478,19 +2599,30 @@ mod tests {
         });
         let mut st = AppState::new();
         st.update_quarantine_info(&held);
-        assert!(st.quarantine.is_none(), "getpolicyinfo, not the rollup, creates the panel");
+        assert!(
+            st.quarantine.is_none(),
+            "getpolicyinfo, not the rollup, creates the panel"
+        );
 
-        st.update_policy_info(&policy_info(json!([{"name": "bulk", "action": "quarantine", "matched": 7}])));
+        st.update_policy_info(&policy_info(
+            json!([{"name": "bulk", "action": "quarantine", "matched": 7}]),
+        ));
         st.update_quarantine_info(&held);
         let q = st.quarantine.as_ref().unwrap();
-        assert_eq!((q.count, q.bytes), (6, 2_000), "the later reading of the totals wins");
+        assert_eq!(
+            (q.count, q.bytes),
+            (6, 2_000),
+            "the later reading of the totals wins"
+        );
         let h = q.held.as_ref().unwrap();
         assert_eq!((h.confirmed_anyway, h.foregone_fees_sat), (4, 12_345));
         assert_eq!(h.per_rule[0].max_fee_rate, 25_500);
 
         // The next policy poll keeps the rollup rather than blanking the
         // table until the rollup's own poll lands.
-        st.update_policy_info(&policy_info(json!([{"name": "bulk", "action": "quarantine", "matched": 8}])));
+        st.update_policy_info(&policy_info(
+            json!([{"name": "bulk", "action": "quarantine", "matched": 8}]),
+        ));
         assert!(st.quarantine.as_ref().unwrap().held.is_some());
     }
 
@@ -2515,11 +2647,19 @@ mod tests {
         let order: Vec<&str> = rows.iter().map(|r| r.stat.name.as_str()).collect();
         assert_eq!(
             order,
-            ["busy", "(infectious: quarantined ancestor)", "small", "idle"],
+            [
+                "busy",
+                "(infectious: quarantined ancestor)",
+                "small",
+                "idle"
+            ],
             "largest holding first; a rule holding nothing still gets a row",
         );
         assert_eq!(rows[0].matched, Some(50));
-        assert_eq!(rows[1].matched, None, "not a rule in the ruleset, so no counter");
+        assert_eq!(
+            rows[1].matched, None,
+            "not a rule in the ruleset, so no counter"
+        );
         assert_eq!(rows[3].stat.count, 0);
         assert_eq!(rows[3].matched, Some(0));
     }
@@ -2688,8 +2828,10 @@ mod tests {
     #[test]
     fn chain_work_bits_from_known_hex() {
         // 2^20 = 0x100000 → 20 bits exactly.
-        let v = chain_work_bits_from_hex("0000000000000000000000000000000000000000000000000000000000100000")
-            .expect("bits");
+        let v = chain_work_bits_from_hex(
+            "0000000000000000000000000000000000000000000000000000000000100000",
+        )
+        .expect("bits");
         assert!((v - 20.0).abs() < 1e-6, "got {}", v);
 
         // 2^256 - 1 max chainwork ≈ 256 bits.
@@ -2732,7 +2874,12 @@ mod tests {
 
         // Forward: next-epoch subsidy = 1.5625, supply at next ≈ supply + 3.125 * (210000 - 945000%210000).
         let forward = st.forward_annual_inflation().expect("forward");
-        assert!(forward < realized, "forward {} should be < realized {}", forward, realized);
+        assert!(
+            forward < realized,
+            "forward {} should be < realized {}",
+            forward,
+            realized
+        );
         assert!(forward > 0.0);
     }
 
@@ -2776,7 +2923,9 @@ mod tests {
             .iter()
             .map(|id| json!({"id": id, "subver": "/Satoshi:27.0.0/", "transport_protocol_type": "v2"}))
             .collect();
-        st.update_peer_behavior(crate::behavior::classify(Ok(crate::behavior::tests::reply())));
+        st.update_peer_behavior(crate::behavior::classify(Ok(
+            crate::behavior::tests::reply(),
+        )));
         st
     }
 
@@ -2788,7 +2937,10 @@ mod tests {
     }
 
     fn visible_ids(st: &AppState) -> Vec<u64> {
-        st.visible_peers().iter().filter_map(|p| p["id"].as_u64()).collect()
+        st.visible_peers()
+            .iter()
+            .filter_map(|p| p["id"].as_u64())
+            .collect()
     }
 
     #[test]
@@ -2803,7 +2955,10 @@ mod tests {
         st.move_peer_selection(1);
         st.move_peer_selection(1);
         st.move_peer_selection(1);
-        assert_eq!(st.selected_peer, 2, "the selection stays inside the filtered rows");
+        assert_eq!(
+            st.selected_peer, 2,
+            "the selection stays inside the filtered rows"
+        );
         st.toggle_flag_filter();
         assert_eq!(visible_ids(&st), [3, 7, 9, 11]);
 
@@ -2819,7 +2974,11 @@ mod tests {
         st.toggle_flag_filter();
         st.move_peer_selection(1);
         st.open_peer_detail();
-        assert_eq!(st.shown_peer_detail(), Some(7), "the second flagged row is peer 7");
+        assert_eq!(
+            st.shown_peer_detail(),
+            Some(7),
+            "the second flagged row is peer 7"
+        );
         // Another view hides it; coming back shows it again.
         st.force_mode = Some(ViewMode::Chain);
         assert_eq!(st.shown_peer_detail(), None);
@@ -2852,7 +3011,10 @@ mod tests {
         assert!(st.shown_peer_detail().is_some());
 
         st.update_peer_behavior(crate::behavior::Poll::Failed("timed out".into()));
-        assert!(st.peer_behavior.is_some(), "a failure keeps the last answer");
+        assert!(
+            st.peer_behavior.is_some(),
+            "a failure keeps the last answer"
+        );
         assert!(st.rpc_failures.contains_key("getpeerbehavior"));
 
         st.update_peer_behavior(mnf());
@@ -2899,9 +3061,16 @@ mod tests {
         assert!(st.peer_survey.is_none(), "survey off");
         assert!(!st.rpc_failures.contains_key("getpeersurvey"));
 
-        for code in [crate::rpc::JSONRPC_METHOD_NOT_FOUND, crate::survey::READONLY_REJECT_CODE, crate::survey::CAPABILITY_DENIED_CODE] {
+        for code in [
+            crate::rpc::JSONRPC_METHOD_NOT_FOUND,
+            crate::survey::READONLY_REJECT_CODE,
+            crate::survey::CAPABILITY_DENIED_CODE,
+        ] {
             st.update_peer_survey(classify(Ok(reply())));
-            st.update_peer_survey(classify(Err(crate::rpc::RpcError::Rpc { code, message: "no".into() })));
+            st.update_peer_survey(classify(Err(crate::rpc::RpcError::Rpc {
+                code,
+                message: "no".into(),
+            })));
             assert!(st.peer_survey.is_none(), "{code}");
             assert!(st.rpc_failures.is_empty(), "{code}: not an error");
         }
@@ -2912,7 +3081,10 @@ mod tests {
     /// with nothing failing; any other failure keeps the last answer.
     #[test]
     fn crawl_poll_shows_or_hides_the_row() {
-        use crate::crawl::{classify, tests::{off_reply, reply}};
+        use crate::crawl::{
+            classify,
+            tests::{off_reply, reply},
+        };
         let mut st = AppState::new();
         st.update_crawl(classify(Ok(reply())));
         assert_eq!(st.crawl.as_ref().map(|c| c.reachable), Some(21000));
@@ -2925,9 +3097,16 @@ mod tests {
         assert!(st.crawl.is_none(), "crawl off");
         assert!(!st.rpc_failures.contains_key("getcrawlinfo"));
 
-        for code in [crate::rpc::JSONRPC_METHOD_NOT_FOUND, crate::survey::READONLY_REJECT_CODE, crate::survey::CAPABILITY_DENIED_CODE] {
+        for code in [
+            crate::rpc::JSONRPC_METHOD_NOT_FOUND,
+            crate::survey::READONLY_REJECT_CODE,
+            crate::survey::CAPABILITY_DENIED_CODE,
+        ] {
             st.update_crawl(classify(Ok(reply())));
-            st.update_crawl(classify(Err(crate::rpc::RpcError::Rpc { code, message: "no".into() })));
+            st.update_crawl(classify(Err(crate::rpc::RpcError::Rpc {
+                code,
+                message: "no".into(),
+            })));
             assert!(st.crawl.is_none(), "{code}");
             assert!(st.rpc_failures.is_empty(), "{code}: not an error");
         }
@@ -2951,7 +3130,11 @@ mod tests {
 
     #[test]
     fn opreturn_progress_parses_a_restore_and_is_absent_otherwise() {
-        assert_eq!(OpReturnProgress::from_json(&json!({"blocks": 5})), None, "a node that never stripped");
+        assert_eq!(
+            OpReturnProgress::from_json(&json!({"blocks": 5})),
+            None,
+            "a node that never stripped"
+        );
         let v = json!({"opreturn_prune": {
             "worker": "restoring", "blocks": 40,
             "restore": {"total_blocks": 123, "remaining_blocks": 40, "progress_ratio": 0.675,
@@ -2961,16 +3144,40 @@ mod tests {
         assert_eq!(p.worker, "restoring");
         let r = p.restore.expect("restore");
         assert_eq!((r.total_blocks, r.remaining_blocks, r.peers), (123, 40, 3));
-        assert_eq!((r.progress_ratio, r.estimated_remaining_seconds), (Some(0.675), Some(240)));
-        let stripping = OpReturnProgress::from_json(&json!({"opreturn_prune": {"worker": "running", "blocks": 7}})).unwrap();
-        assert_eq!((stripping.blocks, stripping.restore, stripping.scan), (7, None, None));
+        assert_eq!(
+            (r.progress_ratio, r.estimated_remaining_seconds),
+            (Some(0.675), Some(240))
+        );
+        let stripping = OpReturnProgress::from_json(
+            &json!({"opreturn_prune": {"worker": "running", "blocks": 7}}),
+        )
+        .unwrap();
+        assert_eq!(
+            (stripping.blocks, stripping.restore, stripping.scan),
+            (7, None, None)
+        );
         let scanning = json!({"blocks": 973_593, "opreturn_prune": {
             "worker": "running", "blocks": 4, "depth": 288, "examined_below_height": 262_640}});
-        assert_eq!(OpReturnProgress::from_json(&scanning).unwrap().scan, Some((262_640, 973_303)), "the daemon's target");
+        assert_eq!(
+            OpReturnProgress::from_json(&scanning).unwrap().scan,
+            Some((262_640, 973_303)),
+            "the daemon's target"
+        );
         let hostile_depth = json!({"blocks": 10, "opreturn_prune": {"depth": u64::MAX, "examined_below_height": 0}});
-        assert_eq!(OpReturnProgress::from_json(&hostile_depth).unwrap().scan, Some((0, 0)), "no overflow");
+        assert_eq!(
+            OpReturnProgress::from_json(&hostile_depth).unwrap().scan,
+            Some((0, 0)),
+            "no overflow"
+        );
         let hostile = json!({"opreturn_prune": {"restore": {"progress_ratio": 7.5}}});
-        assert_eq!(OpReturnProgress::from_json(&hostile).unwrap().restore.unwrap().progress_ratio, Some(1.0));
+        assert_eq!(
+            OpReturnProgress::from_json(&hostile)
+                .unwrap()
+                .restore
+                .unwrap()
+                .progress_ratio,
+            Some(1.0)
+        );
     }
 
     #[test]
@@ -3275,7 +3482,10 @@ mod tests {
             }}
         });
         let bf = BackfillProgress::from_json(&v).unwrap();
-        assert_eq!(bf.last_error.as_deref(), Some("snapshot tip no longer on active chain"));
+        assert_eq!(
+            bf.last_error.as_deref(),
+            Some("snapshot tip no longer on active chain")
+        );
         assert!(bf.is_visible());
     }
 

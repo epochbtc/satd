@@ -178,7 +178,8 @@ impl EventPublisher {
     /// is live and a mempool tweak source is wired, the mempool bridge emits a
     /// `MempoolTweak` at each SP-eligible admission.
     pub fn mempool_tweak_subscriber_guard(&self) -> MempoolTweakSubscriberGuard {
-        self.mempool_tweak_subscribers.fetch_add(1, Ordering::Relaxed);
+        self.mempool_tweak_subscribers
+            .fetch_add(1, Ordering::Relaxed);
         MempoolTweakSubscriberGuard {
             count: self.mempool_tweak_subscribers.clone(),
         }
@@ -322,10 +323,7 @@ impl EventPublisher {
                 | NodeEventBody::MempoolTweak(_)
                 | NodeEventBody::Status(_)
         ) {
-            let mut ring = self
-                .replay_ring
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut ring = self.replay_ring.lock().unwrap_or_else(|p| p.into_inner());
             if ring.len() == self.replay_ring_cap {
                 ring.pop_front();
             }
@@ -355,14 +353,9 @@ impl EventPublisher {
     /// watermark older than the ring's oldest retained entry simply
     /// resumes from the window's start.
     pub fn replay_mempool_since(&self, after_seq: u64) -> Vec<NodeEvent> {
-        let ring = self
-            .replay_ring
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let ring = self.replay_ring.lock().unwrap_or_else(|p| p.into_inner());
         ring.iter()
-            .filter(|e| {
-                e.stamp.seq > after_seq && matches!(e.body, NodeEventBody::Mempool(_))
-            })
+            .filter(|e| e.stamp.seq > after_seq && matches!(e.body, NodeEventBody::Mempool(_)))
             .cloned()
             .collect()
     }
@@ -418,11 +411,7 @@ impl EventPublisher {
     /// traverse the same envelope path as real events so downstream
     /// consumers can probe end-to-end latency without an out-of-band
     /// channel. Production callers should pass [`HEARTBEAT_INTERVAL`].
-    pub fn spawn_heartbeat(
-        self: &Arc<Self>,
-        interval: Duration,
-        shutdown: watch::Receiver<bool>,
-    ) {
+    pub fn spawn_heartbeat(self: &Arc<Self>, interval: Duration, shutdown: watch::Receiver<bool>) {
         let publisher = self.clone();
         tokio::spawn(async move {
             heartbeat_loop(publisher, interval, shutdown).await;
@@ -647,9 +636,7 @@ mod tests {
 
     fn enter_event(byte: u8) -> MempoolEvent {
         MempoolEvent::Enter {
-            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-                [byte; 32],
-            )),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32])),
             fee: 100,
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
@@ -688,15 +675,18 @@ mod tests {
         let mut rx = publisher.subscribe();
         publisher.publish_status(StatusEvent::edge(StatusKind::IbdComplete, "synced"));
         let env = rx.try_recv().expect("status envelope");
-        assert!(env.cursor.is_none(), "status must not anchor a resume position");
+        assert!(
+            env.cursor.is_none(),
+            "status must not anchor a resume position"
+        );
         assert!(matches!(env.body, NodeEventBody::Status(_)));
     }
 
     fn block_event(byte: u8, height: u32) -> ChainEvent {
         ChainEvent::BlockConnected {
-            hash: BlockHash::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]),
-            ),
+            hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [byte; 32],
+            )),
             height,
         }
     }
@@ -707,8 +697,7 @@ mod tests {
         use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
         let secp = Secp256k1::new();
         let pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap());
-        let txid =
-            Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]));
+        let txid = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]));
         TweakEntry {
             txid,
             tweak: pk,
@@ -728,8 +717,9 @@ mod tests {
     }
     impl MempoolTweakSource for FakeTweakSource {
         fn cached_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
-            let want =
-                Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([self.byte; 32]));
+            let want = Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [self.byte; 32],
+            ));
             (txid == &want).then(|| tweak_entry(self.byte))
         }
     }
@@ -1029,7 +1019,10 @@ mod tests {
 
         let envs = received.lock().clone();
         assert_eq!(envs.len(), 2);
-        let delta = envs[1].stamp.edge_wall_ns.saturating_sub(envs[0].stamp.edge_wall_ns);
+        let delta = envs[1]
+            .stamp
+            .edge_wall_ns
+            .saturating_sub(envs[0].stamp.edge_wall_ns);
         assert!(
             delta > 10_000_000,
             "edge_wall_ns delta should reflect real elapsed time (got {} ns)",

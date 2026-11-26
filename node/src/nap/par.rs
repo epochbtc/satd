@@ -30,12 +30,18 @@ pub(super) fn map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> 
     std::thread::scope(|s| {
         let shares: Vec<_> = items
             .chunks(items.len().div_ceil(threads))
-            .map(|share| spawn(s, move || share.iter().map(f).collect::<Vec<R>>()).map_err(|_| share))
+            .map(|share| {
+                spawn(s, move || share.iter().map(f).collect::<Vec<R>>()).map_err(|_| share)
+            })
             .collect();
         let mut out = Vec::with_capacity(items.len());
         for share in shares {
             match share {
-                Ok(handle) => out.extend(handle.join().unwrap_or_else(|p| std::panic::resume_unwind(p))),
+                Ok(handle) => out.extend(
+                    handle
+                        .join()
+                        .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                ),
                 Err(share) => out.extend(share.iter().map(f)),
             }
         }
@@ -50,7 +56,12 @@ pub(crate) fn join<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() ->
     std::thread::scope(|s| match spawn(s, a) {
         Ok(handle) => {
             let b = b();
-            (handle.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), b)
+            (
+                handle
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                b,
+            )
         }
         Err(a) => (a(), b()),
     })
@@ -69,12 +80,20 @@ fn spawn<'scope, T: Send + 'scope, F: FnOnce() -> T + Send + 'scope>(
     // can take `f` from, and `f` is left there if the thread never ran.
     let slot = std::sync::Arc::new(parking_lot::Mutex::new(Some(f)));
     let theirs = slot.clone();
-    match std::thread::Builder::new().name("nap-par".into()).spawn_scoped(s, move || {
-        let f = theirs.lock().take().expect("a started thread finds its work");
-        f()
-    }) {
+    match std::thread::Builder::new()
+        .name("nap-par".into())
+        .spawn_scoped(s, move || {
+            let f = theirs
+                .lock()
+                .take()
+                .expect("a started thread finds its work");
+            f()
+        }) {
         Ok(handle) => Ok(handle),
-        Err(_) => Err(slot.lock().take().expect("a thread that never started left its work")),
+        Err(_) => Err(slot
+            .lock()
+            .take()
+            .expect("a thread that never started left its work")),
     }
 }
 
@@ -114,7 +133,11 @@ mod tests {
     fn a_map_keeps_the_order_of_its_items() {
         let items: Vec<u32> = (0..10_000).collect();
         for n in [1, 2, 3, 7, 64] {
-            assert_eq!(with_threads(n, || map(&items, |x| x * 2)), items.iter().map(|x| x * 2).collect::<Vec<_>>(), "{n}");
+            assert_eq!(
+                with_threads(n, || map(&items, |x| x * 2)),
+                items.iter().map(|x| x * 2).collect::<Vec<_>>(),
+                "{n}"
+            );
         }
         assert!(with_threads(4, || map(&[] as &[u32], |x| *x)).is_empty());
     }
@@ -125,10 +148,16 @@ mod tests {
         let names = map(&items, |_| std::thread::current().name().map(str::to_owned));
         let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         if cores > 1 {
-            assert!(names.iter().all(|n| n.as_deref() == Some("nap-par")), "every share on a thread of its own");
+            assert!(
+                names.iter().all(|n| n.as_deref() == Some("nap-par")),
+                "every share on a thread of its own"
+            );
         }
         let small = map(&items[..MIN_PER_THREAD], |_| std::thread::current().id());
-        assert!(small.iter().all(|id| *id == std::thread::current().id()), "a small map stays on the caller's thread");
+        assert!(
+            small.iter().all(|id| *id == std::thread::current().id()),
+            "a small map stays on the caller's thread"
+        );
     }
 
     /// Perturbation: drop either fallback to the caller's thread and this
@@ -138,14 +167,23 @@ mod tests {
         let items: Vec<u32> = (0..10_000).collect();
         let me = std::thread::current().id();
         let (ids, doubled) = without_threads(|| {
-            with_threads(4, || (map(&items, |_| std::thread::current().id()), map(&items, |x| x * 2)))
+            with_threads(4, || {
+                (
+                    map(&items, |_| std::thread::current().id()),
+                    map(&items, |x| x * 2),
+                )
+            })
         });
         assert!(ids.iter().all(|id| *id == me));
         assert_eq!(doubled, items.iter().map(|x| x * 2).collect::<Vec<_>>());
         let (a, b) = without_threads(|| join(|| std::thread::current().id(), || 7));
         assert_eq!((a, b), (me, 7));
         let (a, b) = join(|| std::thread::current().name().map(str::to_owned), || 7);
-        assert_eq!((a.as_deref(), b), (Some("nap-par"), 7), "with threads, on a thread of its own");
+        assert_eq!(
+            (a.as_deref(), b),
+            (Some("nap-par"), 7),
+            "with threads, on a thread of its own"
+        );
     }
 
     #[test]

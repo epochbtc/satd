@@ -155,7 +155,10 @@ fn init_xor_key(blocks_dir: &Path, mode: XorMode) -> std::io::Result<[u8; 8]> {
     };
     // create_new: never clobber a key racing into existence — a wrong key
     // silently corrupts every subsequent write.
-    let mut f = OpenOptions::new().write(true).create_new(true).open(&path)?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
     f.write_all(&key)?;
     f.sync_all()?;
     Ok(key)
@@ -323,7 +326,11 @@ impl FlatFileManager {
     /// [`FAST_PRUNE_FILE_SIZE`] bytes instead of every 128 MiB, so a prune
     /// on a short test chain has whole files it can delete.
     pub fn set_fast_prune(&mut self, fast: bool) {
-        self.max_file_size = if fast { FAST_PRUNE_FILE_SIZE } else { MAX_FILE_SIZE };
+        self.max_file_size = if fast {
+            FAST_PRUNE_FILE_SIZE
+        } else {
+            MAX_FILE_SIZE
+        };
     }
 
     pub fn with_xor_mode(blocks_dir: &Path, mode: XorMode) -> std::io::Result<Self> {
@@ -398,8 +405,7 @@ impl FlatFileManager {
     }
 
     fn file_path(&self, file_number: u32) -> PathBuf {
-        self.blocks_dir
-            .join(format!("blk{:05}.dat", file_number))
+        self.blocks_dir.join(format!("blk{:05}.dat", file_number))
     }
 
     /// [`Self::write_block`] for a writer that commits an index entry
@@ -488,10 +494,7 @@ impl FlatFileManager {
             None => {
                 let path = self.file_path(self.current_file);
                 let existed = path.exists();
-                let f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)?;
+                let f = OpenOptions::new().create(true).append(true).open(&path)?;
                 if !existed {
                     // fsync the directory so the new file's name is durable.
                     // Without this a power loss can leave a fully-fsync'd blk
@@ -702,7 +705,10 @@ impl FlatFileManager {
         self.dirty = false;
         let path = self.file_path(self.current_file);
         if path.exists() {
-            OpenOptions::new().write(true).open(&path)?.set_len(self.synced_len)?;
+            OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(self.synced_len)?;
         }
         self.current_pos = self.synced_len;
         self.read_cache.clear();
@@ -818,7 +824,9 @@ impl FlatFileManager {
         let mut header = [0u8; 8];
         file.read_exact(&mut header)?;
         xor_in_place(&mut header, &self.xor_key, pos.data_pos as u64);
-        Ok(u32::from_le_bytes([header[4], header[5], header[6], header[7]]))
+        Ok(u32::from_le_bytes([
+            header[4], header[5], header[6], header[7],
+        ]))
     }
 
     /// A cached reader for `file_number`.
@@ -832,7 +840,10 @@ impl FlatFileManager {
             let f = File::open(self.file_path(file_number))?;
             self.read_cache.insert(file_number, f);
         }
-        Ok(self.read_cache.get_mut(&file_number).expect("inserted above"))
+        Ok(self
+            .read_cache
+            .get_mut(&file_number)
+            .expect("inserted above"))
     }
 
     /// Read a block from the flat files at the given position.
@@ -942,11 +953,7 @@ impl FlatFileManager {
     /// overshoot the actual file set are fine). Use this when you know
     /// which file numbers contain the blocks you care about — it
     /// avoids the full-scan cost of `for_each_block`.
-    pub fn for_each_block_in_files<I, F>(
-        &self,
-        files: I,
-        mut visit: F,
-    ) -> std::io::Result<u64>
+    pub fn for_each_block_in_files<I, F>(&self, files: I, mut visit: F) -> std::io::Result<u64>
     where
         I: IntoIterator<Item = u32>,
         F: FnMut(&[u8], FlatFilePos) -> std::ops::ControlFlow<()>,
@@ -1220,8 +1227,7 @@ mod tests {
 
     #[test]
     fn delete_file_refuses_the_current_append_file() {
-        let dir = std::env::temp_dir()
-            .join(format!("satd-flatfile-delcur-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("satd-flatfile-delcur-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut mgr = FlatFileManager::new(&dir).unwrap();
         let magic = [0xfa, 0xbf, 0xb5, 0xda];
@@ -1351,7 +1357,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let mgr = FlatFileManager::new(dir).unwrap();
-        assert_eq!(mgr.first_gap(), None, "an empty dir has nothing out of reach");
+        assert_eq!(
+            mgr.first_gap(),
+            None,
+            "an empty dir has nothing out of reach"
+        );
 
         let touch = |n: u32| std::fs::write(dir.join(format!("blk{n:05}.dat")), b"").unwrap();
         touch(0);
@@ -1385,7 +1395,8 @@ mod tests {
 
     #[test]
     fn test_read_nonexistent() {
-        let dir = std::env::temp_dir().join(format!("satd-flatfile-noexist-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("satd-flatfile-noexist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut mgr = FlatFileManager::new(&dir).unwrap();
@@ -1515,7 +1526,10 @@ mod tests {
         mgr.write_block(&vec![0xBB; 512], magic, 0).unwrap(); // dirty file 0 again
         mgr.current_pos = MAX_FILE_SIZE - 4; // next record won't fit
         let pos_c = mgr.write_block(&vec![0xCC; 1024], magic, 0).unwrap();
-        assert_eq!(pos_c.file_number, 1, "write must have rotated to a new file");
+        assert_eq!(
+            pos_c.file_number, 1,
+            "write must have rotated to a new file"
+        );
         assert!(mgr.has_unsynced_writes(), "new current file is dirty");
         mgr.sync_all().unwrap();
         assert!(!mgr.has_unsynced_writes());
@@ -1677,7 +1691,11 @@ mod tests {
         assert_eq!(mgr.highest_height_written(0), Some(9));
 
         mgr.delete_file(0).unwrap();
-        assert_eq!(mgr.highest_height_written(0), None, "a deleted file is forgotten");
+        assert_eq!(
+            mgr.highest_height_written(0),
+            None,
+            "a deleted file is forgotten"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1691,13 +1709,20 @@ mod tests {
         let mut mgr = FlatFileManager::new(&dir).unwrap();
         mgr.write_block(&[0x11; 100], magic, 1).unwrap();
         // File 1 already exists and is nearly full, as after a pruning gap.
-        std::fs::write(dir.join("blk00001.dat"), vec![0u8; (MAX_FILE_SIZE - 50) as usize]).unwrap();
+        std::fs::write(
+            dir.join("blk00001.dat"),
+            vec![0u8; (MAX_FILE_SIZE - 50) as usize],
+        )
+        .unwrap();
         mgr.current_pos = MAX_FILE_SIZE - 4;
 
         let pos = mgr.write_block(&[0x22; 100], magic, 2).unwrap();
 
         assert_eq!(pos.file_number, 2, "the record must skip the full file");
-        assert_eq!(std::fs::metadata(dir.join("blk00001.dat")).unwrap().len(), MAX_FILE_SIZE - 50);
+        assert_eq!(
+            std::fs::metadata(dir.join("blk00001.dat")).unwrap().len(),
+            MAX_FILE_SIZE - 50
+        );
         assert_eq!(mgr.read_block(&pos).unwrap(), vec![0x22; 100]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1714,7 +1739,10 @@ mod tests {
         mgr.write_block(b"block two", magic, 2).unwrap();
         handle.sync().unwrap();
         mgr.mark_synced(handle);
-        assert!(mgr.has_unsynced_writes(), "block two was written after the handle");
+        assert!(
+            mgr.has_unsynced_writes(),
+            "block two was written after the handle"
+        );
 
         let handle = mgr.sync_handle().unwrap().unwrap();
         handle.sync().unwrap();
@@ -1744,7 +1772,11 @@ mod tests {
         assert_eq!(mgr.files_with_pending_records(), [0, 1].into());
 
         drop(first);
-        assert_eq!(mgr.files_with_pending_records(), [0, 1].into(), "file 0 holds block two");
+        assert_eq!(
+            mgr.files_with_pending_records(),
+            [0, 1].into(),
+            "file 0 holds block two"
+        );
         drop(second);
         assert_eq!(mgr.files_with_pending_records(), [1].into());
         drop(third);
@@ -1814,7 +1846,11 @@ mod tests {
         // On-disk bytes must NOT contain the plaintext run when keyed.
         if key != ZERO_XOR_KEY {
             let raw = std::fs::read(dir.join("blk00000.dat")).unwrap();
-            assert_ne!(&raw[8..16], &[0x11; 8], "payload must be obfuscated on disk");
+            assert_ne!(
+                &raw[8..16],
+                &[0x11; 8],
+                "payload must be obfuscated on disk"
+            );
         }
 
         // Reopen with the plain constructor: xor.dat is honored automatically.
@@ -1867,7 +1903,10 @@ mod tests {
         let mut mgr = FlatFileManager::new(&dir).unwrap();
         assert_eq!(mgr.xor_key(), key);
         for (p, &data_pos) in payloads.iter().zip(&positions) {
-            let pos = FlatFilePos { file_number: 0, data_pos };
+            let pos = FlatFilePos {
+                file_number: 0,
+                data_pos,
+            };
             assert_eq!(mgr.read_block(&pos).unwrap(), *p);
         }
         let mut seen = Vec::new();
@@ -1876,7 +1915,10 @@ mod tests {
             std::ops::ControlFlow::Continue(())
         })
         .unwrap();
-        assert_eq!(seen, payloads.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        assert_eq!(
+            seen,
+            payloads.iter().map(|p| p.to_vec()).collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1901,7 +1943,10 @@ mod tests {
         // File 0's padding starts at a multiple of 8, where this key's last
         // four bytes read as a length of 16: without the padding check, the
         // padding would pass for records.
-        for key in [ZERO_XOR_KEY, [0x8f, 0x1a, 0x00, 0xc4, 0x10, 0x00, 0x00, 0x00]] {
+        for key in [
+            ZERO_XOR_KEY,
+            [0x8f, 0x1a, 0x00, 0xc4, 0x10, 0x00, 0x00, 0x00],
+        ] {
             let dir = temp_dir("header-scan");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("xor.dat"), key).unwrap();
@@ -1931,7 +1976,11 @@ mod tests {
             let mut full = Vec::new();
             let full_count = mgr
                 .for_each_block(|data, pos| {
-                    full.push((data[..data.len().min(80)].to_vec(), pos.file_number, pos.data_pos));
+                    full.push((
+                        data[..data.len().min(80)].to_vec(),
+                        pos.file_number,
+                        pos.data_pos,
+                    ));
                     std::ops::ControlFlow::Continue(())
                 })
                 .unwrap();
@@ -1945,7 +1994,11 @@ mod tests {
                 .unwrap();
             let header_bytes = mgr.scan_bytes_read() - full_bytes;
 
-            assert_eq!(full.len(), 17, "key {key:?}: every whole record, nothing after");
+            assert_eq!(
+                full.len(),
+                17,
+                "key {key:?}: every whole record, nothing after"
+            );
             assert_eq!(headers, full, "key {key:?}");
             assert_eq!(header_count, full_count, "key {key:?}");
             // At most one read per record, plus one per file for what ends it.
@@ -1953,7 +2006,10 @@ mod tests {
                 header_bytes <= (17 + 3) * HEADER_SCAN_CHUNK as u64,
                 "key {key:?}: the header scan read {header_bytes} bytes"
             );
-            assert!(header_bytes < full_bytes / 2, "key {key:?}: {header_bytes} of {full_bytes}");
+            assert!(
+                header_bytes < full_bytes / 2,
+                "key {key:?}: {header_bytes} of {full_bytes}"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -2030,8 +2086,11 @@ mod tests {
         let mut mgr = FlatFileManager::with_xor_mode(&dir, XorMode::Enabled).unwrap();
         assert_eq!(mgr.xor_key(), ZERO_XOR_KEY);
         assert_eq!(
-            mgr.read_block(&FlatFilePos { file_number: 0, data_pos: 0 })
-                .unwrap(),
+            mgr.read_block(&FlatFilePos {
+                file_number: 0,
+                data_pos: 0
+            })
+            .unwrap(),
             b"old plaintext block"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2072,7 +2131,8 @@ mod tests {
         std::fs::write(dir.join("xor.dat"), [0xAA; 8]).unwrap();
         let pos = {
             let mut mgr = FlatFileManager::new(&dir).unwrap();
-            mgr.write_block(&[0x44; 2048], [0xf9, 0xbe, 0xb4, 0xd9], 0).unwrap()
+            mgr.write_block(&[0x44; 2048], [0xf9, 0xbe, 0xb4, 0xd9], 0)
+                .unwrap()
         };
         // Swap the key out from under the files.
         std::fs::write(dir.join("xor.dat"), [0x55; 8]).unwrap();

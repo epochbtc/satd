@@ -5,7 +5,9 @@ use bitcoin::OutPoint;
 use bitcoin::hashes::Hash as _;
 
 use super::CoinCache;
-use crate::index::address::{AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKeyV3, AddrSpendingRowV3, Scripthash};
+use crate::index::address::{
+    AddrFundingKeyV3, AddrFundingRowV3, AddrSpendingKeyV3, AddrSpendingRowV3, Scripthash,
+};
 use crate::storage::coinview::Coin;
 use crate::storage::db::InMemoryStore;
 use crate::storage::{AddrRowKey, Store, StoreBatch};
@@ -39,7 +41,11 @@ fn walk(store: &dyn Store, min_txs: usize) -> Vec<AddrRowKey> {
     loop {
         let run = store.addr_rows_desc(&SH, below, min_txs);
         if let (Some(prev), Some(first)) = (out.last(), run.rows.first()) {
-            assert!(first.txseq < prev.txseq, "ordinal {} split across runs", prev.txseq);
+            assert!(
+                first.txseq < prev.txseq,
+                "ordinal {} split across runs",
+                prev.txseq
+            );
         }
         out.extend(run.rows);
         match run.next_below {
@@ -62,7 +68,9 @@ fn pending_rows_merge_as_the_flush_will_write_them() {
         funding(8, 0),
         funding(12, 0),
     ]);
-    flushed.addr_spending_puts.extend([spending(6, 0), spending(9, 0)]);
+    flushed
+        .addr_spending_puts
+        .extend([spending(6, 0), spending(9, 0)]);
     cache.write_batch(flushed).unwrap();
     cache.flush_durable().unwrap();
 
@@ -70,14 +78,26 @@ fn pending_rows_merge_as_the_flush_will_write_them() {
     // row for a flushed ordinal, a flushed row removed, a flushed ordinal
     // removed outright, and a put and a remove of one key in one batch.
     let mut pending = StoreBatch::default();
-    pending.addr_funding_puts.extend([funding(14, 0), funding(5, 0), funding(4, 2), funding(3, 0)]);
-    pending.addr_funding_removes.extend([
-        AddrFundingKeyV3 { scripthash: SH, txseq: 8, vout: 0 },
-        AddrFundingKeyV3 { scripthash: SH, txseq: 3, vout: 0 },
-    ]);
     pending
-        .addr_spending_removes
-        .push(AddrSpendingKeyV3 { scripthash: SH, txseq: 9, vin: 0 });
+        .addr_funding_puts
+        .extend([funding(14, 0), funding(5, 0), funding(4, 2), funding(3, 0)]);
+    pending.addr_funding_removes.extend([
+        AddrFundingKeyV3 {
+            scripthash: SH,
+            txseq: 8,
+            vout: 0,
+        },
+        AddrFundingKeyV3 {
+            scripthash: SH,
+            txseq: 3,
+            vout: 0,
+        },
+    ]);
+    pending.addr_spending_removes.push(AddrSpendingKeyV3 {
+        scripthash: SH,
+        txseq: 9,
+        vin: 0,
+    });
     // A coin keeps the batch in the cache rather than passing it through.
     pending.coin_puts.push((
         OutPoint {
@@ -94,8 +114,16 @@ fn pending_rows_merge_as_the_flush_will_write_them() {
     ));
     cache.write_batch(pending).unwrap();
 
-    let f = |txseq, index| AddrRowKey { txseq, spending: false, index };
-    let s = |txseq, index| AddrRowKey { txseq, spending: true, index };
+    let f = |txseq, index| AddrRowKey {
+        txseq,
+        spending: false,
+        index,
+    };
+    let s = |txseq, index| AddrRowKey {
+        txseq,
+        spending: true,
+        index,
+    };
     let expected = vec![
         f(14, 0),
         f(12, 0),
@@ -108,10 +136,18 @@ fn pending_rows_merge_as_the_flush_will_write_them() {
         f(2, 0),
     ];
     for min_txs in 1..=8 {
-        assert_eq!(walk(&cache, min_txs), expected, "before the flush, runs of {min_txs}");
+        assert_eq!(
+            walk(&cache, min_txs),
+            expected,
+            "before the flush, runs of {min_txs}"
+        );
     }
     cache.flush_durable().unwrap();
     for min_txs in [1, 3, 8] {
-        assert_eq!(walk(&cache, min_txs), expected, "after the flush, runs of {min_txs}");
+        assert_eq!(
+            walk(&cache, min_txs),
+            expected,
+            "after the flush, runs of {min_txs}"
+        );
     }
 }

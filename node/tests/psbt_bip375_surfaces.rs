@@ -31,7 +31,8 @@ fn vectors(group: &str) -> Vec<(String, Vec<u8>)> {
         .map(|v| {
             (
                 v["description"].as_str().unwrap_or_default().to_string(),
-                B64.decode(v["psbt"].as_str().expect("base64")).expect("base64"),
+                B64.decode(v["psbt"].as_str().expect("base64"))
+                    .expect("base64"),
             )
         })
         .collect()
@@ -46,7 +47,8 @@ fn bip370_valid() -> Vec<(String, Vec<u8>)> {
         .map(|v| {
             (
                 v["description"].as_str().unwrap_or_default().to_string(),
-                B64.decode(v["psbt"].as_str().expect("base64")).expect("base64"),
+                B64.decode(v["psbt"].as_str().expect("base64"))
+                    .expect("base64"),
             )
         })
         .collect()
@@ -56,8 +58,11 @@ fn bip370_valid() -> Vec<(String, Vec<u8>)> {
 const UNKNOWN_TYPE: u64 = 0x7a;
 
 fn plant_unknowns(raw: &mut RawPsbt) {
-    raw.global
-        .set(RawPair::new(UNKNOWN_TYPE, b"global".to_vec(), b"g-value".to_vec()));
+    raw.global.set(RawPair::new(
+        UNKNOWN_TYPE,
+        b"global".to_vec(),
+        b"g-value".to_vec(),
+    ));
     for (i, map) in raw.inputs.iter_mut().enumerate() {
         map.set(RawPair::new(
             UNKNOWN_TYPE,
@@ -113,7 +118,14 @@ fn losses_values(before: &RawPsbt, after: &RawPsbt, may_change: &[u64]) -> Vec<S
 
 fn losses_opt(before: &RawPsbt, after: &RawPsbt, may_change: &[u64], order: bool) -> Vec<String> {
     let mut out = Vec::new();
-    check_map("global map", &before.global, &after.global, may_change, order, &mut out);
+    check_map(
+        "global map",
+        &before.global,
+        &after.global,
+        may_change,
+        order,
+        &mut out,
+    );
     for (i, map) in before.inputs.iter().enumerate() {
         match after.inputs.get(i) {
             Some(a) => check_map(&format!("input {i}"), map, a, may_change, order, &mut out),
@@ -179,7 +191,9 @@ fn the_loss_checker_notices_a_lossy_codec() {
         "{description}: a codec that strips unknown and BIP 375 pairs must be detected"
     );
     assert!(
-        found.iter().any(|l| l.contains(&format!("{UNKNOWN_TYPE:#x}"))),
+        found
+            .iter()
+            .any(|l| l.contains(&format!("{UNKNOWN_TYPE:#x}"))),
         "the planted unknown pairs should be among the losses: {found:?}"
     );
     assert!(
@@ -252,8 +266,14 @@ fn bip375_survives_decodepsbt() {
         let Some(info) = map.get_single(keys::output::SP_V0_INFO) else {
             continue;
         };
-        assert_eq!(out["outputs"][i]["silent_payment"]["scan_key"], hex::encode(&info[..33]));
-        assert_eq!(out["outputs"][i]["silent_payment"]["spend_key"], hex::encode(&info[33..]));
+        assert_eq!(
+            out["outputs"][i]["silent_payment"]["scan_key"],
+            hex::encode(&info[..33])
+        );
+        assert_eq!(
+            out["outputs"][i]["silent_payment"]["spend_key"],
+            hex::encode(&info[33..])
+        );
     }
 }
 
@@ -322,7 +342,8 @@ fn bip375_survives_analyzepsbt() {
 
             let awaiting = raw.outputs.iter().any(|o| {
                 o.contains_type(keys::output::SP_V0_INFO)
-                    && o.get_single(keys::output::SCRIPT).is_none_or(|s| s.is_empty())
+                    && o.get_single(keys::output::SCRIPT)
+                        .is_none_or(|s| s.is_empty())
             });
             if awaiting {
                 in_progress += 1;
@@ -334,7 +355,10 @@ fn bip375_survives_analyzepsbt() {
             }
         }
     }
-    assert!(in_progress > 0, "some vectors should still be awaiting a script");
+    assert!(
+        in_progress > 0,
+        "some vectors should still be awaiting a script"
+    );
 }
 
 #[test]
@@ -415,11 +439,7 @@ fn combinepsbt_refuses_two_different_transactions() {
     let (_, b) = seeded("can finalize: two inputs single-signer using global");
     let err = psbt::combine_psbt(&[to_b64(&a), to_b64(&b)])
         .expect_err("two different transactions must be refused");
-    assert!(
-        err.1.contains("different transaction"),
-        "got: {}",
-        err.1
-    );
+    assert!(err.1.contains("different transaction"), "got: {}", err.1);
 }
 
 /// `joinpsbts` adds inputs and outputs, which changes the silent payment
@@ -432,8 +452,11 @@ fn bip375_survives_joinpsbts() {
     let a = joinable();
     let mut b = joinable();
     // Give the second one distinguishable unknowns.
-    b.global
-        .set(RawPair::new(UNKNOWN_TYPE, b"global".to_vec(), b"g-value".to_vec()));
+    b.global.set(RawPair::new(
+        UNKNOWN_TYPE,
+        b"global".to_vec(),
+        b"g-value".to_vec(),
+    ));
 
     let out = psbt::join_psbts(&[to_b64(&a), to_b64(&b)])
         .unwrap_or_else(|e| panic!("joinpsbts failed: {e:?}"));
@@ -575,7 +598,10 @@ fn finalizepsbt_refuses_an_unverified_silent_payment_psbt() {
 
     // And `analyzepsbt` says the same thing rather than a different one.
     let out = psbt::analyze_psbt(&to_b64(&tampered), None).expect("analyzes");
-    assert_eq!(out["silent_payments"]["outputs"][0]["status"], "invalid_proof");
+    assert_eq!(
+        out["silent_payments"]["outputs"][0]["status"],
+        "invalid_proof"
+    );
     assert_eq!(
         out["silent_payments"]["outputs"][0]["invalid_inputs"][0]["input_index"],
         0
@@ -591,11 +617,7 @@ fn finalizepsbt_refuses_an_uncomputed_silent_payment_script() {
     let err = psbt::finalize_psbt(&to_b64(&raw), true, None)
         .expect_err("an uncomputed script must not be extractable");
     assert_eq!(err.0, -22);
-    assert!(
-        err.1.contains("not ready to extract"),
-        "got: {}",
-        err.1
-    );
+    assert!(err.1.contains("not ready to extract"), "got: {}", err.1);
 }
 
 /// The version 0 path must be exactly where it was. Its error text included:

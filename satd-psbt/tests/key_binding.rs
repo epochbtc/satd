@@ -76,7 +76,11 @@ fn a_bound_key_is_ready_under_both_rules() {
         let report = sp::verify_with_binding(&view, None, binding).expect("verifies");
         assert_eq!(report.eligible_inputs().len(), 2, "{binding:?}");
         for output in &report.outputs {
-            assert_eq!(output.status, OutputStatus::Ready, "{binding:?}: {output:?}");
+            assert_eq!(
+                output.status,
+                OutputStatus::Ready,
+                "{binding:?}: {output:?}"
+            );
             assert_eq!(output.script_state, ScriptState::Matches, "{binding:?}");
         }
         assert!(report.extractable(), "{binding:?}");
@@ -149,8 +153,7 @@ fn a_rebound_key_is_not_ready() {
     // a typo.
     let derived = {
         let view = V2View::new(&raw).unwrap();
-        let report =
-            sp::verify_with_binding(&view, None, KeyBinding::Declared).expect("verifies");
+        let report = sp::verify_with_binding(&view, None, KeyBinding::Declared).expect("verifies");
         report.outputs[0]
             .derived_script
             .clone()
@@ -158,8 +161,7 @@ fn a_rebound_key_is_not_ready() {
     };
     let output_index = {
         let view = V2View::new(&raw).unwrap();
-        let report =
-            sp::verify_with_binding(&view, None, KeyBinding::Declared).expect("verifies");
+        let report = sp::verify_with_binding(&view, None, KeyBinding::Declared).expect("verifies");
         report.outputs[0].index
     };
     raw.outputs[output_index].set(RawPair::new(
@@ -306,17 +308,19 @@ fn a_taproot_input_takes_its_key_from_the_script() {
 fn a_nums_internal_key_makes_a_taproot_input_ineligible() {
     let v = common::bip375_valid()
         .into_iter()
-        .find(|v| v.description.starts_with("can finalize: two mixed input types"))
+        .find(|v| {
+            v.description
+                .starts_with("can finalize: two mixed input types")
+        })
         .expect("the vector is in the file");
     let raw = RawPsbt::parse(&v.psbt).expect("parses");
     let view = V2View::new(&raw).unwrap();
-    let report =
-        sp::verify_with_binding(&view, None, KeyBinding::Declared).expect("verifies");
+    let report = sp::verify_with_binding(&view, None, KeyBinding::Declared).expect("verifies");
     assert!(
-        report
-            .inputs
-            .iter()
-            .any(|i| matches!(i.ineligible, Some(satd_psbt::sp::Ineligible::NumsInternalKey))),
+        report.inputs.iter().any(|i| matches!(
+            i.ineligible,
+            Some(satd_psbt::sp::Ineligible::NumsInternalKey)
+        )),
         "the vector has an input with the nothing-up-my-sleeve internal key: {:?}",
         report.inputs
     );

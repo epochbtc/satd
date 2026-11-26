@@ -14,7 +14,10 @@ fn bin() -> &'static str {
 /// Write `contents` to a uniquely-named temp file and return its path.
 fn temp_policy(tag: &str, contents: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("satcli-policylint-{tag}-{}.policy", std::process::id()));
+    p.push(format!(
+        "satcli-policylint-{tag}-{}.policy",
+        std::process::id()
+    ));
     let mut f = std::fs::File::create(&p).unwrap();
     f.write_all(contents.as_bytes()).unwrap();
     p
@@ -32,7 +35,11 @@ fn valid_file_exits_zero_with_cost_report() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(stdout.contains("version 1 — 1 rule,"), "{stdout}");
     assert!(stdout.contains("budget"), "{stdout}");
     assert!(stdout.contains("cheap"), "{stdout}");
@@ -58,7 +65,10 @@ fn load_error_exits_one_with_caret_diagnostic() {
 #[test]
 fn unreadable_file_exits_two() {
     let mut missing = std::env::temp_dir();
-    missing.push(format!("satcli-policylint-missing-{}.policy", std::process::id()));
+    missing.push(format!(
+        "satcli-policylint-missing-{}.policy",
+        std::process::id()
+    ));
     let out = Command::new(bin())
         .arg("policylint")
         .arg(&missing)
@@ -87,7 +97,10 @@ fn advisory_fires_by_default_and_is_silenced_by_flag() {
         .unwrap();
     assert!(default.status.success());
     let s = String::from_utf8_lossy(&default.stdout);
-    assert!(s.contains("ADVISORIES"), "expected advisory by default: {s}");
+    assert!(
+        s.contains("ADVISORIES"),
+        "expected advisory by default: {s}"
+    );
     assert!(s.contains("anchor"), "{s}");
 
     let quiet = Command::new(bin())
@@ -100,7 +113,10 @@ fn advisory_fires_by_default_and_is_silenced_by_flag() {
     // Advisory never changes the exit code, and --no-advisories drops the section.
     assert!(quiet.status.success());
     let q = String::from_utf8_lossy(&quiet.stdout);
-    assert!(!q.contains("ADVISORIES"), "advisory should be silenced: {q}");
+    assert!(
+        !q.contains("ADVISORIES"),
+        "advisory should be silenced: {q}"
+    );
 
     std::fs::remove_file(&path).ok();
 }
@@ -155,7 +171,11 @@ fn template_only_dangerous_rule_warns_but_exits_zero() {
         .arg(&path)
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("LIGHTNING-ENFORCEMENT DANGER"),
         "expected the danger section to still report the template-only match"
@@ -185,10 +205,7 @@ fn safe_ruleset_reports_no_danger() {
 
 #[test]
 fn explain_renders_plain_english() {
-    let path = temp_policy(
-        "explain",
-        "version 1\nallow own when tx.source == rpc\n",
-    );
+    let path = temp_policy("explain", "version 1\nallow own when tx.source == rpc\n");
     let out = Command::new(bin())
         .arg("policylint")
         .arg(&path)

@@ -1,8 +1,8 @@
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, Network, Txid, Wtxid};
 
-use crate::validation::script::activation_heights;
 use crate::validation::ValidationError;
+use crate::validation::script::activation_heights;
 
 /// Maximum block weight (4 million weight units, per BIP 141).
 const MAX_BLOCK_WEIGHT: usize = 4_000_000;
@@ -62,11 +62,7 @@ pub fn bip34_height_prefix(height: u32) -> Vec<u8> {
 /// rather than reading them from an optional argument is deliberate — the
 /// compiler makes a new caller supply the context instead of silently
 /// inheriting the laxer, context-free behaviour.
-pub fn check_block(
-    block: &Block,
-    network: Network,
-    height: u32,
-) -> Result<(), ValidationError> {
+pub fn check_block(block: &Block, network: Network, height: u32) -> Result<(), ValidationError> {
     let txids: Vec<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
     check_block_with_hashes(block, &txids, None, network, height)
 }
@@ -286,15 +282,12 @@ fn check_witness_rules(
 
 /// Whether the coinbase carries a BIP 141 witness-commitment output.
 pub fn has_witness_commitment_output(block: &Block) -> bool {
-    block
-        .txdata
-        .first()
-        .is_some_and(|coinbase| {
-            coinbase.output.iter().any(|output| {
-                let script = output.script_pubkey.as_bytes();
-                script.len() >= 38 && script[..6] == WITNESS_COMMITMENT_HEADER
-            })
+    block.txdata.first().is_some_and(|coinbase| {
+        coinbase.output.iter().any(|output| {
+            let script = output.script_pubkey.as_bytes();
+            script.len() >= 38 && script[..6] == WITNESS_COMMITMENT_HEADER
         })
+    })
 }
 
 /// Verify the BIP 141 commitment against a caller-validated 32-byte nonce.
@@ -374,8 +367,10 @@ fn verify_witness_commitment(
 /// itself counted — only a transaction list that already contains the duplicate
 /// (the malleated copy of a valid block) trips it.
 fn merkle_tree_mutated(txids: &[Txid]) -> bool {
-    let mut current: Vec<[u8; 32]> =
-        txids.iter().map(|txid| txid.to_raw_hash().to_byte_array()).collect();
+    let mut current: Vec<[u8; 32]> = txids
+        .iter()
+        .map(|txid| txid.to_raw_hash().to_byte_array())
+        .collect();
     if current.is_empty() {
         return false;
     }
@@ -559,7 +554,9 @@ mod tests {
             [p - 1, p, p + 1].map(|h| h.min(u64::from(u32::MAX)) as u32)
         }));
         for h in heights {
-            let script = bitcoin::script::Builder::new().push_int(i64::from(h)).into_script();
+            let script = bitcoin::script::Builder::new()
+                .push_int(i64::from(h))
+                .into_script();
             assert_eq!(bip34_height_prefix(h), script.as_bytes(), "height {h}");
         }
     }
@@ -615,9 +612,9 @@ mod tests {
 
     #[test]
     fn test_non_coinbase_first_rejected() {
-        use bitcoin::transaction::Version;
-        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness, Txid};
         use bitcoin::hashes::Hash as _;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 
         // Build a tx whose first input is NOT a coinbase (has a real previous_output)
         let non_coinbase = Transaction {
@@ -643,7 +640,10 @@ mod tests {
         // Fix merkle root so we don't fail on that first
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        assert!(matches!(check_block(&block, Network::Regtest, 0), Err(ValidationError::NoCoinbase)));
+        assert!(matches!(
+            check_block(&block, Network::Regtest, 0),
+            Err(ValidationError::NoCoinbase)
+        ));
     }
 
     #[test]
@@ -695,8 +695,7 @@ mod tests {
     fn test_bad_merkle_root_rejected() {
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
         // Tamper the merkle root
-        block.header.merkle_root =
-            bitcoin::TxMerkleNode::from_byte_array([0xde; 32]);
+        block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0xde; 32]);
         assert!(matches!(
             check_block(&block, Network::Regtest, 0),
             Err(ValidationError::BadMerkleRoot)
@@ -744,9 +743,9 @@ mod tests {
 
     #[test]
     fn test_no_witness_no_commitment_ok() {
+        use bitcoin::hashes::Hash as _;
         use bitcoin::transaction::Version;
         use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-        use bitcoin::hashes::Hash as _;
 
         let coinbase = Transaction {
             version: Version::ONE,
@@ -791,9 +790,9 @@ mod tests {
 
     #[test]
     fn test_witness_valid_commitment() {
+        use bitcoin::hashes::Hash as _;
         use bitcoin::transaction::Version;
         use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-        use bitcoin::hashes::Hash as _;
 
         let witness_nonce = [0u8; 32];
 
@@ -872,9 +871,9 @@ mod tests {
     /// witness data, with a valid BIP 141 commitment when `commit` is set.
     /// Stripped size stays tiny either way, so only the full weight moves.
     fn block_with_witness_bytes(witness_bytes: usize, commit: bool) -> Block {
+        use bitcoin::hashes::Hash as _;
         use bitcoin::transaction::Version;
         use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-        use bitcoin::hashes::Hash as _;
 
         let witness_nonce = [0u8; 32];
 
@@ -996,9 +995,9 @@ mod tests {
 
     #[test]
     fn test_witness_missing_commitment() {
+        use bitcoin::hashes::Hash as _;
         use bitcoin::transaction::Version;
         use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-        use bitcoin::hashes::Hash as _;
 
         // Spending tx WITH witness data
         let mut witness = Witness::new();
@@ -1053,9 +1052,9 @@ mod tests {
 
     #[test]
     fn test_witness_wrong_commitment() {
+        use bitcoin::hashes::Hash as _;
         use bitcoin::transaction::Version;
         use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-        use bitcoin::hashes::Hash as _;
 
         // Spending tx WITH witness data
         let mut witness = Witness::new();
@@ -1360,7 +1359,10 @@ mod tests {
     #[test]
     fn witness_stripped_block_is_rejected() {
         let block = segwit_block_with_commitment();
-        assert!(check(&block, SEGWIT_ON).is_ok(), "the honest block is valid");
+        assert!(
+            check(&block, SEGWIT_ON).is_ok(),
+            "the honest block is valid"
+        );
 
         let mut stripped = block.clone();
         for tx in &mut stripped.txdata {
@@ -1378,7 +1380,10 @@ mod tests {
         );
         assert_eq!(stripped.header.merkle_root, block.header.merkle_root);
         assert!(
-            stripped.txdata.iter().any(|tx| tx.input.iter().any(|i| i.witness.is_empty())),
+            stripped
+                .txdata
+                .iter()
+                .any(|tx| tx.input.iter().any(|i| i.witness.is_empty())),
             "the fixture must actually be stripped"
         );
 
@@ -1426,8 +1431,7 @@ mod tests {
                  that is what makes it dangerous"
             );
             assert!(
-                bitcoin::consensus::serialize(&forged)
-                    != bitcoin::consensus::serialize(&honest),
+                bitcoin::consensus::serialize(&forged) != bitcoin::consensus::serialize(&honest),
                 "{label}: the fixture must actually change the serialized bytes"
             );
             assert!(
@@ -1575,12 +1579,16 @@ mod tests {
     fn a_commitment_over_an_input_less_transaction_uses_cores_wtxid() {
         use bitcoin::hashes::Hash as _;
 
-        let empty = crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-            .expect("Core reads it");
+        let empty =
+            crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .expect("Core reads it");
         let mut block = segwit_block_with_commitment();
         block.txdata.truncate(1);
         block.txdata.push(empty.clone());
-        let wtxid_hashes = [[0u8; 32], empty.compute_txid().to_raw_hash().to_byte_array()];
+        let wtxid_hashes = [
+            [0u8; 32],
+            empty.compute_txid().to_raw_hash().to_byte_array(),
+        ];
         let witness_root = compute_merkle_root_from_hashes(&wtxid_hashes);
         let mut preimage = [0u8; 64];
         preimage[..32].copy_from_slice(&witness_root);
@@ -1592,10 +1600,15 @@ mod tests {
         block.txdata[0].output[last].script_pubkey = bitcoin::ScriptBuf::from(script);
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
-        assert!(!is_block_mutated(&block, true), "Core's IsBlockMutated passes it");
+        assert!(
+            !is_block_mutated(&block, true),
+            "Core's IsBlockMutated passes it"
+        );
         assert!(check(&block, SEGWIT_ON).is_ok());
         assert_eq!(
-            crate::validation::tx::check_transaction(&block.txdata[1]).unwrap_err().to_string(),
+            crate::validation::tx::check_transaction(&block.txdata[1])
+                .unwrap_err()
+                .to_string(),
             "bad-txns-vin-empty"
         );
     }
@@ -1626,7 +1639,10 @@ mod tests {
         // merkle tree and no 64-byte transaction, so the forgery passed and was
         // caught a layer later in store_block for 10 ban points instead of 100.
         let honest = segwit_block_with_commitment();
-        assert!(!is_block_mutated(&honest, true), "the honest block is not mutated");
+        assert!(
+            !is_block_mutated(&honest, true),
+            "the honest block is not mutated"
+        );
         assert!(is_block_mutated(&witness_stripped(&honest), true));
     }
 

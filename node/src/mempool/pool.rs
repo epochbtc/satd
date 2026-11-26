@@ -13,8 +13,8 @@ use crate::mempool::policy_engine::{self, PolicyCtx};
 use crate::mempool::truc::{self, TrucView};
 use crate::validation::script::ScriptVerifier;
 use crate::validation::tx::check_transaction;
-use node_index::keys::{scripthash_of, Scripthash};
-use node_sp_index::{compute_tweak, TweakEntry};
+use node_index::keys::{Scripthash, scripthash_of};
+use node_sp_index::{TweakEntry, compute_tweak};
 
 #[cfg(test)]
 #[path = "pool_esplorapaging_tests.rs"]
@@ -363,12 +363,8 @@ impl MempoolError {
             MempoolError::NonStandardWitness => "bad-witness-nonstandard".to_string(),
             MempoolError::TooManySigops(_) => "bad-txns-too-many-sigops".to_string(),
             MempoolError::InsufficientReplacementFee(..) => "insufficient fee".to_string(),
-            MempoolError::SpendsConflictingTx(..) => {
-                "bad-txns-spends-conflicting-tx".to_string()
-            }
-            MempoolError::TooManyReplacements(..) => {
-                "too many potential replacements".to_string()
-            }
+            MempoolError::SpendsConflictingTx(..) => "bad-txns-spends-conflicting-tx".to_string(),
+            MempoolError::TooManyReplacements(..) => "too many potential replacements".to_string(),
             // Core: `state.Invalid(TX_RECONSIDERABLE, "replacement-failed",
             // err_string)` — the diagram explanation is the *detail*.
             MempoolError::DoesNotImproveFeerateDiagram(..) => "replacement-failed".to_string(),
@@ -393,15 +389,11 @@ impl MempoolError {
     /// when the short reason is sufficient (no extra detail).
     pub fn reject_details(&self) -> Option<String> {
         match self {
-            MempoolError::InsufficientReplacementFee(_, _, _, detail) => {
-                Some(detail.clone())
-            }
+            MempoolError::InsufficientReplacementFee(_, _, _, detail) => Some(detail.clone()),
             MempoolError::SpendsConflictingTx(detail) => Some(detail.clone()),
             MempoolError::TooManyReplacements(detail) => Some(detail.clone()),
             MempoolError::DoesNotImproveFeerateDiagram(detail) => Some(detail.clone()),
-            MempoolError::EphemeralDustFee => {
-                Some("tx with dust output must be 0-fee".to_string())
-            }
+            MempoolError::EphemeralDustFee => Some("tx with dust output must be 0-fee".to_string()),
             MempoolError::MissingEphemeralSpends(detail) => Some(detail.clone()),
             MempoolError::TrucViolation(detail) => Some(detail.clone()),
             // The replacement details open with their reason; this one's
@@ -434,7 +426,12 @@ impl MempoolError {
         let reason = self.reject_reason();
         match self.reject_details() {
             None => reason,
-            Some(detail) if matches!(self, MempoolError::Script(..) | MempoolError::PolicyScript(..)) => {
+            Some(detail)
+                if matches!(
+                    self,
+                    MempoolError::Script(..) | MempoolError::PolicyScript(..)
+                ) =>
+            {
                 format!("{reason}, {detail}")
             }
             Some(detail) if detail.starts_with(&reason) => detail,
@@ -630,7 +627,10 @@ pub enum ActingOutpointView {
     /// spend. The pool trails the chain (a block is committed before
     /// `remove_for_block` takes what it confirmed or conflicted), so the
     /// answer holds at a tip only while each of these is a coin there.
-    Created { output: Option<TxOut>, rests_on: Vec<OutPoint> },
+    Created {
+        output: Option<TxOut>,
+        rests_on: Vec<OutPoint>,
+    },
     /// No acting transaction spends or creates it.
     NotInPool,
 }
@@ -1049,14 +1049,22 @@ impl EntryMap {
             self.unindex(txid, old);
         }
         self.by_wtxid.insert(wtxid, txid);
-        debug_assert_eq!(self.by_wtxid.len(), self.by_txid.len(), "two entries share a wtxid");
+        debug_assert_eq!(
+            self.by_wtxid.len(),
+            self.by_txid.len(),
+            "two entries share a wtxid"
+        );
         old
     }
 
     fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
         let entry = self.by_txid.remove(txid)?;
         self.unindex(*txid, &entry);
-        debug_assert_eq!(self.by_wtxid.len(), self.by_txid.len(), "an entry left its wtxid behind");
+        debug_assert_eq!(
+            self.by_wtxid.len(),
+            self.by_txid.len(),
+            "an entry left its wtxid behind"
+        );
         Some(entry)
     }
 
@@ -1104,7 +1112,10 @@ impl EntryMap {
         if !self.by_txid.contains_key(txid) {
             return Ok(());
         }
-        if self.by_wtxid.contains_key(&crate::validation::decode::wtxid(tx)) {
+        if self
+            .by_wtxid
+            .contains_key(&crate::validation::decode::wtxid(tx))
+        {
             Err(MempoolError::AlreadyExists)
         } else {
             Err(MempoolError::SameNonWitnessData)
@@ -1151,7 +1162,9 @@ impl TrucView for MempoolInner {
         let mut seen: HashSet<Txid> = HashSet::from([*txid]);
         let mut queue = vec![*txid];
         while let Some(current) = queue.pop() {
-            let Some(entry) = self.entries.get(&current) else { continue };
+            let Some(entry) = self.entries.get(&current) else {
+                continue;
+            };
             for input in &entry.tx.input {
                 let parent = input.previous_output.txid;
                 if self.entries.contains_key(&parent) && seen.insert(parent) {
@@ -1170,7 +1183,9 @@ impl TrucView for MempoolInner {
         let mut seen: HashSet<Txid> = HashSet::new();
         let mut queue = vec![*txid];
         while let Some(current) = queue.pop() {
-            let Some(entry) = self.entries.get(&current) else { continue };
+            let Some(entry) = self.entries.get(&current) else {
+                continue;
+            };
             for input in &entry.tx.input {
                 let parent = input.previous_output.txid;
                 if parent == *ancestor && self.entries.contains_key(&parent) {
@@ -1522,7 +1537,10 @@ where
     // Core reports a single oversized transaction against the per-transaction
     // limit instead, which is the more specific message.
     if pkg.len() > 1 {
-        let total: u64 = pkg.iter().map(|p| crate::validation::decode::weight(p.tx()).to_wu()).sum();
+        let total: u64 = pkg
+            .iter()
+            .map(|p| crate::validation::decode::weight(p.tx()).to_wu())
+            .sum();
         if total > MAX_PACKAGE_WEIGHT {
             return Err("package-too-large");
         }
@@ -1540,8 +1558,7 @@ where
     // or a nonexistent coin.
     for p in pkg {
         later.remove(&p.txid());
-        if p
-            .tx()
+        if p.tx()
             .input
             .iter()
             .any(|i| later.contains(&i.previous_output.txid))
@@ -1927,7 +1944,8 @@ impl Mempool {
     /// mempool is loaded from disk, when a `-zmqpubrawtx` publisher is
     /// configured; every other node leaves it off and pays nothing.
     pub fn set_emit_raw_tx(&self, on: bool) {
-        self.emit_raw_tx.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.emit_raw_tx
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The transaction to put on an `Enter` event: a copy of `tx` while
@@ -1953,7 +1971,10 @@ impl Mempool {
     /// whether to retain full resolved prevout scripts for the unconfirmed SP
     /// matcher. Lock-free single atomic load in the common (cold) case.
     fn sp_gate_hot(&self) -> bool {
-        self.sp_gate.load().load(std::sync::atomic::Ordering::Acquire) > 0
+        self.sp_gate
+            .load()
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
     }
 
     /// Install the shared mempool-tweak firehose gate (Tier 1.5). Wired once at
@@ -1979,7 +2000,11 @@ impl Mempool {
     /// the mempool and carried one (admitted while a tweak gate was hot). Backs
     /// [`crate::events::publisher::MempoolTweakSource`] for the firehose bridge.
     pub fn cached_sp_tweak(&self, txid: &Txid) -> Option<TweakEntry> {
-        self.inner.read().entries.get(txid).and_then(|e| e.sp_tweak.clone())
+        self.inner
+            .read()
+            .entries
+            .get(txid)
+            .and_then(|e| e.sp_tweak.clone())
     }
 
     /// The [`SpendRecord`] for `tx`, whose inputs spend `prev_outputs` (input
@@ -2018,26 +2043,39 @@ impl Mempool {
             prev_outputs,
             crate::validation::sigops::SigOpFlags::P2shWitness,
         );
-        let prev_scripthashes: Vec<Scripthash> =
-            prev_outputs.iter().map(|o| scripthash_of(&o.script_pubkey)).collect();
+        let prev_scripthashes: Vec<Scripthash> = prev_outputs
+            .iter()
+            .map(|o| scripthash_of(&o.script_pubkey))
+            .collect();
         let prev_amounts: Vec<u64> = if prevout_meta.retains_amount() {
             prev_outputs.iter().map(|o| o.value.to_sat()).collect()
         } else {
             Vec::new()
         };
         let prev_scripts: Vec<ScriptBuf> = if prevout_meta.retains_script() {
-            prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect()
+            prev_outputs
+                .iter()
+                .map(|o| o.script_pubkey.clone())
+                .collect()
         } else {
             Vec::new()
         };
         let sp_tweak: Option<TweakEntry> = if self.sp_gate_hot() || self.mempool_tweaks_hot() {
-            let spks: Vec<ScriptBuf> =
-                prev_outputs.iter().map(|o| o.script_pubkey.clone()).collect();
+            let spks: Vec<ScriptBuf> = prev_outputs
+                .iter()
+                .map(|o| o.script_pubkey.clone())
+                .collect();
             compute_tweak(tx, &spks)
         } else {
             None
         };
-        SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak }
+        SpendRecord {
+            sigop_cost,
+            prev_scripthashes,
+            prev_amounts,
+            prev_scripts,
+            sp_tweak,
+        }
     }
 
     /// Whether the operator authorized emitting full prevout `scriptPubKey`s to
@@ -2131,7 +2169,11 @@ impl Mempool {
     fn emit_evicted(&self, evicted: &[(Txid, QuarantineScope, u64)], reason: EvictReason) {
         for (txid, scope, seq) in evicted {
             if scope.is_acting() {
-                self.emit(MempoolEvent::LeaveEvicted { txid: *txid, reason, mempool_sequence: *seq });
+                self.emit(MempoolEvent::LeaveEvicted {
+                    txid: *txid,
+                    reason,
+                    mempool_sequence: *seq,
+                });
             }
         }
     }
@@ -2192,14 +2234,21 @@ impl Mempool {
     /// below the active tip and is ignored on the next start.
     pub const HEALTH_FLUSH_INTERVAL_SECS: u64 = 60;
 
-    pub(crate) fn record_block_health(&self, hash: bitcoin::BlockHash, stats: crate::mempool::health::MinedBlockStats) {
+    pub(crate) fn record_block_health(
+        &self,
+        hash: bitcoin::BlockHash,
+        stats: crate::mempool::health::MinedBlockStats,
+    ) {
         let job = {
             let mut health = self.health.lock();
             health.record(hash, stats);
             let now = crate::time::now_secs();
-            let last = self.health_flushed.load(std::sync::atomic::Ordering::Relaxed);
+            let last = self
+                .health_flushed
+                .load(std::sync::atomic::Ordering::Relaxed);
             if now >= last + Self::HEALTH_FLUSH_INTERVAL_SECS {
-                self.health_flushed.store(now, std::sync::atomic::Ordering::Relaxed);
+                self.health_flushed
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
                 health.flush_job()
             } else {
                 None
@@ -2255,7 +2304,12 @@ impl Mempool {
                 .entries
                 .get(txid)
                 .filter(|e| e.scope.assists_template())
-                .map(|e| (crate::mempool::estimate::entry_own_rate(e), e.adjusted_weight()))
+                .map(|e| {
+                    (
+                        crate::mempool::estimate::entry_own_rate(e),
+                        e.adjusted_weight(),
+                    )
+                })
         });
     }
 
@@ -2432,10 +2486,7 @@ impl Mempool {
     /// error is returned for the caller to log — never a partial apply (I7).
     /// The caller drives re-placement ([`Self::reapply_policy`]) and promotion
     /// announcements when this returns [`PolicyReloadKind::Changed`].
-    pub fn reload_policy_file(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<PolicyReloadKind, String> {
+    pub fn reload_policy_file(&self, path: &std::path::Path) -> Result<PolicyReloadKind, String> {
         let (ruleset, load) = match policy_engine::load_policy_file(path) {
             Ok(v) => v,
             Err(e) => {
@@ -2605,11 +2656,7 @@ impl Mempool {
             .entries
             .iter()
             .filter(|(_, e)| !e.scope.is_acting())
-            .filter(|(_, e)| {
-                rule.is_none_or(|want| {
-                    e.quarantine_rule.as_deref() == Some(want)
-                })
-            })
+            .filter(|(_, e)| rule.is_none_or(|want| e.quarantine_rule.as_deref() == Some(want)))
             .map(|(txid, e)| QuarantineListEntry {
                 // Use the map key — recomputing the txid per entry re-hashes the
                 // whole transaction for no reason.
@@ -2646,13 +2693,12 @@ impl Mempool {
             return None;
         }
         let mut seen: HashSet<Txid> = HashSet::new();
-        let depends: Vec<Txid> = e
-            .tx
-            .input
-            .iter()
-            .map(|i| i.previous_output.txid)
-            .filter(|p| inner.entries.contains_key(p) && seen.insert(*p))
-            .collect();
+        let depends: Vec<Txid> =
+            e.tx.input
+                .iter()
+                .map(|i| i.previous_output.txid)
+                .filter(|p| inner.entries.contains_key(p) && seen.insert(*p))
+                .collect();
         Some(QuarantineEntryDetail {
             txid: *txid,
             rule: e
@@ -2779,11 +2825,11 @@ impl Mempool {
             let order = Self::topological_order(&inner.entries);
 
             for txid in order {
-                let (tx, fee, fee_rate, weight, source, old_scope) =
-                    match inner.entries.get(&txid) {
-                        Some(e) => (e.tx.clone(), e.fee, e.fee_rate, e.weight, e.source, e.scope),
-                        None => continue,
-                    };
+                let (tx, fee, fee_rate, weight, source, old_scope) = match inner.entries.get(&txid)
+                {
+                    Some(e) => (e.tx.clone(), e.fee, e.fee_rate, e.weight, e.source, e.scope),
+                    None => continue,
+                };
 
                 // Re-resolve prevouts (confirmed coins or in-mempool parents),
                 // exactly as admission does, and note the direct in-mempool
@@ -2843,8 +2889,18 @@ impl Mempool {
                         mempool_bytes: inner.total_bytes,
                     };
                     match policy_engine::evaluate(
-                        rs, &tx, &txid, &prev_outputs, &prev_is_coinbase, fee, fee_rate, weight,
-                        &cfg, ctx, source, false,
+                        rs,
+                        &tx,
+                        &txid,
+                        &prev_outputs,
+                        &prev_is_coinbase,
+                        fee,
+                        fee_rate,
+                        weight,
+                        &cfg,
+                        ctx,
+                        source,
+                        false,
                     ) {
                         satd_policy::Verdict::Allow { .. } | satd_policy::Verdict::Pass => {
                             (QuarantineScope::acting(), None)
@@ -2923,11 +2979,21 @@ impl Mempool {
             // that overflowed, only the overflow amount.
             if inner.acting_bytes() > cfg.max_size_bytes {
                 let over = inner.acting_bytes() - cfg.max_size_bytes;
-                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, false, cfg.incremental_relay_fee));
+                evicted.extend(Self::evict_lowest_fee_entries(
+                    &mut inner,
+                    over,
+                    false,
+                    cfg.incremental_relay_fee,
+                ));
             }
             if inner.quarantine_bytes > cfg.quarantine_max_bytes {
                 let over = inner.quarantine_bytes - cfg.quarantine_max_bytes;
-                evicted.extend(Self::evict_lowest_fee_entries(&mut inner, over, true, cfg.incremental_relay_fee));
+                evicted.extend(Self::evict_lowest_fee_entries(
+                    &mut inner,
+                    over,
+                    true,
+                    cfg.incremental_relay_fee,
+                ));
             }
 
             // Net visibility diff for the standard (acting-only) surfaces,
@@ -2998,7 +3064,10 @@ impl Mempool {
 
         let now = crate::time::now_secs();
         for txid in &promoted {
-            self.emit_quarantine(QuarantineEvent::Promoted { txid: *txid, time: now });
+            self.emit_quarantine(QuarantineEvent::Promoted {
+                txid: *txid,
+                time: now,
+            });
         }
         for (txid, scope, rule) in &demoted {
             self.emit_quarantine(QuarantineEvent::Demoted {
@@ -3067,7 +3136,10 @@ impl Mempool {
     /// — those are never exemptable (§6.2 floor).
     /// Core's `ValidateInputsStandardness` then `IsWitnessStandard`, over the
     /// outputs `tx` spends.
-    fn check_spend_standardness(tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), MempoolError> {
+    fn check_spend_standardness(
+        tx: &Transaction,
+        prev_outputs: &[TxOut],
+    ) -> Result<(), MempoolError> {
         super::input_policy::validate_inputs_standardness(tx, prev_outputs)
             .map_err(MempoolError::NonStandardInputs)?;
         if tx.input.iter().any(|i| !i.witness.is_empty())
@@ -3123,7 +3195,11 @@ impl Mempool {
         // carry several OP_RETURN outputs as long as their scripts fit
         // together (Core v30); a bare multisig under `-permitbaremultisig=0`
         // is `bare-multisig`. The first failing output decides the reason.
-        let mut datacarrier_bytes_left = if cfg.data_carrier { cfg.data_carrier_size } else { 0 };
+        let mut datacarrier_bytes_left = if cfg.data_carrier {
+            cfg.data_carrier_size
+        } else {
+            0
+        };
         for output in &tx.output {
             let spk = &output.script_pubkey;
             if !policy::is_standard_output_script(spk, true) {
@@ -3198,7 +3274,10 @@ impl Mempool {
 
     /// [`Self::with_entries`] without waiting: `None` when a writer holds the
     /// pool, for a caller that would rather skip the work than stall.
-    pub fn try_with_entries<R>(&self, f: impl FnOnce(&FxHashMap<Txid, MempoolEntry>) -> R) -> Option<R> {
+    pub fn try_with_entries<R>(
+        &self,
+        f: impl FnOnce(&FxHashMap<Txid, MempoolEntry>) -> R,
+    ) -> Option<R> {
         self.inner.try_read().map(|inner| f(&inner.entries))
     }
 
@@ -3259,7 +3338,8 @@ impl Mempool {
         let mut returned: HashSet<Txid> = HashSet::new();
         let mut order = Vec::new();
         for tx in txs {
-            match self.accept_reorged_with(tx.clone(), chain_state, script_verifier, &mut returned) {
+            match self.accept_reorged_with(tx.clone(), chain_state, script_verifier, &mut returned)
+            {
                 Ok(txid) => order.push(txid),
                 Err(e) => tracing::debug!(
                     txid = %tx.compute_txid(),
@@ -3281,7 +3361,11 @@ impl Mempool {
         returned: &mut HashSet<Txid>,
     ) -> Result<Txid, MempoolError> {
         let _admission = self.admission.lock();
-        let mut pkg = PackageAdmit { skip_truc: true, reorg_returned: Some(std::mem::take(returned)), ..Default::default() };
+        let mut pkg = PackageAdmit {
+            skip_truc: true,
+            reorg_returned: Some(std::mem::take(returned)),
+            ..Default::default()
+        };
         let result = self.accept_transaction_led(
             tx,
             chain_state,
@@ -3513,9 +3597,9 @@ impl Mempool {
                 continue;
             }
             let sweeps_all = dust_indices.iter().all(|&di| {
-                tx.input.iter().any(|i| {
-                    i.previous_output.txid == parent_txid && i.previous_output.vout == di
-                })
+                tx.input
+                    .iter()
+                    .any(|i| i.previous_output.txid == parent_txid && i.previous_output.vout == di)
             });
             if !sweeps_all {
                 return Err(MempoolError::MissingEphemeralSpends(format!(
@@ -3691,16 +3775,21 @@ impl Mempool {
 
         // Apply any deferred standardness error now that the fee rate check
         // has passed.
-        if !has_allow
-            && let Some(e) = deferred_nonstd.take()
-        {
+        if !has_allow && let Some(e) = deferred_nonstd.take() {
             return Err(e);
         }
 
         // TRUC, then RBF, as Core's `PreChecks` ends and `ReplacementChecks`
         // follows: a sibling the TRUC rules offer for eviction is replaced
         // under the same rules as a conflict.
-        let sibling = Self::truc_admission(&inner, &tx, adj_weight, &mempool_parents, &mut conflicts, pkg)?;
+        let sibling = Self::truc_admission(
+            &inner,
+            &tx,
+            adj_weight,
+            &mempool_parents,
+            &mut conflicts,
+            pkg,
+        )?;
         let mut evicted: HashSet<Txid> = HashSet::new();
         if !conflicts.is_empty() && pkg.package_rbf {
             evicted = Self::rbf_conflict_set(&inner, &conflicts, usize::MAX)
@@ -3709,17 +3798,15 @@ impl Mempool {
         } else if !conflicts.is_empty() {
             let new_fee = modified_fee(fee, fee_delta);
             evicted = Self::rbf_check(
-                &inner,
-                &cfg,
-                &tx,
-                &txid,
-                adj_weight,
-                new_fee,
-                &conflicts,
-                &ancestors,
-                sibling,
+                &inner, &cfg, &tx, &txid, adj_weight, new_fee, &conflicts, &ancestors, sibling,
             )
-            .map_err(|e| if sibling.is_some() { e.including_sibling_eviction() } else { e })?;
+            .map_err(|e| {
+                if sibling.is_some() {
+                    e.including_sibling_eviction()
+                } else {
+                    e
+                }
+            })?;
         }
         // A transaction a reorg returns is held to them too: Core runs
         // `CheckMemPoolPolicyLimits` whatever `bypass_limits` says. The
@@ -3727,7 +3814,14 @@ impl Mempool {
         // cluster yet, as they are not in Core's, whose `TxGraph` links
         // them after the reorg; `trim_reorged_clusters` then cuts back a
         // cluster that comes out past the limits.
-        Self::check_cluster_limits(&inner, &cfg, &mempool_parents, adj_weight, &evicted, pkg.reorg_returned.as_ref())?;
+        Self::check_cluster_limits(
+            &inner,
+            &cfg,
+            &mempool_parents,
+            adj_weight,
+            &evicted,
+            pkg.reorg_returned.as_ref(),
+        )?;
 
         // ── DSL evaluation (§7 step 6) ──────────────────────────────────────
         // The single policy eval point: after the DoS floor (fee / RBF / ancestor
@@ -3838,12 +3932,9 @@ impl Mempool {
         // the displaced acting tx). Acting submissions may still replace either
         // class; acting takes priority over a conflicting held tx.
         if scope.is_quarantined()
-            && conflicts.iter().any(|c| {
-                inner
-                    .entries
-                    .get(c)
-                    .is_some_and(|e| e.scope.is_acting())
-            })
+            && conflicts
+                .iter()
+                .any(|c| inner.entries.get(c).is_some_and(|e| e.scope.is_acting()))
         {
             return Err(MempoolError::ConflictingSpend);
         }
@@ -3932,10 +4023,16 @@ impl Mempool {
             // the input. Nothing has changed in the pool, so release it first.
             drop(inner);
             let e = script_verifier.name_failure(&tx, &prev_outputs, at, e);
-            return Err(MempoolError::Script(e.reason().to_string(), e.core_debug_string(&tx)));
+            return Err(MempoolError::Script(
+                e.reason().to_string(),
+                e.core_debug_string(&tx),
+            ));
         }
         if let Err(e) = script_verifier.verify_policy(&tx, &prev_outputs) {
-            return Err(MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(&tx)));
+            return Err(MempoolError::PolicyScript(
+                e.reason().to_string(),
+                e.core_debug_string(&tx),
+            ));
         }
 
         let mut evicted_full_pool: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
@@ -3998,7 +4095,8 @@ impl Mempool {
                 }
                 tracing::info!(%evict_txid, "RBF: evicted conflicting transaction");
                 if pkg.hold_events {
-                    pkg.evicted_entries.push((*evict_txid, evict_entry.clone(), unbroadcast));
+                    pkg.evicted_entries
+                        .push((*evict_txid, evict_entry.clone(), unbroadcast));
                 }
                 replaced_txs.push(evict_entry.tx);
                 pkg.replaced.push(*evict_txid);
@@ -4014,14 +4112,23 @@ impl Mempool {
         }
 
         // Sigop cost and prevout metadata, the same for every admission path.
-        let SpendRecord { sigop_cost, prev_scripthashes, prev_amounts, prev_scripts, sp_tweak } =
-            self.spend_record(cfg.prevout_meta, &tx, &prev_outputs);
+        let SpendRecord {
+            sigop_cost,
+            prev_scripthashes,
+            prev_amounts,
+            prev_scripts,
+            sp_tweak,
+        } = self.spend_record(cfg.prevout_meta, &tx, &prev_outputs);
 
         let vsize_u64 = policy::weight_to_vsize(adj_weight);
         // Apply any pre-set `prioritisetransaction` delta for this txid.
         let preset_delta = inner.fee_deltas.get(&txid).copied().unwrap_or(0);
         // A quarantined admission emits no `Enter`, so it needs no copy.
-        let raw_tx = if scope.is_quarantined() { None } else { self.raw_tx_for_event(&tx) };
+        let raw_tx = if scope.is_quarantined() {
+            None
+        } else {
+            self.raw_tx_for_event(&tx)
+        };
         // The number this insert takes (`account_insert` below). A
         // transaction a reorg returns takes 0, as with Core's
         // `bypass_limits`: it was in a block, so a peer may fetch it before
@@ -4470,9 +4577,15 @@ impl Mempool {
         let mut parents = Vec::with_capacity(txids.len());
         for txid in &txids {
             let e = &inner.entries[txid];
-            ff.push(crate::mempool::feefrac::FeeFrac::new(fee(e), e.adjusted_weight() as i64));
+            ff.push(crate::mempool::feefrac::FeeFrac::new(
+                fee(e),
+                e.adjusted_weight() as i64,
+            ));
             let mut mine: Vec<usize> =
-                e.tx.input.iter().filter_map(|i| index.get(&i.previous_output.txid).copied()).collect();
+                e.tx.input
+                    .iter()
+                    .filter_map(|i| index.get(&i.previous_output.txid).copied())
+                    .collect();
             mine.sort_unstable();
             mine.dedup();
             parents.push(mine);
@@ -4485,10 +4598,17 @@ impl Mempool {
     /// the map instead gave an order that changed whenever a reorg put the
     /// same transactions back.
     fn acting_mining_order(inner: &MempoolInner) -> Vec<Txid> {
-        let acting: Vec<Txid> =
-            inner.entries.iter().filter(|(_, v)| v.scope.is_acting()).map(|(k, _)| *k).collect();
+        let acting: Vec<Txid> = inner
+            .entries
+            .iter()
+            .filter(|(_, v)| v.scope.is_acting())
+            .map(|(k, _)| *k)
+            .collect();
         let g = Self::cluster_graph(inner, acting);
-        clusters::mining_order(&g).into_iter().map(|i| g.txids[i]).collect()
+        clusters::mining_order(&g)
+            .into_iter()
+            .map(|i| g.txids[i])
+            .collect()
     }
 
     /// [`Self::acting_mining_order`], for `getrawmempool`.
@@ -4524,7 +4644,9 @@ impl Mempool {
         }
         let g = Self::signed_cluster_graph(inner, txid);
         let chunks = clusters::chunk_feerates(&g);
-        cache.0.extend(g.txids.iter().copied().zip(chunks.iter().copied()));
+        cache
+            .0
+            .extend(g.txids.iter().copied().zip(chunks.iter().copied()));
         Some(cache.0[txid])
     }
 
@@ -4540,7 +4662,13 @@ impl Mempool {
         while let Some(current) = queue.pop() {
             buf.clear();
             Self::collect_children(inner, &current, &mut buf);
-            buf.extend(inner.entries[&current].tx.input.iter().map(|i| i.previous_output.txid));
+            buf.extend(
+                inner.entries[&current]
+                    .tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output.txid),
+            );
             for next in buf.drain(..) {
                 if acting(&next) && cluster.insert(next) {
                     queue.push(next);
@@ -4559,7 +4687,10 @@ impl Mempool {
     /// fields of `getmempoolentry`. `None` if `txid` is not an acting
     /// entry: a quarantined transaction is as invisible here as in
     /// `getmempoolentry`.
-    pub fn mempool_cluster(&self, txid: &Txid) -> Option<Vec<(Vec<Txid>, crate::mempool::feefrac::FeeFrac)>> {
+    pub fn mempool_cluster(
+        &self,
+        txid: &Txid,
+    ) -> Option<Vec<(Vec<Txid>, crate::mempool::feefrac::FeeFrac)>> {
         let inner = self.inner.read();
         if !inner.entries.get(txid).is_some_and(|e| e.scope.is_acting()) {
             return None;
@@ -4579,9 +4710,14 @@ impl Mempool {
     /// ([`clusters::feerate_diagram`]). Fees are signed, as Core's are.
     pub fn feerate_diagram(&self) -> Vec<crate::mempool::feefrac::FeeFrac> {
         let inner = self.inner.read();
-        let acting: Vec<Txid> =
-            inner.entries.iter().filter(|(_, v)| v.scope.is_acting()).map(|(k, _)| *k).collect();
-        let g = Self::cluster_graph_with(&inner, acting, |e| signed_modified_fee(e.fee, e.fee_delta));
+        let acting: Vec<Txid> = inner
+            .entries
+            .iter()
+            .filter(|(_, v)| v.scope.is_acting())
+            .map(|(k, _)| *k)
+            .collect();
+        let g =
+            Self::cluster_graph_with(&inner, acting, |e| signed_modified_fee(e.fee, e.fee_delta));
         clusters::feerate_diagram(&g)
     }
 
@@ -4596,19 +4732,31 @@ impl Mempool {
     pub fn trim_reorged_clusters(&self, returned: &[Txid]) {
         let (max_count, max_weight) = {
             let cfg = self.config.read();
-            (cfg.max_cluster_count, cfg.max_cluster_vsize.saturating_mul(4))
+            (
+                cfg.max_cluster_count,
+                cfg.max_cluster_vsize.saturating_mul(4),
+            )
         };
         let evicted = {
             let mut inner = self.inner.write();
             // The clusters the returned transactions are in.
             let mut region: HashSet<Txid> = HashSet::new();
-            let mut queue: Vec<Txid> =
-                returned.iter().filter(|t| inner.entries.contains_key(*t) && region.insert(**t)).copied().collect();
+            let mut queue: Vec<Txid> = returned
+                .iter()
+                .filter(|t| inner.entries.contains_key(*t) && region.insert(**t))
+                .copied()
+                .collect();
             let mut buf: Vec<Txid> = Vec::new();
             while let Some(current) = queue.pop() {
                 buf.clear();
                 Self::collect_children(&inner, &current, &mut buf);
-                buf.extend(inner.entries[&current].tx.input.iter().map(|i| i.previous_output.txid));
+                buf.extend(
+                    inner.entries[&current]
+                        .tx
+                        .input
+                        .iter()
+                        .map(|i| i.previous_output.txid),
+                );
                 for next in buf.drain(..) {
                     if inner.entries.contains_key(&next) && region.insert(next) {
                         queue.push(next);
@@ -4621,8 +4769,10 @@ impl Mempool {
             let g = Self::cluster_graph(&inner, region.into_iter().collect());
             let returned: HashSet<&Txid> = returned.iter().collect();
             let is_returned: Vec<bool> = g.txids.iter().map(|t| returned.contains(t)).collect();
-            let mut doomed: Vec<Txid> =
-                clusters::trim(&g, &is_returned, max_count, max_weight).into_iter().map(|i| g.txids[i]).collect();
+            let mut doomed: Vec<Txid> = clusters::trim(&g, &is_returned, max_count, max_weight)
+                .into_iter()
+                .map(|i| g.txids[i])
+                .collect();
             doomed.sort_unstable();
             if !doomed.is_empty() {
                 tracing::info!(
@@ -4635,7 +4785,11 @@ impl Mempool {
             evicted
         };
         for (txid, seq) in evicted {
-            self.emit(MempoolEvent::LeaveEvicted { txid, reason: EvictReason::Reorg, mempool_sequence: seq });
+            self.emit(MempoolEvent::LeaveEvicted {
+                txid,
+                reason: EvictReason::Reorg,
+                mempool_sequence: seq,
+            });
         }
     }
 
@@ -4756,8 +4910,7 @@ impl Mempool {
             if output.script_pubkey.is_op_return() {
                 continue;
             }
-            let threshold =
-                policy::dust_threshold_with_rate(&output.script_pubkey, dust_relay_fee);
+            let threshold = policy::dust_threshold_with_rate(&output.script_pubkey, dust_relay_fee);
             if output.value.to_sat() < threshold {
                 return true;
             }
@@ -4836,7 +4989,12 @@ impl Mempool {
     /// every request, and [`Self::get_acting_entries`] would deep-copy every
     /// transaction to do it.
     pub fn acting_count(&self) -> usize {
-        self.inner.read().entries.values().filter(|v| v.scope.is_acting()).count()
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|v| v.scope.is_acting())
+            .count()
     }
 
     /// Visit every acting-class entry under one read lock, without copying
@@ -4854,16 +5012,27 @@ impl Mempool {
     /// outputs that one has, as `vout -> (spending txid, input index)`, read
     /// under one lock so every output is answered from the same mempool.
     /// Costs one index lookup per output; nothing is copied but the result.
-    pub fn acting_spenders_of_outputs(&self, txid: &Txid, n_outputs: u32) -> HashMap<u32, (Txid, u32)> {
+    pub fn acting_spenders_of_outputs(
+        &self,
+        txid: &Txid,
+        n_outputs: u32,
+    ) -> HashMap<u32, (Txid, u32)> {
         let inner = self.inner.read();
         let mut out = HashMap::new();
         for vout in 0..n_outputs {
             let outpoint = OutPoint { txid: *txid, vout };
-            let Some(spender) = inner.spends.get(&outpoint) else { continue };
+            let Some(spender) = inner.spends.get(&outpoint) else {
+                continue;
+            };
             let Some(entry) = inner.entries.get(spender).filter(|e| e.scope.is_acting()) else {
                 continue;
             };
-            if let Some(vin) = entry.tx.input.iter().position(|i| i.previous_output == outpoint) {
+            if let Some(vin) = entry
+                .tx
+                .input
+                .iter()
+                .position(|i| i.previous_output == outpoint)
+            {
                 out.insert(vout, (*spender, vin as u32));
             }
         }
@@ -4931,7 +5100,10 @@ impl Mempool {
             .iter()
             .filter_map(|wtxid| {
                 let txid = inner.entries.txid_of(wtxid)?;
-                let entry = inner.entries.get(&txid).filter(|e| e.scope.assists_relay())?;
+                let entry = inner
+                    .entries
+                    .get(&txid)
+                    .filter(|e| e.scope.assists_relay())?;
                 Self::collect_ancestors(&inner, &txid, &mut ancestors, &mut queue);
                 Some(crate::net::tx_relay::Candidate {
                     wtxid: *wtxid,
@@ -4962,8 +5134,7 @@ impl Mempool {
             .tx
             .input
             .iter()
-            .position(|i| i.previous_output == *outpoint)?
-            as u32;
+            .position(|i| i.previous_output == *outpoint)? as u32;
         Some((spending_txid, vin))
     }
 
@@ -4974,11 +5145,18 @@ impl Mempool {
     pub fn acting_view_of(&self, outpoint: &OutPoint) -> ActingOutpointView {
         let inner = self.inner.read();
         if let Some(spender) = inner.spends.get(outpoint)
-            && inner.entries.get(spender).is_some_and(|e| e.scope.is_acting())
+            && inner
+                .entries
+                .get(spender)
+                .is_some_and(|e| e.scope.is_acting())
         {
             return ActingOutpointView::Spent;
         }
-        let Some(entry) = inner.entries.get(&outpoint.txid).filter(|e| e.scope.is_acting()) else {
+        let Some(entry) = inner
+            .entries
+            .get(&outpoint.txid)
+            .filter(|e| e.scope.is_acting())
+        else {
             return ActingOutpointView::NotInPool;
         };
         let output = entry.tx.output.get(outpoint.vout as usize).cloned();
@@ -5022,8 +5200,7 @@ impl Mempool {
             .tx
             .input
             .iter()
-            .position(|i| i.previous_output == *outpoint)?
-            as u32;
+            .position(|i| i.previous_output == *outpoint)? as u32;
         Some((spending_txid, vin))
     }
 
@@ -5240,8 +5417,11 @@ impl Mempool {
                     + size_of::<(OutPoint, Txid)>()
             })
             .sum();
-        let outputs: usize =
-            tx.output.iter().map(|o| size_of::<TxOut>() + o.script_pubkey.len()).sum();
+        let outputs: usize = tx
+            .output
+            .iter()
+            .map(|o| size_of::<TxOut>() + o.script_pubkey.len())
+            .sum();
         let prevouts = entry.prev_scripthashes.len() * size_of::<Scripthash>()
             + entry.prev_amounts.len() * size_of::<u64>()
             + entry
@@ -5377,11 +5557,7 @@ impl Mempool {
     /// One function for `accept_transaction` and `test_accept`. The RBF
     /// diagram is built over this set, so the two have to hand `rbf_check`
     /// the same one.
-    fn expand_ancestors(
-        inner: &MempoolInner,
-        cfg: &MempoolConfig,
-        ancestors: &mut HashSet<Txid>,
-    ) {
+    fn expand_ancestors(inner: &MempoolInner, cfg: &MempoolConfig, ancestors: &mut HashSet<Txid>) {
         if ancestors.is_empty() {
             return;
         }
@@ -5424,7 +5600,8 @@ impl Mempool {
         let max_weight = cfg.max_cluster_vsize.saturating_mul(4);
         let mut count = 1usize;
         let mut weight = adj_weight;
-        let oversized = |count: usize, weight: u64| count > cfg.max_cluster_count || weight > max_weight;
+        let oversized =
+            |count: usize, weight: u64| count > cfg.max_cluster_count || weight > max_weight;
         if oversized(count, weight) {
             return Err(MempoolError::TooLongMempoolChain);
         }
@@ -5456,7 +5633,10 @@ impl Mempool {
             }
             buf.extend(entry.tx.input.iter().map(|i| i.previous_output.txid));
             for next in buf.drain(..) {
-                if !evicted.contains(&next) && inner.entries.contains_key(&next) && seen.insert(next) {
+                if !evicted.contains(&next)
+                    && inner.entries.contains_key(&next)
+                    && seen.insert(next)
+                {
                     queue.push(next);
                 }
             }
@@ -5492,7 +5672,8 @@ impl Mempool {
             return Ok(None);
         }
         let vsize = policy::weight_to_vsize(adj_weight);
-        let Some(failure) = truc::single_truc_checks(inner, tx, vsize, mempool_parents, conflicts) else {
+        let Some(failure) = truc::single_truc_checks(inner, tx, vsize, mempool_parents, conflicts)
+        else {
             return Ok(None);
         };
         match failure.sibling {
@@ -5546,7 +5727,9 @@ impl Mempool {
             let detail = format!(
                 "too many potential replacements, rejecting replacement {}; \
                  too many conflicting clusters ({} > {})",
-                txid, clusters, policy::MAX_REPLACEMENT_CANDIDATES,
+                txid,
+                clusters,
+                policy::MAX_REPLACEMENT_CANDIDATES,
             );
             return Err(MempoolError::TooManyReplacements(detail));
         }
@@ -5579,16 +5762,21 @@ impl Mempool {
         }
 
         // Rules 3 and 4.
-        Self::pays_for_rbf(conflict_fee_total, new_fee, policy::weight_to_vsize(weight), cfg, txid).map_err(
-            |(required, err)| {
-                MempoolError::InsufficientReplacementFee(
-                    new_fee,
-                    required,
-                    txid.to_string(),
-                    format!("insufficient fee, {err}"),
-                )
-            },
-        )?;
+        Self::pays_for_rbf(
+            conflict_fee_total,
+            new_fee,
+            policy::weight_to_vsize(weight),
+            cfg,
+            txid,
+        )
+        .map_err(|(required, err)| {
+            MempoolError::InsufficientReplacementFee(
+                new_fee,
+                required,
+                txid.to_string(),
+                format!("insufficient fee, {err}"),
+            )
+        })?;
 
         // Core's `ReplacementChecks` checks the cluster limits after the fees
         // and before the diagram, and refuses a replacement past them as
@@ -5597,7 +5785,14 @@ impl Mempool {
         Self::check_cluster_limits(inner, cfg, &parents, weight, &all_evicted, None)?;
 
         Self::rbf_improves_diagram(
-            inner, cfg, weight, new_fee, &parents, conflicts, ancestors, &all_evicted,
+            inner,
+            cfg,
+            weight,
+            new_fee,
+            &parents,
+            conflicts,
+            ancestors,
+            &all_evicted,
         )?;
 
         Ok(all_evicted)
@@ -5636,7 +5831,10 @@ impl Mempool {
         // Saturating: the release profile has no overflow checks, so a
         // pathological `-incrementalrelayfee` would wrap and produce a *tiny*
         // floor — the opposite of what the operator asked for.
-        let min_relay = cfg.incremental_relay_fee.saturating_mul(replacement_vsize).div_ceil(1000);
+        let min_relay = cfg
+            .incremental_relay_fee
+            .saturating_mul(replacement_vsize)
+            .div_ceil(1000);
         if additional < min_relay {
             return Err((
                 original_fees + min_relay,
@@ -5797,8 +5995,7 @@ impl Mempool {
                     anc_weight_total += ae.adjusted_weight();
                 }
             }
-            let ancestor_feerate =
-                policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
+            let ancestor_feerate = policy::fee_rate_sat_per_kvb(anc_fee_total, anc_weight_total);
             let effective_feerate = new_feerate.min(ancestor_feerate);
             for conflict_txid in conflicts {
                 if let Some(ce) = inner.entries.get(conflict_txid) {
@@ -5826,8 +6023,7 @@ impl Mempool {
                 let entry = inner.entries.get(evicted)?;
                 let mut children: Vec<Txid> = Vec::new();
                 Self::collect_children(inner, evicted, &mut children);
-                let has_descendant =
-                    children.iter().any(|ch| inner.entries.contains_key(ch));
+                let has_descendant = children.iter().any(|ch| inner.entries.contains_key(ch));
                 let parent = entry
                     .tx
                     .input
@@ -5896,7 +6092,12 @@ impl Mempool {
             .iter()
             .filter(|anc| !all_evicted.contains(*anc))
             .filter_map(|anc| inner.entries.get(anc))
-            .map(|ae| FeeFrac::new(modified_fee(ae.fee, ae.fee_delta) as i64, vsize_of(ae.adjusted_weight())))
+            .map(|ae| {
+                FeeFrac::new(
+                    modified_fee(ae.fee, ae.fee_delta) as i64,
+                    vsize_of(ae.adjusted_weight()),
+                )
+            })
             .collect();
         parents.sort_by(|a, b| feerate_compare(*a, *b));
         let mut chunk = individual;
@@ -5937,10 +6138,13 @@ impl Mempool {
         parents: &[Txid],
         ancestors: &HashSet<Txid>,
         all_evicted: &HashSet<Txid>,
-    ) -> Option<(Vec<crate::mempool::feefrac::FeeFrac>, Vec<crate::mempool::feefrac::FeeFrac>)> {
+    ) -> Option<(
+        Vec<crate::mempool::feefrac::FeeFrac>,
+        Vec<crate::mempool::feefrac::FeeFrac>,
+    )> {
         use crate::mempool::feefrac::{
-            FeeFrac, MAX_CHUNKED_CLUSTER, chunk_order, feerate_compare, linearize, merge_linearizations,
-            sort_chunks,
+            FeeFrac, MAX_CHUNKED_CLUSTER, chunk_order, feerate_compare, linearize,
+            merge_linearizations, sort_chunks,
         };
 
         // Rule 5 bounds the clusters at MAX_REPLACEMENT_CANDIDATES, and the
@@ -5983,13 +6187,21 @@ impl Mempool {
             None => new_ff,
             Some(t) => {
                 let e = &inner.entries[t];
-                FeeFrac::new(modified_fee(e.fee, e.fee_delta) as i64, e.adjusted_weight() as i64)
+                FeeFrac::new(
+                    modified_fee(e.fee, e.fee_delta) as i64,
+                    e.adjusted_weight() as i64,
+                )
             }
         };
         let parents_of = |n: &Node| -> Vec<Node> {
             match n {
                 None => parents.iter().map(|p| Some(*p)).collect(),
-                Some(t) => inner.entries[t].tx.input.iter().map(|i| Some(i.previous_output.txid)).collect(),
+                Some(t) => inner.entries[t]
+                    .tx
+                    .input
+                    .iter()
+                    .map(|i| Some(i.previous_output.txid))
+                    .collect(),
             }
         };
         let is_evicted = |n: &Node| n.is_some_and(|t| all_evicted.contains(&t));
@@ -6028,11 +6240,15 @@ impl Mempool {
         };
         // A group as `feefrac` takes it, with each node's index.
         let cluster_txs = |component: &[Node]| -> (HashMap<Node, usize>, Vec<(FeeFrac, u64)>) {
-            let index: HashMap<Node, usize> = component.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+            let index: HashMap<Node, usize> =
+                component.iter().enumerate().map(|(i, n)| (*n, i)).collect();
             let txs = component
                 .iter()
                 .map(|n| {
-                    let mask = parents_of(n).iter().filter_map(|p| index.get(p)).fold(0u64, |m, i| m | (1u64 << i));
+                    let mask = parents_of(n)
+                        .iter()
+                        .filter_map(|p| index.get(p))
+                        .fold(0u64, |m, i| m | (1u64 << i));
                     (ff_of(n), mask)
                 })
                 .collect();
@@ -6080,8 +6296,11 @@ impl Mempool {
         // replacement in the first slot one held, after its parents. A
         // replacement that does better in place then never chunks worse
         // than the original, which a fresh order alone could not promise.
-        let mut new_nodes: HashSet<Node> =
-            region.iter().filter(|t| !all_evicted.contains(*t)).map(|t| Some(*t)).collect();
+        let mut new_nodes: HashSet<Node> = region
+            .iter()
+            .filter(|t| !all_evicted.contains(*t))
+            .map(|t| Some(*t))
+            .collect();
         new_nodes.insert(None);
         let mut new_chunks: Vec<FeeFrac> = Vec::new();
         for component in components(&new_nodes) {
@@ -6091,8 +6310,11 @@ impl Mempool {
             let (index, txs) = cluster_txs(&component);
             let fresh = linearize(&txs);
             let here: HashSet<Node> = component.iter().copied().collect();
-            let mut groups: Vec<usize> =
-                component.iter().flatten().filter_map(|t| group_of.get(t).copied()).collect();
+            let mut groups: Vec<usize> = component
+                .iter()
+                .flatten()
+                .filter_map(|t| group_of.get(t).copied())
+                .collect();
             groups.sort_unstable();
             groups.dedup();
             // The old clusters this one draws from, cut to its transactions
@@ -6100,8 +6322,11 @@ impl Mempool {
             let mut queues: Vec<std::collections::VecDeque<(Vec<Node>, FeeFrac)>> = groups
                 .iter()
                 .map(|g| {
-                    let seq: Vec<Node> =
-                        old_orders[*g].iter().filter(|n| here.contains(*n) || is_evicted(n)).copied().collect();
+                    let seq: Vec<Node> = old_orders[*g]
+                        .iter()
+                        .filter(|n| here.contains(*n) || is_evicted(n))
+                        .copied()
+                        .collect();
                     chunk_seq(&seq).into()
                 })
                 .collect();
@@ -6111,7 +6336,8 @@ impl Mempool {
                 for (q, queue) in queues.iter().enumerate() {
                     if let Some((_, ff)) = queue.front()
                         && pick.is_none_or(|b| {
-                            feerate_compare(*ff, queues[b].front().expect("picked").1) == std::cmp::Ordering::Greater
+                            feerate_compare(*ff, queues[b].front().expect("picked").1)
+                                == std::cmp::Ordering::Greater
                         })
                     {
                         pick = Some(q);
@@ -6435,7 +6661,11 @@ impl Mempool {
     /// [`Self::get_entry_verbose`] for one of many entries one RPC call
     /// reports: `cache` carries the chunks of the clusters already
     /// linearized for the call's earlier entries.
-    pub fn get_entry_verbose_cached(&self, txid: &Txid, cache: &mut ChunkCache) -> Option<serde_json::Value> {
+    pub fn get_entry_verbose_cached(
+        &self,
+        txid: &Txid,
+        cache: &mut ChunkCache,
+    ) -> Option<serde_json::Value> {
         let inner = self.inner.read();
         let entry = inner.entries.get(txid)?;
         // Standard surface (design §6.1): a quarantined entry is invisible here —
@@ -6630,7 +6860,9 @@ impl Mempool {
             .map_err(|e| MempoolError::Validation(e.to_string()))?;
 
         if tx.is_coinbase() {
-            return Err(MempoolError::Validation("coinbase not accepted".to_string()));
+            return Err(MempoolError::Validation(
+                "coinbase not accepted".to_string(),
+            ));
         }
 
         // `tx-size` is part of `check_standardness` on admission, so
@@ -6721,35 +6953,44 @@ impl Mempool {
             } else {
                 // Check mempool parents
                 if let Some(parent) = inner.entries.get(&input.previous_output.txid)
-                    && let Some(output) = parent.tx.output.get(input.previous_output.vout as usize) {
-                        // BIP 68 for unconfirmed parent.
-                        if bip68_enforced
-                            && !Self::bip68_satisfied(
-                                chain_state,
-                                input.sequence.0,
-                                next_height,
-                                next_height,
-                                tip_mtp,
-                            )
-                        {
-                            return Err(MempoolError::NonBip68Final);
-                        }
-                        sum_inputs += output.value.to_sat();
-                        prev_outputs.push(output.clone());
-                        prev_is_coinbase.push(false);
-                        ancestors.insert(input.previous_output.txid);
-                        continue;
+                    && let Some(output) = parent.tx.output.get(input.previous_output.vout as usize)
+                {
+                    // BIP 68 for unconfirmed parent.
+                    if bip68_enforced
+                        && !Self::bip68_satisfied(
+                            chain_state,
+                            input.sequence.0,
+                            next_height,
+                            next_height,
+                            tip_mtp,
+                        )
+                    {
+                        return Err(MempoolError::NonBip68Final);
                     }
+                    sum_inputs += output.value.to_sat();
+                    prev_outputs.push(output.clone());
+                    prev_is_coinbase.push(false);
+                    ancestors.insert(input.previous_output.txid);
+                    continue;
+                }
                 // An earlier member of the package being tested: unconfirmed,
                 // like a mempool parent, but not in the mempool's graph.
                 if let Some(output) = package
                     .and_then(|members| {
-                        members.iter().find(|m| m.compute_txid() == input.previous_output.txid)
+                        members
+                            .iter()
+                            .find(|m| m.compute_txid() == input.previous_output.txid)
                     })
                     .and_then(|m| m.output.get(input.previous_output.vout as usize))
                 {
                     if bip68_enforced
-                        && !Self::bip68_satisfied(chain_state, input.sequence.0, next_height, next_height, tip_mtp)
+                        && !Self::bip68_satisfied(
+                            chain_state,
+                            input.sequence.0,
+                            next_height,
+                            next_height,
+                            tip_mtp,
+                        )
                     {
                         return Err(MempoolError::NonBip68Final);
                     }
@@ -6854,7 +7095,10 @@ impl Mempool {
             weight_u64,
             &mempool_parents,
             &mut conflicts,
-            &PackageAdmit { no_sibling_eviction: package.is_some(), ..Default::default() },
+            &PackageAdmit {
+                no_sibling_eviction: package.is_some(),
+                ..Default::default()
+            },
         )?;
         let mut evicted: HashSet<Txid> = HashSet::new();
         if !conflicts.is_empty() && !replacing {
@@ -6869,7 +7113,13 @@ impl Mempool {
                 &ancestors,
                 sibling,
             )
-            .map_err(|e| if sibling.is_some() { e.including_sibling_eviction() } else { e })?;
+            .map_err(|e| {
+                if sibling.is_some() {
+                    e.including_sibling_eviction()
+                } else {
+                    e
+                }
+            })?;
         }
         // A package is held to the limits as a whole, by the caller.
         if package.is_none() {
@@ -6903,8 +7153,16 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         pre: TestPrechecked,
     ) -> Result<(Txid, usize, u64), MempoolError> {
-        self.test_finish_scoped(tx, chain_state, script_verifier, pre, QuarantineScope::acting(), None, TxSource::Rpc)
-            .map(|(txid, vsize, fee, _)| (txid, vsize, fee))
+        self.test_finish_scoped(
+            tx,
+            chain_state,
+            script_verifier,
+            pre,
+            QuarantineScope::acting(),
+            None,
+            TxSource::Rpc,
+        )
+        .map(|(txid, vsize, fee, _)| (txid, vsize, fee))
     }
 
     /// [`Self::test_finish`], also returning the quarantine scope the policy
@@ -6946,11 +7204,12 @@ impl Mempool {
         let at = crate::validation::script::ScriptContext::unmined(tip_height + 1);
         script_verifier
             .verify_transaction(tx, &prev_outputs, at)
+            .map_err(|e| MempoolError::Script(e.reason().to_string(), e.core_debug_string(tx)))?;
+        script_verifier
+            .verify_policy(tx, &prev_outputs)
             .map_err(|e| {
-                MempoolError::Script(e.reason().to_string(), e.core_debug_string(tx))
+                MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(tx))
             })?;
-        script_verifier.verify_policy(tx, &prev_outputs)
-            .map_err(|e| MempoolError::PolicyScript(e.reason().to_string(), e.core_debug_string(tx)))?;
 
         // Policy dry-run (§6.1): `testmempoolaccept` answers "would a local
         // `sendrawtransaction` accept this?", so it must apply the same policy
@@ -6986,8 +7245,18 @@ impl Mempool {
                 mempool_bytes: mempool_bytes.unwrap_or(inner.total_bytes),
             };
             let verdict = policy_engine::evaluate(
-                rs, tx, &txid, &prev_outputs, &prev_is_coinbase, fee, fee_rate, weight, &cfg, ctx,
-                source, false,
+                rs,
+                tx,
+                &txid,
+                &prev_outputs,
+                &prev_is_coinbase,
+                fee,
+                fee_rate,
+                weight,
+                &cfg,
+                ctx,
+                source,
+                false,
             );
             let (mut scope, own_rule) = match &verdict {
                 satd_policy::Verdict::Allow { .. } => {
@@ -7070,7 +7339,8 @@ impl Mempool {
             match checked {
                 Ok(p) => pre.push(p),
                 Err(e) => {
-                    out.results.insert(crate::validation::decode::wtxid(tx), Err(e));
+                    out.results
+                        .insert(crate::validation::decode::wtxid(tx), Err(e));
                     return out;
                 }
             }
@@ -7082,7 +7352,9 @@ impl Mempool {
             let members: Vec<&Transaction> = txs.iter().collect();
             for (tx, p) in txs.iter().zip(&pre) {
                 let vsize = policy::weight_to_vsize(p.adj_weight);
-                if let Some(detail) = truc::package_truc_checks(&*inner, tx, vsize, &members, &p.mempool_parents) {
+                if let Some(detail) =
+                    truc::package_truc_checks(&*inner, tx, vsize, &members, &p.mempool_parents)
+                {
                     out.package_error = Some(format!("TRUC-violation, {detail}"));
                     return out;
                 }
@@ -7095,7 +7367,8 @@ impl Mempool {
             if !cfg.accept_non_std_txn
                 && let Some((i, e)) = Self::package_ephemeral_spends(&inner, &cfg, txs)
             {
-                out.results.insert(crate::validation::decode::wtxid(&txs[i]), Err(e));
+                out.results
+                    .insert(crate::validation::decode::wtxid(&txs[i]), Err(e));
                 return out;
             }
         }
@@ -7137,7 +7410,10 @@ impl Mempool {
         let mut spenders: HashMap<Txid, Vec<usize>> = HashMap::new();
         for (i, tx) in txs.iter().enumerate() {
             for input in &tx.input {
-                spenders.entry(input.previous_output.txid).or_default().push(i);
+                spenders
+                    .entry(input.previous_output.txid)
+                    .or_default()
+                    .push(i);
             }
         }
         let max_weight = cfg.max_cluster_vsize.saturating_mul(4);
@@ -7165,12 +7441,18 @@ impl Mempool {
                         txids[i]
                     }
                     Node::Pool(t) => {
-                        let Some(entry) = inner.entries.get(&t) else { continue };
+                        let Some(entry) = inner.entries.get(&t) else {
+                            continue;
+                        };
                         weight = weight.saturating_add(entry.adjusted_weight());
                         buf.clear();
                         Self::collect_children(inner, &t, &mut buf);
                         buf.extend(entry.tx.input.iter().map(|i| i.previous_output.txid));
-                        next.extend(buf.iter().filter(|n| inner.entries.contains_key(*n)).map(|n| Node::Pool(*n)));
+                        next.extend(
+                            buf.iter()
+                                .filter(|n| inner.entries.contains_key(*n))
+                                .map(|n| Node::Pool(*n)),
+                        );
                         t
                     }
                 };
@@ -7178,7 +7460,13 @@ impl Mempool {
                 if count > cfg.max_cluster_count || weight > max_weight {
                     return Err(MempoolError::TooLongMempoolChain);
                 }
-                next.extend(spenders.get(&txid).into_iter().flatten().map(|j| Node::Member(*j)));
+                next.extend(
+                    spenders
+                        .get(&txid)
+                        .into_iter()
+                        .flatten()
+                        .map(|j| Node::Member(*j)),
+                );
                 for n in next {
                     if seen.insert(n) {
                         queue.push(n);
@@ -7211,9 +7499,9 @@ impl Mempool {
                 let Some(parent) = parent else { continue };
                 let dust = Self::dust_output_indices(parent, cfg.dust_relay_fee);
                 let sweeps_all = dust.iter().all(|&di| {
-                    tx.input
-                        .iter()
-                        .any(|i| i.previous_output.txid == parent_txid && i.previous_output.vout == di)
+                    tx.input.iter().any(|i| {
+                        i.previous_output.txid == parent_txid && i.previous_output.vout == di
+                    })
                 });
                 if !sweeps_all {
                     return Some((
@@ -7264,23 +7552,39 @@ impl Mempool {
         // Only a parent and its child: with more, or with an unconfirmed
         // parent in the mempool, the new cluster would hold more than the
         // two of them, which the checks below do not describe.
-        if pre.len() != 2 || !members[1].input.iter().any(|i| i.previous_output.txid == pre[0].txid) {
+        if pre.len() != 2
+            || !members[1]
+                .input
+                .iter()
+                .any(|i| i.previous_output.txid == pre[0].txid)
+        {
             return Err(failed("package must be 1-parent-1-child", None));
         }
         if pre.iter().any(|p| !p.mempool_parents.is_empty()) {
-            return Err(failed("new transaction cannot have mempool ancestors", None));
+            return Err(failed(
+                "new transaction cannot have mempool ancestors",
+                None,
+            ));
         }
 
         let cfg = self.config.read().clone();
         let inner = self.inner.read();
         let child = pre[1].txid;
-        let conflicts: HashSet<Txid> = pre.iter().flat_map(|p| p.conflicts.iter().copied()).collect();
+        let conflicts: HashSet<Txid> = pre
+            .iter()
+            .flat_map(|p| p.conflicts.iter().copied())
+            .collect();
 
         // `-mempoolfullrbf=0`: every direct conflict must signal, as
         // `rbf_check` asks of a single replacement. Core has no such switch.
         if !cfg.full_rbf {
             for (i, p) in pre.iter().enumerate() {
-                if p.conflicts.iter().any(|c| inner.entries.get(c).is_some_and(|e| !Self::signals_rbf(&e.tx))) {
+                if p.conflicts.iter().any(|c| {
+                    inner
+                        .entries
+                        .get(c)
+                        .is_some_and(|e| !Self::signals_rbf(&e.tx))
+                }) {
                     return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend));
                 }
             }
@@ -7288,8 +7592,12 @@ impl Mempool {
 
         // Rule 5 over the conflicts of both, as the child's replacement.
         let bound = Self::rbf_eviction_bound(&cfg);
-        let clusters =
-            Self::conflicting_cluster_count(&inner, &conflicts, policy::MAX_REPLACEMENT_CANDIDATES, bound);
+        let clusters = Self::conflicting_cluster_count(
+            &inner,
+            &conflicts,
+            policy::MAX_REPLACEMENT_CANDIDATES,
+            bound,
+        );
         if clusters > policy::MAX_REPLACEMENT_CANDIDATES {
             return Err(failed(
                 "too many potential replacements",
@@ -7299,10 +7607,13 @@ impl Mempool {
                 )),
             ));
         }
-        let Some((evicted, conflict_fees)) = Self::rbf_conflict_set(&inner, &conflicts, bound) else {
+        let Some((evicted, conflict_fees)) = Self::rbf_conflict_set(&inner, &conflicts, bound)
+        else {
             return Err(failed(
                 "too many potential replacements",
-                Some(format!("rejecting replacement {child}; the eviction set exceeds {bound} transactions")),
+                Some(format!(
+                    "rejecting replacement {child}; the eviction set exceeds {bound} transactions"
+                )),
             ));
         };
 
@@ -7319,7 +7630,8 @@ impl Mempool {
         // exact; its text is the rate per kvB, rounded down.
         let parent_fee = pre[0].modified_fee;
         let parent_vsize = pre[0].vsize as u64;
-        if u128::from(fee) * u128::from(parent_vsize) <= u128::from(parent_fee) * u128::from(vsize) {
+        if u128::from(fee) * u128::from(parent_vsize) <= u128::from(parent_fee) * u128::from(vsize)
+        {
             let per_kvb = |fee: u64, vsize: u64| {
                 let rate = fee.saturating_mul(1000) / vsize.max(1);
                 format!("{}.{:08} BTC/kvB", rate / 100_000_000, rate % 100_000_000)
@@ -7337,13 +7649,29 @@ impl Mempool {
         // The two make a cluster of their own: no mempool parent, and
         // nothing in the mempool spends them yet.
         if pre.len() > cfg.max_cluster_count || weight > cfg.max_cluster_vsize.saturating_mul(4) {
-            return Err(PackageRbfRefusal::Package(MempoolError::TooLongMempoolChain.state_string()));
+            return Err(PackageRbfRefusal::Package(
+                MempoolError::TooLongMempoolChain.state_string(),
+            ));
         }
 
         // A single chunk, so the new side of the diagram is the package as
         // one transaction with no mempool parents.
-        Self::rbf_improves_diagram(&inner, &cfg, weight, fee, &[], &conflicts, &HashSet::new(), &evicted)
-            .map_err(|e| failed(&e.reject_details().unwrap_or_else(|| e.reject_reason()), None))?;
+        Self::rbf_improves_diagram(
+            &inner,
+            &cfg,
+            weight,
+            fee,
+            &[],
+            &conflicts,
+            &HashSet::new(),
+            &evicted,
+        )
+        .map_err(|e| {
+            failed(
+                &e.reject_details().unwrap_or_else(|| e.reject_reason()),
+                None,
+            )
+        })?;
 
         // Unconditionally, unlike `testmempoolaccept`: admission enforces the
         // dust spends whatever `-acceptnonstdtxn` says, and a refusal there
@@ -7362,7 +7690,8 @@ impl Mempool {
             .filter_map(|t| inner.entries.get(t))
             .map(|e| bitcoin::consensus::serialize(&e.tx).len())
             .sum();
-        let child_sees = inner.total_bytes.saturating_sub(freed) + bitcoin::consensus::serialize(&members[0]).len();
+        let child_sees = inner.total_bytes.saturating_sub(freed)
+            + bitcoin::consensus::serialize(&members[0]).len();
         drop(inner);
 
         // Scripts and the policy, the child taking on its parent's scope.
@@ -7384,9 +7713,13 @@ impl Mempool {
                 )
                 .map_err(|e| PackageRbfRefusal::Member(i, e))?;
             if scope.is_quarantined()
-                && own_conflicts
-                    .iter()
-                    .any(|c| self.inner.read().entries.get(c).is_some_and(|e| e.scope.is_acting()))
+                && own_conflicts.iter().any(|c| {
+                    self.inner
+                        .read()
+                        .entries
+                        .get(c)
+                        .is_some_and(|e| e.scope.is_acting())
+                })
             {
                 return Err(PackageRbfRefusal::Member(i, MempoolError::ConflictingSpend));
             }
@@ -7421,8 +7754,7 @@ impl Mempool {
                 if o.script_pubkey.is_op_return() {
                     return None;
                 }
-                let threshold =
-                    policy::dust_threshold_with_rate(&o.script_pubkey, dust_relay_fee);
+                let threshold = policy::dust_threshold_with_rate(&o.script_pubkey, dust_relay_fee);
                 if o.value.to_sat() < threshold {
                     Some(i as u32)
                 } else {
@@ -7447,17 +7779,30 @@ impl Mempool {
         let mut prev_outputs = Vec::with_capacity(tx.input.len());
         for input in &tx.input {
             let prev = if let Some(coin) = chain_state.get_coin(&input.previous_output) {
-                TxOut { value: bitcoin::Amount::from_sat(coin.amount), script_pubkey: coin.script_pubkey }
+                TxOut {
+                    value: bitcoin::Amount::from_sat(coin.amount),
+                    script_pubkey: coin.script_pubkey,
+                }
             } else if let Some(parent) = pkg_tx_map.get(&input.previous_output.txid) {
-                parent.output.get(input.previous_output.vout as usize)?.clone()
+                parent
+                    .output
+                    .get(input.previous_output.vout as usize)?
+                    .clone()
             } else {
                 let inner = self.inner.read();
                 let entry = inner.entries.get(&input.previous_output.txid)?;
-                entry.tx.output.get(input.previous_output.vout as usize)?.clone()
+                entry
+                    .tx
+                    .output
+                    .get(input.previous_output.vout as usize)?
+                    .clone()
             };
             prev_outputs.push(prev);
         }
-        let sum_in: u64 = prev_outputs.iter().map(|o| o.value.to_sat()).fold(0, u64::saturating_add);
+        let sum_in: u64 = prev_outputs
+            .iter()
+            .map(|o| o.value.to_sat())
+            .fold(0, u64::saturating_add);
         let sum_out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
         let adj_weight = policy::sigops_adjusted_weight(
             tx.weight().to_wu(),
@@ -7483,8 +7828,7 @@ impl Mempool {
         modified_fee: i64,
         dust_relay_fee: u64,
     ) -> Result<(), MempoolError> {
-        if (base_fee != 0 || modified_fee != 0)
-            && Self::count_dust_outputs(tx, dust_relay_fee) > 0
+        if (base_fee != 0 || modified_fee != 0) && Self::count_dust_outputs(tx, dust_relay_fee) > 0
         {
             return Err(MempoolError::EphemeralDustFee);
         }
@@ -7522,7 +7866,13 @@ impl Mempool {
         script_verifier: &dyn ScriptVerifier,
         client_maxfeerate: Option<u64>,
     ) -> PackageResult {
-        self.accept_package_from(txs, chain_state, script_verifier, client_maxfeerate, TxSource::Rpc)
+        self.accept_package_from(
+            txs,
+            chain_state,
+            script_verifier,
+            client_maxfeerate,
+            TxSource::Rpc,
+        )
     }
 
     /// [`Self::accept_package_with`] for a package from `source`: a local
@@ -7606,13 +7956,11 @@ impl Mempool {
             };
         }
 
-
         // Build a set of txids in the package for CPFP resolution.
         let _pkg_txids: HashSet<Txid> = pkg.iter().map(|p| p.txid).collect();
 
         // Track package outputs: txid -> tx, for CPFP within the package.
-        let pkg_tx_map: HashMap<Txid, &Transaction> =
-            pkg.iter().map(|p| (p.txid, &p.tx)).collect();
+        let pkg_tx_map: HashMap<Txid, &Transaction> = pkg.iter().map(|p| (p.txid, &p.tx)).collect();
 
         // `maxfeerate`, Core's `m_client_maxfeerate`: refuse a member above the
         // caller's own ceiling *before* admitting it, so the transaction never
@@ -7638,11 +7986,18 @@ impl Mempool {
                 }
                 // Unknowable fee (an input resolves nowhere) — acceptance will
                 // refuse it for that instead, and with a better reason.
-                let Some((base_fee, adj_weight)) = self.package_member_fee(&ptx.tx, chain_state, &pkg_tx_map)
+                let Some((base_fee, adj_weight)) =
+                    self.package_member_fee(&ptx.tx, chain_state, &pkg_tx_map)
                 else {
                     continue;
                 };
-                let delta = self.inner.read().fee_deltas.get(&ptx.txid).copied().unwrap_or(0);
+                let delta = self
+                    .inner
+                    .read()
+                    .fee_deltas
+                    .get(&ptx.txid)
+                    .copied()
+                    .unwrap_or(0);
                 // Core's `CFeeRate(ws.m_modified_fees, ws.m_vsize)`: the
                 // sigop-adjusted size.
                 let rate = policy::fee_rate_sat_per_kvb(modified_fee(base_fee, delta), adj_weight);
@@ -7744,7 +8099,10 @@ impl Mempool {
 
             // Try normal acceptance. Room is made once the whole package is
             // in, not member by member.
-            let mut admit = PackageAdmit { defer_trim: true, ..Default::default() };
+            let mut admit = PackageAdmit {
+                defer_trim: true,
+                ..Default::default()
+            };
             let accepted = self.accept_transaction_led(
                 ptx.tx.clone(),
                 chain_state,
@@ -7791,8 +8149,11 @@ impl Mempool {
                     for input in &ptx.tx.input {
                         if let Some(coin) = chain_state.get_coin(&input.previous_output) {
                             sum_in += coin.amount;
-                        } else if let Some(parent_tx) = pkg_tx_map.get(&input.previous_output.txid) {
-                            if let Some(out) = parent_tx.output.get(input.previous_output.vout as usize) {
+                        } else if let Some(parent_tx) = pkg_tx_map.get(&input.previous_output.txid)
+                        {
+                            if let Some(out) =
+                                parent_tx.output.get(input.previous_output.vout as usize)
+                            {
                                 sum_in += out.value.to_sat();
                             } else {
                                 inputs_ok = false;
@@ -7801,7 +8162,9 @@ impl Mempool {
                         } else {
                             let inner = self.inner.read();
                             if let Some(entry) = inner.entries.get(&input.previous_output.txid) {
-                                if let Some(out) = entry.tx.output.get(input.previous_output.vout as usize) {
+                                if let Some(out) =
+                                    entry.tx.output.get(input.previous_output.vout as usize)
+                                {
                                     sum_in += out.value.to_sat();
                                 } else {
                                     inputs_ok = false;
@@ -7815,7 +8178,13 @@ impl Mempool {
                     }
 
                     if !inputs_ok {
-                        failed.insert(ptx.wtxid, ("bad-txns-inputs-missingorspent".to_string(), MempoolError::MissingInputs));
+                        failed.insert(
+                            ptx.wtxid,
+                            (
+                                "bad-txns-inputs-missingorspent".to_string(),
+                                MempoolError::MissingInputs,
+                            ),
+                        );
                         continue;
                     }
 
@@ -7827,15 +8196,21 @@ impl Mempool {
                     // pays a fee, then the relay floor applies. The strings
                     // come from the error variants so the two admission paths
                     // cannot drift apart.
-                    let fee_delta = self.inner.read().fee_deltas.get(&ptx.txid).copied().unwrap_or(0);
+                    let fee_delta = self
+                        .inner
+                        .read()
+                        .fee_deltas
+                        .get(&ptx.txid)
+                        .copied()
+                        .unwrap_or(0);
                     if dust_count > policy::MAX_DUST_OUTPUTS_PER_TX {
-                        failed.insert(ptx.wtxid, (MempoolError::Dust.to_string(), MempoolError::Dust));
-                    } else if let Err(e) = Self::pre_check_ephemeral(
-                        &ptx.tx,
-                        base_fee,
-                        fee_delta,
-                        cfg.dust_relay_fee,
-                    ) {
+                        failed.insert(
+                            ptx.wtxid,
+                            (MempoolError::Dust.to_string(), MempoolError::Dust),
+                        );
+                    } else if let Err(e) =
+                        Self::pre_check_ephemeral(&ptx.tx, base_fee, fee_delta, cfg.dust_relay_fee)
+                    {
                         failed.insert(ptx.wtxid, (e.to_string(), e));
                     } else if dust_count == 1 && base_fee == 0 {
                         // Valid ephemeral dust candidate — defer acceptance.
@@ -7844,7 +8219,8 @@ impl Mempool {
                     } else if dust_count == 0
                         && matches!(
                             orig_err,
-                            MempoolError::InsufficientFee(..) | MempoolError::MempoolMinFeeNotMet(..)
+                            MempoolError::InsufficientFee(..)
+                                | MempoolError::MempoolMinFeeNotMet(..)
                         )
                     {
                         // Below a floor and nothing else: the child may pay
@@ -7865,7 +8241,10 @@ impl Mempool {
                             failed.insert(
                                 ptx.wtxid,
                                 (
-                                    format!("min relay fee not met. {} < {}", fee_rate, cfg.min_fee_rate),
+                                    format!(
+                                        "min relay fee not met. {} < {}",
+                                        fee_rate, cfg.min_fee_rate
+                                    ),
                                     MempoolError::InsufficientFee(fee_rate, cfg.min_fee_rate),
                                 ),
                             );
@@ -7877,7 +8256,13 @@ impl Mempool {
                 Err(MempoolError::MissingInputs) => {
                     // Might be a child spending from a package parent — defer
                     // and retry after parents are accepted.
-                    deferred_err.insert(ptx.txid, (MempoolError::MissingInputs.to_string(), MempoolError::MissingInputs));
+                    deferred_err.insert(
+                        ptx.txid,
+                        (
+                            MempoolError::MissingInputs.to_string(),
+                            MempoolError::MissingInputs,
+                        ),
+                    );
                     let dust_count = Self::count_dust_outputs(&ptx.tx, cfg.dust_relay_fee);
                     if dust_count == 1 {
                         // Resolve inputs to check fee
@@ -7887,8 +8272,12 @@ impl Mempool {
                         for input in &ptx.tx.input {
                             if let Some(coin) = chain_state.get_coin(&input.previous_output) {
                                 sum_in += coin.amount;
-                            } else if let Some(parent_tx) = pkg_tx_map.get(&input.previous_output.txid) {
-                                if let Some(out) = parent_tx.output.get(input.previous_output.vout as usize) {
+                            } else if let Some(parent_tx) =
+                                pkg_tx_map.get(&input.previous_output.txid)
+                            {
+                                if let Some(out) =
+                                    parent_tx.output.get(input.previous_output.vout as usize)
+                                {
                                     sum_in += out.value.to_sat();
                                 } else {
                                     inputs_ok = false;
@@ -7896,8 +8285,11 @@ impl Mempool {
                                 }
                             } else {
                                 let inner = self.inner.read();
-                                if let Some(entry) = inner.entries.get(&input.previous_output.txid) {
-                                    if let Some(out) = entry.tx.output.get(input.previous_output.vout as usize) {
+                                if let Some(entry) = inner.entries.get(&input.previous_output.txid)
+                                {
+                                    if let Some(out) =
+                                        entry.tx.output.get(input.previous_output.vout as usize)
+                                    {
                                         sum_in += out.value.to_sat();
                                     } else {
                                         inputs_ok = false;
@@ -7909,11 +8301,21 @@ impl Mempool {
                                 }
                             }
                         }
-                        let base_fee = if inputs_ok { sum_in.saturating_sub(sum_out) } else { 1 };
+                        let base_fee = if inputs_ok {
+                            sum_in.saturating_sub(sum_out)
+                        } else {
+                            1
+                        };
                         if inputs_ok && base_fee == 0 {
                             ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
                         } else if inputs_ok && base_fee > 0 {
-                            failed.insert(ptx.wtxid, (MempoolError::EphemeralDustFee.to_string(), MempoolError::EphemeralDustFee));
+                            failed.insert(
+                                ptx.wtxid,
+                                (
+                                    MempoolError::EphemeralDustFee.to_string(),
+                                    MempoolError::EphemeralDustFee,
+                                ),
+                            );
                         } else {
                             ephemeral_parents.insert(ptx.txid, ptx.tx.clone());
                         }
@@ -7951,9 +8353,13 @@ impl Mempool {
                     || rbf_members.contains(&p.txid)
             })
             .collect();
-        let refuse_deferred = |failed: &mut HashMap<bitcoin::Wtxid, Refusal>, members: &[&PkgTx]| {
+        let refuse_deferred = |failed: &mut HashMap<bitcoin::Wtxid, Refusal>,
+                               members: &[&PkgTx]| {
             for p in members {
-                if let Some(err) = cpfp_parents.get(&p.txid).or_else(|| deferred_err.get(&p.txid)) {
+                if let Some(err) = cpfp_parents
+                    .get(&p.txid)
+                    .or_else(|| deferred_err.get(&p.txid))
+                {
                     failed.insert(p.wtxid, err.clone());
                 }
             }
@@ -7988,21 +8394,45 @@ impl Mempool {
                     .collect();
                 Self::direct_mempool_parents(tx, &resident)
             };
-            let member_failure = eval.iter().zip(&vsizes).enumerate().find_map(|(i, (p, vsize))| {
-                let conflicts: HashSet<Txid> =
-                    p.tx.input.iter().filter_map(|i| inner.spends.get(&i.previous_output).copied()).collect();
-                truc::single_truc_checks(&*inner, &p.tx, (*vsize)?, &parents_in_pool(&p.tx), &conflicts)
-                    .map(|f| (i, f.detail))
-            });
+            let member_failure =
+                eval.iter()
+                    .zip(&vsizes)
+                    .enumerate()
+                    .find_map(|(i, (p, vsize))| {
+                        let conflicts: HashSet<Txid> =
+                            p.tx.input
+                                .iter()
+                                .filter_map(|i| inner.spends.get(&i.previous_output).copied())
+                                .collect();
+                        truc::single_truc_checks(
+                            &*inner,
+                            &p.tx,
+                            (*vsize)?,
+                            &parents_in_pool(&p.tx),
+                            &conflicts,
+                        )
+                        .map(|f| (i, f.detail))
+                    });
             let package_failure = || {
                 eval.iter().zip(&vsizes).find_map(|(p, vsize)| {
-                    truc::package_truc_checks(&*inner, &p.tx, (*vsize)?, &members, &parents_in_pool(&p.tx))
+                    truc::package_truc_checks(
+                        &*inner,
+                        &p.tx,
+                        (*vsize)?,
+                        &members,
+                        &parents_in_pool(&p.tx),
+                    )
                 })
             };
             if let Some((i, detail)) = member_failure {
                 // Core stops at the member; the others keep what they were
                 // refused for alone.
-                let rest: Vec<&PkgTx> = eval.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
+                let rest: Vec<&PkgTx> = eval
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, p)| *p)
+                    .collect();
                 refuse_deferred(&mut failed, &rest);
                 let e = MempoolError::TrucViolation(detail);
                 failed.insert(eval[i].wtxid, (e.state_string(), e));
@@ -8020,7 +8450,13 @@ impl Mempool {
             // for acceptance to refuse, with the reason that says so.
             let totals = eval.iter().try_fold((0u64, 0u64), |(fee, weight), p| {
                 let (base, w) = self.package_member_fee(&p.tx, chain_state, &pkg_tx_map)?;
-                let delta = self.inner.read().fee_deltas.get(&p.txid).copied().unwrap_or(0);
+                let delta = self
+                    .inner
+                    .read()
+                    .fee_deltas
+                    .get(&p.txid)
+                    .copied()
+                    .unwrap_or(0);
                 Some((fee.saturating_add(modified_fee(base, delta)), weight + w))
             });
             if let Some((fee, weight)) = totals {
@@ -8043,7 +8479,11 @@ impl Mempool {
         // evicted; then committed, and the paths below have nothing left.
         let replaces = package_eval && {
             let inner = self.inner.read();
-            eval.iter().any(|p| p.tx.input.iter().any(|i| inner.spends.contains_key(&i.previous_output)))
+            eval.iter().any(|p| {
+                p.tx.input
+                    .iter()
+                    .any(|i| inner.spends.contains_key(&i.previous_output))
+            })
         };
         if replaces {
             let members: Vec<Transaction> = eval.iter().map(|p| p.tx.clone()).collect();
@@ -8053,8 +8493,12 @@ impl Mempool {
                     package_error = Some(msg);
                 }
                 Err(PackageRbfRefusal::Member(i, err)) => {
-                    let rest: Vec<&PkgTx> =
-                        eval.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
+                    let rest: Vec<&PkgTx> = eval
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, p)| *p)
+                        .collect();
                     refuse_deferred(&mut failed, &rest);
                     failed.insert(eval[i].wtxid, (err.state_string(), err));
                 }
@@ -8074,7 +8518,10 @@ impl Mempool {
                         hold_events: true,
                         ..Default::default()
                     };
-                    let mut parent_admit = PackageAdmit { skip_fee_floor: true, ..hold() };
+                    let mut parent_admit = PackageAdmit {
+                        skip_fee_floor: true,
+                        ..hold()
+                    };
                     let mut child_admit = hold();
                     let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
                     let outcome = {
@@ -8155,7 +8602,11 @@ impl Mempool {
                         Err((member, err)) => {
                             self.emit_evicted(&gone, EvictReason::BlockConflict);
                             failed.insert(member.wtxid, (err.state_string(), err));
-                            let other = if member.txid == parent.txid { child } else { parent };
+                            let other = if member.txid == parent.txid {
+                                child
+                            } else {
+                                parent
+                            };
                             refuse_deferred(&mut failed, &[other]);
                         }
                     }
@@ -8230,7 +8681,12 @@ impl Mempool {
         // First identify which deferred txs are parents and which are children.
         for (txid, tx) in &ephemeral_parents {
             let dust_indices = Self::dust_output_indices(tx, cfg.dust_relay_fee);
-            if dust_indices.is_empty() && !tx.input.iter().any(|i| ephemeral_parents.contains_key(&i.previous_output.txid) || accepted_txids.contains(&i.previous_output.txid)) {
+            if dust_indices.is_empty()
+                && !tx.input.iter().any(|i| {
+                    ephemeral_parents.contains_key(&i.previous_output.txid)
+                        || accepted_txids.contains(&i.previous_output.txid)
+                })
+            {
                 // Not a dust parent and not a child — this shouldn't be deferred.
                 // It might have been deferred due to MissingInputs with no dust.
                 children_to_accept.push(*txid);
@@ -8303,17 +8759,20 @@ impl Mempool {
                         // contributes none and the child is not refused at all.
                         if spends_parent && !accepted_txids.contains(&ptx.txid) {
                             let spends_all_dust = dust_indices.iter().all(|&di| {
-                                ptx.tx
-                                    .input
-                                    .iter()
-                                    .any(|i| i.previous_output.txid == parent_txid && i.previous_output.vout == di)
+                                ptx.tx.input.iter().any(|i| {
+                                    i.previous_output.txid == parent_txid
+                                        && i.previous_output.vout == di
+                                })
                             });
                             if !spends_all_dust {
                                 let text = format!(
                                     "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
                                     ptx.txid, ptx.wtxid
                                 );
-                                failed.insert(ptx.wtxid, (text.clone(), MempoolError::MissingEphemeralSpends(text)));
+                                failed.insert(
+                                    ptx.wtxid,
+                                    (text.clone(), MempoolError::MissingEphemeralSpends(text)),
+                                );
                             }
                         }
                     }
@@ -8337,7 +8796,9 @@ impl Mempool {
                     // one has none: it is off the standard stream, and only
                     // its quarantine-channel event goes out, once settled.
                     let seq = admit.held.iter().find_map(|e| match e {
-                        MempoolEvent::Enter { mempool_sequence, .. } => Some(*mempool_sequence),
+                        MempoolEvent::Enter {
+                            mempool_sequence, ..
+                        } => Some(*mempool_sequence),
                         _ => None,
                     });
                     dust_quarantine.insert(parent_txid, std::mem::take(&mut admit.held_quarantine));
@@ -8389,14 +8850,15 @@ impl Mempool {
                 // Check in-mempool parents for dust outputs.
                 let inner = self.inner.read();
                 if let Some(parent_entry) = inner.entries.get(&parent_txid_ref) {
-                    let dust_indices = Self::dust_output_indices(&parent_entry.tx, cfg.dust_relay_fee);
+                    let dust_indices =
+                        Self::dust_output_indices(&parent_entry.tx, cfg.dust_relay_fee);
                     if !dust_indices.is_empty() {
                         // Parent has dust — does this child spend ALL dust outputs?
                         let spends_all = dust_indices.iter().all(|&di| {
-                            child_tx
-                                .input
-                                .iter()
-                                .any(|i| i.previous_output.txid == parent_txid_ref && i.previous_output.vout == di)
+                            child_tx.input.iter().any(|i| {
+                                i.previous_output.txid == parent_txid_ref
+                                    && i.previous_output.vout == di
+                            })
                         });
                         if !spends_all {
                             ephemeral_violation = true;
@@ -8411,7 +8873,10 @@ impl Mempool {
                     "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
                     child_txid, wtxid
                 );
-                failed.insert(wtxid, (text.clone(), MempoolError::MissingEphemeralSpends(text)));
+                failed.insert(
+                    wtxid,
+                    (text.clone(), MempoolError::MissingEphemeralSpends(text)),
+                );
                 continue;
             }
 
@@ -8430,7 +8895,8 @@ impl Mempool {
                             .iter()
                             .all(|&di| {
                                 child_tx.input.iter().any(|i| {
-                                    i.previous_output.txid == **parent && i.previous_output.vout == di
+                                    i.previous_output.txid == **parent
+                                        && i.previous_output.vout == di
                                 })
                             })
                     })
@@ -8446,7 +8912,12 @@ impl Mempool {
             // the order the parents went in.
             let paid_for: Vec<Txid> = cpfp_admitted
                 .iter()
-                .filter(|parent| child_tx.input.iter().any(|i| i.previous_output.txid == **parent))
+                .filter(|parent| {
+                    child_tx
+                        .input
+                        .iter()
+                        .any(|i| i.previous_output.txid == **parent)
+                })
                 .copied()
                 .collect();
             for parent in &paid_for {
@@ -8455,11 +8926,17 @@ impl Mempool {
                 }
             }
             lead.sort_by_key(|event| match event {
-                MempoolEvent::Enter { mempool_sequence, .. } => *mempool_sequence,
+                MempoolEvent::Enter {
+                    mempool_sequence, ..
+                } => *mempool_sequence,
                 _ => 0,
             });
 
-            let mut admit = PackageAdmit { defer_trim: true, no_sibling_eviction: true, ..Default::default() };
+            let mut admit = PackageAdmit {
+                defer_trim: true,
+                no_sibling_eviction: true,
+                ..Default::default()
+            };
             let accepted = self.accept_transaction_led(
                 child_tx.clone(),
                 chain_state,
@@ -8529,7 +9006,10 @@ impl Mempool {
             .filter(|parent| {
                 !pkg.iter().any(|m| {
                     accepted_txids.contains(&m.txid)
-                        && m.tx.input.iter().any(|i| i.previous_output.txid == **parent)
+                        && m.tx
+                            .input
+                            .iter()
+                            .any(|i| i.previous_output.txid == **parent)
                 })
             })
             .copied()
@@ -8601,13 +9081,21 @@ impl Mempool {
                 accepted_results.retain(|m| m.txid != p.txid);
                 accepted_txids.remove(&p.txid);
                 same_txid_other_witness.remove(&p.txid);
-                failed.insert(p.wtxid, (MempoolError::MempoolFull.to_string(), MempoolError::MempoolFull));
+                failed.insert(
+                    p.wtxid,
+                    (
+                        MempoolError::MempoolFull.to_string(),
+                        MempoolError::MempoolFull,
+                    ),
+                );
                 trimmed_member = true;
             }
         }
 
         let unspent_dust = !stranded.is_empty()
-            || parents_to_accept.iter().any(|txid| !accepted_txids.contains(txid) && !trimmed.contains(txid));
+            || parents_to_accept
+                .iter()
+                .any(|txid| !accepted_txids.contains(txid) && !trimmed.contains(txid));
         //
         // A member refused for the caller's `maxfeerate` ceiling never enters
         // the acceptance loop, so it is in `over_maxfeerate` and not `failed`
@@ -8733,8 +9221,16 @@ impl Mempool {
             }
         }
 
-        let member_errors = failed.into_iter().map(|(wtxid, (_, e))| (wtxid, e)).collect();
-        PackageResult { package_msg, tx_results, replaced, member_errors }
+        let member_errors = failed
+            .into_iter()
+            .map(|(wtxid, (_, e))| (wtxid, e))
+            .collect();
+        PackageResult {
+            package_msg,
+            tx_results,
+            replaced,
+            member_errors,
+        }
     }
 
     /// Admit an ephemeral dust parent of a package: the ordinary admission,
@@ -8755,8 +9251,15 @@ impl Mempool {
             hold_events: true,
             ..Default::default()
         };
-        let txid =
-            self.accept_transaction_led(tx, chain_state, script_verifier, source, false, Vec::new(), &mut admit)?;
+        let txid = self.accept_transaction_led(
+            tx,
+            chain_state,
+            script_verifier,
+            source,
+            false,
+            Vec::new(),
+            &mut admit,
+        )?;
         Ok((txid, admit))
     }
 
@@ -8795,7 +9298,10 @@ impl Mempool {
             return Some(MempoolError::MempoolMinFeeNotMet(fee, required));
         }
         if policy::fee_rate_sat_per_kvb(fee, adj_weight) < cfg.min_fee_rate {
-            return Some(MempoolError::InsufficientFee(fee, policy::fee_for_rate(cfg.min_fee_rate, adj_weight)));
+            return Some(MempoolError::InsufficientFee(
+                fee,
+                policy::fee_for_rate(cfg.min_fee_rate, adj_weight),
+            ));
         }
         None
     }
@@ -8849,7 +9355,11 @@ impl Mempool {
         let left_at: HashMap<Txid, u64> = held
             .iter()
             .filter_map(|event| match event {
-                MempoolEvent::LeaveReplaced { txid, mempool_sequence, .. } => Some((*txid, *mempool_sequence)),
+                MempoolEvent::LeaveReplaced {
+                    txid,
+                    mempool_sequence,
+                    ..
+                } => Some((*txid, *mempool_sequence)),
                 _ => None,
             })
             .collect();
@@ -8864,16 +9374,17 @@ impl Mempool {
         let order = Self::topological_order(&entries);
         let mut gone: Vec<(Txid, QuarantineScope, u64)> = Vec::new();
         for txid in order {
-            let Some(entry) = entries.remove(&txid) else { continue };
-            let valid = !inner.entries.contains_key(&txid)
-                && entry.tx.input.iter().all(|i| {
-                    !inner.spends.contains_key(&i.previous_output)
-                        && (inner
-                            .entries
-                            .get(&i.previous_output.txid)
-                            .is_some_and(|p| (i.previous_output.vout as usize) < p.tx.output.len())
-                            || chain_state.get_coin(&i.previous_output).is_some())
-                });
+            let Some(entry) = entries.remove(&txid) else {
+                continue;
+            };
+            let valid =
+                !inner.entries.contains_key(&txid)
+                    && entry.tx.input.iter().all(|i| {
+                        !inner.spends.contains_key(&i.previous_output)
+                            && (inner.entries.get(&i.previous_output.txid).is_some_and(|p| {
+                                (i.previous_output.vout as usize) < p.tx.output.len()
+                            }) || chain_state.get_coin(&i.previous_output).is_some())
+                    });
             if valid {
                 for input in &entry.tx.input {
                     inner.spends.insert(input.previous_output, txid);
@@ -8898,24 +9409,42 @@ impl Mempool {
     fn trim_to_size(&self) -> HashSet<Txid> {
         let (max_size_bytes, quarantine_max_bytes, incremental_relay_fee) = {
             let cfg = self.config.read();
-            (cfg.max_size_bytes, cfg.quarantine_max_bytes, cfg.incremental_relay_fee)
+            (
+                cfg.max_size_bytes,
+                cfg.quarantine_max_bytes,
+                cfg.incremental_relay_fee,
+            )
         };
         let none = HashSet::new();
         let (acting, held) = {
             let mut inner = self.inner.write();
             let over = inner.acting_bytes().saturating_sub(max_size_bytes);
-            let acting =
-                Self::evict_lowest_fee_entries_except(&mut inner, over, false, incremental_relay_fee, &none);
+            let acting = Self::evict_lowest_fee_entries_except(
+                &mut inner,
+                over,
+                false,
+                incremental_relay_fee,
+                &none,
+            );
             let over = inner.quarantine_bytes.saturating_sub(quarantine_max_bytes);
-            let held =
-                Self::evict_lowest_fee_entries_except(&mut inner, over, true, incremental_relay_fee, &none);
+            let held = Self::evict_lowest_fee_entries_except(
+                &mut inner,
+                over,
+                true,
+                incremental_relay_fee,
+                &none,
+            );
             self.sync_unbroadcast_len(&inner);
             (acting, held)
         };
         // Reported as admission reports them: only what was acting.
         self.emit_evicted(&acting, EvictReason::FullPool);
         self.emit_evicted(&held, EvictReason::Policy);
-        acting.iter().chain(held.iter()).map(|(txid, _, _)| *txid).collect()
+        acting
+            .iter()
+            .chain(held.iter())
+            .map(|(txid, _, _)| *txid)
+            .collect()
     }
 
     /// Remove any ephemeral dust parent that made it into the mempool without
@@ -8959,8 +9488,7 @@ impl Mempool {
                 pkg.iter().any(|member| {
                     accepted_txids.contains(&member.txid())
                         && member.tx().input.iter().any(|i| {
-                            i.previous_output.txid == *parent_txid
-                                && i.previous_output.vout == di
+                            i.previous_output.txid == *parent_txid && i.previous_output.vout == di
                         })
                 })
             });
@@ -9028,7 +9556,11 @@ impl Mempool {
     /// v30 limit is 25), and a trim re-scores every ancestor of each package
     /// it evicts, under the pool's write lock: an unbounded family would make
     /// that cost grow with the square of its size.
-    fn descendant_score(inner: &MempoolInner, txid: &Txid, excluded: &HashSet<Txid>) -> Option<u64> {
+    fn descendant_score(
+        inner: &MempoolInner,
+        txid: &Txid,
+        excluded: &HashSet<Txid>,
+    ) -> Option<u64> {
         let entry = inner.entries.get(txid)?;
         let own_fee = modified_fee(entry.fee, entry.fee_delta);
         let own_weight = entry.adjusted_weight();
@@ -9107,13 +9639,16 @@ impl Mempool {
                 entry.scope.is_quarantined() == want_quarantined && !keep.contains(*txid)
             })
             .filter_map(|(txid, _)| {
-                Self::descendant_score(inner, txid, &none).map(|score| std::cmp::Reverse((score, *txid)))
+                Self::descendant_score(inner, txid, &none)
+                    .map(|score| std::cmp::Reverse((score, *txid)))
             })
             .collect();
         // Each candidate's current score. A heap entry whose key differs is
         // stale and skipped.
-        let mut current: HashMap<Txid, u64> =
-            by_score.iter().map(|std::cmp::Reverse((score, txid))| (*txid, *score)).collect();
+        let mut current: HashMap<Txid, u64> = by_score
+            .iter()
+            .map(|std::cmp::Reverse((score, txid))| (*txid, *score))
+            .collect();
 
         let mut freed = 0usize;
         let mut to_remove: Vec<Txid> = Vec::new();
@@ -9165,7 +9700,9 @@ impl Mempool {
             let mut up: Vec<Txid> = to_remove[package_start..].to_vec();
             let mut walked: HashSet<Txid> = HashSet::new();
             while let Some(t) = up.pop() {
-                let Some(entry) = inner.entries.get(&t) else { continue };
+                let Some(entry) = inner.entries.get(&t) else {
+                    continue;
+                };
                 for input in &entry.tx.input {
                     let parent = input.previous_output.txid;
                     if removing.contains(&parent) || !walked.insert(parent) {
@@ -9188,7 +9725,10 @@ impl Mempool {
                     .iter()
                     .filter_map(|t| inner.entries.get(t))
                     .fold((0u64, 0u64), |(f, w), e| {
-                        (f + modified_fee(e.fee, e.fee_delta), w + e.adjusted_weight())
+                        (
+                            f + modified_fee(e.fee, e.fee_delta),
+                            w + e.adjusted_weight(),
+                        )
                     });
                 let removed = policy::fee_rate_sat_per_kvb(fees, weight) + incremental_relay_fee;
                 inner.rolling.lock().package_removed(removed);
@@ -9229,8 +9769,10 @@ impl Mempool {
     /// Must be called (with the `inner` write lock still held) after any
     /// mutation of `inner.unbroadcast`.
     fn sync_unbroadcast_len(&self, inner: &MempoolInner) {
-        self.unbroadcast_len
-            .store(inner.unbroadcast.len(), std::sync::atomic::Ordering::Relaxed);
+        self.unbroadcast_len.store(
+            inner.unbroadcast.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Whether any local tx is pending propagation confirmation. Lock-free
@@ -9239,7 +9781,9 @@ impl Mempool {
     /// skip [`record_broadcast_witness`](Self::record_broadcast_witness)'s
     /// write-lock acquisition entirely.
     pub fn has_unbroadcast(&self) -> bool {
-        self.unbroadcast_len.load(std::sync::atomic::Ordering::Relaxed) > 0
+        self.unbroadcast_len
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
     }
 
     /// Mark a locally-originated tx as unbroadcast (pending propagation
@@ -9284,7 +9828,11 @@ impl Mempool {
     /// the retain here is a cheap second line of defense.
     pub fn unbroadcast_txids(&self) -> Vec<Txid> {
         let mut inner = self.inner.write();
-        let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
+        let MempoolInner {
+            entries,
+            unbroadcast,
+            ..
+        } = &mut *inner;
         unbroadcast.retain(|txid, _| entries.contains_key(txid));
         let txids = unbroadcast.keys().copied().collect();
         self.sync_unbroadcast_len(&inner);
@@ -9304,7 +9852,11 @@ impl Mempool {
     /// still prunes departed txids regardless of scope.
     pub fn unbroadcast_entries(&self) -> Vec<(Txid, Wtxid, u64)> {
         let mut inner = self.inner.write();
-        let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
+        let MempoolInner {
+            entries,
+            unbroadcast,
+            ..
+        } = &mut *inner;
         unbroadcast.retain(|txid, _| entries.contains_key(txid));
         let pairs = unbroadcast
             .keys()
@@ -9322,7 +9874,11 @@ impl Mempool {
     /// Count of live unbroadcast txs — Core's `getmempoolinfo.unbroadcastcount`.
     pub fn unbroadcast_count(&self) -> usize {
         let mut inner = self.inner.write();
-        let MempoolInner { entries, unbroadcast, .. } = &mut *inner;
+        let MempoolInner {
+            entries,
+            unbroadcast,
+            ..
+        } = &mut *inner;
         unbroadcast.retain(|txid, _| entries.contains_key(txid));
         let count = unbroadcast.len();
         self.sync_unbroadcast_len(&inner);
@@ -9333,7 +9889,8 @@ impl Mempool {
     /// `SetLoadTried`, which runs whether or not `-persistmempool` is on and
     /// whether or not the file loaded).
     pub fn set_load_tried(&self, tried: bool) {
-        self.load_tried.store(tried, std::sync::atomic::Ordering::Release);
+        self.load_tried
+            .store(tried, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether the startup load of `mempool.dat` has finished.
@@ -9532,7 +10089,12 @@ impl Mempool {
     /// Test-only: set an entry's sigop cost, which `insert_tx_weighted_for_test`
     /// leaves at zero.
     pub(crate) fn set_sigop_cost_for_test(&self, txid: &Txid, sigop_cost: u64) {
-        self.inner.write().entries.get_mut(txid).expect("entry").sigop_cost = sigop_cost;
+        self.inner
+            .write()
+            .entries
+            .get_mut(txid)
+            .expect("entry")
+            .sigop_cost = sigop_cost;
     }
 
     /// Test-only: insert a fully-formed entry for `tx` with the given fee,
@@ -9764,7 +10326,10 @@ mod tests {
         let parent = tx_spending(&[(1, 0)], 1000);
         let child = Transaction {
             input: vec![bitcoin::TxIn {
-                previous_output: OutPoint { txid: parent.compute_txid(), vout: 0 },
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::new(),
@@ -9785,19 +10350,28 @@ mod tests {
         let a = tx_spending(&[(9, 0)], 500);
         let b = tx_spending(&[(9, 0)], 400);
         assert_ne!(a.compute_txid(), b.compute_txid());
-        assert_eq!(check_well_formed_package(&[a.clone(), b]), Err("conflict-in-package"));
+        assert_eq!(
+            check_well_formed_package(&[a.clone(), b]),
+            Err("conflict-in-package")
+        );
 
         // One member spending one outpoint twice is not a package conflict:
         // Core adds a member's inputs as one batch (`IsConsistentPackage`)
         // and leaves the duplicate to `CheckTransaction`'s
         // `bad-txns-inputs-duplicate`. Alone, first or after another member.
         let dup = tx_spending(&[(8, 0), (8, 0)], 500);
-        assert_eq!(check_well_formed_package(std::slice::from_ref(&dup)), Ok(()));
+        assert_eq!(
+            check_well_formed_package(std::slice::from_ref(&dup)),
+            Ok(())
+        );
         assert_eq!(check_well_formed_package(&[dup.clone(), a.clone()]), Ok(()));
         assert_eq!(check_well_formed_package(&[a.clone(), dup.clone()]), Ok(()));
         // It still conflicts with another member spending that outpoint.
         let c = tx_spending(&[(8, 0)], 400);
-        assert_eq!(check_well_formed_package(&[dup, c]), Err("conflict-in-package"));
+        assert_eq!(
+            check_well_formed_package(&[dup, c]),
+            Err("conflict-in-package")
+        );
 
         // Duplicates are caught by txid, which also covers a same-txid,
         // different-witness pair.
@@ -9807,8 +10381,7 @@ mod tests {
         );
 
         // 26 distinct transactions is one over MAX_PACKAGE_COUNT.
-        let many: Vec<Transaction> =
-            (0u8..26).map(|i| tx_spending(&[(i, 0)], 100)).collect();
+        let many: Vec<Transaction> = (0u8..26).map(|i| tx_spending(&[(i, 0)], 100)).collect();
         assert_eq!(
             check_well_formed_package(&many),
             Err("package-too-many-transactions")
@@ -9831,13 +10404,19 @@ mod tests {
         // refuses it, and `submitpackage` answers `conflict-in-package`.
         let empty = tx_spending(&[], 0);
         assert!(empty.input.is_empty());
-        assert_eq!(check_well_formed_package(std::slice::from_ref(&empty)), Err("conflict-in-package"));
-        assert_eq!(check_well_formed_package(&[parent.clone(), empty]), Err("conflict-in-package"));
+        assert_eq!(
+            check_well_formed_package(std::slice::from_ref(&empty)),
+            Err("conflict-in-package")
+        );
+        assert_eq!(
+            check_well_formed_package(&[parent.clone(), empty]),
+            Err("conflict-in-package")
+        );
     }
     use super::*;
+    use crate::chain::state::AssumeValid;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
-    use crate::chain::state::AssumeValid;
     use crate::validation::script::NoopVerifier;
 
     fn make_test_env() -> (ChainState, Mempool, std::path::PathBuf) {
@@ -10058,7 +10637,10 @@ mod tests {
             "policy() must read the reloaded policy"
         );
         let info = mp.info();
-        assert_eq!(info.min_fee_rate, 5_000, "info() must read the reloaded policy");
+        assert_eq!(
+            info.min_fee_rate, 5_000,
+            "info() must read the reloaded policy"
+        );
         assert_eq!(info.max_size, 2_000_000);
         assert!(!info.full_rbf, "info() must reflect the reloaded full_rbf");
     }
@@ -10171,9 +10753,7 @@ mod tests {
             output: vec![TxOut {
                 value: Amount::from_sat(1_000_000),
                 script_pubkey: ScriptBuf::from_bytes(vec![
-                    0x76, 0xa9, 0x14,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0x88, 0xac,
                 ]),
             }],
@@ -10194,9 +10774,9 @@ mod tests {
 
         // Fund a UTXO so the tx reaches the deferred dust check.
         let input_op = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xbb; 32],
+            )),
             vout: 0,
         };
         let coin = crate::storage::coinview::Coin {
@@ -10229,9 +10809,7 @@ mod tests {
             output: vec![TxOut {
                 value: Amount::from_sat(1), // 1 sat — definitely dust
                 script_pubkey: ScriptBuf::from_bytes(vec![
-                    0x76, 0xa9, 0x14,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0x88, 0xac,
                 ]),
             }],
@@ -10286,18 +10864,30 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(50_000),
-                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                    [7; 20],
+                )),
             }],
         };
         let cfg = MempoolConfig::default();
-        let is_version = |r: &Result<(), MempoolError>| {
-            matches!(r, Err(MempoolError::Validation(reason)) if reason == "version")
-        };
-        for (version, standard) in [(0, false), (1, true), (2, true), (3, true), (4, false), (-1, false)] {
+        let is_version = |r: &Result<(), MempoolError>| matches!(r, Err(MempoolError::Validation(reason)) if reason == "version");
+        for (version, standard) in [
+            (0, false),
+            (1, true),
+            (2, true),
+            (3, true),
+            (4, false),
+            (-1, false),
+        ] {
             let tx = tx_with(version);
             let weight = tx.weight().to_wu() as usize;
             let result = Mempool::check_standardness(&tx, &cfg, weight);
-            assert_eq!(!is_version(&result), standard, "version {version:#x}: {result:?}", version = version as u32);
+            assert_eq!(
+                !is_version(&result),
+                standard,
+                "version {version:#x}: {result:?}",
+                version = version as u32
+            );
             if standard {
                 assert!(result.is_ok(), "version {version}: {result:?}");
             }
@@ -10309,8 +10899,12 @@ mod tests {
             matches!(&result, Err(MempoolError::Validation(reason)) if reason == "version"),
             "version 4 must be refused as non-standard, got {result:?}"
         );
-        let nonstd = Mempool::with_config(MempoolConfig { accept_non_std_txn: true, ..Default::default() });
-        let result = nonstd.accept_transaction(tx_with(4), &cs, &NoopVerifier, TxSource::Rpc, false);
+        let nonstd = Mempool::with_config(MempoolConfig {
+            accept_non_std_txn: true,
+            ..Default::default()
+        });
+        let result =
+            nonstd.accept_transaction(tx_with(4), &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(
             !matches!(&result, Err(MempoolError::Validation(reason)) if reason == "version"),
             "-acceptnonstdtxn must lift the version rule, got {result:?}"
@@ -10354,9 +10948,7 @@ mod tests {
             output: vec![TxOut {
                 value: Amount::from_sat(1), // dust under standard relay
                 script_pubkey: ScriptBuf::from_bytes(vec![
-                    0x76, 0xa9, 0x14,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                     0x88, 0xac,
                 ]),
             }],
@@ -10385,7 +10977,10 @@ mod tests {
         // for an output that is not a standard type at all -- reporting it
         // here tells a client its script was unrecognised when in fact its
         // data was merely too big (mempool_datacarrier.py).
-        assert_eq!(MempoolError::NonStandardOpReturn.reject_reason(), "datacarrier");
+        assert_eq!(
+            MempoolError::NonStandardOpReturn.reject_reason(),
+            "datacarrier"
+        );
 
         // `validation.cpp` `CheckMemPoolPolicyLimits`. The pre-cluster
         // "too-long-mempool-chain" does not appear anywhere in Core v31's
@@ -10461,7 +11056,10 @@ mod tests {
             .expect("parent");
         for vout in 0..120u32 {
             let child = tx_from(
-                &[OutPoint { txid: parent_txid, vout }],
+                &[OutPoint {
+                    txid: parent_txid,
+                    vout,
+                }],
                 &[(40_000, 0xA0)],
             );
             mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
@@ -10498,8 +11096,9 @@ mod tests {
     /// function that always answered 1.
     #[test]
     fn rule_five_counts_distinct_clusters_separately() {
-        let coins: Vec<(OutPoint, Coin)> =
-            (0..5u8).map(|i| (outpoint(0xE1 + i), coin(100_000))).collect();
+        let coins: Vec<(OutPoint, Coin)> = (0..5u8)
+            .map(|i| (outpoint(0xE1 + i), coin(100_000)))
+            .collect();
         let (cs, mp, dir) = make_funded_env(&coins);
 
         let mut txids = HashSet::new();
@@ -10544,14 +11143,38 @@ mod tests {
 
         // A → B → C is two ancestors for C: at the limit, accepted.
         let a = tx_from(&[op], &[(90_000, 0xD2)]);
-        let a_txid = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
-        let b = tx_from(&[OutPoint { txid: a_txid, vout: 0 }], &[(80_000, 0xD3)]);
-        let b_txid = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
-        let c = tx_from(&[OutPoint { txid: b_txid, vout: 0 }], &[(70_000, 0xD4)]);
-        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+        let a_txid = mp
+            .accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("a");
+        let b = tx_from(
+            &[OutPoint {
+                txid: a_txid,
+                vout: 0,
+            }],
+            &[(80_000, 0xD3)],
+        );
+        let b_txid = mp
+            .accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("b");
+        let c = tx_from(
+            &[OutPoint {
+                txid: b_txid,
+                vout: 0,
+            }],
+            &[(70_000, 0xD4)],
+        );
+        let c_txid = mp
+            .accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("c");
 
         // D has three. Both paths must say so.
-        let d = tx_from(&[OutPoint { txid: c_txid, vout: 0 }], &[(60_000, 0xD5)]);
+        let d = tx_from(
+            &[OutPoint {
+                txid: c_txid,
+                vout: 0,
+            }],
+            &[(60_000, 0xD5)],
+        );
         assert!(matches!(
             mp.test_accept(&d, &cs, &NoopVerifier),
             Err(MempoolError::TooLongMempoolChain)
@@ -10583,15 +11206,27 @@ mod tests {
         let parent_txid = mp
             .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("parent");
-        let conflict = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(55_000, 0xD9)]);
+        let conflict = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            }],
+            &[(55_000, 0xD9)],
+        );
         let conflict_txid = mp
             .accept_transaction(conflict, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("conflict");
 
         let replacement = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(74_700, 0xDA)],
         );
@@ -10621,11 +11256,28 @@ mod tests {
         let mut a = tx_from(&[op], &[(50_000, 0xDC)]);
         a.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
         let a_weight = a.weight().to_wu();
-        let a_txid = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
-        let b = tx_from(&[OutPoint { txid: a_txid, vout: 0 }], &[(49_700, 0xDD)]);
-        let b_txid = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
-        let c = tx_from(&[OutPoint { txid: b_txid, vout: 0 }], &[(49_400, 0xDE)]);
-        mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+        let a_txid = mp
+            .accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("a");
+        let b = tx_from(
+            &[OutPoint {
+                txid: a_txid,
+                vout: 0,
+            }],
+            &[(49_700, 0xDD)],
+        );
+        let b_txid = mp
+            .accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("b");
+        let c = tx_from(
+            &[OutPoint {
+                txid: b_txid,
+                vout: 0,
+            }],
+            &[(49_400, 0xDE)],
+        );
+        mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("c");
 
         let outs: Vec<(u64, u8)> = (0..5).map(|i| (9_800, 0xE0 + i)).collect();
         let r = tx_from(&[op], &outs);
@@ -10659,13 +11311,26 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op_p, coin(100_000)), (op_c, coin(100_000))]);
 
         let p = tx_from(&[op_p], &[(60_000, 0xE9), (20_000, 0xEA)]);
-        let p_txid = mp.accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false).expect("p");
+        let p_txid = mp
+            .accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("p");
         let mut c = tx_from(&[op_c], &[(99_000, 0xEB)]);
         c.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
         let c_weight = c.weight().to_wu();
-        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+        let c_txid = mp
+            .accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("c");
 
-        let r = tx_from(&[op_c, OutPoint { txid: p_txid, vout: 1 }], &[(118_700, 0xEC)]);
+        let r = tx_from(
+            &[
+                op_c,
+                OutPoint {
+                    txid: p_txid,
+                    vout: 1,
+                },
+            ],
+            &[(118_700, 0xEC)],
+        );
         let rate = crate::mempool::policy::fee_rate_sat_per_kvb;
         assert!(
             rate(1_300, r.weight().to_wu()) < rate(1_000, c_weight),
@@ -10698,15 +11363,31 @@ mod tests {
         ]);
 
         let p = tx_from(&[op_p], &[(70_000, 0xF0), (20_000, 0xF1)]);
-        let p_txid = mp.accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false).expect("p");
+        let p_txid = mp
+            .accept_transaction(p, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("p");
         let q = tx_from(&[op_q], &[(80_000, 0xF2), (19_900, 0xF3)]);
-        let q_txid = mp.accept_transaction(q, &cs, &NoopVerifier, TxSource::Rpc, false).expect("q");
+        let q_txid = mp
+            .accept_transaction(q, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("q");
         let mut c = tx_from(&[op_c], &[(99_000, 0xF4)]);
         c.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
-        let c_txid = mp.accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false).expect("c");
+        let c_txid = mp
+            .accept_transaction(c, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("c");
 
         let r = tx_from(
-            &[op_c, OutPoint { txid: p_txid, vout: 1 }, OutPoint { txid: q_txid, vout: 1 }],
+            &[
+                op_c,
+                OutPoint {
+                    txid: p_txid,
+                    vout: 1,
+                },
+                OutPoint {
+                    txid: q_txid,
+                    vout: 1,
+                },
+            ],
             &[(135_900, 0xF5)],
         );
         let r_txid = r.compute_txid();
@@ -10717,7 +11398,10 @@ mod tests {
         );
         assert!(in_pool(&mp, &r_txid));
         assert!(!in_pool(&mp, &c_txid), "the conflict is evicted");
-        assert!(in_pool(&mp, &p_txid) && in_pool(&mp, &q_txid), "the ancestors stay");
+        assert!(
+            in_pool(&mp, &p_txid) && in_pool(&mp, &q_txid),
+            "the ancestors stay"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10744,7 +11428,10 @@ mod tests {
         for vout in 0..N {
             // Signal RBF so the replacement below is allowed to displace them.
             let mut child = tx_from(
-                &[OutPoint { txid: parent_txid, vout }],
+                &[OutPoint {
+                    txid: parent_txid,
+                    vout,
+                }],
                 &[(90_000, 0xA0)],
             );
             child.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
@@ -10755,7 +11442,10 @@ mod tests {
         // One transaction spending every one of the parent's outputs conflicts
         // with all 120 children at once, and pays far more than they do.
         let ins: Vec<OutPoint> = (0..N)
-            .map(|vout| OutPoint { txid: parent_txid, vout })
+            .map(|vout| OutPoint {
+                txid: parent_txid,
+                vout,
+            })
             .collect();
         let replacement = tx_from(&ins, &[(1_000_000, 0xA1)]);
         let r = mp.accept_transaction(replacement, &cs, &NoopVerifier, TxSource::Rpc, false);
@@ -10824,8 +11514,16 @@ mod tests {
 
         let listed = mp.get_prioritised_transactions();
         // 100_000 in, 90_000 out: a 10_000 base fee, lifted by the delta.
-        assert_eq!(listed.get(&txid), Some(&(5_000, true, Some(15_000))), "{listed:?}");
-        assert_eq!(listed.get(&absent), Some(&(7_000, false, None)), "{listed:?}");
+        assert_eq!(
+            listed.get(&txid),
+            Some(&(5_000, true, Some(15_000))),
+            "{listed:?}"
+        );
+        assert_eq!(
+            listed.get(&absent),
+            Some(&(7_000, false, None)),
+            "{listed:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10842,7 +11540,13 @@ mod tests {
         let parent_txid = mp
             .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("parent admitted");
-        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(80_000, 0xC3)]);
+        let child = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            }],
+            &[(80_000, 0xC3)],
+        );
         let child_txid = mp
             .accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("child admitted");
@@ -10852,7 +11556,10 @@ mod tests {
 
         assert_eq!(mp.remove_expired(), 2);
         assert!(mp.get_entry_verbose(&parent_txid).is_none());
-        assert!(mp.get_entry_verbose(&child_txid).is_none(), "the child must not outlive its parent");
+        assert!(
+            mp.get_entry_verbose(&child_txid).is_none(),
+            "the child must not outlive its parent"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10867,7 +11574,11 @@ mod tests {
         assert_eq!(r.at(0, limit, limit, 1_000), 0);
 
         r.package_removed(8_000);
-        assert_eq!(r.at(1_000_000, limit, limit, 1_000), 8_000, "no decay before a block");
+        assert_eq!(
+            r.at(1_000_000, limit, limit, 1_000),
+            8_000,
+            "no decay before a block"
+        );
 
         r.last_update = 100;
         r.block_since_bump = true;
@@ -10877,7 +11588,11 @@ mod tests {
         let min = r.at(100 + half_day + half_day / 4, limit / 5, limit, 1_000);
         assert_eq!(min, 2_000, "a quarter-full pool decays four times as fast");
         let min = r.at(100 + 4 * half_day, limit, limit, 1_000);
-        assert_eq!((min, r.rate), (0, 0.0), "below half the incremental fee it is gone");
+        assert_eq!(
+            (min, r.rate),
+            (0, 0.0),
+            "below half the incremental fee it is gone"
+        );
     }
 
     /// Core's `GetMinFee` writes the decay it computed through `mutable`
@@ -10962,7 +11677,16 @@ mod tests {
         let parent_txid = mp
             .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("parent admitted");
-        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }, c], &[(280_000, 0xD5)]);
+        let child = tx_from(
+            &[
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                c,
+            ],
+            &[(280_000, 0xD5)],
+        );
         let child_txid = mp
             .accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("child admitted");
@@ -10980,7 +11704,8 @@ mod tests {
     fn remove_for_block_records_the_mempool_coverage_of_the_block() {
         let held_op = outpoint(0xC1);
         let other_op = outpoint(0xC2);
-        let (cs, mp, _dir) = make_funded_env(&[(held_op, coin(100_000)), (other_op, coin(100_000))]);
+        let (cs, mp, _dir) =
+            make_funded_env(&[(held_op, coin(100_000)), (other_op, coin(100_000))]);
         let held = tx_from(&[held_op], &[(90_000, 0xC3)]);
         mp.accept_transaction(held.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("held");
@@ -11004,7 +11729,11 @@ mod tests {
         assert_eq!(mp.health_blocks(), vec![want]);
         // The caller then cleans up again and finds nothing left to remove.
         mp.remove_for_block(&block, 5);
-        assert_eq!(mp.health_blocks(), vec![want], "the second report removed nothing");
+        assert_eq!(
+            mp.health_blocks(),
+            vec![want],
+            "the second report removed nothing"
+        );
     }
 
     /// Arrivals count only once resident for ten seconds, and only while in
@@ -11023,7 +11752,10 @@ mod tests {
             tx_from(&[outpoint(0xD2)], &[(1_000, 0xD2)]),
             100_000,
             4_000,
-            QuarantineScope { relay: false, template: true },
+            QuarantineScope {
+                relay: false,
+                template: true,
+            },
         );
         let gone = <Txid as bitcoin::hashes::Hash>::from_byte_array([0xD3; 32]);
         let t0 = 1_000_000;
@@ -11032,7 +11764,13 @@ mod tests {
         }
         mp.promote_arrivals_at(t0 + 9);
         let total = |mp: &Mempool| -> f64 {
-            mp.arrivals.lock().rates(t0 + 10).bands.iter().map(|(_, r)| r).sum()
+            mp.arrivals
+                .lock()
+                .rates(t0 + 10)
+                .bands
+                .iter()
+                .map(|(_, r)| r)
+                .sum()
         };
         assert_eq!(total(&mp), 0.0, "nothing counts before 10 s");
         mp.promote_arrivals_at(t0 + 10);
@@ -11040,7 +11778,10 @@ mod tests {
         let half_life = crate::mempool::arrivals::RATE_HALF_LIFE_SECS;
         let one = 4_000.0 * std::f64::consts::LN_2 / half_life * 0.5f64.powf(10.0 / half_life);
         let got = total(&mp);
-        assert!((got - one).abs() < 1e-9, "only the acting entry counts: {got} vs {one}");
+        assert!(
+            (got - one).abs() < 1e-9,
+            "only the acting entry counts: {got} vs {one}"
+        );
     }
 
     /// A full mempool floors `estimatesmartfee` at the rolling minimum: the
@@ -11057,17 +11798,39 @@ mod tests {
         let rich_op = outpoint(0xE2);
         let (cs, mp, _dir) =
             make_funded_env(&[(cheap_op, coin(100_000)), (rich_op, coin(100_000))]);
-        mp.accept_transaction(tx_from(&[cheap_op], &[(99_000, 0xD1)]), &cs, &NoopVerifier, TxSource::Rpc, false)
-            .expect("cheap");
-        mp.accept_transaction(tx_from(&[rich_op], &[(50_000, 0xD2)]), &cs, &NoopVerifier, TxSource::Rpc, false)
-            .expect("rich");
+        mp.accept_transaction(
+            tx_from(&[cheap_op], &[(99_000, 0xD1)]),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
+        .expect("cheap");
+        mp.accept_transaction(
+            tx_from(&[rich_op], &[(50_000, 0xD2)]),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
+        .expect("rich");
 
         let history = FeeEstimator::new();
         history.record_block(&[5_000; 50]); // 5 sat/vB at every percentile
 
-        let calm = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
-            .expect("history answers");
-        assert_eq!(calm.feerate_sat_per_kvb, 5_000, "uncongested: the history value");
+        let calm = estimate_smart_fee(
+            &mp,
+            &history,
+            6,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .expect("history answers");
+        assert_eq!(
+            calm.feerate_sat_per_kvb, 5_000,
+            "uncongested: the history value"
+        );
         assert_eq!(calm.estimator, EstimateSource::BlockPolicy);
 
         let mut inner = mp.inner.write();
@@ -11075,11 +11838,24 @@ mod tests {
         Mempool::evict_lowest_fee_entries(&mut inner, half, false, 1_000);
         drop(inner);
         let rolling = mp.info().mempool_min_fee;
-        assert!(rolling > 5_000, "the eviction must lift the minimum past history ({rolling})");
+        assert!(
+            rolling > 5_000,
+            "the eviction must lift the minimum past history ({rolling})"
+        );
 
-        let full = estimate_smart_fee(&mp, &history, 6, EstimateMode::Historical, FeeRateEstimator::Auto, false)
-            .expect("history answers");
-        assert_eq!(full.feerate_sat_per_kvb, rolling, "full: the rolling minimum");
+        let full = estimate_smart_fee(
+            &mp,
+            &history,
+            6,
+            EstimateMode::Historical,
+            FeeRateEstimator::Auto,
+            false,
+        )
+        .expect("history answers");
+        assert_eq!(
+            full.feerate_sat_per_kvb, rolling,
+            "full: the rolling minimum"
+        );
         assert_eq!(full.estimator, EstimateSource::Floor);
         assert_eq!(full.blocks, 6);
     }
@@ -11106,8 +11882,14 @@ mod tests {
             let e = &inner.entries[&txid];
             policy::fee_rate_sat_per_kvb(e.fee, e.weight as u64)
         };
-        mp.accept_transaction(tx_from(&[rich_op], &[(50_000, 0xD2)]), &cs, &NoopVerifier, TxSource::Rpc, false)
-            .expect("rich");
+        mp.accept_transaction(
+            tx_from(&[rich_op], &[(50_000, 0xD2)]),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
+        .expect("rich");
         let min_relay = mp.info().min_fee_rate;
         assert_eq!(mp.info().mempool_min_fee, min_relay);
 
@@ -11121,8 +11903,16 @@ mod tests {
         let err = mp
             .accept_transaction(low, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect_err("below the raised minimum");
-        assert!(matches!(err, MempoolError::MempoolMinFeeNotMet(..)), "{err:?}");
-        assert!(err.state_string().starts_with("mempool min fee not met, 1000 < "), "{}", err.state_string());
+        assert!(
+            matches!(err, MempoolError::MempoolMinFeeNotMet(..)),
+            "{err:?}"
+        );
+        assert!(
+            err.state_string()
+                .starts_with("mempool min fee not met, 1000 < "),
+            "{}",
+            err.state_string()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11139,7 +11929,13 @@ mod tests {
         let parent_txid = mp
             .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("parent admitted");
-        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(80_000, 0xC5)]);
+        let child = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            }],
+            &[(80_000, 0xC5)],
+        );
         mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("child admitted");
         let (txids, sequence) = mp.acting_txids_with_sequence();
@@ -11184,7 +11980,13 @@ mod tests {
 
         // The first addition takes 1, and the snapshot then reports 2.
         let a = mp
-            .accept_transaction(tx_from(&[ops[0]], &[(90_000, 0xB0)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .accept_transaction(
+                tx_from(&[ops[0]], &[(90_000, 0xB0)]),
+                &cs,
+                &NoopVerifier,
+                TxSource::Rpc,
+                false,
+            )
             .expect("a");
         assert_eq!(drain_sequenced(&mut rx), vec![("enter", a, 1)]);
         assert_eq!(seq(&mp), 2);
@@ -11192,9 +11994,18 @@ mod tests {
         // A replacement: the conflict leaves with 2, the replacement enters
         // with 3.
         let a2 = mp
-            .accept_transaction(tx_from(&[ops[0]], &[(80_000, 0xB1)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .accept_transaction(
+                tx_from(&[ops[0]], &[(80_000, 0xB1)]),
+                &cs,
+                &NoopVerifier,
+                TxSource::Rpc,
+                false,
+            )
             .expect("replacement");
-        assert_eq!(drain_sequenced(&mut rx), vec![("replaced", a, 2), ("enter", a2, 3)]);
+        assert_eq!(
+            drain_sequenced(&mut rx),
+            vec![("replaced", a, 2), ("enter", a2, 3)]
+        );
         assert_eq!(seq(&mp), 4);
 
         // Expiry.
@@ -11210,9 +12021,18 @@ mod tests {
             .accept_transaction(confirmed.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("c");
         let d = mp
-            .accept_transaction(tx_from(&[ops[2]], &[(90_000, 0xB3)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .accept_transaction(
+                tx_from(&[ops[2]], &[(90_000, 0xB3)]),
+                &cs,
+                &NoopVerifier,
+                TxSource::Rpc,
+                false,
+            )
             .expect("d");
-        assert_eq!(drain_sequenced(&mut rx), vec![("enter", c, 5), ("enter", d, 6)]);
+        assert_eq!(
+            drain_sequenced(&mut rx),
+            vec![("enter", c, 5), ("enter", d, 6)]
+        );
         let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         block.txdata.push(confirmed);
         block.txdata.push(tx_from(&[ops[2]], &[(70_000, 0xB4)]));
@@ -11234,13 +12054,25 @@ mod tests {
         // second one pushes the first out. The eviction takes its number
         // before the newcomer's insert does.
         let low = mp
-            .accept_transaction(tx_from(&[ops[3]], &[(99_000, 0xB6)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .accept_transaction(
+                tx_from(&[ops[3]], &[(99_000, 0xB6)]),
+                &cs,
+                &NoopVerifier,
+                TxSource::Rpc,
+                false,
+            )
             .expect("low");
         assert_eq!(drain_sequenced(&mut rx), vec![("enter", low, 10)]);
         let one_tx = mp.inner.read().total_bytes;
         mp.config.write().max_size_bytes = one_tx;
         let high = mp
-            .accept_transaction(tx_from(&[ops[4]], &[(50_000, 0xB7)]), &cs, &NoopVerifier, TxSource::Rpc, false)
+            .accept_transaction(
+                tx_from(&[ops[4]], &[(50_000, 0xB7)]),
+                &cs,
+                &NoopVerifier,
+                TxSource::Rpc,
+                false,
+            )
             .expect("high evicts low");
         assert_eq!(
             drain_sequenced(&mut rx),
@@ -11261,10 +12093,18 @@ mod tests {
         let (event_tx, mut rx) = broadcast::channel::<MempoolEvent>(16);
         mp.set_event_sender(event_tx);
 
-        mp.accept_transaction(tx_from(&[op1], &[(90_000, 0xC2)]), &cs, &NoopVerifier, TxSource::Rpc, false)
-            .expect("first");
+        mp.accept_transaction(
+            tx_from(&[op1], &[(90_000, 0xC2)]),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
+        .expect("first");
         match rx.try_recv() {
-            Ok(MempoolEvent::Enter { raw_tx, .. }) => assert!(raw_tx.is_none(), "raw_tx is off by default"),
+            Ok(MempoolEvent::Enter { raw_tx, .. }) => {
+                assert!(raw_tx.is_none(), "raw_tx is off by default")
+            }
             other => panic!("expected Enter, got {other:?}"),
         }
 
@@ -11274,17 +12114,22 @@ mod tests {
             .accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("second");
         match rx.try_recv() {
-            Ok(MempoolEvent::Enter { txid: t, raw_tx: Some(raw), .. }) => {
+            Ok(MempoolEvent::Enter {
+                txid: t,
+                raw_tx: Some(raw),
+                ..
+            }) => {
                 assert_eq!(t, txid);
                 assert_eq!(*raw, tx, "the event carries the admitted transaction");
             }
             other => panic!("expected Enter with raw_tx, got {other:?}"),
         }
         // The MCP ring keeps the event, but not the transaction.
-        assert!(mp.recent_events().iter().all(|e| matches!(
-            e,
-            MempoolEvent::Enter { raw_tx: None, .. }
-        )));
+        assert!(
+            mp.recent_events()
+                .iter()
+                .all(|e| matches!(e, MempoolEvent::Enter { raw_tx: None, .. }))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11297,8 +12142,7 @@ mod tests {
     fn a_prioritised_transaction_survives_eviction() {
         let cheap_op = outpoint(0xEB);
         let rich_op = outpoint(0xEC);
-        let (cs, mp, dir) =
-            make_funded_env(&[(cheap_op, coin(100_000)), (rich_op, coin(100_000))]);
+        let (cs, mp, dir) = make_funded_env(&[(cheap_op, coin(100_000)), (rich_op, coin(100_000))]);
 
         let cheap = tx_from(&[cheap_op], &[(99_800, 0xC1)]);
         let cheap_txid = mp
@@ -11310,7 +12154,8 @@ mod tests {
             .expect("rich");
 
         // Lift the cheap one well above the rich one.
-        mp.prioritise_transaction(&cheap_txid, 1_000_000).expect("delta");
+        mp.prioritise_transaction(&cheap_txid, 1_000_000)
+            .expect("delta");
 
         // Squeeze the pool until exactly one entry can stay.
         let mut inner = mp.inner.write();
@@ -11655,8 +12500,7 @@ mod tests {
         use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, transaction};
 
         let (_cs, mp, dir) = make_test_env();
-        let (event_tx, mut event_rx) =
-            tokio::sync::broadcast::channel::<MempoolEvent>(64);
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<MempoolEvent>(64);
         mp.set_event_sender(event_tx);
 
         // A mempool tx spending UTXO X. We bypass accept_transaction
@@ -11664,9 +12508,9 @@ mod tests {
         // is "tx is in the mempool, a conflicting block arrives" and
         // that state is awkward to reach through the public API.
         let contested = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [7u8; 32],
+            )),
             vout: 0,
         };
         let mempool_tx = Transaction {
@@ -11738,9 +12582,7 @@ mod tests {
         let mut saw_block_conflict = false;
         for _ in 0..8 {
             match event_rx.try_recv() {
-                Ok(MempoolEvent::LeaveEvicted { txid, reason, .. })
-                    if txid == mempool_txid =>
-                {
+                Ok(MempoolEvent::LeaveEvicted { txid, reason, .. }) if txid == mempool_txid => {
                     assert_eq!(
                         reason,
                         EvictReason::BlockConflict,
@@ -11804,7 +12646,10 @@ mod tests {
             version: transaction::Version(2),
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint { txid: parent_txid, vout: 0 },
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -12298,7 +13143,10 @@ mod tests {
         let ip9: std::net::IpAddr = "10.0.0.9".parse().unwrap();
         assert!(!mp.record_broadcast_witness(&txid, ip7, 2));
         assert!(!mp.record_broadcast_witness(&txid, ip7, 2));
-        assert!(mp.is_unbroadcast(&txid), "one distinct witness < threshold 2");
+        assert!(
+            mp.is_unbroadcast(&txid),
+            "one distinct witness < threshold 2"
+        );
         assert!(mp.has_unbroadcast());
 
         // A second distinct host crosses the threshold → dropped.
@@ -12402,10 +13250,8 @@ mod tests {
         let acting = mp.insert_scoped_for_test(3, 1, QuarantineScope::acting()); // cheapest overall
 
         // Free just enough to drop one held entry — the cheapest held one.
-        let one_entry = bitcoin::consensus::serialize(
-            &mp.inner.read().entries.get(&q_lo).unwrap().tx,
-        )
-        .len();
+        let one_entry =
+            bitcoin::consensus::serialize(&mp.inner.read().entries.get(&q_lo).unwrap().tx).len();
         let evicted = {
             let mut inner = mp.inner.write();
             Mempool::evict_lowest_fee_entries(&mut inner, one_entry, true, 0)
@@ -12435,56 +13281,57 @@ mod tests {
         use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
         let mp = Mempool::new(1_000_000, 0);
 
-        let insert = |inputs: Vec<OutPoint>, nonce: u64, fee_rate: u64, scope: QuarantineScope| -> Txid {
-            let tx = Transaction {
-                version: bitcoin::transaction::Version(2),
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: inputs
-                    .into_iter()
-                    .map(|o| TxIn {
-                        previous_output: o,
-                        script_sig: ScriptBuf::new(),
-                        sequence: Sequence::MAX,
-                        witness: Witness::new(),
-                    })
-                    .collect(),
-                output: vec![TxOut {
-                    value: Amount::from_sat(nonce),
-                    script_pubkey: ScriptBuf::new(),
-                }],
+        let insert =
+            |inputs: Vec<OutPoint>, nonce: u64, fee_rate: u64, scope: QuarantineScope| -> Txid {
+                let tx = Transaction {
+                    version: bitcoin::transaction::Version(2),
+                    lock_time: bitcoin::absolute::LockTime::ZERO,
+                    input: inputs
+                        .into_iter()
+                        .map(|o| TxIn {
+                            previous_output: o,
+                            script_sig: ScriptBuf::new(),
+                            sequence: Sequence::MAX,
+                            witness: Witness::new(),
+                        })
+                        .collect(),
+                    output: vec![TxOut {
+                        value: Amount::from_sat(nonce),
+                        script_pubkey: ScriptBuf::new(),
+                    }],
+                };
+                let txid = tx.compute_txid();
+                let tx_size = bitcoin::consensus::serialize(&tx).len();
+                let mut inner = mp.inner.write();
+                // Index the spends as every admission does: eviction finds a
+                // descendant through them.
+                for i in &tx.input {
+                    inner.spends.insert(i.previous_output, txid);
+                }
+                inner.entries.insert(
+                    txid,
+                    MempoolEntry {
+                        entry_sequence: 0,
+                        tx,
+                        fee: 0,
+                        weight: 4,
+                        fee_rate,
+                        time: 0,
+                        height: 0,
+                        fee_delta: 0,
+                        sigop_cost: 0,
+                        prev_scripthashes: Vec::new(),
+                        prev_amounts: Vec::new(),
+                        prev_scripts: Vec::new(),
+                        sp_tweak: None,
+                        source: TxSource::Rpc,
+                        scope,
+                        quarantine_rule: None,
+                    },
+                );
+                inner.account_insert(scope, tx_size);
+                txid
             };
-            let txid = tx.compute_txid();
-            let tx_size = bitcoin::consensus::serialize(&tx).len();
-            let mut inner = mp.inner.write();
-            // Index the spends as every admission does: eviction finds a
-            // descendant through them.
-            for i in &tx.input {
-                inner.spends.insert(i.previous_output, txid);
-            }
-            inner.entries.insert(
-                txid,
-                MempoolEntry {
-                    entry_sequence: 0,
-                    tx,
-                    fee: 0,
-                    weight: 4,
-                    fee_rate,
-                    time: 0,
-                    height: 0,
-                    fee_delta: 0,
-                    sigop_cost: 0,
-                    prev_scripthashes: Vec::new(),
-                    prev_amounts: Vec::new(),
-                    prev_scripts: Vec::new(),
-                    sp_tweak: None,
-                    source: TxSource::Rpc,
-                    scope,
-                    quarantine_rule: None,
-                },
-            );
-            inner.account_insert(scope, tx_size);
-            txid
-        };
 
         // Acting parent P (cheapest), a quarantined child C spending P, and a
         // second acting entry that also has to go to meet the goal.
@@ -12651,8 +13498,7 @@ mod tests {
         (dir, path)
     }
 
-    const CSV_RULE: &str =
-        "version 1\nquarantine csv when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n";
+    const CSV_RULE: &str = "version 1\nquarantine csv when any inputs (in.leaf_script.count_op(OP_CHECKSEQUENCEVERIFY) > 0)\n";
 
     #[test]
     fn danger_gate_refuses_relay_withholding_rule_unless_allowed() {
@@ -12695,7 +13541,10 @@ mod tests {
     fn danger_gate_reload_keeps_last_good() {
         // A safe ruleset loads; a dangerous reload is refused and the safe one
         // stays installed (I7 last-good).
-        let (dir, safe) = write_policy("safe", "version 1\nquarantine cheap when tx.fee_rate < 1000\n");
+        let (dir, safe) = write_policy(
+            "safe",
+            "version 1\nquarantine cheap when tx.fee_rate < 1000\n",
+        );
         let danger = dir.join("danger.policy");
         std::fs::write(&danger, CSV_RULE).unwrap();
 
@@ -12743,7 +13592,10 @@ mod tests {
         assert!(err.contains("withhold relay"), "{err}");
 
         // A safe policy never trips the recheck regardless of the flag.
-        let (sdir, safe) = write_policy("recheck-safe", "version 1\nquarantine cheap when tx.fee_rate < 1000\n");
+        let (sdir, safe) = write_policy(
+            "recheck-safe",
+            "version 1\nquarantine cheap when tx.fee_rate < 1000\n",
+        );
         let mp2 = Mempool::with_config(MempoolConfig::default());
         mp2.load_policy_file(&safe).expect("safe loads");
         assert!(mp2.recheck_loaded_danger_gate().is_ok());
@@ -12771,7 +13623,10 @@ mod tests {
         };
         let mp = Mempool::with_config(cfg.clone());
 
-        let (pdir, path) = write_policy("eject", "version 1\nquarantine catch when tx.version == 2\n");
+        let (pdir, path) = write_policy(
+            "eject",
+            "version 1\nquarantine catch when tx.version == 2\n",
+        );
         mp.load_policy_file(&path)
             .expect("dangerous policy loads with the flag on");
         assert!(mp.has_policy());
@@ -12782,7 +13637,13 @@ mod tests {
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
             .expect("admitted into quarantine");
         assert!(
-            mp.inner.read().entries.get(&txid).unwrap().scope.is_quarantined(),
+            mp.inner
+                .read()
+                .entries
+                .get(&txid)
+                .unwrap()
+                .scope
+                .is_quarantined(),
             "tx is held under the dangerous policy"
         );
 
@@ -12808,7 +13669,13 @@ mod tests {
             t.promoted
         );
         assert!(
-            mp.inner.read().entries.get(&txid).unwrap().scope.is_acting(),
+            mp.inner
+                .read()
+                .entries
+                .get(&txid)
+                .unwrap()
+                .scope
+                .is_acting(),
             "tx is acting after the eject"
         );
 
@@ -12855,7 +13722,10 @@ mod tests {
         let inner = mp.inner.read();
         let entry = inner.entries.get(&txid).unwrap();
         assert!(entry.scope.is_quarantined(), "held in quarantine class");
-        assert!(entry.scope.relay && entry.scope.template, "default full scope");
+        assert!(
+            entry.scope.relay && entry.scope.template,
+            "default full scope"
+        );
         assert!(inner.quarantine_bytes > 0);
         // The held entry must NOT count against the acting class.
         assert_eq!(inner.acting_bytes(), 0);
@@ -12963,11 +13833,17 @@ mod tests {
                 None => mp.clear_policy(),
             }
             let tested = mp.test_accept(&tx, &cs, &NoopVerifier).unwrap_err();
-            assert!(matches!(tested, MempoolError::Dust), "{rules:?}: test_accept got {tested:?}");
+            assert!(
+                matches!(tested, MempoolError::Dust),
+                "{rules:?}: test_accept got {tested:?}"
+            );
             let admitted = mp
                 .accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
                 .unwrap_err();
-            assert!(matches!(admitted, MempoolError::Dust), "{rules:?}: admission got {admitted:?}");
+            assert!(
+                matches!(admitted, MempoolError::Dust),
+                "{rules:?}: admission got {admitted:?}"
+            );
         }
 
         // A matching quarantine rule does not forgive it either: the
@@ -12977,7 +13853,10 @@ mod tests {
             "version 1\nallow mine when tx.source == mcp\nquarantine catch when tx.version == 2",
         );
         let tested = mp.test_accept(&tx, &cs, &NoopVerifier).unwrap_err();
-        assert!(matches!(tested, MempoolError::Dust), "quarantine: test_accept got {tested:?}");
+        assert!(
+            matches!(tested, MempoolError::Dust),
+            "quarantine: test_accept got {tested:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12987,7 +13866,10 @@ mod tests {
         // `check_standardness`), so `testmempoolaccept` must lift it too:
         // with no policy, and with an `allow` rule that does not match.
         use bitcoin::{Amount, ScriptBuf, TxOut};
-        for (tag, rules) in [(0xa8u8, None), (0xa9, Some("version 1\nallow mine when tx.source == mcp"))] {
+        for (tag, rules) in [
+            (0xa8u8, None),
+            (0xa9, Some("version 1\nallow mine when tx.source == mcp")),
+        ] {
             let op = outpoint(tag);
             let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
             mp.config.write().accept_non_std_txn = true;
@@ -12998,10 +13880,16 @@ mod tests {
             let mut data = vec![0x6a, 0x4e];
             data.extend_from_slice(&(100_300u32).to_le_bytes());
             data.extend(std::iter::repeat_n(0u8, 100_300));
-            tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(data) });
+            tx.output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(data),
+            });
             // Over the standard weight, under the 101 kvB cluster limit.
             let w = tx.weight().to_wu() as usize;
-            assert!(w > MAX_STANDARD_TX_WEIGHT && w < 404_000, "fixture: oversize, weight {w}");
+            assert!(
+                w > MAX_STANDARD_TX_WEIGHT && w < 404_000,
+                "fixture: oversize, weight {w}"
+            );
 
             let tested = mp.test_accept(&tx, &cs, &NoopVerifier);
             let admitted = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
@@ -13022,7 +13910,10 @@ mod tests {
             let mut data = vec![0x6a, 0x4e];
             data.extend_from_slice(&(len as u32).to_le_bytes());
             data.extend(std::iter::repeat_n(0u8, len));
-            tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(data) });
+            tx.output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(data),
+            });
             tx
         };
 
@@ -13030,15 +13921,27 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
         mp.config.write().min_fee_rate = 1_000;
         let over = with_data(spend(op, 99_000, 0x22), 99_900);
-        assert_eq!(over.weight().to_wu(), MAX_STANDARD_TX_WEIGHT as u64 + 4, "fixture");
+        assert_eq!(
+            over.weight().to_wu(),
+            MAX_STANDARD_TX_WEIGHT as u64 + 4,
+            "fixture"
+        );
         let r = mp.test_accept(&over, &cs, &NoopVerifier);
-        assert!(matches!(r, Err(MempoolError::Validation(ref e)) if e == "tx-size"), "{r:?}");
+        assert!(
+            matches!(r, Err(MempoolError::Validation(ref e)) if e == "tx-size"),
+            "{r:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
         let at = with_data(spend(op, 99_000, 0x22), 99_899);
-        assert_eq!(at.weight().to_wu(), MAX_STANDARD_TX_WEIGHT as u64, "fixture");
-        mp.test_accept(&at, &cs, &NoopVerifier).expect("the standard weight itself is standard");
+        assert_eq!(
+            at.weight().to_wu(),
+            MAX_STANDARD_TX_WEIGHT as u64,
+            "fixture"
+        );
+        mp.test_accept(&at, &cs, &NoopVerifier)
+            .expect("the standard weight itself is standard");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13091,7 +13994,14 @@ mod tests {
         );
 
         // Child spends the parent's output; it matches no rule on its own.
-        let child = spend(OutPoint { txid: parent_txid, vout: 0 }, 50_000, 0x33);
+        let child = spend(
+            OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
+            50_000,
+            0x33,
+        );
         let child_txid = child.compute_txid();
         mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::P2p, false)
             .expect("child admitted");
@@ -13184,7 +14094,13 @@ mod tests {
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::P2p, false)
             .expect("p2p quarantine is admitted, not refused");
         assert!(
-            mp.inner.read().entries.get(&txid).unwrap().scope.is_quarantined()
+            mp.inner
+                .read()
+                .entries
+                .get(&txid)
+                .unwrap()
+                .scope
+                .is_quarantined()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13214,7 +14130,13 @@ mod tests {
         );
         // Exactly one Quarantined event on the separate channel, naming the rule.
         match qrx.try_recv() {
-            Ok(QuarantineEvent::Quarantined { txid: t, rule, relay, template, .. }) => {
+            Ok(QuarantineEvent::Quarantined {
+                txid: t,
+                rule,
+                relay,
+                template,
+                ..
+            }) => {
                 assert_eq!(t, txid);
                 assert_eq!(rule, "catch");
                 assert!(relay && template, "full default scope");
@@ -13345,7 +14267,10 @@ mod tests {
         let op = outpoint(0xc7);
         let (cs, mp, dir) = make_funded_env(&[(op, coin(1_000_000))]);
         // Quarantine txs with a small output; a large output stays acting.
-        set_ruleset(&mp, "version 1\nquarantine small when any output (out.value < 200000)");
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine small when any output (out.value < 200000)",
+        );
 
         let rbf_spend = |value: u64, tag: u8| Transaction {
             version: transaction::Version(2),
@@ -13364,14 +14289,26 @@ mod tests {
 
         // Acting tx: large output (fee 100k), admitted to the acting class.
         let acting_id = mp
-            .accept_transaction(rbf_spend(900_000, 0x01), &cs, &NoopVerifier, TxSource::P2p, false)
+            .accept_transaction(
+                rbf_spend(900_000, 0x01),
+                &cs,
+                &NoopVerifier,
+                TxSource::P2p,
+                false,
+            )
             .expect("acting tx admitted");
         assert!(mp.get(&acting_id).unwrap().scope.is_acting());
 
         // Conflicting quarantined replacement: small output ⇒ higher fee (900k),
         // which clears the RBF fee bar, but the two-class guard rejects it.
         let err = mp
-            .accept_transaction(rbf_spend(100_000, 0x02), &cs, &NoopVerifier, TxSource::P2p, false)
+            .accept_transaction(
+                rbf_spend(100_000, 0x02),
+                &cs,
+                &NoopVerifier,
+                TxSource::P2p,
+                false,
+            )
             .unwrap_err();
         assert!(
             matches!(err, MempoolError::ConflictingSpend),
@@ -13386,8 +14323,14 @@ mod tests {
 
     // --- PR 5: assist-path scope filtering (the three-consumer split, §2.4) ---
 
-    const RELAY_ONLY: QuarantineScope = QuarantineScope { relay: true, template: false };
-    const TEMPLATE_ONLY: QuarantineScope = QuarantineScope { relay: false, template: true };
+    const RELAY_ONLY: QuarantineScope = QuarantineScope {
+        relay: true,
+        template: false,
+    };
+    const TEMPLATE_ONLY: QuarantineScope = QuarantineScope {
+        relay: false,
+        template: true,
+    };
 
     #[test]
     fn scope_assist_predicates() {
@@ -13413,13 +14356,22 @@ mod tests {
         let template_only = mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
         let full = mp.insert_scoped_for_test(4, 100, RELAY_TEMPLATE);
 
-        let ids: std::collections::HashSet<Txid> =
-            mp.get_template_entries().into_iter().map(|(t, _)| t).collect();
+        let ids: std::collections::HashSet<Txid> = mp
+            .get_template_entries()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
         // The template (and the smart-fee simulator that shares this view)
         // mine what we would build: acting + relay-only-quarantined.
         assert!(ids.contains(&acting));
-        assert!(ids.contains(&relay_only), "on-relay txs are still mineable by us");
-        assert!(!ids.contains(&template_only), "on-template txs are withheld from blocks");
+        assert!(
+            ids.contains(&relay_only),
+            "on-relay txs are still mineable by us"
+        );
+        assert!(
+            !ids.contains(&template_only),
+            "on-template txs are withheld from blocks"
+        );
         assert!(!ids.contains(&full));
         // The union still has everything (reconstruction / observability rely on it).
         assert_eq!(mp.get_all_entries().len(), 4);
@@ -13433,12 +14385,21 @@ mod tests {
         let template_only = mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
         let full = mp.insert_scoped_for_test(4, 100, RELAY_TEMPLATE);
 
-        let ids: std::collections::HashSet<Txid> =
-            mp.relay_ids_above_feerate(0).into_iter().map(|(t, _)| t).collect();
+        let ids: std::collections::HashSet<Txid> = mp
+            .relay_ids_above_feerate(0)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
         // BIP35 is a relay path: announce only what we gossip.
         assert!(ids.contains(&acting));
-        assert!(ids.contains(&template_only), "on-template txs are still relayed");
-        assert!(!ids.contains(&relay_only), "on-relay txs are withheld from announcement");
+        assert!(
+            ids.contains(&template_only),
+            "on-template txs are still relayed"
+        );
+        assert!(
+            !ids.contains(&relay_only),
+            "on-relay txs are withheld from announcement"
+        );
         assert!(!ids.contains(&full));
     }
 
@@ -13451,8 +14412,11 @@ mod tests {
         mp.mark_unbroadcast(acting);
         mp.mark_unbroadcast(relay_only);
 
-        let ids: std::collections::HashSet<Txid> =
-            mp.unbroadcast_entries().into_iter().map(|(t, _, _)| t).collect();
+        let ids: std::collections::HashSet<Txid> = mp
+            .unbroadcast_entries()
+            .into_iter()
+            .map(|(t, _, _)| t)
+            .collect();
         assert!(ids.contains(&acting));
         assert!(
             !ids.contains(&relay_only),
@@ -13470,7 +14434,10 @@ mod tests {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
-                previous_output: OutPoint { txid: Txid::from_byte_array([seed; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([seed; 32]),
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::from_slice(&[vec![witness_byte]]),
@@ -13514,24 +14481,50 @@ mod tests {
         let b = witness_tx(2, 0xaa);
         let txid = a.compute_txid();
         assert_eq!(a_other.compute_txid(), txid, "fixture: same txid");
-        assert_ne!(a.compute_wtxid(), a_other.compute_wtxid(), "fixture: other witness");
-        assert_ne!(a.compute_wtxid().to_raw_hash(), txid.to_raw_hash(), "fixture: wtxid is not the txid");
+        assert_ne!(
+            a.compute_wtxid(),
+            a_other.compute_wtxid(),
+            "fixture: other witness"
+        );
+        assert_ne!(
+            a.compute_wtxid().to_raw_hash(),
+            txid.to_raw_hash(),
+            "fixture: wtxid is not the txid"
+        );
 
         let mut map = EntryMap::default();
         assert!(map.insert(txid, entry_of(a.clone())).is_none());
         map.insert(b.compute_txid(), entry_of(b.clone()));
         assert_eq!(map.txid_of(&a.compute_wtxid()), Some(txid));
         assert_eq!(map.txid_of(&b.compute_wtxid()), Some(b.compute_txid()));
-        assert_eq!(map.txid_of(&a_other.compute_wtxid()), None, "another witness is another transaction");
+        assert_eq!(
+            map.txid_of(&a_other.compute_wtxid()),
+            None,
+            "another witness is another transaction"
+        );
 
-        let replaced = map.insert(txid, entry_of(a_other.clone())).expect("same txid replaces");
+        let replaced = map
+            .insert(txid, entry_of(a_other.clone()))
+            .expect("same txid replaces");
         assert_eq!(replaced.tx.compute_wtxid(), a.compute_wtxid());
         assert_eq!(map.txid_of(&a_other.compute_wtxid()), Some(txid));
-        assert_eq!(map.txid_of(&a.compute_wtxid()), None, "the replaced witness no longer resolves");
+        assert_eq!(
+            map.txid_of(&a.compute_wtxid()),
+            None,
+            "the replaced witness no longer resolves"
+        );
 
         map.remove(&txid).expect("resident");
-        assert_eq!(map.txid_of(&a_other.compute_wtxid()), None, "a removed entry takes its wtxid with it");
-        assert_eq!(map.txid_of(&b.compute_wtxid()), Some(b.compute_txid()), "the other entry is untouched");
+        assert_eq!(
+            map.txid_of(&a_other.compute_wtxid()),
+            None,
+            "a removed entry takes its wtxid with it"
+        );
+        assert_eq!(
+            map.txid_of(&b.compute_wtxid()),
+            Some(b.compute_txid()),
+            "the other entry is untouched"
+        );
         assert_eq!(map.by_wtxid.len(), map.len());
 
         let ids: Vec<(Txid, Wtxid)> = map.iter_with_wtxid().map(|(t, w, _)| (t, w)).collect();
@@ -13552,10 +14545,14 @@ mod tests {
         assert_eq!(entry.tx, tx);
         assert_eq!(mp.txid_of_wtxid(&wtxid), Some(txid));
         assert!(
-            mp.get_by_wtxid(&Wtxid::from_raw_hash(txid.to_raw_hash())).is_none(),
+            mp.get_by_wtxid(&Wtxid::from_raw_hash(txid.to_raw_hash()))
+                .is_none(),
             "a txid is not a wtxid for a witness transaction"
         );
-        assert!(mp.get_by_wtxid(&witness_tx(3, 0xbb).compute_wtxid()).is_none());
+        assert!(
+            mp.get_by_wtxid(&witness_tx(3, 0xbb).compute_wtxid())
+                .is_none()
+        );
 
         assert_eq!(mp.relay_ids_above_feerate(0), vec![(txid, wtxid)]);
         mp.mark_unbroadcast(txid);
@@ -13583,9 +14580,17 @@ mod tests {
             .accept_transaction(one.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("admitted");
 
-        for (tx, want) in [(&one, "txn-already-in-mempool"), (&two, "txn-same-nonwitness-data-in-mempool")] {
-            let accepted = mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false);
-            assert_eq!(accepted.unwrap_err().reject_reason(), want, "accept_transaction");
+        for (tx, want) in [
+            (&one, "txn-already-in-mempool"),
+            (&two, "txn-same-nonwitness-data-in-mempool"),
+        ] {
+            let accepted =
+                mp.accept_transaction(tx.clone(), &cs, &NoopVerifier, TxSource::Rpc, false);
+            assert_eq!(
+                accepted.unwrap_err().reject_reason(),
+                want,
+                "accept_transaction"
+            );
             let tested = mp.test_accept(tx, &cs, &NoopVerifier);
             assert_eq!(tested.unwrap_err().reject_reason(), want, "test_accept");
         }
@@ -13672,7 +14677,10 @@ mod tests {
         let t = mp.reapply_policy(&cs);
         assert_eq!(t.demoted, vec![txid]);
         let (acting_after, seq_after) = mp.acting_txids_with_sequence();
-        assert!(acting_after.is_empty(), "the tx is still visible: {acting_after:?}");
+        assert!(
+            acting_after.is_empty(),
+            "the tx is still visible: {acting_after:?}"
+        );
         assert!(
             seq_after > seq,
             "the acting set emptied at the same sequence ({seq} -> {seq_after})"
@@ -13731,7 +14739,11 @@ mod tests {
         // The quarantined admission took sequence 1 without an event (a gap
         // on the stream); crossing into the acting set takes the next one.
         match erx.try_recv() {
-            Ok(MempoolEvent::Enter { txid: e, mempool_sequence, .. }) => {
+            Ok(MempoolEvent::Enter {
+                txid: e,
+                mempool_sequence,
+                ..
+            }) => {
                 assert_eq!(e, txid);
                 assert_eq!(mempool_sequence, 2);
             }
@@ -13743,7 +14755,11 @@ mod tests {
         let t = mp.reapply_policy(&cs);
         assert_eq!(t.demoted, vec![txid]);
         match erx.try_recv() {
-            Ok(MempoolEvent::LeaveEvicted { txid: e, reason, mempool_sequence }) => {
+            Ok(MempoolEvent::LeaveEvicted {
+                txid: e,
+                reason,
+                mempool_sequence,
+            }) => {
                 assert_eq!(e, txid);
                 assert_eq!(reason, EvictReason::Policy);
                 assert_eq!(mempool_sequence, 3);
@@ -13810,7 +14826,10 @@ mod tests {
         mp.clear_policy();
         mp.reapply_policy(&cs);
         assert!(scope_of(&mp, &txid).is_acting());
-        assert!(mp.inner.read().entries.contains_key(&txid), "nothing dropped");
+        assert!(
+            mp.inner.read().entries.contains_key(&txid),
+            "nothing dropped"
+        );
         assert_eq!(mp.inner.read().total_bytes, before_total);
         assert_eq!(mp.acting_bytes(), before_acting);
         assert_eq!(mp.quarantine_bytes(), 0);
@@ -13841,13 +14860,20 @@ mod tests {
         // Reload to template-only quarantine: relay is recovered, template stays
         // held. Net result is still quarantined → this is a Demoted move, never a
         // Promoted one.
-        set_ruleset(&mp, "version 1\nquarantine catch on template when tx.version == 2");
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine catch on template when tx.version == 2",
+        );
         let t = mp.reapply_policy(&cs);
         assert!(
             t.promoted.is_empty(),
             "still template-held ⇒ not a promotion"
         );
-        assert_eq!(t.demoted, vec![txid], "partial recovery reported as a scope change");
+        assert_eq!(
+            t.demoted,
+            vec![txid],
+            "partial recovery reported as a scope change"
+        );
         let s = scope_of(&mp, &txid);
         assert!(!s.relay && s.template, "now relay-assisting, template-held");
         assert!(s.is_quarantined(), "still quarantined overall");
@@ -13863,8 +14889,7 @@ mod tests {
         // `Promoted` event for a tx that no longer exists.
         let op_keep = outpoint(0xd1);
         let op_q = outpoint(0xd2);
-        let (cs, mp, dir) =
-            make_funded_env(&[(op_keep, coin(100_000)), (op_q, coin(100_000))]);
+        let (cs, mp, dir) = make_funded_env(&[(op_keep, coin(100_000)), (op_q, coin(100_000))]);
 
         // High-fee acting tx to keep; low-fee tx that will be quarantined then
         // promoted. Both are 1-in/1-out and serialize to the same length.
@@ -13928,7 +14953,10 @@ mod tests {
         // Parent: version 2, will match the rule. Child spends the parent.
         let parent = spend(op, 150_000, 0x33);
         let parent_txid = parent.compute_txid();
-        let parent_out = OutPoint { txid: parent_txid, vout: 0 };
+        let parent_out = OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        };
         let child = spend(parent_out, 100_000, 0x44);
         let child_txid = child.compute_txid();
 
@@ -13966,7 +14994,14 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin(200_000))]);
         let parent = spend(op, 150_000, 0x33);
         let parent_txid = parent.compute_txid();
-        let child = spend(OutPoint { txid: parent_txid, vout: 0 }, 100_000, 0x44);
+        let child = spend(
+            OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
+            100_000,
+            0x44,
+        );
         let child_txid = child.compute_txid();
 
         mp.accept_transaction(parent, &cs, &NoopVerifier, TxSource::P2p, false)
@@ -13983,9 +15018,14 @@ mod tests {
         let pscope = scope_of(&mp, &parent_txid);
         assert!(pscope.relay && !pscope.template, "parent held on relay");
         let cscope = scope_of(&mp, &child_txid);
-        assert!(cscope.relay, "child inherits the parent's relay hold (infectious, §3/§7)");
+        assert!(
+            cscope.relay,
+            "child inherits the parent's relay hold (infectious, §3/§7)"
+        );
         assert_eq!(
-            mp.inner.read().entries[&child_txid].quarantine_rule.as_deref(),
+            mp.inner.read().entries[&child_txid]
+                .quarantine_rule
+                .as_deref(),
             Some(INFECTIOUS_RULE)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -13999,10 +15039,16 @@ mod tests {
         let ops = [outpoint(0xd5), outpoint(0xd6), outpoint(0xd7)];
         let (cs, mp, dir) = make_funded_env(&ops.map(|op| (op, coin(100_000))));
         // Fees 100, 200 and 300; all 1-in/1-out, so the same size.
-        let txs: Vec<Transaction> =
-            ops.iter().zip([100u64, 200, 300]).map(|(op, fee)| spend(*op, 100_000 - fee, 0x33)).collect();
+        let txs: Vec<Transaction> = ops
+            .iter()
+            .zip([100u64, 200, 300])
+            .map(|(op, fee)| spend(*op, 100_000 - fee, 0x33))
+            .collect();
         let l = bitcoin::consensus::serialize(&txs[0]).len();
-        assert!(txs.iter().all(|t| bitcoin::consensus::serialize(t).len() == l));
+        assert!(
+            txs.iter()
+                .all(|t| bitcoin::consensus::serialize(t).len() == l)
+        );
         let ids: Vec<Txid> = txs
             .iter()
             .map(|t| {
@@ -14098,7 +15144,11 @@ mod tests {
             .map(|(t, _)| t)
             .collect();
         assert_eq!(acting, vec![a], "only the fully-acting tx is visible");
-        assert_eq!(mp.get_all_entries().len(), 4, "all four are physically held");
+        assert_eq!(
+            mp.get_all_entries().len(),
+            4,
+            "all four are physically held"
+        );
     }
 
     /// The borrowing accessors the unauthenticated Esplora routes use see
@@ -14118,7 +15168,10 @@ mod tests {
                 version: bitcoin::transaction::Version(2),
                 lock_time: bitcoin::absolute::LockTime::ZERO,
                 input: vec![bitcoin::TxIn {
-                    previous_output: OutPoint { txid: funding, vout },
+                    previous_output: OutPoint {
+                        txid: funding,
+                        vout,
+                    },
                     ..Default::default()
                 }],
                 output: vec![bitcoin::TxOut {
@@ -14131,7 +15184,10 @@ mod tests {
             tx.input.insert(
                 0,
                 bitcoin::TxIn {
-                    previous_output: OutPoint { txid: <Txid as bitcoin::hashes::Hash>::all_zeros(), vout: nonce as u32 },
+                    previous_output: OutPoint {
+                        txid: <Txid as bitcoin::hashes::Hash>::all_zeros(),
+                        vout: nonce as u32,
+                    },
                     ..Default::default()
                 },
             );
@@ -14141,20 +15197,34 @@ mod tests {
             entry.tx = tx;
             entry.scope = scope;
             inner.entries.insert(txid, entry);
-            inner.spends.insert(OutPoint { txid: funding, vout }, txid);
+            inner.spends.insert(
+                OutPoint {
+                    txid: funding,
+                    vout,
+                },
+                txid,
+            );
             txid
         };
         let acting_spender = spend(0, 10, QuarantineScope::acting());
         spend(1, 11, RELAY_ONLY);
 
-        let mut cloned: Vec<Txid> = mp.get_acting_entries().into_iter().map(|(t, _)| t).collect();
+        let mut cloned: Vec<Txid> = mp
+            .get_acting_entries()
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
         cloned.sort();
         let mut borrowed = Vec::new();
         mp.for_each_acting(|t, _| borrowed.push(*t));
         borrowed.sort();
         assert_eq!(borrowed, cloned);
         assert_eq!(mp.acting_count(), cloned.len());
-        assert_eq!(mp.acting_count(), 2, "the funding tx and its acting spender");
+        assert_eq!(
+            mp.acting_count(),
+            2,
+            "the funding tx and its acting spender"
+        );
 
         let spenders = mp.acting_spenders_of_outputs(&funding, 3);
         assert_eq!(spenders.get(&0), Some(&(acting_spender, 1)));
@@ -14162,7 +15232,10 @@ mod tests {
         assert_eq!(spenders.len(), 1);
         assert_eq!(
             spenders.get(&0).copied(),
-            mp.spending_tx_acting(&OutPoint { txid: funding, vout: 0 }),
+            mp.spending_tx_acting(&OutPoint {
+                txid: funding,
+                vout: 0
+            }),
             "agrees with the single-output lookup"
         );
         assert!(mp.acting_spenders_of_outputs(&funding, 0).is_empty());
@@ -14183,8 +15256,14 @@ mod tests {
 
         let r = reference.info();
         let q = occupied.info();
-        assert_eq!(r.size, q.size, "getmempoolinfo.size counts the acting class only");
-        assert_eq!(r.bytes, q.bytes, "getmempoolinfo.bytes counts the acting class only");
+        assert_eq!(
+            r.size, q.size,
+            "getmempoolinfo.size counts the acting class only"
+        );
+        assert_eq!(
+            r.bytes, q.bytes,
+            "getmempoolinfo.bytes counts the acting class only"
+        );
         assert_eq!(q.size, 1);
         assert!(
             occupied.quarantine_bytes() > 0,
@@ -14198,7 +15277,10 @@ mod tests {
         let a = mp.insert_scoped_for_test(1, 100, QuarantineScope::acting());
         let r = mp.insert_scoped_for_test(2, 100, RELAY_ONLY);
         let t = mp.insert_scoped_for_test(3, 100, TEMPLATE_ONLY);
-        assert!(mp.get_entry_verbose(&a).is_some(), "acting entry is visible");
+        assert!(
+            mp.get_entry_verbose(&a).is_some(),
+            "acting entry is visible"
+        );
         assert!(
             mp.get_entry_verbose(&r).is_none(),
             "relay-quarantined entry is not-found on getmempoolentry"
@@ -14271,9 +15353,14 @@ mod tests {
         // unchanged, so the byte-accounting move is correctly skipped).
         set_ruleset(&mp, "version 1\nquarantine renamed when tx.version == 2");
         let t = mp.reapply_policy(&cs);
-        assert!(t.promoted.is_empty() && t.demoted.is_empty(), "scope unchanged ⇒ no move");
+        assert!(
+            t.promoted.is_empty() && t.demoted.is_empty(),
+            "scope unchanged ⇒ no move"
+        );
         assert_eq!(
-            mp.get_quarantine_entry(&txid).expect("still quarantined").rule,
+            mp.get_quarantine_entry(&txid)
+                .expect("still quarantined")
+                .rule,
             "renamed",
             "rename with same scope must update the attributed rule"
         );
@@ -14307,7 +15394,11 @@ mod tests {
         let mut block2 = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         block2.txdata.push(tx2);
         mp.remove_for_block(&block2, 102);
-        assert_eq!(mp.quarantine_confirmed_count(), 1, "acting confirmation is not counted");
+        assert_eq!(
+            mp.quarantine_confirmed_count(),
+            1,
+            "acting confirmation is not counted"
+        );
     }
 
     #[test]
@@ -14316,7 +15407,10 @@ mod tests {
         // placement the tx would receive. The tx is NOT admitted.
         let op = outpoint(0xab);
         let (cs, mp, dir) = make_funded_env(&[(op, coin(100_000))]);
-        set_ruleset(&mp, "version 1\nquarantine catch on relay when tx.version == 2");
+        set_ruleset(
+            &mp,
+            "version 1\nquarantine catch on relay when tx.version == 2",
+        );
         let tx = spend(op, 99_000, 0x66);
         let hex_tx = hex::encode(bitcoin::consensus::serialize(&tx));
 
@@ -14326,7 +15420,10 @@ mod tests {
         assert_eq!(v["decisive_rule"], serde_json::json!("catch"));
         assert_eq!(v["placement"]["class"], serde_json::json!("quarantine"));
         assert_eq!(v["placement"]["scope"]["relay"], serde_json::json!(true));
-        assert_eq!(v["placement"]["scope"]["template"], serde_json::json!(false));
+        assert_eq!(
+            v["placement"]["scope"]["template"],
+            serde_json::json!(false)
+        );
         assert_eq!(v["rules"][0]["name"], serde_json::json!("catch"));
         assert_eq!(v["rules"][0]["decisive"], serde_json::json!(true));
         // Dry-run only: nothing was admitted.
@@ -14651,7 +15748,10 @@ mod tests {
         let op = outpoint(0xE3);
         let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
         let tip_mtp = cs.get_median_time_past(1);
-        assert!(tip_mtp >= 500_000_000, "regtest genesis time is a time-locktime");
+        assert!(
+            tip_mtp >= 500_000_000,
+            "regtest genesis time is a time-locktime"
+        );
 
         let at = spend_with(op, 40_000, 0x23, 2, 0, tip_mtp);
         let r = mp.accept_transaction(at, &cs, &NoopVerifier, TxSource::Rpc, false);
@@ -14732,7 +15832,10 @@ mod tests {
         // which `-acceptnonstdtxn` does not lift.
         let op = outpoint(0xEA);
         let (cs, _, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
-        let mp = Mempool::with_config(MempoolConfig { accept_non_std_txn: true, ..Default::default() });
+        let mp = Mempool::with_config(MempoolConfig {
+            accept_non_std_txn: true,
+            ..Default::default()
+        });
         let tx = spend_with(op, 40_000, 0x2A, 0x8000_0002u32 as i32, 1, 0);
         let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");
@@ -14747,9 +15850,18 @@ mod tests {
         let (cs, _, dir) = make_funded_env(&[]);
         let seq_time_1 = (1u32 << 22) | 1;
         let anchor = cs.get_median_time_past(0);
-        assert!(!Mempool::bip68_satisfied(&cs, seq_time_1, 0, 2, anchor), "two blocks, no time");
-        assert!(!Mempool::bip68_satisfied(&cs, seq_time_1, 0, 2, anchor + 511), "one second short");
-        assert!(Mempool::bip68_satisfied(&cs, seq_time_1, 0, 0, anchor + 512), "512 seconds, no blocks");
+        assert!(
+            !Mempool::bip68_satisfied(&cs, seq_time_1, 0, 2, anchor),
+            "two blocks, no time"
+        );
+        assert!(
+            !Mempool::bip68_satisfied(&cs, seq_time_1, 0, 2, anchor + 511),
+            "one second short"
+        );
+        assert!(
+            Mempool::bip68_satisfied(&cs, seq_time_1, 0, 0, anchor + 512),
+            "512 seconds, no blocks"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14771,7 +15883,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, cb_coin)]);
         let tx = spend_with(op, 40_000, 0x2B, 2, 0xffff_ffff, 0);
         let r = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false);
-        assert!(matches!(r, Err(MempoolError::PrematureCoinbaseSpend)), "{r:?}");
+        assert!(
+            matches!(r, Err(MempoolError::PrematureCoinbaseSpend)),
+            "{r:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14790,7 +15905,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, cb_coin)]);
         let tx = spend_with(op, 40_000, 0x2C, 2, 0xffff_ffff, 0);
         let r = mp.test_accept(&tx, &cs, &NoopVerifier);
-        assert!(matches!(r, Err(MempoolError::PrematureCoinbaseSpend)), "{r:?}");
+        assert!(
+            matches!(r, Err(MempoolError::PrematureCoinbaseSpend)),
+            "{r:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14806,7 +15924,10 @@ mod tests {
             .accept_transaction(parent, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("parent admits");
 
-        let child_prev = OutPoint { txid: parent_txid, vout: 0 };
+        let child_prev = OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        };
         let locked_child = spend_with(child_prev, 30_000, 0x2C, 2, 1, 0);
         let r = mp.accept_transaction(locked_child, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(matches!(r, Err(MempoolError::NonBip68Final)), "{r:?}");
@@ -14883,7 +16004,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
         let txid = insert_raw(&mp, spend(op, 40_000, 0x30));
         mp.remove_for_reorg(&cs);
-        assert!(in_pool(&mp, &txid), "a valid transaction was evicted by the reorg sweep");
+        assert!(
+            in_pool(&mp, &txid),
+            "a valid transaction was evicted by the reorg sweep"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14924,8 +16048,14 @@ mod tests {
 
         mp.remove_for_reorg(&cs);
 
-        assert!(!in_pool(&mp, &evicted), "an unsatisfiable height locktime survived the reorg");
-        assert!(in_pool(&mp, &kept), "a locktime the next block satisfies was evicted");
+        assert!(
+            !in_pool(&mp, &evicted),
+            "an unsatisfiable height locktime survived the reorg"
+        );
+        assert!(
+            in_pool(&mp, &kept),
+            "a locktime the next block satisfies was evicted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14939,17 +16069,25 @@ mod tests {
         // delete the surviving transaction's index row.
         let op = outpoint(0xF3);
         let op2 = outpoint(0xFE);
-        let (cs, mp, dir) =
-            make_funded_env(&[(op, coin(50_000)), (op2, coin(50_000))]);
+        let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000)), (op2, coin(50_000))]);
         let tip_mtp = cs.get_median_time_past(1);
-        assert!(tip_mtp >= 500_000_000, "regtest genesis time is a time locktime");
+        assert!(
+            tip_mtp >= 500_000_000,
+            "regtest genesis time is a time locktime"
+        );
         let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x33, 2, 0, tip_mtp));
         let kept = insert_raw(&mp, spend_with(op2, 40_000, 0x34, 2, 0, tip_mtp - 1));
 
         mp.remove_for_reorg(&cs);
 
-        assert!(!in_pool(&mp, &evicted), "a time locktime at the tip MTP survived the reorg");
-        assert!(in_pool(&mp, &kept), "a time locktime below the tip MTP was evicted");
+        assert!(
+            !in_pool(&mp, &evicted),
+            "a time locktime at the tip MTP survived the reorg"
+        );
+        assert!(
+            in_pool(&mp, &kept),
+            "a time locktime below the tip MTP was evicted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14962,7 +16100,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
         let txid = insert_raw(&mp, spend_with(op, 40_000, 0x35, 2, 0xffff_ffff, 1_000_000));
         mp.remove_for_reorg(&cs);
-        assert!(in_pool(&mp, &txid), "a final-sequence transaction was evicted for its locktime");
+        assert!(
+            in_pool(&mp, &txid),
+            "a final-sequence transaction was evicted for its locktime"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14983,7 +16124,10 @@ mod tests {
         // Sequence MAX and locktime 0 isolate maturity from the other guards.
         let txid = insert_raw(&mp, spend_with(op, 40_000, 0x36, 2, 0xffff_ffff, 0));
         mp.remove_for_reorg(&cs);
-        assert!(!in_pool(&mp, &txid), "an immature coinbase spend survived the reorg");
+        assert!(
+            !in_pool(&mp, &txid),
+            "an immature coinbase spend survived the reorg"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14995,7 +16139,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 0))]);
         let txid = insert_raw(&mp, spend_with(op, 40_000, 0x37, 2, 0xffff_ffff, 0));
         mp.remove_for_reorg(&cs);
-        assert!(in_pool(&mp, &txid), "a shallow non-coinbase spend was evicted as immature");
+        assert!(
+            in_pool(&mp, &txid),
+            "a shallow non-coinbase spend was evicted as immature"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15008,7 +16155,10 @@ mod tests {
         // Coin at height 1 evaluated at height 1: zero blocks elapsed.
         let evicted = insert_raw(&mp, spend_with(op, 40_000, 0x38, 2, 1, 0));
         mp.remove_for_reorg(&cs);
-        assert!(!in_pool(&mp, &evicted), "an unmet BIP 68 height lock survived the reorg");
+        assert!(
+            !in_pool(&mp, &evicted),
+            "an unmet BIP 68 height lock survived the reorg"
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // The same lock against a coin one block older is met.
@@ -15030,7 +16180,10 @@ mod tests {
         let op = outpoint(0xB0);
         let (cs, mp, dir) = make_funded_env(&[(op, coin(50_000))]);
         let parent = insert_raw(&mp, spend(op, 45_000, 0xA0));
-        let prev = OutPoint { txid: parent, vout: 0 };
+        let prev = OutPoint {
+            txid: parent,
+            vout: 0,
+        };
         let evicted = insert_raw(&mp, spend_with(prev, 40_000, 0xA1, 2, 1, 0));
 
         mp.remove_for_reorg(&cs);
@@ -15048,10 +16201,23 @@ mod tests {
         let parent2 = insert_raw(&mp2, spend(op2, 45_000, 0xA2));
         let free = insert_raw(
             &mp2,
-            spend_with(OutPoint { txid: parent2, vout: 0 }, 40_000, 0xA3, 2, 0, 0),
+            spend_with(
+                OutPoint {
+                    txid: parent2,
+                    vout: 0,
+                },
+                40_000,
+                0xA3,
+                2,
+                0,
+                0,
+            ),
         );
         mp2.remove_for_reorg(&cs2);
-        assert!(in_pool(&mp2, &free), "a zero lock value against a mempool parent was evicted");
+        assert!(
+            in_pool(&mp2, &free),
+            "a zero lock value against a mempool parent was evicted"
+        );
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
@@ -15067,7 +16233,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
         let evicted = insert_raw(&mp, spend_with(op, 40_000, 0xA4, 2, seq_time_1, 0));
         mp.remove_for_reorg(&cs);
-        assert!(!in_pool(&mp, &evicted), "an unmet BIP 68 time lock survived the reorg");
+        assert!(
+            !in_pool(&mp, &evicted),
+            "an unmet BIP 68 time lock survived the reorg"
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         // A coin at height 0 anchors at an empty MTP window, so the whole
@@ -15088,7 +16257,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[(op, coin_at(50_000, 1))]);
         let txid = insert_raw(&mp, spend_with(op, 40_000, 0x3A, 1, 1, 0));
         mp.remove_for_reorg(&cs);
-        assert!(in_pool(&mp, &txid), "BIP 68 was enforced against a version-1 transaction");
+        assert!(
+            in_pool(&mp, &txid),
+            "BIP 68 was enforced against a version-1 transaction"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15101,7 +16273,10 @@ mod tests {
         let (cs, mp, dir) = make_funded_env(&[]);
         let txid = insert_raw(&mp, spend(outpoint(0xFA), 40_000, 0x3B));
         mp.remove_for_reorg(&cs);
-        assert!(!in_pool(&mp, &txid), "a spend of a vanished coin survived the reorg");
+        assert!(
+            !in_pool(&mp, &txid),
+            "a spend of a vanished coin survived the reorg"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15114,15 +16289,40 @@ mod tests {
         // Parent spends a coin that does not exist -> directly invalid.
         let parent_tx = spend(outpoint(0xFB), 40_000, 0x3C);
         let parent = insert_raw(&mp, parent_tx);
-        let child = insert_raw(&mp, spend(OutPoint { txid: parent, vout: 0 }, 30_000, 0x3D));
-        let grandchild =
-            insert_raw(&mp, spend(OutPoint { txid: child, vout: 0 }, 20_000, 0x3E));
+        let child = insert_raw(
+            &mp,
+            spend(
+                OutPoint {
+                    txid: parent,
+                    vout: 0,
+                },
+                30_000,
+                0x3D,
+            ),
+        );
+        let grandchild = insert_raw(
+            &mp,
+            spend(
+                OutPoint {
+                    txid: child,
+                    vout: 0,
+                },
+                20_000,
+                0x3E,
+            ),
+        );
 
         mp.remove_for_reorg(&cs);
 
         assert!(!in_pool(&mp, &parent), "the invalid parent survived");
-        assert!(!in_pool(&mp, &child), "the child of an evicted parent survived");
-        assert!(!in_pool(&mp, &grandchild), "the descendant walk stopped after one level");
+        assert!(
+            !in_pool(&mp, &child),
+            "the child of an evicted parent survived"
+        );
+        assert!(
+            !in_pool(&mp, &grandchild),
+            "the descendant walk stopped after one level"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15155,7 +16355,8 @@ mod tests {
             "the evicted transaction left its outpoint marked as spent"
         );
         assert_eq!(
-            inner.total_bytes, SLACK,
+            inner.total_bytes,
+            SLACK,
             "eviction released {} bytes, not the transaction's {size}",
             (size + SLACK).saturating_sub(inner.total_bytes)
         );
@@ -15177,7 +16378,10 @@ mod tests {
 
         let mut seen = None;
         while let Ok(ev) = rx.try_recv() {
-            if let MempoolEvent::LeaveEvicted { txid: t, reason, .. } = ev {
+            if let MempoolEvent::LeaveEvicted {
+                txid: t, reason, ..
+            } = ev
+            {
                 seen = Some((t, reason));
             }
         }
@@ -15284,8 +16488,14 @@ mod tests {
         // pays the package's fee.
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0x52)],
         );
@@ -15295,7 +16505,10 @@ mod tests {
             mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
 
         assert_eq!(msg, "success", "package rejected: {results:?}");
-        assert!(in_pool(&mp, &parent_txid), "the ephemeral dust parent was not accepted");
+        assert!(
+            in_pool(&mp, &parent_txid),
+            "the ephemeral dust parent was not accepted"
+        );
         assert!(in_pool(&mp, &child_txid), "the child was not accepted");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15315,7 +16528,13 @@ mod tests {
         let parent_txid = parent.compute_txid();
         // Output 0 is the dust; output 1 is left for later.
         let child = tx_from(
-            &[OutPoint { txid: parent_txid, vout: 0 }, funding],
+            &[
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                funding,
+            ],
             &[(dust + 50_000 - 2_000, 0x52)],
         );
         let child_txid = child.compute_txid();
@@ -15324,8 +16543,14 @@ mod tests {
             mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
 
         assert_eq!(msg, "success", "package rejected: {results:?}");
-        assert!(in_pool(&mp, &parent_txid), "the parent was unwound: {results:?}");
-        assert!(in_pool(&mp, &child_txid), "the child was not accepted: {results:?}");
+        assert!(
+            in_pool(&mp, &parent_txid),
+            "the parent was unwound: {results:?}"
+        );
+        assert!(
+            in_pool(&mp, &child_txid),
+            "the child was not accepted: {results:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15342,19 +16567,38 @@ mod tests {
         let dust = p2wpkh_dust_threshold() - 1;
         let parent = tx_from(&[op], &[(dust, 0x50), (50_000 - dust, 0x51)]);
         let parent_txid = parent.compute_txid();
-        let (dust_out, rest_out) =
-            (OutPoint { txid: parent_txid, vout: 0 }, OutPoint { txid: parent_txid, vout: 1 });
+        let (dust_out, rest_out) = (
+            OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            },
+            OutPoint {
+                txid: parent_txid,
+                vout: 1,
+            },
+        );
         // Mined: its outputs are coins, and the coin it spent is gone.
-        let (cs, mp, dir) = make_package_env(&[(dust_out, coin(dust)), (rest_out, coin(50_000 - dust))]);
+        let (cs, mp, dir) =
+            make_package_env(&[(dust_out, coin(dust)), (rest_out, coin(50_000 - dust))]);
         let child = tx_from(&[rest_out], &[(40_000, 0x55)]);
         let child_txid = child.compute_txid();
 
         let (_msg, results) =
             mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
 
-        assert!(in_pool(&mp, &child_txid), "the child was not accepted: {results:?}");
-        assert!(!in_pool(&mp, &parent_txid), "a confirmed parent entered the mempool");
-        assert_eq!(err_of(&results, &child), "<no error reported>", "{results:?}");
+        assert!(
+            in_pool(&mp, &child_txid),
+            "the child was not accepted: {results:?}"
+        );
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "a confirmed parent entered the mempool"
+        );
+        assert_eq!(
+            err_of(&results, &child),
+            "<no error reported>",
+            "{results:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15370,8 +16614,14 @@ mod tests {
         let parent_txid = parent.compute_txid();
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0x58)],
         );
@@ -15381,15 +16631,24 @@ mod tests {
         // `time::tests` for why a concurrent test cannot be harmed by one.
         let mock = crate::time::now_secs() - 60;
         let times = {
-            let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _clock = crate::time::CLOCK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             crate::time::set_mock_time(Some(mock));
             let (msg, results) = mp.accept_package(vec![parent, child], &cs, &NoopVerifier);
             crate::time::set_mock_time(None);
             assert_eq!(msg, "success", "package rejected: {results:?}");
             let inner = mp.inner.read();
-            (inner.entries[&parent_txid].time, inner.entries[&child_txid].time)
+            (
+                inner.entries[&parent_txid].time,
+                inner.entries[&child_txid].time,
+            )
         };
-        assert_eq!(times, (mock, mock), "(parent, child) entry times under setmocktime");
+        assert_eq!(
+            times,
+            (mock, mock),
+            "(parent, child) entry times under setmocktime"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15405,7 +16664,13 @@ mod tests {
         let parent = tx_from(&[op], &[(dust, 0x53), (50_000 - dust, 0x54)]);
         let parent_txid = parent.compute_txid();
         // Spends output 1 only, leaving the dust at output 0.
-        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 1 }], &[(40_000, 0x55)]);
+        let child = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 1,
+            }],
+            &[(40_000, 0x55)],
+        );
 
         let (msg, results) =
             mp.accept_package(vec![parent.clone(), child.clone()], &cs, &NoopVerifier);
@@ -15419,8 +16684,14 @@ mod tests {
             "wrong reason: {}",
             err_of(&results, &child)
         );
-        assert!(!in_pool(&mp, &parent_txid), "the dust parent entered with its dust unspent");
-        assert!(!in_pool(&mp, &child.compute_txid()), "the offending child entered");
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "the dust parent entered with its dust unspent"
+        );
+        assert!(
+            !in_pool(&mp, &child.compute_txid()),
+            "the offending child entered"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15438,8 +16709,14 @@ mod tests {
         let parent_txid = parent.compute_txid();
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0x58)],
         );
@@ -15452,7 +16729,10 @@ mod tests {
             "wrong reason: {}",
             err_of(&results, &parent)
         );
-        assert!(!in_pool(&mp, &parent_txid), "a fee-paying dust parent entered the mempool");
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "a fee-paying dust parent entered the mempool"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15467,13 +16747,25 @@ mod tests {
         let (cs, mp, dir) = make_package_env(&[(op, coin(50_000))]);
         let dust = p2wpkh_dust_threshold() - 1;
 
-        let parent = tx_from(&[op], &[(dust, 0x59), (dust, 0x5A), (50_000 - 2 * dust, 0x5B)]);
+        let parent = tx_from(
+            &[op],
+            &[(dust, 0x59), (dust, 0x5A), (50_000 - 2 * dust, 0x5B)],
+        );
         let parent_txid = parent.compute_txid();
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
-                OutPoint { txid: parent_txid, vout: 2 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 2,
+                },
             ],
             &[(40_000, 0x5C)],
         );
@@ -15482,7 +16774,10 @@ mod tests {
 
         assert_eq!(msg, "transaction failed", "{results:?}");
         assert_eq!(err_of(&results, &parent), "dust");
-        assert!(!in_pool(&mp, &parent_txid), "a two-dust parent entered the mempool");
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "a two-dust parent entered the mempool"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15503,8 +16798,14 @@ mod tests {
         let (msg, results) = mp.accept_package(vec![parent.clone()], &cs, &NoopVerifier);
 
         assert_eq!(msg, "transaction failed", "{results:?}");
-        assert!(err_of(&results, &parent).starts_with("min relay fee not met, 0 < "), "{results:?}");
-        assert!(!in_pool(&mp, &parent_txid), "a lone dust parent entered the mempool");
+        assert!(
+            err_of(&results, &parent).starts_with("min relay fee not met, 0 < "),
+            "{results:?}"
+        );
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "a lone dust parent entered the mempool"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15531,8 +16832,14 @@ mod tests {
         // acceptance finds only once the parent is in the pool.
         let child = bip68_locked(tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0x63)],
         ));
@@ -15540,7 +16847,10 @@ mod tests {
 
         let (msg, results) = mp.accept_package(vec![parent, child.clone()], &cs, &NoopVerifier);
 
-        assert!(!in_pool(&mp, &child_txid), "the non-final child was accepted: {results:?}");
+        assert!(
+            !in_pool(&mp, &child_txid),
+            "the non-final child was accepted: {results:?}"
+        );
         assert_eq!(err_of(&results, &child), "non-BIP68-final", "{results:?}");
         assert!(
             !in_pool(&mp, &parent_txid),
@@ -15555,7 +16865,10 @@ mod tests {
             !inner.spends.contains_key(&op),
             "the unwound parent left its input marked as spent"
         );
-        assert_eq!(inner.total_bytes, 0, "the unwound parent's bytes were not released");
+        assert_eq!(
+            inner.total_bytes, 0,
+            "the unwound parent's bytes were not released"
+        );
         drop(inner);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15582,13 +16895,25 @@ mod tests {
         // Names the dust, so the parent is admitted — then refused for its fee.
         let sweeper = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(dust + 25_000 - 1, 0x67)],
         );
         // Pays properly and conflicts with nobody, but leaves the dust alone.
-        let sibling = tx_from(&[OutPoint { txid: parent_txid, vout: 2 }], &[(20_000, 0x68)]);
+        let sibling = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 2,
+            }],
+            &[(20_000, 0x68)],
+        );
         let sibling_txid = sibling.compute_txid();
 
         let (msg, results) =
@@ -15596,13 +16921,19 @@ mod tests {
 
         // Guards the fixture: any well-formedness refusal would short-circuit
         // the whole function and make every assertion below vacuously true.
-        assert_eq!(msg, "unspent-dust", "the package never reached the dust policy: {results:?}");
+        assert_eq!(
+            msg, "unspent-dust",
+            "the package never reached the dust policy: {results:?}"
+        );
         assert!(
             err_of(&results, &sibling).contains("missing-ephemeral-spends"),
             "the sibling was not refused for leaving the dust: {}",
             err_of(&results, &sibling)
         );
-        assert!(!in_pool(&mp, &parent_txid), "the dust parent survived: {results:?}");
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "the dust parent survived: {results:?}"
+        );
         assert!(
             !in_pool(&mp, &sibling_txid),
             "a transaction that left the dust unswept was accepted: {results:?}"
@@ -15639,16 +16970,28 @@ mod tests {
         // combined feerate to it.
         let sweeper = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(10_000, 0x78)],
         );
         let sweeper_txid = sweeper.compute_txid();
         let (msg, results) = mp.accept_package(vec![parent, sweeper], &cs, &NoopVerifier);
         assert_eq!(msg, "success", "{results:?}");
-        assert!(in_pool(&mp, &parent_txid), "the dust parent was refused: {results:?}");
-        assert!(in_pool(&mp, &sweeper_txid), "the sweeping child was stranded: {results:?}");
+        assert!(
+            in_pool(&mp, &parent_txid),
+            "the dust parent was refused: {results:?}"
+        );
+        assert!(
+            in_pool(&mp, &sweeper_txid),
+            "the sweeping child was stranded: {results:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15670,18 +17013,33 @@ mod tests {
         let parent_txid = parent.compute_txid();
         let sweeper = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(20_000, 0x73)],
         );
         let (msg, results) = mp.accept_package(vec![parent, sweeper], &cs, &NoopVerifier);
         assert_eq!(msg, "success", "{results:?}");
-        assert!(in_pool(&mp, &parent_txid), "the fixture needs a resident dust parent");
+        assert!(
+            in_pool(&mp, &parent_txid),
+            "the fixture needs a resident dust parent"
+        );
 
         // Now, separately: a transaction spending the parent's *other* output
         // and leaving the dust behind.
-        let around = tx_from(&[OutPoint { txid: parent_txid, vout: 2 }], &[(20_000, 0x74)]);
+        let around = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 2,
+            }],
+            &[(20_000, 0x74)],
+        );
         let r = mp.accept_transaction(around, &cs, &NoopVerifier, TxSource::Rpc, false);
         assert!(
             matches!(r, Err(MempoolError::MissingEphemeralSpends(_))),
@@ -15716,7 +17074,10 @@ mod tests {
         for tx in [&a, &b] {
             let entry = &r.tx_results[&tx.compute_wtxid().to_string()];
             assert_eq!(entry["error"], serde_json::json!("package-not-validated"));
-            assert_eq!(entry["txid"], serde_json::json!(tx.compute_txid().to_string()));
+            assert_eq!(
+                entry["txid"],
+                serde_json::json!(tx.compute_txid().to_string())
+            );
         }
         assert!(r.replaced.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -15739,7 +17100,10 @@ mod tests {
         let parent = tx_from(&[op], &[(90_000, 0xC7)]);
         let parent_txid = parent.compute_txid();
         let child = tx_from(
-            &[OutPoint { txid: parent_txid, vout: 0 }],
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            }],
             &[(80_000, 0xC8)],
         );
         let wtxids: Vec<String> = [&parent, &child]
@@ -15785,8 +17149,14 @@ mod tests {
         let parent_txid = parent.compute_txid();
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0xD2)],
         );
@@ -15837,13 +17207,22 @@ mod tests {
         mp.accept_transaction(parent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("parent");
 
-        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(49_000, 0xD4)]);
+        let child = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            }],
+            &[(49_000, 0xD4)],
+        );
         let child_wtxid = child.compute_wtxid().to_string();
         let r = mp.accept_package_with(vec![parent, child], &cs, &NoopVerifier, Some(100_000));
         assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
 
         let resident = &r.tx_results[&parent_wtxid];
-        assert!(resident["error"].is_null(), "a resident member is not refused: {resident}");
+        assert!(
+            resident["error"].is_null(),
+            "a resident member is not refused: {resident}"
+        );
         assert!(!resident["vsize"].is_null(), "{resident}");
         assert!(!resident["fees"]["base"].is_null(), "{resident}");
         assert!(
@@ -15853,7 +17232,11 @@ mod tests {
         );
 
         let fresh = &r.tx_results[&child_wtxid]["fees"];
-        assert_eq!(fresh["effective-includes"], serde_json::json!([child_wtxid]), "{fresh}");
+        assert_eq!(
+            fresh["effective-includes"],
+            serde_json::json!([child_wtxid]),
+            "{fresh}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15877,7 +17260,10 @@ mod tests {
             r.tx_results[&tx.compute_wtxid().to_string()]["error"],
             serde_json::json!("max feerate exceeded")
         );
-        assert!(!in_pool(&mp, &txid), "a refused transaction reached the mempool");
+        assert!(
+            !in_pool(&mp, &txid),
+            "a refused transaction reached the mempool"
+        );
         // The refusal is the package's verdict as well: Core sets `PCKG_TX,
         // "transaction failed"` alongside the member's error, and
         // `rpc_packages.py` asserts both. A caller that keys "retry?" off
@@ -15909,21 +17295,37 @@ mod tests {
         let parent_txid = parent.compute_txid();
         let parent_wtxid = parent.compute_wtxid().to_string();
         // 50_000 sats over ~82 vbytes is ~610_000 sat/kvB: over it.
-        let child = tx_from(&[OutPoint { txid: parent_txid, vout: 0 }], &[(49_000, 0xD6)]);
+        let child = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 0,
+            }],
+            &[(49_000, 0xD6)],
+        );
         let child_txid = child.compute_txid();
         let child_wtxid = child.compute_wtxid().to_string();
 
         let r = mp.accept_package_with(vec![parent, child], &cs, &NoopVerifier, Some(100_000));
         assert_eq!(r.package_msg, "transaction failed", "{:?}", r.tx_results);
-        assert!(r.tx_results[&parent_wtxid]["error"].is_null(), "{:?}", r.tx_results);
+        assert!(
+            r.tx_results[&parent_wtxid]["error"].is_null(),
+            "{:?}",
+            r.tx_results
+        );
         assert_eq!(
             r.tx_results[&child_wtxid]["error"],
             serde_json::json!("max feerate exceeded"),
             "{:?}",
             r.tx_results
         );
-        assert!(in_pool(&mp, &parent_txid), "the parent under the ceiling is admitted");
-        assert!(!in_pool(&mp, &child_txid), "the child over the ceiling is not");
+        assert!(
+            in_pool(&mp, &parent_txid),
+            "the parent under the ceiling is admitted"
+        );
+        assert!(
+            !in_pool(&mp, &child_txid),
+            "the child over the ceiling is not"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15945,7 +17347,13 @@ mod tests {
         // A child of the original goes with it: Core's set is
         // `m_all_conflicts`, conflicts and descendants, and the child is in
         // fact gone afterwards.
-        let child = tx_from(&[OutPoint { txid: original_txid, vout: 0 }], &[(90_000, 0xCC)]);
+        let child = tx_from(
+            &[OutPoint {
+                txid: original_txid,
+                vout: 0,
+            }],
+            &[(90_000, 0xCC)],
+        );
         let child_txid = child.compute_txid();
         mp.accept_transaction(child, &cs, &NoopVerifier, TxSource::Rpc, false)
             .expect("child");
@@ -15992,12 +17400,24 @@ mod tests {
         // Names the dust, so the parent is admitted — then refused for its fee.
         let sweeper = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(dust + 25_000 - 1, 0xCF)],
         );
-        let sibling = tx_from(&[OutPoint { txid: parent_txid, vout: 2 }], &[(20_000, 0xD9)]);
+        let sibling = tx_from(
+            &[OutPoint {
+                txid: parent_txid,
+                vout: 2,
+            }],
+            &[(20_000, 0xD9)],
+        );
 
         let r = mp.accept_package_with(
             vec![parent.clone(), sweeper, sibling],
@@ -16006,7 +17426,11 @@ mod tests {
             None,
         );
         assert_eq!(r.package_msg, "unspent-dust", "{:?}", r.tx_results);
-        assert!(!in_pool(&mp, &parent_txid), "the parent survived: {:?}", r.tx_results);
+        assert!(
+            !in_pool(&mp, &parent_txid),
+            "the parent survived: {:?}",
+            r.tx_results
+        );
 
         let entry = &r.tx_results[&parent.compute_wtxid().to_string()];
         assert!(
@@ -16081,7 +17505,10 @@ mod tests {
         let err = mp
             .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
             .unwrap_err();
-        assert!(matches!(err, MempoolError::InsufficientFee(..)), "got {err:?}");
+        assert!(
+            matches!(err, MempoolError::InsufficientFee(..)),
+            "got {err:?}"
+        );
         assert_eq!(err.reject_reason(), "min relay fee not met");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16161,8 +17588,14 @@ mod tests {
         let parent_txid = parent.compute_txid();
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0x77)],
         );
@@ -16173,12 +17606,23 @@ mod tests {
 
         let mut entered: HashMap<Txid, u64> = HashMap::new();
         while let Ok(ev) = rx.try_recv() {
-            if let MempoolEvent::Enter { txid, mempool_sequence, .. } = ev {
+            if let MempoolEvent::Enter {
+                txid,
+                mempool_sequence,
+                ..
+            } = ev
+            {
                 entered.insert(txid, mempool_sequence);
             }
         }
-        assert!(entered.contains_key(&parent_txid), "the dust parent entered silently");
-        assert!(entered.contains_key(&child_txid), "the child entered silently");
+        assert!(
+            entered.contains_key(&parent_txid),
+            "the dust parent entered silently"
+        );
+        assert!(
+            entered.contains_key(&child_txid),
+            "the child entered silently"
+        );
         // The parent went in first and keeps the number it took then.
         assert_eq!(
             (entered[&parent_txid], entered[&child_txid]),
@@ -16215,8 +17659,14 @@ mod tests {
         let parent_txid = parent.compute_txid();
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0x7D)],
         );
@@ -16255,8 +17705,14 @@ mod tests {
         // Sweeps the dust and spends `original`'s coin with far more fee.
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
                 op2,
             ],
             &[(90_000, 0x81)],
@@ -16307,17 +17763,33 @@ mod tests {
         let invalid = tx_from(&[op2], &[(60_000, 0x82)]);
         let child = tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
-                OutPoint { txid: invalid.compute_txid(), vout: 0 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
+                OutPoint {
+                    txid: invalid.compute_txid(),
+                    vout: 0,
+                },
             ],
             &[(100_000, 0x83)],
         );
 
-        let (msg, results) = mp.accept_package(vec![parent.clone(), invalid, child.clone()], &cs, &NoopVerifier);
+        let (msg, results) = mp.accept_package(
+            vec![parent.clone(), invalid, child.clone()],
+            &cs,
+            &NoopVerifier,
+        );
 
         assert_eq!(msg, "transaction failed", "{results:?}");
-        assert!(err_of(&results, &parent).starts_with("min relay fee not met, 0 < "), "{results:?}");
+        assert!(
+            err_of(&results, &parent).starts_with("min relay fee not met, 0 < "),
+            "{results:?}"
+        );
         assert_eq!(err_of(&results, &child), "bad-txns-inputs-missingorspent");
         assert!(!in_pool(&mp, &parent_txid), "{results:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -16341,8 +17813,14 @@ mod tests {
         // non-final.
         let child = bip68_locked(tx_from(
             &[
-                OutPoint { txid: parent_txid, vout: 0 },
-                OutPoint { txid: parent_txid, vout: 1 },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
             ],
             &[(40_000, 0x7A)],
         ));
@@ -16371,13 +17849,19 @@ mod tests {
         let op = outpoint(0xC5);
         let at_threshold = p2wpkh_dust_threshold();
 
-        let parent = tx_from(&[op], &[(at_threshold, 0x5F), (50_000 - at_threshold, 0x60)]);
+        let parent = tx_from(
+            &[op],
+            &[(at_threshold, 0x5F), (50_000 - at_threshold, 0x60)],
+        );
         assert_eq!(
             Mempool::count_dust_outputs(&parent, policy::DUST_RELAY_FEE_RATE),
             0,
             "an output at the threshold was counted as dust"
         );
-        let below = tx_from(&[op], &[(at_threshold - 1, 0x5F), (50_000 - at_threshold, 0x60)]);
+        let below = tx_from(
+            &[op],
+            &[(at_threshold - 1, 0x5F), (50_000 - at_threshold, 0x60)],
+        );
         assert_eq!(
             Mempool::count_dust_outputs(&below, policy::DUST_RELAY_FEE_RATE),
             1,

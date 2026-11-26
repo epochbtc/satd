@@ -187,8 +187,6 @@ impl std::fmt::Debug for Hook {
     }
 }
 
-
-
 /// A parsed, validated alertfile.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AlertFile {
@@ -220,7 +218,11 @@ impl AlertFile {
                     // `span()` is a byte range into `text`; turn it into a line
                     // number without carrying any of the text along with it.
                     line: source.span().map_or(0, |s| {
-                        text[..s.start.min(text.len())].bytes().filter(|b| *b == b'\n').count() + 1
+                        text[..s.start.min(text.len())]
+                            .bytes()
+                            .filter(|b| *b == b'\n')
+                            .count()
+                            + 1
                     }),
                     message: source.message().to_string(),
                 })?;
@@ -294,16 +296,25 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         if !KNOWN.contains(&key) {
             return Err(AlertFileError::invalid(
                 path,
-                format!("unknown key `{key}` in [[webhook]] (known: {})", KNOWN.join(", ")),
+                format!(
+                    "unknown key `{key}` in [[webhook]] (known: {})",
+                    KNOWN.join(", ")
+                ),
             ));
         }
     }
 
     let id = req_str(path, t, "id")?;
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(AlertFileError::invalid(
             path,
-            format!("webhook id `{id}` must be non-empty [A-Za-z0-9_-] (it is used in headers and metric labels)"),
+            format!(
+                "webhook id `{id}` must be non-empty [A-Za-z0-9_-] (it is used in headers and metric labels)"
+            ),
         ));
     }
     if id == RESERVED_LEGACY_REORG_ID {
@@ -355,7 +366,10 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
         None => None,
         Some(v) => {
             let s = v.as_str().ok_or_else(|| {
-                AlertFileError::invalid(path, format!("webhook `{id}`: `min_severity` must be a string"))
+                AlertFileError::invalid(
+                    path,
+                    format!("webhook `{id}`: `min_severity` must be a string"),
+                )
             })?;
             Some(StatusSeverity::from_str_exact(s).ok_or_else(|| {
                 AlertFileError::invalid(
@@ -377,9 +391,7 @@ fn parse_hook(path: &Path, t: &toml_edit::Table) -> Result<Hook, AlertFileError>
             Some(n as u64)
         }
     };
-    if heartbeat_interval_secs.is_some()
-        && !categories.contains(node::events::CATEGORY_HEARTBEAT)
-    {
+    if heartbeat_interval_secs.is_some() && !categories.contains(node::events::CATEGORY_HEARTBEAT) {
         return Err(AlertFileError::invalid(
             path,
             format!(
@@ -418,7 +430,10 @@ fn parse_categories(
         ));
     };
     let arr = v.as_array().ok_or_else(|| {
-        AlertFileError::invalid(path, format!("webhook `{id}`: `categories` must be an array"))
+        AlertFileError::invalid(
+            path,
+            format!("webhook `{id}`: `categories` must be an array"),
+        )
     })?;
     let mut mask = 0u32;
     for item in arr {
@@ -479,7 +494,10 @@ fn parse_kinds(
     let mut out = BTreeSet::new();
     for item in arr {
         let name = item.as_str().ok_or_else(|| {
-            AlertFileError::invalid(path, format!("webhook `{id}`: `kinds` entries must be strings"))
+            AlertFileError::invalid(
+                path,
+                format!("webhook `{id}`: `kinds` entries must be strings"),
+            )
         })?;
         // Validated against the live taxonomy, not a copy: a typo'd kind would
         // otherwise match nothing and silently disable the hook.
@@ -584,7 +602,10 @@ fn req_str(path: &Path, t: &toml_edit::Table, key: &str) -> Result<String, Alert
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| {
-            AlertFileError::invalid(path, format!("[[webhook]] is missing required string `{key}`"))
+            AlertFileError::invalid(
+                path,
+                format!("[[webhook]] is missing required string `{key}`"),
+            )
         })
 }
 
@@ -702,15 +723,19 @@ categories = ["chain"]
 "#,
         )
         .unwrap();
-        assert!(!f.hooks[0]
-            .filter
-            .accepts_status(StatusKind::TipStall, StatusSeverity::Critical));
+        assert!(
+            !f.hooks[0]
+                .filter
+                .accepts_status(StatusKind::TipStall, StatusSeverity::Critical)
+        );
     }
 
     #[test]
     fn missing_or_wrong_version_is_rejected() {
         assert!(matches!(
-            parse("[[webhook]]\nid=\"a\"\nurl=\"https://x/h\"\nsecret=\"s\"\ncategories=[\"status\"]\n"),
+            parse(
+                "[[webhook]]\nid=\"a\"\nurl=\"https://x/h\"\nsecret=\"s\"\ncategories=[\"status\"]\n"
+            ),
             Err(AlertFileError::Invalid { .. })
         ));
         assert!(parse(&MINIMAL.replace("version = 1", "version = 2")).is_err());
@@ -729,7 +754,13 @@ categories = ["chain"]
         let top_level = MINIMAL.replace("[[webhook]]", "not_a_key = 1\n[[webhook]]");
         let err = parse(&top_level).expect_err("a stray top-level key must be refused");
         assert!(err.to_string().contains("not_a_key"), "{err}");
-        assert!(parse(&MINIMAL.replace("categories = [\"status\"]", "categories = [\"status\"]\nkindz = [\"tip_stall\"]")).is_err());
+        assert!(
+            parse(&MINIMAL.replace(
+                "categories = [\"status\"]",
+                "categories = [\"status\"]\nkindz = [\"tip_stall\"]"
+            ))
+            .is_err()
+        );
     }
 
     /// A URL that satisfies the old `starts_with("https://")` check but that
@@ -740,11 +771,11 @@ categories = ["chain"]
     #[test]
     fn a_well_prefixed_but_unparseable_url_is_refused_at_load() {
         for bad in [
-            "https://",                     // no host at all
-            "https://:8080/hook",           // empty host with a port
+            "https://",                          // no host at all
+            "https://:8080/hook",                // empty host with a port
             "https://alerts.example:99999/hook", // port out of range
-            "https://[::1/hook",            // unterminated IPv6 literal
-            "https://<your-host>/hook",     // template placeholder, left unedited
+            "https://[::1/hook",                 // unterminated IPv6 literal
+            "https://<your-host>/hook",          // template placeholder, left unedited
         ] {
             let f = MINIMAL.replace("https://alerts.example/satd", bad);
             assert!(
@@ -770,10 +801,8 @@ categories = ["chain"]
         // Reading `"true"` as `false` would reject the very hook the operator
         // just opted in for, with an error about plaintext that makes no sense
         // beside the line they added.
-        let f = MINIMAL.replace(
-            "https://alerts.example/satd",
-            "http://alerts.example/satd",
-        ) + "allow_insecure_http = \"true\"\n";
+        let f = MINIMAL.replace("https://alerts.example/satd", "http://alerts.example/satd")
+            + "allow_insecure_http = \"true\"\n";
         let err = parse(&f).expect_err("a non-bool must be refused");
         assert!(err.to_string().contains("must be a bool"), "{err}");
     }
@@ -781,7 +810,10 @@ categories = ["chain"]
     #[test]
     fn an_over_long_hook_id_is_refused() {
         let f = MINIMAL.replace(r#"id = "ops""#, &format!(r#"id = "{}""#, "x".repeat(65)));
-        assert!(parse(&f).is_err(), "an id becomes a header value on every delivery");
+        assert!(
+            parse(&f).is_err(),
+            "an id becomes a header value on every delivery"
+        );
     }
 
     /// A syntax error must not quote the offending line back, because the line
@@ -795,7 +827,10 @@ categories = ["chain"]
             !rendered.contains("s3cret"),
             "the signing secret reached the error text, and both callers log it: {rendered}",
         );
-        assert!(rendered.contains("line"), "should still locate the error: {rendered}");
+        assert!(
+            rendered.contains("line"),
+            "should still locate the error: {rendered}"
+        );
     }
 
     #[test]
@@ -805,7 +840,10 @@ categories = ["chain"]
             "categories = [\"status\"]",
             "categories = [\"status\"]\nkinds = [\"tip_stal\"]",
         );
-        assert!(parse(&with_kind).is_err(), "a typo'd kind must not silently match nothing");
+        assert!(
+            parse(&with_kind).is_err(),
+            "a typo'd kind must not silently match nothing"
+        );
     }
 
     #[test]
@@ -826,7 +864,9 @@ categories = ["chain"]
     #[test]
     fn duplicate_ids_are_rejected() {
         // Two hooks sharing an id would be indistinguishable to a receiver.
-        let two = format!("{MINIMAL}\n[[webhook]]\nid = \"ops\"\nurl = \"https://b.example/h\"\nsecret = \"t\"\ncategories = [\"chain\"]\n");
+        let two = format!(
+            "{MINIMAL}\n[[webhook]]\nid = \"ops\"\nurl = \"https://b.example/h\"\nsecret = \"t\"\ncategories = [\"chain\"]\n"
+        );
         let err = parse(&two).unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");
     }
@@ -842,7 +882,10 @@ categories = ["chain"]
     #[test]
     fn plaintext_http_is_gated_unless_local_or_opted_in() {
         let remote = MINIMAL.replace("https://alerts.example/satd", "http://alerts.example/satd");
-        assert!(parse(&remote).is_err(), "plaintext to a public host needs the opt-in");
+        assert!(
+            parse(&remote).is_err(),
+            "plaintext to a public host needs the opt-in"
+        );
 
         // Loopback and RFC1918 are fine unannotated — a relay on the same host
         // or inside a private network is the normal deployment.
@@ -920,8 +963,14 @@ categories = ["chain"]
         }
 
         // A genuine loopback target with userinfo is still local.
-        let text = MINIMAL.replace("https://alerts.example/satd", "http://user:pw@127.0.0.1:9000/h");
-        assert!(parse(&text).is_ok(), "userinfo on a real loopback host is fine");
+        let text = MINIMAL.replace(
+            "https://alerts.example/satd",
+            "http://user:pw@127.0.0.1:9000/h",
+        );
+        assert!(
+            parse(&text).is_ok(),
+            "userinfo on a real loopback host is fine"
+        );
     }
 
     #[test]
@@ -1047,7 +1096,10 @@ categories = ["chain"]
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            matches!(AlertFile::load(&path), Err(AlertFileError::Permissions { .. })),
+            matches!(
+                AlertFile::load(&path),
+                Err(AlertFileError::Permissions { .. })
+            ),
             "a world-readable file holding signing secrets must be refused",
         );
 

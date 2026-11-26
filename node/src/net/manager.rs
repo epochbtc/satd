@@ -1,9 +1,9 @@
+use bitcoin::Network;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, ServiceFlags};
-use bitcoin::Network;
 use parking_lot::{Condvar, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -26,11 +26,13 @@ use crate::net::bg_catchup::BgDownloader;
 use crate::net::compact;
 use crate::net::connection::{Connection, ConnectionWriter};
 use crate::net::ibd::IbdScheduler;
-use crate::net::peer::{default_p2p_port, ConnType, Direction, PeerAddr, PeerId, PeerInfo, PeerState};
+use crate::net::peer::{
+    ConnType, Direction, PeerAddr, PeerId, PeerInfo, PeerState, default_p2p_port,
+};
 use crate::net::proxy;
 use crate::net::stats::{NetTotals, PeerStats};
 use crate::net::sync;
-use crate::net::txrequest::{AnnouncerInfo, GenTxid, GETDATA_TX_INTERVAL, MAX_GETDATA_SZ};
+use crate::net::txrequest::{AnnouncerInfo, GETDATA_TX_INTERVAL, GenTxid, MAX_GETDATA_SZ};
 
 /// The full-relay outbound target's default, `-maxoutboundfullrelay`'s:
 /// Core's `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`.
@@ -602,7 +604,11 @@ const BG_CATCHUP_PER_PEER: usize = 16;
 /// worth of time behind now. A pending OP_RETURN restore downloads only from
 /// peers that keep every block (plan §11.4), so while one is pending the
 /// outbound slots keep looking for those, as they do while the tip is old.
-fn missing_desirable_services(services: ServiceFlags, tip_depth: u64, restore_pending: bool) -> Option<ServiceFlags> {
+fn missing_desirable_services(
+    services: ServiceFlags,
+    tip_depth: u64,
+    restore_pending: bool,
+) -> Option<ServiceFlags> {
     let mut wanted = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
     if services.has(ServiceFlags::NETWORK_LIMITED)
         && tip_depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
@@ -619,7 +625,8 @@ type RestoreWork = Result<Vec<crate::chain::state::RestoreItem>, String>;
 /// error: the slot it fills is what clears the download's `loading`, so a
 /// read that never reports would hold the restore until a restart.
 fn load_restore_work(load: impl FnOnce() -> RestoreWork + std::panic::UnwindSafe) -> RestoreWork {
-    std::panic::catch_unwind(load).unwrap_or_else(|_| Err("the work-list read panicked".to_string()))
+    std::panic::catch_unwind(load)
+        .unwrap_or_else(|_| Err("the work-list read panicked".to_string()))
 }
 
 /// What became of a block the restore asked for.
@@ -785,8 +792,7 @@ impl StuckWait {
         if now.duration_since(w.since) < STUCK_WAIT_WARN_AFTER {
             return false;
         }
-        if w
-            .warned_at
+        if w.warned_at
             .is_some_and(|t| now.duration_since(t) < STUCK_WAIT_WARN_EVERY)
         {
             return false;
@@ -941,7 +947,9 @@ impl Drop for DialSlot {
             }
             DialBudget::StaleTip => in_flight.stale_tip = in_flight.stale_tip.saturating_sub(1),
             DialBudget::AltTrial => in_flight.alt_trial = in_flight.alt_trial.saturating_sub(1),
-            DialBudget::AltFallback => in_flight.alt_fallback = in_flight.alt_fallback.saturating_sub(1),
+            DialBudget::AltFallback => {
+                in_flight.alt_fallback = in_flight.alt_fallback.saturating_sub(1)
+            }
             DialBudget::Unlimited => {}
         }
     }
@@ -976,8 +984,14 @@ pub enum NetEvent {
 /// [`crate::net::orphan_blocks`]). A rebuilt block that fails is not charged
 /// to its sender, as in Core's `MaybePunishNodeForBlock(via_compact_block)`:
 /// a short-id collision can rebuild a different block from honest data.
-type IncomingBlock =
-    (PeerId, Option<Arc<PeerStats>>, bitcoin::Block, crate::net::flow::InFlight, bool, bool);
+type IncomingBlock = (
+    PeerId,
+    Option<Arc<PeerStats>>,
+    bitcoin::Block,
+    crate::net::flow::InFlight,
+    bool,
+    bool,
+);
 
 /// Core's `MAX_ADDR_TO_SEND` and `MAX_PCT_ADDR_TO_SEND`, for a `getaddr`
 /// reply.
@@ -1016,17 +1030,25 @@ impl GetAddrEntry {
                 },
                 sa.port(),
             ),
-            PeerAddr::Onion { host, port } => {
-                (AddrV2::TorV3(crate::net::peer::onion_host_to_torv3_pubkey(host)?), *port)
-            }
+            PeerAddr::Onion { host, port } => (
+                AddrV2::TorV3(crate::net::peer::onion_host_to_torv3_pubkey(host)?),
+                *port,
+            ),
         };
-        Some(AddrV2Message { time: self.time, services: self.services, addr, port })
+        Some(AddrV2Message {
+            time: self.time,
+            services: self.services,
+            addr,
+            port,
+        })
     }
 
     /// As a legacy `addr` entry; `None` for an onion, which it cannot carry.
     fn to_addr(&self) -> Option<(u32, bitcoin::p2p::Address)> {
         match &self.addr {
-            PeerAddr::Socket(sa) => Some((self.time, bitcoin::p2p::Address::new(sa, self.services))),
+            PeerAddr::Socket(sa) => {
+                Some((self.time, bitcoin::p2p::Address::new(sa, self.services)))
+            }
             PeerAddr::Onion { .. } => None,
         }
     }
@@ -1111,7 +1133,9 @@ struct PeerHandle {
 /// does, so it cannot break a log line.
 fn handshake_msg_type(msg: &NetworkMessage) -> String {
     match msg {
-        NetworkMessage::Unknown { command, .. } => crate::net::limits::sanitize_string(command.as_ref()),
+        NetworkMessage::Unknown { command, .. } => {
+            crate::net::limits::sanitize_string(command.as_ref())
+        }
         m => m.cmd().to_string(),
     }
 }
@@ -1124,7 +1148,8 @@ fn log_received(id: PeerId, msg: &NetworkMessage) {
         return;
     }
     let cmd = handshake_msg_type(msg);
-    let raw = bitcoin::p2p::message::RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg.clone());
+    let raw =
+        bitcoin::p2p::message::RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg.clone());
     let payload = bitcoin::consensus::serialize(&raw).len().saturating_sub(24);
     tracing::debug!("received: {cmd} ({payload} bytes) peer={id}");
 }
@@ -1472,7 +1497,8 @@ pub struct PeerManager {
     onion_disabled: std::sync::atomic::AtomicBool,
     /// `getaddr` replies, per listener (local socket, and onion or not): expiry and the
     /// entries. See [`Self::getaddr_reply`].
-    addr_response_cache: parking_lot::Mutex<std::collections::HashMap<GetAddrCacheKey, (u64, Vec<GetAddrEntry>)>>,
+    addr_response_cache:
+        parking_lot::Mutex<std::collections::HashMap<GetAddrCacheKey, (u64, Vec<GetAddrEntry>)>>,
     /// Soft forks this node does not know about; see
     /// [`Self::check_unknown_versionbits`].
     unknown_bits: Arc<UnknownBitsState>,
@@ -1523,7 +1549,9 @@ pub struct PeerManager {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     test_resolver: RwLock<
-        Option<Arc<dyn Fn(&str) -> Result<PeerAddr, crate::net::dns::PeerTargetError> + Send + Sync>>,
+        Option<
+            Arc<dyn Fn(&str) -> Result<PeerAddr, crate::net::dns::PeerTargetError> + Send + Sync>,
+        >,
     >,
     /// Operator-declared external addresses (Bitcoin Core's
     /// `-externalip`). Advertised in `getaddr` responses and used as the
@@ -1880,8 +1908,26 @@ impl PeerManager {
         network: Network,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Arc<Self> {
-        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, 0, DEFAULT_MAX_PEER_CONNECTIONS, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self::with_config(
+            chain_state,
+            mempool,
+            fee_estimator,
+            network,
+            shutdown,
+            0,
+            DEFAULT_MAX_PEER_CONNECTIONS,
+            DEFAULT_MAX_INBOUND_PER_IP,
+            86400,
+            None,
+            None,
+            workers,
+            50_000,
+            0,
+            None,
+        )
     }
 
     pub fn with_prune(
@@ -1892,8 +1938,26 @@ impl PeerManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
         prune_target_mb: u64,
     ) -> Arc<Self> {
-        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        Self::with_config(chain_state, mempool, fee_estimator, network, shutdown, prune_target_mb, DEFAULT_MAX_PEER_CONNECTIONS, DEFAULT_MAX_INBOUND_PER_IP, 86400, None, None, workers, 50_000, 0, None)
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self::with_config(
+            chain_state,
+            mempool,
+            fee_estimator,
+            network,
+            shutdown,
+            prune_target_mb,
+            DEFAULT_MAX_PEER_CONNECTIONS,
+            DEFAULT_MAX_INBOUND_PER_IP,
+            86400,
+            None,
+            None,
+            workers,
+            50_000,
+            0,
+            None,
+        )
     }
 
     /// `stop_at_height` is `-stopatheight` and the sender on which reaching
@@ -1934,8 +1998,14 @@ impl PeerManager {
         let tip_height = chain_state.tip_height();
         let headers_tip_height = chain_state.headers_tip_height();
         let ibd_scheduler = if headers_tip_height > tip_height + 24 {
-            let effective_max_ahead = Self::resolve_max_ahead(max_ahead, headers_tip_height, tip_height);
-            let mut sched = IbdScheduler::new(headers_tip_height, tip_height, &chain_state, effective_max_ahead);
+            let effective_max_ahead =
+                Self::resolve_max_ahead(max_ahead, headers_tip_height, tip_height);
+            let mut sched = IbdScheduler::new(
+                headers_tip_height,
+                tip_height,
+                &chain_state,
+                effective_max_ahead,
+            );
             // Scan for already-downloaded blocks (crash-resume)
             for h in (tip_height + 1)..=headers_tip_height {
                 if let Some(hash) = chain_state.get_block_hash_by_height(h)
@@ -2053,7 +2123,9 @@ impl PeerManager {
             immediate_tx_announce: AtomicBool::new(false),
             tx_inv_wake: Arc::new(tokio::sync::Notify::new()),
             compact_prefill: std::sync::atomic::AtomicBool::new(false),
-            compact_prefill_bytes: std::sync::atomic::AtomicUsize::new(compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES),
+            compact_prefill_bytes: std::sync::atomic::AtomicUsize::new(
+                compact::DEFAULT_CMPCTBLOCK_PREFILL_BYTES,
+            ),
             highest_fast_announce: std::sync::atomic::AtomicU32::new(0),
             fee_estimator: fee_estimator.clone(),
             reconnect_backoff: RwLock::new(HashMap::new()),
@@ -2097,7 +2169,9 @@ impl PeerManager {
             max_ahead,
             ibd_eta_secs: Arc::new(AtomicU64::new(0)),
             orphanage: Arc::new(TxOrphanage::with_defaults()),
-            recent_rejects: parking_lot::Mutex::new(crate::net::recent_rejects::RecentRejects::new()),
+            recent_rejects: parking_lot::Mutex::new(
+                crate::net::recent_rejects::RecentRejects::new(),
+            ),
             tx_requests: parking_lot::Mutex::new(crate::net::txrequest::TxRequestTracker::new()),
             block_sources: parking_lot::Mutex::new(Default::default()),
             #[cfg(feature = "block-filter-index")]
@@ -2133,11 +2207,12 @@ impl PeerManager {
         // P2P, `submitblock`, or a miner on the Stratum server.
         {
             let pm = Arc::downgrade(&mgr);
-            mgr.chain_state.set_pow_valid_block_hook(Box::new(move |block, height| {
-                if let Some(pm) = pm.upgrade() {
-                    pm.fast_announce(block, height);
-                }
-            }));
+            mgr.chain_state
+                .set_pow_valid_block_hook(Box::new(move |block, height| {
+                    if let Some(pm) = pm.upgrade() {
+                        pm.fast_announce(block, height);
+                    }
+                }));
         }
 
         // Spawn block processing thread
@@ -2152,7 +2227,23 @@ impl PeerManager {
         let block_processor = std::thread::Builder::new()
             .name("block-processor".into())
             .spawn(move || {
-                Self::block_processor(block_rx, cs_for_block, mp, fe, prune_mb, connect_signal, ibd, prefetch_workers, max_ahead, ibd_l0_pause_at, network, eta_secs, orph, pm_for_block, connect_shutdown);
+                Self::block_processor(
+                    block_rx,
+                    cs_for_block,
+                    mp,
+                    fe,
+                    prune_mb,
+                    connect_signal,
+                    ibd,
+                    prefetch_workers,
+                    max_ahead,
+                    ibd_l0_pause_at,
+                    network,
+                    eta_secs,
+                    orph,
+                    pm_for_block,
+                    connect_shutdown,
+                );
             })
             .expect("failed to spawn the block processor thread");
 
@@ -2263,7 +2354,8 @@ impl PeerManager {
     /// dropped (Core's `-peertimeout`, seconds). Call once at startup. A value
     /// of 0 is clamped to 1s so a peer can never be held forever.
     pub fn set_peer_connect_timeout_secs(&self, secs: u64) {
-        self.peer_connect_timeout_secs.store(secs.max(1), Ordering::Relaxed);
+        self.peer_connect_timeout_secs
+            .store(secs.max(1), Ordering::Relaxed);
     }
 
     /// Whether `-prune=1` manual pruning is on. The node deletes nothing on
@@ -2456,7 +2548,9 @@ impl PeerManager {
     /// `-externalip` onions after the first), so `getaddr` never hands one
     /// out.
     pub fn add_own_onions(&self, hosts: impl IntoIterator<Item = String>) {
-        self.own_onions.write().extend(hosts.into_iter().map(|h| h.to_ascii_lowercase()));
+        self.own_onions
+            .write()
+            .extend(hosts.into_iter().map(|h| h.to_ascii_lowercase()));
     }
 
     /// The P2P listen port, `None` when the node does not listen (Core's
@@ -2496,10 +2590,21 @@ impl PeerManager {
     /// exit, and announcing anything there ties the link to an IP.
     fn peer_reported_local(&self, info: &PeerInfo) -> Option<SocketAddr> {
         let port = self.listen_port.load(Ordering::Relaxed);
-        if !self.discover.load(Ordering::Relaxed) || port == 0 || self.link_hides_our_ip(info) || !crate::net::is_routable(info.addr.ip()) {
+        if !self.discover.load(Ordering::Relaxed)
+            || port == 0
+            || self.link_hides_our_ip(info)
+            || !crate::net::is_routable(info.addr.ip())
+        {
             return None;
         }
-        let ip = info.version.as_ref()?.receiver.socket_addr().ok()?.ip().to_canonical();
+        let ip = info
+            .version
+            .as_ref()?
+            .receiver
+            .socket_addr()
+            .ok()?
+            .ip()
+            .to_canonical();
         crate::net::is_routable(ip).then(|| SocketAddr::new(ip, port))
     }
 
@@ -2602,7 +2707,12 @@ impl PeerManager {
         s: &str,
         default_port: u16,
     ) -> Result<Option<PeerAddr>, crate::net::dns::PeerTargetError> {
-        crate::net::dns::classify_peer_target(s, default_port, self.proxy.as_deref(), self.dns_enabled())
+        crate::net::dns::classify_peer_target(
+            s,
+            default_port,
+            self.proxy.as_deref(),
+            self.dns_enabled(),
+        )
     }
 
     /// The SOCKS proxy used for clearnet (ipv4/ipv6) outbound, if any.
@@ -2629,7 +2739,8 @@ impl PeerManager {
     fn serves_intact_blocks(&self) -> bool {
         !self.is_pruning()
             && self.chain_state.opreturn_prune_active()
-            && self.chain_state.opreturn_prune_peers() == crate::storage::opreturn_strip::PrunePeers::Intact
+            && self.chain_state.opreturn_prune_peers()
+                == crate::storage::opreturn_strip::PrunePeers::Intact
     }
 
     /// A fresh random SOCKS5 credential pair for one outbound dial, or `None`
@@ -2672,11 +2783,19 @@ impl PeerManager {
     /// name another node's and keep it out of our replies at every port.
     fn is_own_address(&self, addr: &PeerAddr) -> bool {
         match addr {
-            PeerAddr::Onion { host, .. } => self.own_onions.read().contains(&host.to_ascii_lowercase()),
+            PeerAddr::Onion { host, .. } => {
+                self.own_onions.read().contains(&host.to_ascii_lowercase())
+            }
             PeerAddr::Socket(sa) => {
                 let ip = sa.ip().to_canonical();
-                self.external_addrs.read().iter().any(|e| e.ip().to_canonical() == ip)
-                    || self.discovered.read().contains(&SocketAddr::new(ip, sa.port()))
+                self.external_addrs
+                    .read()
+                    .iter()
+                    .any(|e| e.ip().to_canonical() == ip)
+                    || self
+                        .discovered
+                        .read()
+                        .contains(&SocketAddr::new(ip, sa.port()))
             }
         }
     }
@@ -2695,7 +2814,11 @@ impl PeerManager {
     /// [`Self::self_advertise_externals`] against `our_onion`, the onion
     /// the handshake read once for both self-advertisements: read twice, a
     /// registration between the reads would send a hidden link both.
-    fn self_advertise_externals_given(&self, id: PeerId, our_onion: Option<&PeerAddr>) -> Option<NetworkMessage> {
+    fn self_advertise_externals_given(
+        &self,
+        id: PeerId,
+        our_onion: Option<&PeerAddr>,
+    ) -> Option<NetworkMessage> {
         let (peer_v4, wants_v2, onion, hidden, reported) = {
             let peers = self.peers.read();
             let h = peers.get(&id).filter(|h| h.info.relays_addrs())?;
@@ -2730,7 +2853,11 @@ impl PeerManager {
                 };
                 v4 == peer_v4
             })
-            .map(|a| GetAddrEntry { addr: PeerAddr::Socket(*a), time, services })
+            .map(|a| GetAddrEntry {
+                addr: PeerAddr::Socket(*a),
+                time,
+                services,
+            })
             .collect();
         // `-externalip` is the operator's word and wins; Core instead swaps
         // in the peer's report one time in two (or eight). A report on
@@ -2741,7 +2868,11 @@ impl PeerManager {
         {
             self.note_discovered(sa);
             tracing::debug!("Advertising address {sa} to peer={id}");
-            vec![GetAddrEntry { addr: PeerAddr::Socket(sa), time, services }]
+            vec![GetAddrEntry {
+                addr: PeerAddr::Socket(sa),
+                time,
+                services,
+            }]
         } else {
             mine
         };
@@ -2835,7 +2966,9 @@ impl PeerManager {
         if !uncached {
             use rand::Rng as _;
             let lifetime = 21 * 3600 + rand::thread_rng().gen_range(0..6 * 3600);
-            self.addr_response_cache.lock().insert(listener, (now + lifetime, fresh.clone()));
+            self.addr_response_cache
+                .lock()
+                .insert(listener, (now + lifetime, fresh.clone()));
         }
         fresh
     }
@@ -2922,7 +3055,8 @@ impl PeerManager {
     /// peer; peers already above a lowered share are not dropped until one
     /// arrives. Used at startup and by SIGHUP config reload.
     pub fn set_inbound_relay_percent(&self, pct: usize) {
-        self.inbound_relay_percent.store(pct.min(100), Ordering::Relaxed);
+        self.inbound_relay_percent
+            .store(pct.min(100), Ordering::Relaxed);
     }
 
     /// Set the `-bantime` duration in seconds. Applies to bans created after
@@ -3006,11 +3140,7 @@ impl PeerManager {
     /// peer's per-IP rate limit will FIN all but the first within a few
     /// hundred ms — surfacing as severe peer churn.
     pub fn add_learned_addr(&self, addr: SocketAddr) {
-        self.add_learned_addr_from(
-            addr,
-            crate::net::addrman::DEFAULT_SERVICES,
-            addr.ip(),
-        );
+        self.add_learned_addr_from(addr, crate::net::addrman::DEFAULT_SERVICES, addr.ip());
     }
 
     /// [`add_learned_addr`](Self::add_learned_addr) for a gossiped address,
@@ -3018,7 +3148,12 @@ impl PeerManager {
     /// announced it (Core's `nServices` and `source`, which `getnodeaddresses`
     /// and `getrawaddrman` report).
     pub fn add_learned_addr_from(&self, addr: SocketAddr, services: u64, source: IpAddr) {
-        self.learn_addr(PeerAddr::Socket(addr), now_unix_secs(), services, NetAddr::Ip(source));
+        self.learn_addr(
+            PeerAddr::Socket(addr),
+            now_unix_secs(),
+            services,
+            NetAddr::Ip(source),
+        );
     }
 
     /// Put `addr` in the address book as new, last seen at `seen`: the rule
@@ -3073,7 +3208,9 @@ impl PeerManager {
                 self.reconnect_backoff.write().remove(sa);
             }
             PeerAddr::Onion { .. } => {
-                self.onion_reconnect_backoff.write().remove(&addr.to_string());
+                self.onion_reconnect_backoff
+                    .write()
+                    .remove(&addr.to_string());
             }
         }
     }
@@ -3081,9 +3218,11 @@ impl PeerManager {
     /// Whether a dial to `addr` ended at or after `since`.
     fn tried_since(&self, addr: &PeerAddr, since: Instant) -> bool {
         match addr {
-            PeerAddr::Socket(sa) => {
-                self.reconnect_backoff.read().get(sa).is_some_and(|s| s.tried_since(since))
-            }
+            PeerAddr::Socket(sa) => self
+                .reconnect_backoff
+                .read()
+                .get(sa)
+                .is_some_and(|s| s.tried_since(since)),
             PeerAddr::Onion { .. } => self
                 .onion_reconnect_backoff
                 .read()
@@ -3153,7 +3292,8 @@ impl PeerManager {
             PeerAddr::Socket(sa) => self.reachable.read().contains_socket(sa),
             PeerAddr::Onion { .. } => self.network_reachable(crate::net::reachable::Network::Onion),
         };
-        (self.automatic_outbound.load(Ordering::Relaxed) && reachable) || self.is_manual_target(addr)
+        (self.automatic_outbound.load(Ordering::Relaxed) && reachable)
+            || self.is_manual_target(addr)
     }
 
     /// `-onion=0`: refuse every `.onion` dial. Called once at startup.
@@ -3174,7 +3314,9 @@ impl PeerManager {
         let listed = self.reachable.read().contains(net);
         match net {
             crate::net::reachable::Network::Onion => {
-                listed && self.onion_routing_available() && !self.onion_disabled.load(Ordering::Relaxed)
+                listed
+                    && self.onion_routing_available()
+                    && !self.onion_disabled.load(Ordering::Relaxed)
             }
             _ => listed,
         }
@@ -3189,7 +3331,11 @@ impl PeerManager {
         if let Some(ip) = self.peer_ip(id) {
             return Some(NetAddr::Ip(ip));
         }
-        let host = self.peers.read().get(&id).and_then(|h| h.info.onion_host.clone())?;
+        let host = self
+            .peers
+            .read()
+            .get(&id)
+            .and_then(|h| h.info.onion_host.clone())?;
         NetAddr::of(&PeerAddr::Onion { host, port: 0 })
     }
 
@@ -3203,7 +3349,10 @@ impl PeerManager {
             tracing::warn!(path = %path.display(), "addrman load failed: {e}");
             return;
         }
-        tracing::info!(loaded = self.addrman.read().len(), "Loaded persistent address book");
+        tracing::info!(
+            loaded = self.addrman.read().len(),
+            "Loaded persistent address book"
+        );
     }
 
     /// Persist the address book to `path` (peers.dat).
@@ -3225,12 +3374,16 @@ impl PeerManager {
         if !self.automatic_outbound.load(Ordering::Relaxed) {
             return;
         }
-        let mut read = anchors::read(path, self.chain_state.p2p_magic().to_bytes()).unwrap_or_else(|e| {
-            tracing::warn!("Could not read the anchors: {e}");
-            Vec::new()
-        });
+        let mut read =
+            anchors::read(path, self.chain_state.p2p_magic().to_bytes()).unwrap_or_else(|e| {
+                tracing::warn!("Could not read the anchors: {e}");
+                Vec::new()
+            });
         read.truncate(anchors::MAX_BLOCK_RELAY_ONLY_ANCHORS);
-        tracing::info!("{} block-relay-only anchors will be tried for connections.", read.len());
+        tracing::info!(
+            "{} block-relay-only anchors will be tried for connections.",
+            read.len()
+        );
         *self.anchors.lock() = read;
     }
 
@@ -3252,19 +3405,33 @@ impl PeerManager {
             .peers
             .read()
             .values()
-            .filter(|h| h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected)
+            .filter(|h| {
+                h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected
+            })
             .map(|h| {
                 let addr = match &h.info.onion_host {
-                    Some(host) => PeerAddr::Onion { host: host.clone(), port: h.info.addr.port() },
+                    Some(host) => PeerAddr::Onion {
+                        host: host.clone(),
+                        port: h.info.addr.port(),
+                    },
                     None => PeerAddr::Socket(h.info.addr),
                 };
-                (h.info.id, Anchor { addr, services: h.info.services })
+                (
+                    h.info.id,
+                    Anchor {
+                        addr,
+                        services: h.info.services,
+                    },
+                )
             })
             .collect();
         held.sort_by_key(|(id, _)| *id);
         held.truncate(anchors::MAX_BLOCK_RELAY_ONLY_ANCHORS);
         let held: Vec<Anchor> = held.into_iter().map(|(_, a)| a).collect();
-        tracing::info!("Flush {} outbound block-relay-only peer addresses to anchors.dat", held.len());
+        tracing::info!(
+            "Flush {} outbound block-relay-only peer addresses to anchors.dat",
+            held.len()
+        );
         if let Err(e) = anchors::write(path, self.chain_state.p2p_magic().to_bytes(), &held) {
             tracing::warn!("Could not write the anchors: {e}");
         }
@@ -3285,7 +3452,10 @@ impl PeerManager {
     /// (`ThreadOpenConnections`, `src/net.cpp`).
     pub fn addrman_has_reachable(&self) -> bool {
         let reachable = *self.reachable.read();
-        self.addrman.read().iter().any(|e| reachable.contains_peer(&e.addr))
+        self.addrman
+            .read()
+            .iter()
+            .any(|e| reachable.contains_peer(&e.addr))
     }
 
     /// A copy of every address-book entry, for `getnodeaddresses`.
@@ -3297,7 +3467,10 @@ impl PeerManager {
     /// `getrawaddrman`.
     pub fn addrman_positions(
         &self,
-    ) -> Vec<(crate::net::addrman::AddrSlot, crate::net::addrman::AddrEntry)> {
+    ) -> Vec<(
+        crate::net::addrman::AddrSlot,
+        crate::net::addrman::AddrEntry,
+    )> {
         self.addrman
             .read()
             .positions()
@@ -3336,10 +3509,7 @@ impl PeerManager {
     }
 
     /// Install a custom addrman network-group function (e.g. `-asmap`).
-    pub fn set_addrman_group_fn(
-        &self,
-        f: Box<dyn Fn(IpAddr) -> Vec<u8> + Send + Sync>,
-    ) {
+    pub fn set_addrman_group_fn(&self, f: Box<dyn Fn(IpAddr) -> Vec<u8> + Send + Sync>) {
         self.addrman.write().set_group_fn(f);
     }
 
@@ -3437,7 +3607,11 @@ impl PeerManager {
                 Some(addr)
             }
             Err(PeerTargetError::Lookup(e)) => {
-                tracing::warn!(addr = target, "connect address does not resolve yet; will keep trying: {}", e);
+                tracing::warn!(
+                    addr = target,
+                    "connect address does not resolve yet; will keep trying: {}",
+                    e
+                );
                 self.connect_name_add(target, None);
                 None
             }
@@ -3595,7 +3769,11 @@ impl PeerManager {
                         let prev = entries[idx].resolved.clone();
                         entries[idx].lookups_failed = 0;
                         entries[idx].next_lookup = Instant::now()
-                            + if prev.is_some() { MANUAL_TARGET_RELOOKUP } else { Duration::ZERO };
+                            + if prev.is_some() {
+                                MANUAL_TARGET_RELOOKUP
+                            } else {
+                                Duration::ZERO
+                            };
                         if prev.as_ref() != Some(&new) {
                             if let Some(p) = &prev {
                                 let shared = entries
@@ -3620,7 +3798,11 @@ impl PeerManager {
                         // Unresolved: try again next tick. Resolved: keep
                         // the address it had; look again later.
                         entries[idx].next_lookup = Instant::now()
-                            + if entries[idx].resolved.is_some() { MANUAL_TARGET_RELOOKUP } else { Duration::ZERO };
+                            + if entries[idx].resolved.is_some() {
+                                MANUAL_TARGET_RELOOKUP
+                            } else {
+                                Duration::ZERO
+                            };
                         if first && entries[idx].resolved.is_none() {
                             tracing::info!(target = %target, "Peer name does not resolve yet; will keep trying: {e}");
                         } else {
@@ -3640,7 +3822,8 @@ impl PeerManager {
                 });
             }
         }
-        self.refreshing_manual_targets.store(false, Ordering::Release);
+        self.refreshing_manual_targets
+            .store(false, Ordering::Release);
     }
 
     /// Whether a connection to `addr` is up or being set up.
@@ -3694,9 +3877,7 @@ impl PeerManager {
         let mut total = 0usize;
         let mut same_ip = 0usize;
         for h in peers.values() {
-            if h.info.direction != Direction::Inbound
-                || h.info.state == PeerState::Disconnected
-            {
+            if h.info.direction != Direction::Inbound || h.info.state == PeerState::Disconnected {
                 continue;
             }
             total += 1;
@@ -3713,8 +3894,7 @@ impl PeerManager {
         peers
             .values()
             .filter(|h| {
-                h.info.direction == Direction::Outbound
-                    && h.info.state == PeerState::Connected
+                h.info.direction == Direction::Outbound && h.info.state == PeerState::Connected
             })
             .count()
     }
@@ -3726,7 +3906,10 @@ impl PeerManager {
         self.peers
             .read()
             .values()
-            .filter(|h| h.info.conn_type == ConnType::OutboundFullRelay && h.info.state == PeerState::Connected)
+            .filter(|h| {
+                h.info.conn_type == ConnType::OutboundFullRelay
+                    && h.info.state == PeerState::Connected
+            })
             .count()
     }
 
@@ -3741,8 +3924,7 @@ impl PeerManager {
         peers
             .values()
             .filter(|h| {
-                h.info.direction == Direction::Inbound
-                    && h.info.state == PeerState::Connected
+                h.info.direction == Direction::Inbound && h.info.state == PeerState::Connected
             })
             .count()
     }
@@ -3837,18 +4019,24 @@ impl PeerManager {
         // them; they must still take that grant, so they cannot return early
         // here.
         let max = match conn_type {
-            ConnType::OutboundFullRelay => {
-                Some(self.max_connections.load(Ordering::Relaxed).min(self.max_outbound_full_relay()))
-            }
+            ConnType::OutboundFullRelay => Some(
+                self.max_connections
+                    .load(Ordering::Relaxed)
+                    .min(self.max_outbound_full_relay()),
+            ),
             ConnType::BlockRelay => Some(self.max_outbound_block_relay()),
             ConnType::AddrFetch | ConnType::Feeler => None,
             // Core returns false rather than opening one of these. A NAP pull
             // is satd's own, and opened only by the aggregator.
-            ConnType::Inbound | ConnType::Manual | ConnType::NapPull | ConnType::Survey | ConnType::Crawl => {
+            ConnType::Inbound
+            | ConnType::Manual
+            | ConnType::NapPull
+            | ConnType::Survey
+            | ConnType::Crawl => {
                 return Err(format!(
                     "cannot open a {} connection this way",
                     conn_type.as_str()
-                ))
+                ));
             }
         };
         // Count dials already in flight for this type alongside the peers
@@ -3870,9 +4058,7 @@ impl PeerManager {
                     _ => 0,
                 };
             if existing >= max {
-                return Err(
-                    "Error: Already at capacity for specified connection type.".to_string()
-                );
+                return Err("Error: Already at capacity for specified connection type.".to_string());
             }
         }
 
@@ -3934,16 +4120,20 @@ impl PeerManager {
     /// value disconnects nothing at once: the surplus full-relay peers go
     /// one at a time, as after IBD ([`Self::evict_extra_outbound_peer`]).
     pub fn set_max_outbound_full_relay(&self, n: usize) {
-        self.max_outbound_full_relay
-            .store(n.clamp(1, crate::net::altslots::MAX_OUTBOUND_FULL_RELAY_CEILING), Ordering::Relaxed);
+        self.max_outbound_full_relay.store(
+            n.clamp(1, crate::net::altslots::MAX_OUTBOUND_FULL_RELAY_CEILING),
+            Ordering::Relaxed,
+        );
     }
 
     /// `-peerflagpolicy`. Under `evict`, the inbound eviction
     /// ([`Self::attempt_to_evict_connection`]) takes a flagged inbound peer
     /// first; under `observe`, the default, it is Core's.
     pub fn set_flag_policy(&self, policy: crate::net::flags::FlagPolicy) {
-        self.flag_policy_evict
-            .store(policy == crate::net::flags::FlagPolicy::Evict, Ordering::Relaxed);
+        self.flag_policy_evict.store(
+            policy == crate::net::flags::FlagPolicy::Evict,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn flag_policy(&self) -> crate::net::flags::FlagPolicy {
@@ -3994,7 +4184,12 @@ impl PeerManager {
                 .count();
             tx_inbound_peers > self.max_inbound_full_relay()
         };
-        self.attempt_to_evict_connection(true, protect_peer, &over_cap, "evicted for an inbound tx-relay slot")
+        self.attempt_to_evict_connection(
+            true,
+            protect_peer,
+            &over_cap,
+            "evicted for an inbound tx-relay slot",
+        )
     }
 
     /// Core's `CConnman::AttemptToEvictConnection` (v32.1 `src/net.cpp:1699`):
@@ -4021,17 +4216,20 @@ impl PeerManager {
         needed: &dyn Fn(&HashMap<PeerId, PeerHandle>) -> bool,
         reason: &'static str,
     ) -> bool {
-        let (victim, flags) = match self.eviction_victim(evict_tx_relay_peer_only, protect_peer, needed) {
-            EvictionVictim::NotNeeded => return true,
-            EvictionVictim::None => return false,
-            EvictionVictim::Peer(victim, flags) => (victim, flags),
-        };
+        let (victim, flags) =
+            match self.eviction_victim(evict_tx_relay_peer_only, protect_peer, needed) {
+                EvictionVictim::NotNeeded => return true,
+                EvictionVictim::None => return false,
+                EvictionVictim::Peer(victim, flags) => (victim, flags),
+            };
         tracing::debug!("selected inbound connection for eviction, disconnecting peer={victim}");
         // A victim that left in the meantime freed its slot all the same.
         if flags.is_empty() {
             self.disconnect_peer(victim, reason);
         } else {
-            tracing::info!("peer={victim} evicted first under -peerflagpolicy=evict, flagged {flags} ({reason})");
+            tracing::info!(
+                "peer={victim} evicted first under -peerflagpolicy=evict, flagged {flags} ({reason})"
+            );
             self.disconnect_peer(victim, "evicted-flagged");
         }
         true
@@ -4097,8 +4295,11 @@ impl PeerManager {
                 })
                 .collect()
         };
-        let flagged: HashMap<PeerId, crate::net::flags::FlagSet> =
-            seen.iter().filter(|p| !p.evict_flags.is_empty()).map(|p| (p.id, p.evict_flags)).collect();
+        let flagged: HashMap<PeerId, crate::net::flags::FlagSet> = seen
+            .iter()
+            .filter(|p| !p.evict_flags.is_empty())
+            .map(|p| (p.id, p.evict_flags))
+            .collect();
         let candidates: Vec<crate::net::eviction::EvictionCandidate> = {
             let reachable = self.reachable.read();
             let addrman = self.addrman.read();
@@ -4114,7 +4315,11 @@ impl PeerManager {
                     };
                     // Core's `NetGroupManager::GetGroup`: every address that
                     // is not publicly routable falls in one group.
-                    let group = if routable { addrman.group_key(ip) } else { Vec::new() };
+                    let group = if routable {
+                        addrman.group_key(ip)
+                    } else {
+                        Vec::new()
+                    };
                     crate::net::eviction::EvictionCandidate {
                         id: p.id,
                         connected: p.connected,
@@ -4140,7 +4345,9 @@ impl PeerManager {
                 .collect()
         };
         match crate::net::eviction::select_node_to_evict(candidates) {
-            Some(victim) => EvictionVictim::Peer(victim, flagged.get(&victim).copied().unwrap_or_default()),
+            Some(victim) => {
+                EvictionVictim::Peer(victim, flagged.get(&victim).copied().unwrap_or_default())
+            }
             None => EvictionVictim::None,
         }
     }
@@ -4151,8 +4358,9 @@ impl PeerManager {
     /// 9.
     fn max_outbound_block_relay(&self) -> usize {
         let max_connections = self.max_connections.load(Ordering::Relaxed);
-        MAX_OUTBOUND_BLOCK_RELAY
-            .min(max_connections.saturating_sub(max_connections.min(self.max_outbound_full_relay())))
+        MAX_OUTBOUND_BLOCK_RELAY.min(
+            max_connections.saturating_sub(max_connections.min(self.max_outbound_full_relay())),
+        )
     }
 
     /// The automatic outbound target: 8 (`-maxoutboundfullrelay`), capped
@@ -4161,7 +4369,9 @@ impl PeerManager {
         if self.is_ibd() {
             MAX_OUTBOUND_IBD
         } else {
-            self.max_connections.load(Ordering::Relaxed).min(self.max_outbound_full_relay())
+            self.max_connections
+                .load(Ordering::Relaxed)
+                .min(self.max_outbound_full_relay())
         }
     }
 
@@ -4224,9 +4434,16 @@ impl PeerManager {
             .peers
             .read()
             .values()
-            .filter(|h| h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected)
+            .filter(|h| {
+                h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected
+            })
             .count();
-        let typed = self.pending_typed_dials.read().iter().filter(|t| **t == ConnType::BlockRelay).count();
+        let typed = self
+            .pending_typed_dials
+            .read()
+            .iter()
+            .filter(|t| **t == ConnType::BlockRelay)
+            .count();
         peers + in_flight.block_relay + in_flight.extra_block_relay + typed
     }
 
@@ -4248,9 +4465,17 @@ impl PeerManager {
             .peers
             .read()
             .values()
-            .filter(|h| h.info.conn_type == ConnType::OutboundFullRelay && h.info.state != PeerState::Disconnected)
+            .filter(|h| {
+                h.info.conn_type == ConnType::OutboundFullRelay
+                    && h.info.state != PeerState::Disconnected
+            })
             .count();
-        let typed = self.pending_typed_dials.read().iter().filter(|t| **t == ConnType::OutboundFullRelay).count();
+        let typed = self
+            .pending_typed_dials
+            .read()
+            .iter()
+            .filter(|t| **t == ConnType::OutboundFullRelay)
+            .count();
         peers
             + in_flight.automatic
             + in_flight.extra_network
@@ -4304,13 +4529,17 @@ impl PeerManager {
         self.peers
             .read()
             .values()
-            .filter(|h| h.info.conn_type == ConnType::Manual && h.info.state != PeerState::Disconnected)
             .filter(|h| {
-                added.iter().any(|a| match (a, h.info.onion_host.as_deref()) {
-                    (PeerAddr::Socket(sa), None) => *sa == h.info.addr,
-                    (PeerAddr::Onion { host, .. }, Some(peer_host)) => host == peer_host,
-                    _ => false,
-                })
+                h.info.conn_type == ConnType::Manual && h.info.state != PeerState::Disconnected
+            })
+            .filter(|h| {
+                added
+                    .iter()
+                    .any(|a| match (a, h.info.onion_host.as_deref()) {
+                        (PeerAddr::Socket(sa), None) => *sa == h.info.addr,
+                        (PeerAddr::Onion { host, .. }, Some(peer_host)) => host == peer_host,
+                        _ => false,
+                    })
             })
             .count()
     }
@@ -4324,7 +4553,9 @@ impl PeerManager {
         let manual = match (conn_type, target) {
             (Some(ConnType::Manual), _) => true,
             (Some(_), _) => return DialBudget::Unlimited,
-            (None, PeerAddr::Socket(sa)) => self.untyped_outbound_conn_type(sa, None) == ConnType::Manual,
+            (None, PeerAddr::Socket(sa)) => {
+                self.untyped_outbound_conn_type(sa, None) == ConnType::Manual
+            }
             (None, PeerAddr::Onion { host, port }) => {
                 let placeholder = SocketAddr::from(([0, 0, 0, 0], *port));
                 self.untyped_outbound_conn_type(&placeholder, Some(host)) == ConnType::Manual
@@ -4464,7 +4695,10 @@ impl PeerManager {
             }
             DialBudget::Unlimited => {}
         }
-        Ok(DialSlot { pm: Arc::clone(self), budget })
+        Ok(DialSlot {
+            pm: Arc::clone(self),
+            budget,
+        })
     }
 
     /// Connect to an outbound peer with no caller-chosen type, as the
@@ -4487,7 +4721,8 @@ impl PeerManager {
         conn_type: Option<ConnType>,
         use_v2: Option<bool>,
     ) -> Result<(), String> {
-        self.connect_outbound_inner(addr, conn_type, use_v2, true).await
+        self.connect_outbound_inner(addr, conn_type, use_v2, true)
+            .await
     }
 
     /// Core's `CConnman::AddConnection`, behind `addconnection`.
@@ -4533,14 +4768,23 @@ impl PeerManager {
         tokio::spawn(async move {
             // Releases the reservation on every exit path, including a
             // resolver failure, a dial timeout, or a panic below.
-            let _grant = OwnedTypedDialGuard { pm: pm.clone(), conn_type };
+            let _grant = OwnedTypedDialGuard {
+                pm: pm.clone(),
+                conn_type,
+            };
             let addr = match pm.resolve_peer_target(&target, default_port).await {
                 Ok(PeerAddr::Socket(sa)) => sa,
                 // Through the proxy, typed as asked (#1150: Core's
                 // `feature_anchors.py` opens a block-relay-only onion).
                 Ok(PeerAddr::Onion { host, port }) => {
                     if let Err(e) = pm
-                        .connect_outbound_onion_inner(&host, port, Some(conn_type), Some(use_v2), false)
+                        .connect_outbound_onion_inner(
+                            &host,
+                            port,
+                            Some(conn_type),
+                            Some(use_v2),
+                            false,
+                        )
                         .await
                     {
                         tracing::debug!(%host, port, ?conn_type, "addconnection dial failed: {e}");
@@ -4590,7 +4834,8 @@ impl PeerManager {
             // The dials in flight are locked first, as `reserve_dial` takes them.
             let in_flight = self.dials_in_flight.lock();
             let mut pending = self.pending_typed_dials.write();
-            if let Err(e) = self.check_outbound_limit_for(ConnType::AddrFetch, &pending, &in_flight) {
+            if let Err(e) = self.check_outbound_limit_for(ConnType::AddrFetch, &pending, &in_flight)
+            {
                 tracing::debug!(%host, port, "addr-fetch by name not opened: {e}");
                 return;
             }
@@ -4599,7 +4844,10 @@ impl PeerManager {
         let pm = self.clone();
         tokio::spawn(async move {
             // Releases the reservation on every exit path.
-            let _grant = OwnedTypedDialGuard { pm: pm.clone(), conn_type: ConnType::AddrFetch };
+            let _grant = OwnedTypedDialGuard {
+                pm: pm.clone(),
+                conn_type: ConnType::AddrFetch,
+            };
             if let Err(e) = pm.connect_addr_fetch_by_name(&host, port).await {
                 tracing::debug!(%host, port, "addr-fetch by name failed: {e}");
             }
@@ -4608,7 +4856,11 @@ impl PeerManager {
 
     /// Dial `host:port` through the proxy and open it as an `addr-fetch`
     /// connection. The caller holds the outbound reservation.
-    async fn connect_addr_fetch_by_name(self: &Arc<Self>, host: &str, port: u16) -> Result<(), String> {
+    async fn connect_addr_fetch_by_name(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+    ) -> Result<(), String> {
         let stream = self.dial_name(host, port).await?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(%host, port, id, "Opening addr-fetch connection by name via proxy");
@@ -4678,7 +4930,10 @@ impl PeerManager {
                 self.check_outbound_limit_for(t, &pending, &in_flight)?;
                 pending.push(t);
                 drop(pending);
-                Some(TypedDialGuard { set: &self.pending_typed_dials, conn_type: t })
+                Some(TypedDialGuard {
+                    set: &self.pending_typed_dials,
+                    conn_type: t,
+                })
             }
             Some(_) => None,
         };
@@ -4762,7 +5017,8 @@ impl PeerManager {
         port: u16,
         conn_type: Option<ConnType>,
     ) -> Result<(), String> {
-        self.connect_outbound_onion_inner(host, port, conn_type, None, true).await
+        self.connect_outbound_onion_inner(host, port, conn_type, None, true)
+            .await
     }
 
     /// `connect_outbound_onion`, with the [`DialSlot`] optional, as in
@@ -4779,7 +5035,10 @@ impl PeerManager {
             return Err("networking disabled (networkactive=false)".to_string());
         }
         let _dial_slot = if reserve {
-            let target = PeerAddr::Onion { host: host.to_string(), port };
+            let target = PeerAddr::Onion {
+                host: host.to_string(),
+                port,
+            };
             Some(self.reserve_dial(self.dial_budget(&target, conn_type))?)
         } else {
             None
@@ -4828,7 +5087,12 @@ impl PeerManager {
         tracing::info!(onion = host, id, "Connecting to .onion peer via proxy");
 
         let (conn, id) = self
-            .establish_outbound(id, stream, OutboundDial::Onion(host.to_string(), port), use_v2)
+            .establish_outbound(
+                id,
+                stream,
+                OutboundDial::Onion(host.to_string(), port),
+                use_v2,
+            )
             .await?;
 
         // Re-check after the dial + handshake awaits (see connect_outbound):
@@ -4874,10 +5138,12 @@ impl PeerManager {
         // manual for good, dialled as one even under `-connect`.
         match addr {
             PeerAddr::Socket(sa) => {
-                self.connect_outbound_as(*sa, Some(ConnType::Manual), use_v2).await
+                self.connect_outbound_as(*sa, Some(ConnType::Manual), use_v2)
+                    .await
             }
             PeerAddr::Onion { host, port } => {
-                self.connect_outbound_onion(host, *port, Some(ConnType::Manual)).await
+                self.connect_outbound_onion(host, *port, Some(ConnType::Manual))
+                    .await
             }
         }
     }
@@ -4903,10 +5169,12 @@ impl PeerManager {
         }
         match addr {
             PeerAddr::Socket(sa) => {
-                self.connect_outbound_inner(*sa, Some(ConnType::Manual), use_v2, false).await
+                self.connect_outbound_inner(*sa, Some(ConnType::Manual), use_v2, false)
+                    .await
             }
             PeerAddr::Onion { host, port } => {
-                self.connect_outbound_onion_inner(host, *port, Some(ConnType::Manual), None, false).await
+                self.connect_outbound_onion_inner(host, *port, Some(ConnType::Manual), None, false)
+                    .await
             }
         }
     }
@@ -4923,7 +5191,10 @@ impl PeerManager {
     /// loop's, and a seed's. No type is chosen here; `spawn_peer` reports
     /// the connection `manual` if the operator named the peer and
     /// `outbound-full-relay` otherwise.
-    pub async fn connect_peer_addr_automatic(self: &Arc<Self>, addr: &PeerAddr) -> Result<(), String> {
+    pub async fn connect_peer_addr_automatic(
+        self: &Arc<Self>,
+        addr: &PeerAddr,
+    ) -> Result<(), String> {
         // An automatic connection is not opened to a banned address, as in
         // Core; a peer the operator named is dialled regardless.
         if !self.is_manual_target(addr) && self.is_peer_addr_banned(addr) {
@@ -5027,7 +5298,9 @@ impl PeerManager {
                 // cap below still bounds loopback, so this cannot exhaust
                 // all slots. It is checked first so that no peer is evicted
                 // for a newcomer it then refuses.
-                if !ip.is_loopback() && same_ip_count >= self.max_inbound_per_ip.load(Ordering::Relaxed) {
+                if !ip.is_loopback()
+                    && same_ip_count >= self.max_inbound_per_ip.load(Ordering::Relaxed)
+                {
                     tracing::warn!(
                         %addr,
                         same_ip_count,
@@ -5054,7 +5327,12 @@ impl PeerManager {
                     let still_full = |peers: &HashMap<PeerId, PeerHandle>| {
                         Self::count_inbound(peers, ip).0 >= self.max_inbound()
                     };
-                    if !self.attempt_to_evict_connection(false, None, &still_full, "evicted for an inbound slot") {
+                    if !self.attempt_to_evict_connection(
+                        false,
+                        None,
+                        &still_full,
+                        "evicted for an inbound slot",
+                    ) {
                         tracing::debug!(
                             "failed to find an eviction candidate - connection dropped (full), peer={addr}"
                         );
@@ -5284,7 +5562,10 @@ impl PeerManager {
         let peers = self.peers.read();
         // A survey connection is not one of the node's peers: it is open
         // for seconds and outside every connection budget (`survey_conn`).
-        let mut entries: Vec<_> = peers.iter().filter(|(_, h)| !h.info.conn_type.is_measurement()).collect();
+        let mut entries: Vec<_> = peers
+            .iter()
+            .filter(|(_, h)| !h.info.conn_type.is_measurement())
+            .collect();
         entries.sort_by_key(|(id, _)| **id);
         // `inflight` was a hardcoded `[]`, which reads as "this peer owes us
         // nothing" — the opposite of the answer when the question is which
@@ -5326,7 +5607,10 @@ impl PeerManager {
                 Direction::Inbound => summary.inbound += 1,
                 Direction::Outbound => summary.outbound += 1,
             }
-            *summary.clients.entry(h.info.user_agent.clone()).or_default() += 1;
+            *summary
+                .clients
+                .entry(h.info.user_agent.clone())
+                .or_default() += 1;
         }
         summary
     }
@@ -5353,7 +5637,11 @@ impl PeerManager {
         // state made them disagree for as long as a handshake was in
         // flight — which is exactly when a caller polling both notices. Survey
         // connections are left out of both.
-        self.peers.read().values().filter(|h| !h.info.conn_type.is_measurement()).count()
+        self.peers
+            .read()
+            .values()
+            .filter(|h| !h.info.conn_type.is_measurement())
+            .count()
     }
 
     /// Number of connected peers using the BIP 324 v2 encrypted transport.
@@ -5486,18 +5774,16 @@ impl PeerManager {
                 .iter()
                 .filter_map(|(id, handle)| {
                     let covered = match (target, handle.info.onion_host.as_deref()) {
-                        (crate::net::ban::BanTarget::Onion(host), Some(peer_host)) => host == peer_host,
+                        (crate::net::ban::BanTarget::Onion(host), Some(peer_host)) => {
+                            host == peer_host
+                        }
                         (crate::net::ban::BanTarget::Onion(_), None) => false,
                         (crate::net::ban::BanTarget::Net(_), Some(_)) => false,
                         (crate::net::ban::BanTarget::Net(_), None) => {
                             target.contains_addr(&handle.info.addr.ip())
                         }
                     };
-                    if covered {
-                        Some(*id)
-                    } else {
-                        None
-                    }
+                    if covered { Some(*id) } else { None }
                 })
                 .collect()
         };
@@ -5566,7 +5852,8 @@ impl PeerManager {
     /// 12-byte header field. Returns false if the peer is not connected or its
     /// send queue is full.
     pub fn send_raw_message(&self, id: PeerId, msg_type: &str, payload: Vec<u8>) -> bool {
-        let Ok(command) = bitcoin::p2p::message::CommandString::try_from(msg_type.to_string()) else {
+        let Ok(command) = bitcoin::p2p::message::CommandString::try_from(msg_type.to_string())
+        else {
             return false;
         };
         let peers = self.peers.read();
@@ -5649,7 +5936,11 @@ impl PeerManager {
             .map(|(id, h)| (*id, h.fee_filter_sent))
             .collect();
         let ibd = self.chain_state.is_initial_block_download();
-        let max_filter = fee_filter_round(MAX_MONEY_SATS, self.mempool.policy().incremental_relay_fee, 0);
+        let max_filter = fee_filter_round(
+            MAX_MONEY_SATS,
+            self.mempool.policy().incremental_relay_fee,
+            0,
+        );
         for (id, sent) in ids {
             let Some(sent) = sent else { continue };
             let stale = if ibd {
@@ -5735,9 +6026,9 @@ impl PeerManager {
 
         for entry in entries.iter().filter(|e| e.listed) {
             let connected = match &entry.resolved {
-                Some(PeerAddr::Socket(sa)) => peers.values().any(|h| {
-                    h.info.addr == *sa && h.info.state == PeerState::Connected
-                }),
+                Some(PeerAddr::Socket(sa)) => peers
+                    .values()
+                    .any(|h| h.info.addr == *sa && h.info.state == PeerState::Connected),
                 Some(PeerAddr::Onion { host, .. }) => peers.values().any(|h| {
                     h.info.onion_host.as_deref() == Some(host.as_str())
                         && h.info.state == PeerState::Connected
@@ -5786,8 +6077,10 @@ impl PeerManager {
         let state = self.unknown_bits.clone();
         let chain = self.chain_state.clone();
         tokio::task::spawn_blocking(move || {
-            let params = crate::validation::versionbits::UnknownBitsParams::for_network(chain.network);
-            let known = crate::validation::versionbits::testdummy_deployment_configured(chain.network);
+            let params =
+                crate::validation::versionbits::UnknownBitsParams::for_network(chain.network);
+            let known =
+                crate::validation::versionbits::testdummy_deployment_configured(chain.network);
             let bits = state.monitor.check(&*chain, &tip, params, &known);
             let mut reported = state.reported.lock();
             for &(bit, active) in &bits {
@@ -5805,7 +6098,9 @@ impl PeerManager {
             }
             for &(bit, active) in reported.iter() {
                 if active && !bits.contains(&(bit, true)) {
-                    chain.warnings().clear(&format!("versionbits.unknown.{bit}"));
+                    chain
+                        .warnings()
+                        .clear(&format!("versionbits.unknown.{bit}"));
                 }
             }
             *reported = bits;
@@ -5856,14 +6151,16 @@ impl PeerManager {
         let expected_headers = self
             .chain_state
             .get_block_index(&self.chain_state.best_header_hash())
-            .map_or(0, |e| (now_micros / 1_000_000).saturating_sub(u64::from(e.header.time)) / POW_TARGET_SPACING_SECS);
+            .map_or(0, |e| {
+                (now_micros / 1_000_000).saturating_sub(u64::from(e.header.time))
+                    / POW_TARGET_SPACING_SECS
+            });
         let timeout = now_micros
             + HEADERS_DOWNLOAD_TIMEOUT_BASE_MICROS
             + HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER_MICROS.saturating_mul(expected_headers);
         let mut peers = self.peers.write();
-        let preferred = |info: &PeerInfo| {
-            Self::syncs_headers(info) && Self::tx_announcer_info(info).preferred
-        };
+        let preferred =
+            |info: &PeerInfo| Self::syncs_headers(info) && Self::tx_announcer_info(info).preferred;
         let Some(h) = peers.get(&id) else {
             return false;
         };
@@ -5871,9 +6168,7 @@ impl PeerManager {
             return false;
         }
         if !recent {
-            let syncing = peers
-                .values()
-                .any(|p| p.header_sync.started);
+            let syncing = peers.values().any(|p| p.header_sync.started);
             // Only a preferred peer that could take the slot now stands in a
             // non-preferred one's way: one that has synced already never
             // takes it again, and one still in its handshake may never
@@ -5894,7 +6189,11 @@ impl PeerManager {
         // Core's line (v32.1 `net_processing.cpp:6160`): the height the
         // locator starts at, the best header's parent
         // ([`sync::make_initial_getheaders`]).
-        let start = self.chain_state.headers_tip_height().max(self.chain_state.tip_height()).saturating_sub(1);
+        let start = self
+            .chain_state
+            .headers_tip_height()
+            .max(self.chain_state.tip_height())
+            .saturating_sub(1);
         tracing::debug!("initial getheaders ({start}) to peer={id}");
         true
     }
@@ -5915,7 +6214,10 @@ impl PeerManager {
             let syncing = peers.values().filter(|p| p.header_sync.started).count();
             let preferred_peers = peers
                 .values()
-                .filter(|p| p.info.state == PeerState::Connected && Self::tx_announcer_info(&p.info).preferred)
+                .filter(|p| {
+                    p.info.state == PeerState::Connected
+                        && Self::tx_announcer_info(&p.info).preferred
+                })
                 .count();
             for (id, h) in peers.iter_mut() {
                 if !h.header_sync.started {
@@ -5929,12 +6231,12 @@ impl PeerManager {
                     continue;
                 }
                 let preferred = Self::tx_announcer_info(&h.info).preferred;
-                if now_micros > at
-                    && syncing == 1
-                    && preferred_peers - usize::from(preferred) >= 1
+                if now_micros > at && syncing == 1 && preferred_peers - usize::from(preferred) >= 1
                 {
                     if h.info.permissions.noban {
-                        tracing::info!("Timeout downloading headers from noban peer, not disconnecting peer={id}");
+                        tracing::info!(
+                            "Timeout downloading headers from noban peer, not disconnecting peer={id}"
+                        );
                         h.header_sync.started = false;
                         h.header_sync.download_timeout = HeadersTimeout::Unset;
                     } else {
@@ -5965,7 +6267,10 @@ impl PeerManager {
     /// Core runs `ConsiderEviction` in each peer's `SendMessages`, right
     /// after its messages, so a `headers` reply moves the timer at once.
     fn consider_evictions_of(&self, only: Option<PeerId>, now: u64) {
-        let Some(tip) = self.chain_state.get_block_index(&self.chain_state.tip_hash()) else {
+        let Some(tip) = self
+            .chain_state
+            .get_block_index(&self.chain_state.tip_hash())
+        else {
             return;
         };
         let tip_hash = self.chain_state.tip_hash();
@@ -5976,14 +6281,19 @@ impl PeerManager {
             .filter(|(id, _)| only.is_none_or(|o| o == **id))
             .filter(|(_, h)| {
                 !h.info.chain_sync_protect
-                    && matches!(h.info.conn_type, ConnType::OutboundFullRelay | ConnType::BlockRelay)
+                    && matches!(
+                        h.info.conn_type,
+                        ConnType::OutboundFullRelay | ConnType::BlockRelay
+                    )
                     && h.header_sync.started
                     && h.info.state == PeerState::Connected
             })
             .map(|(id, h)| (*id, h.info.best_known_block))
             .collect();
         for (id, best_known) in candidates {
-            let best_work = best_known.and_then(|b| self.chain_state.get_block_index(&b)).map(|e| e.chainwork);
+            let best_work = best_known
+                .and_then(|b| self.chain_state.get_block_index(&b))
+                .map(|e| e.chainwork);
             let at_least = |work: &[u8; 32]| {
                 best_work.is_some_and(|w| crate::chain::state::compare_u256(&w, work) >= 0)
             };
@@ -5991,13 +6301,16 @@ impl PeerManager {
             let mut disconnect = false;
             {
                 let mut peers = self.peers.write();
-                let Some(h) = peers.get_mut(&id) else { continue };
+                let Some(h) = peers.get_mut(&id) else {
+                    continue;
+                };
                 let cs = &mut h.header_sync.chain_sync;
                 if at_least(&tip.chainwork) {
                     if cs.timeout.is_some() {
                         *cs = ChainSyncTimeout::default();
                     }
-                } else if cs.timeout.is_none() || cs.work_header.is_some_and(|(_, w)| at_least(&w)) {
+                } else if cs.timeout.is_none() || cs.work_header.is_some_and(|(_, w)| at_least(&w))
+                {
                     cs.timeout = Some(now + CHAIN_SYNC_TIMEOUT_SECS);
                     cs.work_header = Some((tip_hash, tip.chainwork));
                     cs.sent_getheaders = false;
@@ -6029,7 +6342,10 @@ impl PeerManager {
                     "sending getheaders to outbound peer={id} to verify chain work (current best known block:{}, benchmark blockhash: {work_hash})",
                     best_known.map_or_else(|| "<none>".to_string(), |b| b.to_string())
                 );
-                self.maybe_send_getheaders_msg(id, sync::make_getheaders_after(&self.chain_state, parent));
+                self.maybe_send_getheaders_msg(
+                    id,
+                    sync::make_getheaders_after(&self.chain_state, parent),
+                );
             }
         }
     }
@@ -6071,7 +6387,10 @@ impl PeerManager {
             return;
         }
         if self.automatic_outbound.load(Ordering::Relaxed) && self.tip_may_be_stale(now) {
-            let since = self.last_tip_update.lock().map_or(0, |(_, at)| now.saturating_sub(at));
+            let since = self
+                .last_tip_update
+                .lock()
+                .map_or(0, |(_, at)| now.saturating_sub(at));
             tracing::info!(
                 "Potential stale tip detected, will try using extra outbound peer (last tip update: {since} seconds ago)"
             );
@@ -6079,7 +6398,8 @@ impl PeerManager {
         } else {
             self.try_new_outbound_peer.store(false, Ordering::Relaxed);
         }
-        self.stale_tip_check_time.store(now + STALE_CHECK_INTERVAL_SECS, Ordering::Relaxed);
+        self.stale_tip_check_time
+            .store(now + STALE_CHECK_INTERVAL_SECS, Ordering::Relaxed);
     }
 
     /// Whether header sync may run with this connection at all: one that
@@ -6241,7 +6561,12 @@ impl PeerManager {
             let pm = Arc::clone(self);
             tokio::spawn(async move {
                 let _slot = slot;
-                pm.dial_book_target(&target, Some(ConnType::BlockRelay), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+                pm.dial_book_target(
+                    &target,
+                    Some(ConnType::BlockRelay),
+                    AUTOMATIC_RECONNECT_MAX_BACKOFF,
+                )
+                .await;
             });
         }
         dialled
@@ -6279,24 +6604,39 @@ impl PeerManager {
             let anchor = self.anchors.lock().pop()?;
             let valid = match &anchor.addr {
                 PeerAddr::Socket(sa) => crate::net::is_valid(sa.ip()) && sa.port() != 0,
-                PeerAddr::Onion { host, port } => *port != 0 && crate::net::peer::onion_host_to_torv3_pubkey(host).is_some(),
+                PeerAddr::Onion { host, port } => {
+                    *port != 0 && crate::net::peer::onion_host_to_torv3_pubkey(host).is_some()
+                }
             };
             let host = match &anchor.addr {
                 PeerAddr::Socket(sa) => sa.ip().to_string(),
                 PeerAddr::Onion { host, .. } => host.clone(),
             };
-            let own = local.iter().any(|(h, p, _)| *h == host && *p == anchor.addr.port());
-            let candidate = DialCandidate { addr: anchor.addr, services: anchor.services.to_u64() };
+            let own = local
+                .iter()
+                .any(|(h, p, _)| *h == host && *p == anchor.addr.port());
+            let candidate = DialCandidate {
+                addr: anchor.addr,
+                services: anchor.services.to_u64(),
+            };
             // A bad port is no reason to pass over an anchor, in Core.
             if !valid
                 || own
                 || dialled.contains(&candidate.addr)
-                || !self.automatic_dial_may_take(&candidate, usize::MAX, now, tip_depth, restore_pending)
+                || !self.automatic_dial_may_take(
+                    &candidate,
+                    usize::MAX,
+                    now,
+                    tip_depth,
+                    restore_pending,
+                )
             {
                 continue;
             }
             if let PeerAddr::Socket(sa) = &candidate.addr
-                && self.outbound_netgroup(sa.ip()).is_some_and(|g| groups.contains(&g))
+                && self
+                    .outbound_netgroup(sa.ip())
+                    .is_some_and(|g| groups.contains(&g))
             {
                 continue;
             }
@@ -6309,14 +6649,23 @@ impl PeerManager {
     /// the full-relay half of this pass just started. Returns the address
     /// dialled, which the extra block-relay-only draw later in the pass then
     /// passes over, with its group.
-    fn open_block_relay_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) -> Option<PeerAddr> {
+    fn open_block_relay_peer(
+        self: &Arc<Self>,
+        now: Instant,
+        dialled: &[PeerAddr],
+    ) -> Option<PeerAddr> {
         let (target, slot) = self.reserve_block_relay_peer(now, dialled)?;
         tracing::debug!(%target, "Making block-relay-only connection");
         let pm = Arc::clone(self);
         let dialled = target.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            pm.dial_book_target(&target, Some(ConnType::BlockRelay), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+            pm.dial_book_target(
+                &target,
+                Some(ConnType::BlockRelay),
+                AUTOMATIC_RECONNECT_MAX_BACKOFF,
+            )
+            .await;
         });
         Some(dialled)
     }
@@ -6342,12 +6691,17 @@ impl PeerManager {
         dialled: &[PeerAddr],
     ) -> Option<(PeerAddr, DialSlot)> {
         let slot = self.reserve_dial(DialBudget::BlockRelay).ok()?;
-        self.draw_block_relay_target(now, dialled).map(|target| (target, slot))
+        self.draw_block_relay_target(now, dialled)
+            .map(|target| (target, slot))
     }
 
     /// The address a block-relay-only peer is dialled at, drawn as every
     /// automatic one is (see [`Self::reserve_block_relay_peer`]).
-    fn draw_block_relay_target(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) -> Option<PeerAddr> {
+    fn draw_block_relay_target(
+        self: &Arc<Self>,
+        now: Instant,
+        dialled: &[PeerAddr],
+    ) -> Option<PeerAddr> {
         let recent = now.checked_sub(RECENT_TRY_WINDOW);
         let tried_recently =
             |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
@@ -6359,18 +6713,26 @@ impl PeerManager {
         }));
         let mut rng = rand::thread_rng();
         let mut chosen = None;
-        pass_over_recent_tries(self.automatic_dial_order(&mut rng), tried_recently, |c, tries| {
-            if dialled.contains(&c.addr) || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
-                return Ok(false);
-            }
-            if let PeerAddr::Socket(sa) = &c.addr
-                && self.outbound_netgroup(sa.ip()).is_some_and(|g| groups.contains(&g))
-            {
-                return Ok(false);
-            }
-            chosen = Some(c.addr);
-            Err(())
-        });
+        pass_over_recent_tries(
+            self.automatic_dial_order(&mut rng),
+            tried_recently,
+            |c, tries| {
+                if dialled.contains(&c.addr)
+                    || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending)
+                {
+                    return Ok(false);
+                }
+                if let PeerAddr::Socket(sa) = &c.addr
+                    && self
+                        .outbound_netgroup(sa.ip())
+                        .is_some_and(|g| groups.contains(&g))
+                {
+                    return Ok(false);
+                }
+                chosen = Some(c.addr);
+                Err(())
+            },
+        );
         chosen
     }
 
@@ -6380,7 +6742,8 @@ impl PeerManager {
     /// once `CanDirectFetch` holds (v31.1 `src/net_processing.cpp:5481`).
     fn maybe_start_extra_block_relay_peers(&self) {
         if !self.start_extra_block_relay_peers.load(Ordering::Relaxed) && self.can_direct_fetch() {
-            self.start_extra_block_relay_peers.store(true, Ordering::Relaxed);
+            self.start_extra_block_relay_peers
+                .store(true, Ordering::Relaxed);
             tracing::debug!("enabling extra block-relay-only peers");
         }
     }
@@ -6396,7 +6759,12 @@ impl PeerManager {
         let pm = Arc::clone(self);
         tokio::spawn(async move {
             let _slot = slot;
-            pm.dial_book_target(&target, Some(ConnType::BlockRelay), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+            pm.dial_book_target(
+                &target,
+                Some(ConnType::BlockRelay),
+                AUTOMATIC_RECONNECT_MAX_BACKOFF,
+            )
+            .await;
         });
     }
 
@@ -6436,7 +6804,8 @@ impl PeerManager {
             }
             *next = next_extra_block_relay_after(now);
         }
-        self.draw_block_relay_target(now, dialled).map(|target| (target, slot))
+        self.draw_block_relay_target(now, dialled)
+            .map(|target| (target, slot))
     }
 
     /// Open a feeler if one is due: [`Self::reserve_feeler`], then the dial,
@@ -6455,7 +6824,12 @@ impl PeerManager {
             let _grant = grant;
             tokio::time::sleep(wait).await;
             tracing::debug!(%target, "Making feeler connection");
-            pm.dial_book_target(&target, Some(ConnType::Feeler), AUTOMATIC_RECONNECT_MAX_BACKOFF).await;
+            pm.dial_book_target(
+                &target,
+                Some(ConnType::Feeler),
+                AUTOMATIC_RECONNECT_MAX_BACKOFF,
+            )
+            .await;
         });
     }
 
@@ -6516,32 +6890,39 @@ impl PeerManager {
             }
             pending.push(ConnType::Feeler);
         }
-        let grant = OwnedTypedDialGuard { pm: Arc::clone(self), conn_type: ConnType::Feeler };
+        let grant = OwnedTypedDialGuard {
+            pm: Arc::clone(self),
+            conn_type: ConnType::Feeler,
+        };
         let recent = now.checked_sub(RECENT_TRY_WINDOW);
         let tried_recently =
             |c: &DialCandidate| recent.is_some_and(|since| self.tried_since(&c.addr, since));
         let useful = ServiceFlags::NETWORK | ServiceFlags::NETWORK_LIMITED;
         let mut chosen = None;
         let mut rng = rand::thread_rng();
-        pass_over_recent_tries(self.feeler_dial_order(&mut rng), tried_recently, |c, tries| {
-            let target = c.addr;
-            if dialled.contains(&target)
-                || self.is_manual_target(&target)
-                || !self.may_dial(&target)
-                || self.is_peer_addr_banned(&target)
-                || !self.redial_due(&target, now)
-            {
-                return Ok(false);
-            }
-            if c.services & useful.to_u64() == 0 {
-                return Ok(false);
-            }
-            if tries < BAD_PORT_SKIPS && crate::net::is_bad_port(target.port()) {
-                return Ok(false);
-            }
-            chosen = Some(target);
-            Err(())
-        });
+        pass_over_recent_tries(
+            self.feeler_dial_order(&mut rng),
+            tried_recently,
+            |c, tries| {
+                let target = c.addr;
+                if dialled.contains(&target)
+                    || self.is_manual_target(&target)
+                    || !self.may_dial(&target)
+                    || self.is_peer_addr_banned(&target)
+                    || !self.redial_due(&target, now)
+                {
+                    return Ok(false);
+                }
+                if c.services & useful.to_u64() == 0 {
+                    return Ok(false);
+                }
+                if tries < BAD_PORT_SKIPS && crate::net::is_bad_port(target.port()) {
+                    return Ok(false);
+                }
+                chosen = Some(target);
+                Err(())
+            },
+        );
         chosen.map(|target| (target, grant))
     }
 
@@ -6603,7 +6984,9 @@ impl PeerManager {
         let net = self.pick_network_without_peer(&mut rng)?;
         *self.next_extra_network_peer.lock() = next_extra_network_peer_after(now);
         let reachable = *self.reachable.read();
-        let chosen = self.pick_automatic_dial(now, dialled, &mut rng, |c| addr_network(&reachable, &c.addr) == Some(net));
+        let chosen = self.pick_automatic_dial(now, dialled, &mut rng, |c| {
+            addr_network(&reachable, &c.addr) == Some(net)
+        });
         chosen.map(|target| (target, net, slot))
     }
 
@@ -6630,11 +7013,15 @@ impl PeerManager {
         let candidates = self.automatic_dial_order(rng).filter(|c| filter(c));
         let mut chosen = None;
         pass_over_recent_tries(candidates, tried_recently, |c, tries| {
-            if dialled.contains(&c.addr) || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
+            if dialled.contains(&c.addr)
+                || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending)
+            {
                 return Ok(false);
             }
             if let PeerAddr::Socket(sa) = &c.addr
-                && self.outbound_netgroup(sa.ip()).is_some_and(|g| groups.contains(&g))
+                && self
+                    .outbound_netgroup(sa.ip())
+                    .is_some_and(|g| groups.contains(&g))
             {
                 return Ok(false);
             }
@@ -6660,13 +7047,20 @@ impl PeerManager {
     /// `src/net.cpp:2812`). Only while [`Self::check_for_stale_tip`] allows
     /// it, once the full-relay and block-relay-only targets are met, one at
     /// a time ([`DialBudget::StaleTip`]). Not under `-connect`.
-    fn reserve_stale_tip_peer(self: &Arc<Self>, now: Instant, dialled: &[PeerAddr]) -> Option<(PeerAddr, DialSlot)> {
-        if !self.automatic_outbound.load(Ordering::Relaxed) || !self.try_new_outbound_peer.load(Ordering::Relaxed) {
+    fn reserve_stale_tip_peer(
+        self: &Arc<Self>,
+        now: Instant,
+        dialled: &[PeerAddr],
+    ) -> Option<(PeerAddr, DialSlot)> {
+        if !self.automatic_outbound.load(Ordering::Relaxed)
+            || !self.try_new_outbound_peer.load(Ordering::Relaxed)
+        {
             return None;
         }
         let slot = self.reserve_dial(DialBudget::StaleTip).ok()?;
         let mut rng = rand::thread_rng();
-        self.pick_automatic_dial(now, dialled, &mut rng, |_| true).map(|target| (target, slot))
+        self.pick_automatic_dial(now, dialled, &mut rng, |_| true)
+            .map(|target| (target, slot))
     }
 
     /// A reachable network the node holds no manual or full-relay outbound
@@ -6675,7 +7069,10 @@ impl PeerManager {
     /// `src/net.cpp:2512`), the networks tried in a random order. IPv4,
     /// IPv6 and onion only: satd has no I2P or CJDNS transport, and dials
     /// neither automatically.
-    fn pick_network_without_peer(&self, rng: &mut impl rand::Rng) -> Option<crate::net::reachable::Network> {
+    fn pick_network_without_peer(
+        &self,
+        rng: &mut impl rand::Rng,
+    ) -> Option<crate::net::reachable::Network> {
         use crate::net::reachable::Network;
         use rand::seq::SliceRandom as _;
         let reachable = *self.reachable.read();
@@ -6684,12 +7081,17 @@ impl PeerManager {
             .read()
             .values()
             .filter(|h| {
-                matches!(h.info.conn_type, ConnType::Manual | ConnType::OutboundFullRelay)
-                    && h.info.state != PeerState::Disconnected
+                matches!(
+                    h.info.conn_type,
+                    ConnType::Manual | ConnType::OutboundFullRelay
+                ) && h.info.state != PeerState::Disconnected
             })
             .filter_map(|h| {
                 let addr = match &h.info.onion_host {
-                    Some(host) => PeerAddr::Onion { host: host.clone(), port: h.info.addr.port() },
+                    Some(host) => PeerAddr::Onion {
+                        host: host.clone(),
+                        port: h.info.addr.port(),
+                    },
                     None => PeerAddr::Socket(h.info.addr),
                 };
                 addr_network(&reachable, &addr)
@@ -6710,15 +7112,18 @@ impl PeerManager {
         }
         let mut nets = [Network::Ipv4, Network::Ipv6, Network::Onion];
         nets.shuffle(rng);
-        let wanted: Vec<Network> =
-            nets.into_iter().filter(|n| !held.contains(n) && self.network_reachable(*n)).collect();
+        let wanted: Vec<Network> = nets
+            .into_iter()
+            .filter(|n| !held.contains(n) && self.network_reachable(*n))
+            .collect();
         if wanted.is_empty() {
             return None;
         }
         let book = self.addrman.read();
-        wanted
-            .into_iter()
-            .find(|n| book.iter().any(|e| addr_network(&reachable, &e.addr) == Some(*n)))
+        wanted.into_iter().find(|n| {
+            book.iter()
+                .any(|e| addr_network(&reachable, &e.addr) == Some(*n))
+        })
     }
 
     /// Settle the promotions waiting on a taken tried slot, as Core's
@@ -6731,8 +7136,10 @@ impl PeerManager {
     fn resolve_tried_collisions(&self) {
         let now = now_unix_secs();
         let incumbents = self.addrman.read().tried_collision_incumbents();
-        let connected: Vec<PeerAddr> =
-            incumbents.into_iter().filter(|a| self.is_book_addr_connected(a)).collect();
+        let connected: Vec<PeerAddr> = incumbents
+            .into_iter()
+            .filter(|a| self.is_book_addr_connected(a))
+            .collect();
         let dropped = {
             let mut book = self.addrman.write();
             // Only one the book still holds: one dropped since the read
@@ -6770,8 +7177,12 @@ impl PeerManager {
     /// ones (`OpenNetworkConnection`, `net.cpp`); satd skipped a banned
     /// manual peer here.
     fn redial_manual_peers(self: &Arc<Self>, now: Instant) {
-        let mut targets: Vec<PeerAddr> =
-            self.manual_addrs.read().iter().map(|a| PeerAddr::Socket(*a)).collect();
+        let mut targets: Vec<PeerAddr> = self
+            .manual_addrs
+            .read()
+            .iter()
+            .map(|a| PeerAddr::Socket(*a))
+            .collect();
         targets.extend(self.manual_onion_addrs.read().iter().cloned());
         for target in targets {
             if !self.redial_due(&target, now) {
@@ -6871,7 +7282,11 @@ impl PeerManager {
     /// circuit through the one proxy, so a pass starts at most
     /// [`MAX_ONION_DIALS_PER_TICK`] of them; the one-per-group rule leaves
     /// them alone ([`Self::outbound_netgroup`]).
-    fn reserve_automatic_dials(self: &Arc<Self>, now: Instant, taken: &[PeerAddr]) -> Vec<(PeerAddr, DialSlot)> {
+    fn reserve_automatic_dials(
+        self: &Arc<Self>,
+        now: Instant,
+        taken: &[PeerAddr],
+    ) -> Vec<(PeerAddr, DialSlot)> {
         if !self.automatic_outbound.load(Ordering::Relaxed) {
             return Vec::new();
         }
@@ -6918,7 +7333,9 @@ impl PeerManager {
             self.automatic_dial_order(&mut rng),
             tried_recently,
             |c, tries| {
-                if taken.contains(&c.addr) || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending) {
+                if taken.contains(&c.addr)
+                    || !self.automatic_dial_may_take(&c, tries, now, tip_depth, restore_pending)
+                {
                     return Ok(false);
                 }
                 take(c.addr)
@@ -7008,14 +7425,22 @@ impl PeerManager {
         rng: &'r mut impl rand::Rng,
     ) -> impl Iterator<Item = DialCandidate> + 'r {
         let now = now_unix_secs();
-        let mut buckets: std::collections::BTreeMap<u64, Vec<(DialCandidate, f64)>> = Default::default();
+        let mut buckets: std::collections::BTreeMap<u64, Vec<(DialCandidate, f64)>> =
+            Default::default();
         let mut new = Vec::new();
         let mut first = None;
         {
             let book = self.addrman.read();
-            let incumbent = if feeler { book.select_tried_collision() } else { None };
+            let incumbent = if feeler {
+                book.select_tried_collision()
+            } else {
+                None
+            };
             for e in book.iter() {
-                let candidate = DialCandidate { addr: e.addr.clone(), services: e.services };
+                let candidate = DialCandidate {
+                    addr: e.addr.clone(),
+                    services: e.services,
+                };
                 if incumbent.as_ref() == Some(&e.addr) {
                     first = Some(candidate);
                     continue;
@@ -7120,7 +7545,9 @@ impl PeerManager {
                 .chain(pending.iter().map(|a| a.ip()))
                 .collect()
         };
-        ips.into_iter().filter_map(|ip| self.outbound_netgroup(ip)).collect()
+        ips.into_iter()
+            .filter_map(|ip| self.outbound_netgroup(ip))
+            .collect()
     }
 
     /// Disconnect one block-relay-only peer if more are connected than
@@ -7143,13 +7570,20 @@ impl PeerManager {
     fn evict_extra_block_relay_peer(&self) -> Option<PeerId> {
         let (connected, mut youngest): (usize, Vec<(PeerId, u64, u64)>) = {
             let peers = self.peers.read();
-            let block_relay =
-                peers.values().filter(|h| h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected);
-            let connected = block_relay.clone().filter(|h| h.info.state == PeerState::Connected).count();
+            let block_relay = peers.values().filter(|h| {
+                h.info.conn_type == ConnType::BlockRelay && h.info.state != PeerState::Disconnected
+            });
+            let connected = block_relay
+                .clone()
+                .filter(|h| h.info.state == PeerState::Connected)
+                .count();
             let all = block_relay
                 .map(|h| {
-                    let conn_secs =
-                        h.info.conn_time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                    let conn_secs = h
+                        .info
+                        .conn_time
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
                     (h.info.id, h.stats.last_block(), conn_secs)
                 })
                 .collect();
@@ -7173,7 +7607,11 @@ impl PeerManager {
             .read()
             .get(&id)
             .is_some_and(|asked| asked.values().any(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL))
-            || self.ibd.read().as_ref().is_some_and(|s| s.peer_inflight_count(id) > 0);
+            || self
+                .ibd
+                .read()
+                .as_ref()
+                .is_some_and(|s| s.peer_inflight_count(id) > 0);
         if now.saturating_sub(conn_secs) < MINIMUM_CONNECT_TIME_SECS || blocks_in_flight {
             tracing::debug!(
                 "keeping block-relay-only peer={id} chosen for eviction (connect time: {conn_secs}, blocks in flight: {blocks_in_flight})"
@@ -7183,7 +7621,9 @@ impl PeerManager {
         let handle = self.peers.write().remove(&id)?;
         handle.disconnect.notify_one();
         drop(handle);
-        tracing::debug!("disconnecting extra block-relay-only peer={id} (last block received at time {last_block})");
+        tracing::debug!(
+            "disconnecting extra block-relay-only peer={id} (last block received at time {last_block})"
+        );
         self.handle_peer_disconnected(id);
         Some(id)
     }
@@ -7263,19 +7703,32 @@ impl PeerManager {
         use crate::net::altslots::AltRole;
         let full_relay = outbound
             .iter()
-            .filter(|p| p.conn_type == ConnType::OutboundFullRelay && p.connected && p.alt != Some(AltRole::Trial))
+            .filter(|p| {
+                p.conn_type == ConnType::OutboundFullRelay
+                    && p.connected
+                    && p.alt != Some(AltRole::Trial)
+            })
             .count();
         if full_relay <= target {
             return None;
         }
         // Core's `MultipleManualOrFullOutboundConns`, per network.
         let mut per_network: HashMap<&'static str, usize> = HashMap::new();
-        for p in outbound.iter().filter(|p| p.conn_type != ConnType::BlockRelay) {
+        for p in outbound
+            .iter()
+            .filter(|p| p.conn_type != ConnType::BlockRelay)
+        {
             *per_network.entry(p.network).or_default() += 1;
         }
         let groups: Vec<Option<Vec<u8>>> = outbound
             .iter()
-            .map(|p| if p.network == "onion" { None } else { self.outbound_netgroup(p.ip) })
+            .map(|p| {
+                if p.network == "onion" {
+                    None
+                } else {
+                    self.outbound_netgroup(p.ip)
+                }
+            })
             .collect();
         let shares_group = |i: usize| {
             groups[i]
@@ -7295,16 +7748,21 @@ impl PeerManager {
                     && !matches!(p.alt, Some(AltRole::Trial | AltRole::Matched { .. }))
             })
             .collect();
-        let duplicates: Vec<usize> = candidates.iter().copied().filter(|&i| shares_group(i)).collect();
-        let pool = if duplicates.is_empty() { &candidates } else { &duplicates };
-        let worst = pool
+        let duplicates: Vec<usize> = candidates
             .iter()
-            .map(|&i| &outbound[i])
-            .min_by(|a, b| {
-                a.last_block_announcement
-                    .cmp(&b.last_block_announcement)
-                    .then(b.id.cmp(&a.id))
-            })?;
+            .copied()
+            .filter(|&i| shares_group(i))
+            .collect();
+        let pool = if duplicates.is_empty() {
+            &candidates
+        } else {
+            &duplicates
+        };
+        let worst = pool.iter().map(|&i| &outbound[i]).min_by(|a, b| {
+            a.last_block_announcement
+                .cmp(&b.last_block_announcement)
+                .then(b.id.cmp(&a.id))
+        })?;
         let id = worst.id;
 
         let now = crate::time::now_secs();
@@ -7313,7 +7771,11 @@ impl PeerManager {
             .read()
             .get(&id)
             .is_some_and(|asked| asked.values().any(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL))
-            || self.ibd.read().as_ref().is_some_and(|s| s.peer_inflight_count(id) > 0);
+            || self
+                .ibd
+                .read()
+                .as_ref()
+                .is_some_and(|s| s.peer_inflight_count(id) > 0);
         if now.saturating_sub(worst.conn_secs) <= MINIMUM_CONNECT_TIME_SECS || blocks_in_flight {
             tracing::debug!(
                 "keeping outbound peer={id} chosen for eviction (connect time: {}, blocks in flight: {blocks_in_flight})",
@@ -7369,9 +7831,13 @@ impl PeerManager {
         max_backoff: Duration,
     ) -> bool {
         let result = match target {
-            PeerAddr::Socket(sa) => self.connect_outbound_inner(*sa, conn_type, None, false).await,
+            PeerAddr::Socket(sa) => {
+                self.connect_outbound_inner(*sa, conn_type, None, false)
+                    .await
+            }
             PeerAddr::Onion { host, port } => {
-                self.connect_outbound_onion_inner(host, *port, conn_type, None, false).await
+                self.connect_outbound_onion_inner(host, *port, conn_type, None, false)
+                    .await
             }
         };
         if let Err(e) = &result {
@@ -7407,8 +7873,14 @@ impl PeerManager {
             // Likewise for an onion, in the same order.
             PeerAddr::Onion { .. } => {
                 let mut backoff = self.onion_reconnect_backoff.write();
-                if self.addrman.read().contains(target) || self.manual_onion_addrs.read().contains(target) {
-                    update(backoff.entry(target.to_string()).or_insert_with(ReconnectState::new));
+                if self.addrman.read().contains(target)
+                    || self.manual_onion_addrs.read().contains(target)
+                {
+                    update(
+                        backoff
+                            .entry(target.to_string())
+                            .or_insert_with(ReconnectState::new),
+                    );
                 }
             }
         }
@@ -7438,7 +7910,10 @@ impl PeerManager {
             return None;
         }
         Some(match &info.onion_host {
-            Some(host) => PeerAddr::Onion { host: host.clone(), port: info.addr.port() },
+            Some(host) => PeerAddr::Onion {
+                host: host.clone(),
+                port: info.addr.port(),
+            },
             None => PeerAddr::Socket(info.addr),
         })
     }
@@ -7446,8 +7921,7 @@ impl PeerManager {
     /// Pure predicate behind `is_onion_connected`, factored out for testing.
     fn onion_connected_in(peers: &HashMap<PeerId, PeerHandle>, host: &str) -> bool {
         peers.values().any(|h| {
-            h.info.onion_host.as_deref() == Some(host)
-                && h.info.state != PeerState::Disconnected
+            h.info.onion_host.as_deref() == Some(host) && h.info.state != PeerState::Disconnected
         })
     }
 
@@ -7462,9 +7936,10 @@ impl PeerManager {
     fn is_peer_addr_banned(&self, addr: &PeerAddr) -> bool {
         match addr {
             PeerAddr::Socket(sa) => self.is_addr_banned(sa),
-            PeerAddr::Onion { host, .. } => {
-                self.ban_list.read().is_onion_banned(host, crate::time::now_secs())
-            }
+            PeerAddr::Onion { host, .. } => self
+                .ban_list
+                .read()
+                .is_onion_banned(host, crate::time::now_secs()),
         }
     }
 
@@ -7478,7 +7953,12 @@ impl PeerManager {
         };
         handle.info.ban_score = handle.info.ban_score.saturating_add(score);
         if handle.info.ban_score < BAN_THRESHOLD {
-            tracing::debug!(id, score = handle.info.ban_score, reason, "Increased ban score");
+            tracing::debug!(
+                id,
+                score = handle.info.ban_score,
+                reason,
+                "Increased ban score"
+            );
             return;
         }
         let ban = match Self::misbehaviour_action(&handle.info) {
@@ -7490,8 +7970,16 @@ impl PeerManager {
                 return;
             }
             MisbehaviourAction::Disconnect => {
-                let kind = if handle.info.inbound_onion { "inbound onion" } else { "local" };
-                tracing::debug!(id, reason, "Warning: disconnecting but not banning {kind} peer {id}!");
+                let kind = if handle.info.inbound_onion {
+                    "inbound onion"
+                } else {
+                    "local"
+                };
+                tracing::debug!(
+                    id,
+                    reason,
+                    "Warning: disconnecting but not banning {kind} peer {id}!"
+                );
                 None
             }
             MisbehaviourAction::Ban(target) => {
@@ -7566,7 +8054,9 @@ impl PeerManager {
         if crate::net::is_local(info.addr.ip()) || info.inbound_onion {
             return MisbehaviourAction::Disconnect;
         }
-        MisbehaviourAction::Ban(crate::net::ban::BanTarget::Net(ipnet::IpNet::from(info.addr.ip())))
+        MisbehaviourAction::Ban(crate::net::ban::BanTarget::Net(ipnet::IpNet::from(
+            info.addr.ip(),
+        )))
     }
 
     /// Run the main event loop. Returns when shutdown signal is received.
@@ -7624,7 +8114,11 @@ impl PeerManager {
                     break;
                 }
                 match event_rx.try_recv() {
-                    Ok(NetEvent::PeerConnected { id, addr: _, version }) => {
+                    Ok(NetEvent::PeerConnected {
+                        id,
+                        addr: _,
+                        version,
+                    }) => {
                         self.handle_peer_connected(id, version);
                         self.nap_peer_connected(id);
                     }
@@ -7720,8 +8214,11 @@ impl PeerManager {
                     // arriving unrequested, and keeps it out of the
                     // assignment pass below (#972).
                     for peer_id in stalled {
-                        let timeout_secs =
-                            self.ibd.read().as_ref().map(|s| s.stall_timeout().as_secs());
+                        let timeout_secs = self
+                            .ibd
+                            .read()
+                            .as_ref()
+                            .map(|s| s.stall_timeout().as_secs());
                         tracing::info!(
                             peer_id,
                             next_timeout_secs = timeout_secs,
@@ -7730,7 +8227,10 @@ impl PeerManager {
                         self.disconnect_peer(peer_id, "block-download-stall");
                     }
                     if stale_heights > 0 {
-                        tracing::info!(stale_heights, "IBD: stale in-flight heights returned to pending");
+                        tracing::info!(
+                            stale_heights,
+                            "IBD: stale in-flight heights returned to pending"
+                        );
                     }
                     for peer_id in silent {
                         let addr = self
@@ -7766,9 +8266,7 @@ impl PeerManager {
                     };
                     let (dl, inf, pend, _) = {
                         let ibd = self.ibd.read();
-                        ibd.as_ref()
-                            .map(|s| s.progress())
-                            .unwrap_or((0, 0, 0, 0))
+                        ibd.as_ref().map(|s| s.progress()).unwrap_or((0, 0, 0, 0))
                     };
                     let peers_active = self.connection_count();
                     // "stored" is the count of blocks already connected,
@@ -7816,7 +8314,8 @@ impl PeerManager {
                 if !self.maybe_start_ibd() {
                     let peer_ids: Vec<PeerId> = {
                         let peers = self.peers.read();
-                        peers.iter()
+                        peers
+                            .iter()
                             .filter(|(_, h)| {
                                 h.info.state == PeerState::Connected
                                     && h.info.serves_blocks()
@@ -8092,11 +8591,15 @@ impl PeerManager {
                 inv.iter().any(|i| {
                     matches!(
                         i,
-                        Inventory::Block(_) | Inventory::WitnessBlock(_) | Inventory::CompactBlock(_)
+                        Inventory::Block(_)
+                            | Inventory::WitnessBlock(_)
+                            | Inventory::CompactBlock(_)
                     )
                 }) && !self.headers_queue.is_idle()
             }
-            NetworkMessage::CmpctBlock(_) | NetworkMessage::BlockTxn(_) => !self.headers_queue.is_idle(),
+            NetworkMessage::CmpctBlock(_) | NetworkMessage::BlockTxn(_) => {
+                !self.headers_queue.is_idle()
+            }
             NetworkMessage::Block(_) => !self.headers_queue.is_idle() && self.ibd.read().is_none(),
             _ => false,
         }
@@ -8136,7 +8639,11 @@ impl PeerManager {
                 // Core's `MAX_HEADERS_RESULTS`, checked before any header in
                 // the message is looked at.
                 if headers.len() > crate::net::limits::MAX_HEADERS_RESULTS {
-                    self.add_ban_score(id, 100, &format!("headers message size = {}", headers.len()));
+                    self.add_ban_score(
+                        id,
+                        100,
+                        &format!("headers message size = {}", headers.len()),
+                    );
                     return;
                 }
                 self.handle_headers(id, headers);
@@ -8178,7 +8685,11 @@ impl PeerManager {
                 if let Some(handle) = peers.get_mut(&id) {
                     handle.info.compact_blocks = true;
                     handle.info.hb_from = msg.send_compact;
-                    tracing::debug!(id, high_bandwidth = msg.send_compact, "Peer supports compact blocks");
+                    tracing::debug!(
+                        id,
+                        high_bandwidth = msg.send_compact,
+                        "Peer supports compact blocks"
+                    );
                 }
             }
             NetworkMessage::CmpctBlock(msg) => {
@@ -8199,7 +8710,9 @@ impl PeerManager {
             // 37 filter message is violating the protocol, and Core
             // disconnects it (`ProcessMessage`, "filterload received despite
             // not offering bloom services").
-            NetworkMessage::FilterLoad(_) | NetworkMessage::FilterAdd(_) | NetworkMessage::FilterClear => {
+            NetworkMessage::FilterLoad(_)
+            | NetworkMessage::FilterAdd(_)
+            | NetworkMessage::FilterClear => {
                 tracing::debug!(
                     id,
                     "{} received despite not offering bloom services, disconnecting peer={id}",
@@ -8223,7 +8736,11 @@ impl PeerManager {
                     return;
                 }
                 let count = addrs.len();
-                let admitted = if relay_addrs { self.rate_limit_addrs(id, addrs) } else { Vec::new() };
+                let admitted = if relay_addrs {
+                    self.rate_limit_addrs(id, addrs)
+                } else {
+                    Vec::new()
+                };
                 let source = self.peer_ip(id);
                 let mut processed = 0u64;
                 for (_, addr) in &admitted {
@@ -8275,8 +8792,17 @@ impl PeerManager {
                         if inbound {
                             h.info.getaddr_recvd = true;
                         }
-                        let listener = GetAddrCacheKey { bind: h.info.bind_addr, onion: h.info.inbound_onion };
-                        (inbound, repeated, listener, h.info.wants_addrv2, h.info.permissions.addr)
+                        let listener = GetAddrCacheKey {
+                            bind: h.info.bind_addr,
+                            onion: h.info.inbound_onion,
+                        };
+                        (
+                            inbound,
+                            repeated,
+                            listener,
+                            h.info.wants_addrv2,
+                            h.info.permissions.addr,
+                        )
                     })
                 }) else {
                     return;
@@ -8330,7 +8856,11 @@ impl PeerManager {
                     return;
                 }
                 let count = addrs.len();
-                let admitted = if relay_addrs { self.rate_limit_addrs(id, addrs) } else { Vec::new() };
+                let admitted = if relay_addrs {
+                    self.rate_limit_addrs(id, addrs)
+                } else {
+                    Vec::new()
+                };
                 // Read once for the whole message: the announcer can leave
                 // `peers` while it is processed, and its later onions must
                 // still count against its share.
@@ -8344,13 +8874,20 @@ impl PeerManager {
                             if onion_routing && addr_msg.port != 0 =>
                         {
                             let host = crate::net::peer::torv3_to_onion_host(pubkey);
-                            if self.ban_list.read().is_onion_banned(&host, crate::time::now_secs()) {
+                            if self
+                                .ban_list
+                                .read()
+                                .is_onion_banned(&host, crate::time::now_secs())
+                            {
                                 continue;
                             }
                             processed += 1;
                             if !self.is_onion_connected(&host) {
                                 self.learn_addr(
-                                    PeerAddr::Onion { host, port: addr_msg.port },
+                                    PeerAddr::Onion {
+                                        host,
+                                        port: addr_msg.port,
+                                    },
                                     now_unix_secs(),
                                     addr_msg.services.to_u64(),
                                     source.clone().unwrap_or(NetAddr::Onion(*pubkey)),
@@ -8402,7 +8939,11 @@ impl PeerManager {
                 // `MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER`
                 // entries, and ignores a longer one whole, without penalty.
                 if inventory.len() > crate::net::limits::MAX_NOTFOUND_SZ {
-                    tracing::debug!(id, count = inventory.len(), "ignoring an oversized notfound");
+                    tracing::debug!(
+                        id,
+                        count = inventory.len(),
+                        "ignoring an oversized notfound"
+                    );
                     return;
                 }
                 // Authoritative "I don't have this" from the peer. Until
@@ -8433,7 +8974,10 @@ impl PeerManager {
                 if !tx_hashes.is_empty() {
                     let answered = {
                         let mut tracker = self.tx_requests.lock();
-                        tx_hashes.iter().filter(|hash| tracker.received_response(id, hash)).count()
+                        tx_hashes
+                            .iter()
+                            .filter(|hash| tracker.received_response(id, hash))
+                            .count()
                     };
                     // Each was announced by this peer: it is asked only for
                     // what it announced.
@@ -8445,7 +8989,11 @@ impl PeerManager {
                     self.send_all_tx_requests();
                 }
                 if block_hashes.is_empty() {
-                    tracing::debug!(id, count = inventory.len(), "Peer sent notfound (non-block)");
+                    tracing::debug!(
+                        id,
+                        count = inventory.len(),
+                        "Peer sent notfound (non-block)"
+                    );
                 } else {
                     // A tip-following request it cannot answer no longer
                     // holds the block back from the sweep's next pass.
@@ -8462,16 +9010,25 @@ impl PeerManager {
                     }
                     // A restore request (plan §11.4): another peer is asked,
                     // and this one not again for that block this pass.
-                    let refused: Vec<bitcoin::BlockHash> = match self.opreturn_restore.lock().as_mut() {
-                        Some(restore) => block_hashes.iter().copied().filter(|h| restore.note_not_found(h, id)).collect(),
-                        None => Vec::new(),
-                    };
+                    let refused: Vec<bitcoin::BlockHash> =
+                        match self.opreturn_restore.lock().as_mut() {
+                            Some(restore) => block_hashes
+                                .iter()
+                                .copied()
+                                .filter(|h| restore.note_not_found(h, id))
+                                .collect(),
+                            None => Vec::new(),
+                        };
                     if !refused.is_empty() {
                         let mut pending = self.block_refetch.write();
                         for h in &refused {
                             pending.remove(&(*h, id));
                         }
-                        tracing::debug!(id, count = refused.len(), "OP_RETURN restore: notfound, asking another peer");
+                        tracing::debug!(
+                            id,
+                            count = refused.len(),
+                            "OP_RETURN restore: notfound, asking another peer"
+                        );
                     }
                     // The background download's heights too, so the next
                     // pass asks a different peer instead of waiting out
@@ -8482,7 +9039,11 @@ impl PeerManager {
                             if let Some(entry) = self.chain_state.get_block_index(h)
                                 && dl.note_not_found(entry.height, id)
                             {
-                                tracing::debug!(id, height = entry.height, "background download: notfound, released");
+                                tracing::debug!(
+                                    id,
+                                    height = entry.height,
+                                    "background download: notfound, released"
+                                );
                             }
                         }
                     }
@@ -8538,11 +9099,17 @@ impl PeerManager {
             // Built without filters: no filter type is served, and Core
             // disconnects a peer that asks for one it does not serve.
             #[cfg(not(feature = "block-filter-index"))]
-            NetworkMessage::GetCFilters(_) | NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFCheckpt(_) => {
-                tracing::debug!("peer requested unsupported block filter type, disconnecting peer={id}");
+            NetworkMessage::GetCFilters(_)
+            | NetworkMessage::GetCFHeaders(_)
+            | NetworkMessage::GetCFCheckpt(_) => {
+                tracing::debug!(
+                    "peer requested unsupported block filter type, disconnecting peer={id}"
+                );
                 self.disconnect_peer(id, "unsupported-filter-type");
             }
-            NetworkMessage::Unknown { command, payload } if command.as_ref() == crate::nap::p2p::GETNAPATT => {
+            NetworkMessage::Unknown { command, payload }
+                if command.as_ref() == crate::nap::p2p::GETNAPATT =>
+            {
                 self.handle_getnapatt(id, &payload)
             }
             _ => {}
@@ -8560,7 +9127,11 @@ impl PeerManager {
             return;
         };
         let Some((publishes, conn_type, source)) = self.peers.read().get(&id).map(|h| {
-            (h.info.services.has(crate::nap::p2p::node_nap()), h.info.conn_type, h.info.addr_string())
+            (
+                h.info.services.has(crate::nap::p2p::node_nap()),
+                h.info.conn_type,
+                h.info.addr_string(),
+            )
         }) else {
             return;
         };
@@ -8612,7 +9183,12 @@ impl PeerManager {
     /// NAP `napatt`: take a page of a pull in progress, off the network
     /// thread, then continue, end or punish as the pull says. Without
     /// `-napaggregator` it is ignored, as any unknown message.
-    fn handle_napatt(self: &Arc<Self>, id: PeerId, payload: Vec<u8>, in_flight: crate::net::flow::InFlight) {
+    fn handle_napatt(
+        self: &Arc<Self>,
+        id: PeerId,
+        payload: Vec<u8>,
+        in_flight: crate::net::flow::InFlight,
+    ) {
         let Some(puller) = self.nap_puller.read().clone() else {
             return;
         };
@@ -8627,7 +9203,9 @@ impl PeerManager {
     fn act_on_pull(&self, id: PeerId, next: crate::nap::pull::Next) {
         use crate::nap::pull::Next;
         match next {
-            Next::Unsolicited => tracing::debug!(target: "nap", "ignoring unsolicited napatt from peer={id}"),
+            Next::Unsolicited => {
+                tracing::debug!(target: "nap", "ignoring unsolicited napatt from peer={id}")
+            }
             Next::Continue(req) => {
                 self.send_raw_message(id, crate::nap::p2p::GETNAPATT, req);
             }
@@ -8654,7 +9232,10 @@ impl PeerManager {
     /// publisher went quiet, verify deferred attestations as the budget
     /// allows, save the set, pull connected publishers that are due, and
     /// open pull connections to due publishers the address book knows.
-    pub async fn run_nap_collection(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    pub async fn run_nap_collection(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
         let mut tick = tokio::time::interval(crate::nap::pull::TICK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -8670,7 +9251,9 @@ impl PeerManager {
                 }
                 _ = tick.tick() => {}
             }
-            let Some(puller) = self.nap_puller.read().clone() else { continue };
+            let Some(puller) = self.nap_puller.read().clone() else {
+                continue;
+            };
             self.nap_collection_tick(&puller).await;
         }
     }
@@ -8688,7 +9271,11 @@ impl PeerManager {
         let (p, pm, ibd) = (puller.clone(), Arc::clone(self), self.is_ibd());
         let drained = tokio::task::spawn_blocking(move || {
             let collector = p.collector();
-            let bad = if ibd { Vec::new() } else { collector.drain_deferred(&*pm.chain_state, Instant::now()) };
+            let bad = if ibd {
+                Vec::new()
+            } else {
+                collector.drain_deferred(&*pm.chain_state, Instant::now())
+            };
             if let Err(e) = collector.aggregate().save_if_dirty() {
                 tracing::error!(target: "nap", "NAP: could not write the aggregate: {e}");
             }
@@ -8698,9 +9285,17 @@ impl PeerManager {
         .unwrap_or_default();
         for (source, why) in drained {
             puller.note_misbehaving();
-            let peer = self.peers.read().values().find(|h| h.info.addr_string() == source).map(|h| h.info.id);
+            let peer = self
+                .peers
+                .read()
+                .values()
+                .find(|h| h.info.addr_string() == source)
+                .map(|h| h.info.id);
             if let Some(id) = peer {
-                self.act_on_pull(id, crate::nap::pull::Next::Misbehaved(crate::nap::pull::misbehaviour(&why)));
+                self.act_on_pull(
+                    id,
+                    crate::nap::pull::Next::Misbehaved(crate::nap::pull::misbehaviour(&why)),
+                );
             } else {
                 tracing::info!(
                     target: "nap",
@@ -8718,7 +9313,10 @@ impl PeerManager {
             .peers
             .read()
             .values()
-            .filter(|h| h.info.state == PeerState::Connected && h.info.services.has(crate::nap::p2p::node_nap()))
+            .filter(|h| {
+                h.info.state == PeerState::Connected
+                    && h.info.services.has(crate::nap::p2p::node_nap())
+            })
             .filter_map(|h| match nap_pull_via(h.info.conn_type)? {
                 crate::nap::pull::Via::Pull => None,
                 via => Some((h.info.id, h.info.addr_string(), via)),
@@ -8736,7 +9334,10 @@ impl PeerManager {
         // automatic dial, so not under `-connect`, as Core opens no feeler
         // there either.
         let free = crate::nap::pull::MAX_PULL_CONNECTIONS.saturating_sub(puller.pull_connections());
-        if free == 0 || !puller.collector().has_room() || !self.automatic_outbound.load(Ordering::Relaxed) {
+        if free == 0
+            || !puller.collector().has_room()
+            || !self.automatic_outbound.load(Ordering::Relaxed)
+        {
             return;
         }
         let mut candidates: Vec<SocketAddr> = self
@@ -8769,7 +9370,8 @@ impl PeerManager {
             let (pm, p) = (Arc::clone(self), puller.clone());
             tokio::spawn(async move {
                 let dial = pm.connect_outbound_inner(addr, Some(ConnType::NapPull), None, false);
-                let failed = match tokio::time::timeout(crate::nap::pull::DIAL_TIMEOUT, dial).await {
+                let failed = match tokio::time::timeout(crate::nap::pull::DIAL_TIMEOUT, dial).await
+                {
                     Ok(Ok(())) => None,
                     Ok(Err(e)) => Some(e),
                     Err(_) => Some("timed out".to_owned()),
@@ -8854,9 +9456,15 @@ impl PeerManager {
             // only to a peer with `mempool` permission and disconnects any
             // other that is not `noban`.
             if permissions.noban {
-                tracing::debug!(id, "ignoring mempool request from peer without mempool permission");
+                tracing::debug!(
+                    id,
+                    "ignoring mempool request from peer without mempool permission"
+                );
             } else {
-                tracing::debug!(id, "mempool request with bloom filters disabled, disconnecting peer={id}");
+                tracing::debug!(
+                    id,
+                    "mempool request with bloom filters disabled, disconnecting peer={id}"
+                );
                 self.disconnect_peer(id, "mempool-not-permitted");
             }
             return;
@@ -8889,7 +9497,11 @@ impl PeerManager {
         let mut blocks_to_get = Vec::new();
         let mut txs_announced = Vec::new();
         let reject_tx_invs = self.rejects_incoming_txs(id);
-        let wtxid_relay = self.peers.read().get(&id).is_some_and(|h| h.info.wtxid_relay);
+        let wtxid_relay = self
+            .peers
+            .read()
+            .get(&id)
+            .is_some_and(|h| h.info.wtxid_relay);
         // Each orphan is looked at once per message: an `inv` may name the
         // same one thousands of times, and looking at it walks its parents.
         let mut orphans_seen: HashSet<bitcoin::Wtxid> = HashSet::new();
@@ -8943,7 +9555,9 @@ impl PeerManager {
                 continue;
             }
             match &inv {
-                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => known.push(txid.to_byte_array()),
+                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                    known.push(txid.to_byte_array())
+                }
                 Inventory::WTx(wtxid) => known.push(wtxid.to_byte_array()),
                 _ => {}
             }
@@ -8984,7 +9598,10 @@ impl PeerManager {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    let have = if self.orphanage.contains_wtxid(&bitcoin::Wtxid::from_byte_array(txid.to_byte_array())) {
+                    let have = if self
+                        .orphanage
+                        .contains_wtxid(&bitcoin::Wtxid::from_byte_array(txid.to_byte_array()))
+                    {
                         // Core's `AlreadyHaveTx`: an orphan without a witness,
                         // whose wtxid is its txid.
                         true
@@ -9116,7 +9733,9 @@ impl PeerManager {
     /// request scheduler: Core's `AddTxAnnouncement`, whose `AlreadyHaveTx`
     /// half the caller has already applied.
     fn add_tx_announcements(&self, id: PeerId, gtxids: &[GenTxid]) {
-        let Some((info, wtxid_peers)) = self.tx_announcer(id) else { return };
+        let Some((info, wtxid_peers)) = self.tx_announcer(id) else {
+            return;
+        };
         let now = crate::time::now_micros();
         let mut tracker = self.tx_requests.lock();
         for gtxid in gtxids {
@@ -9128,8 +9747,17 @@ impl PeerManager {
     /// `AddTxAnnouncement` (`txdownloadman_impl.cpp`). The peer is asked for
     /// the parents still missing, as if it had announced them, and becomes
     /// one of the orphan's announcers.
-    fn add_orphan_announcer(&self, id: PeerId, orphan: &bitcoin::Transaction, wtxid: &bitcoin::Wtxid) {
-        let mut parents: Vec<bitcoin::Txid> = orphan.input.iter().map(|i| i.previous_output.txid).collect();
+    fn add_orphan_announcer(
+        &self,
+        id: PeerId,
+        orphan: &bitcoin::Transaction,
+        wtxid: &bitcoin::Wtxid,
+    ) {
+        let mut parents: Vec<bitcoin::Txid> = orphan
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .collect();
         parents.sort_unstable();
         parents.dedup();
         parents.retain(|p| !self.already_have_tx(&GenTxid::Txid(*p), false));
@@ -9138,10 +9766,17 @@ impl PeerManager {
         if parents.is_empty() {
             return;
         }
-        let Some((info, wtxid_peers)) = self.tx_announcer(id) else { return };
+        let Some((info, wtxid_peers)) = self.tx_announcer(id) else {
+            return;
+        };
         let now = crate::time::now_micros();
-        let candidate =
-            self.tx_requests.lock().add_orphan_resolution_candidate(id, &parents, info, wtxid_peers, now);
+        let candidate = self.tx_requests.lock().add_orphan_resolution_candidate(
+            id,
+            &parents,
+            info,
+            wtxid_peers,
+            now,
+        );
         if candidate {
             self.orphanage.add_announcer(wtxid, id);
             self.send_tx_requests(id);
@@ -9157,11 +9792,18 @@ impl PeerManager {
         // An orphan is looked up only by wtxid, as in Core: by txid, a
         // malleated orphan would stop the real one being fetched. A txid
         // that is also the wtxid finds an orphan without a witness.
-        if self.orphanage.contains_wtxid(&bitcoin::Wtxid::from_byte_array(gtxid.hash())) {
+        if self
+            .orphanage
+            .contains_wtxid(&bitcoin::Wtxid::from_byte_array(gtxid.hash()))
+        {
             return true;
         }
         let tip = self.chain_state.tip_hash();
-        if self.recent_rejects.lock().contains(tip, &gtxid.hash(), include_reconsiderable) {
+        if self
+            .recent_rejects
+            .lock()
+            .contains(tip, &gtxid.hash(), include_reconsiderable)
+        {
             return true;
         }
         match gtxid {
@@ -9185,7 +9827,10 @@ impl PeerManager {
         }
         // The mempool is consulted without the scheduler's lock held: its
         // read lock can wait behind a long admission.
-        let have: Vec<bool> = requestable.iter().map(|g| self.already_have_tx(g, false)).collect();
+        let have: Vec<bool> = requestable
+            .iter()
+            .map(|g| self.already_have_tx(g, false))
+            .collect();
         let mut wanted = Vec::with_capacity(requestable.len());
         {
             let mut tracker = self.tx_requests.lock();
@@ -9211,7 +9856,11 @@ impl PeerManager {
                 })
                 .collect();
             if !self.send_to_peer(id, NetworkMessage::GetData(inv)) {
-                tracing::debug!(peer = id, count = chunk.len(), "tx getdata not queued; retrying next tick");
+                tracing::debug!(
+                    peer = id,
+                    count = chunk.len(),
+                    "tx getdata not queued; retrying next tick"
+                );
                 break;
             }
             let mut tracker = self.tx_requests.lock();
@@ -9298,8 +9947,16 @@ impl PeerManager {
         // peer saying its chain ends there: what the behaviour record holds
         // its `start_height` against, once the headers are taken.
         let short_reply = headers.len() < crate::net::limits::MAX_HEADERS_RESULTS
-            && headers.first().is_none_or(|first| self.chain_state.get_block_index(&first.prev_blockhash).is_some())
-            && self.peers.read().get(&id).is_some_and(|h| h.last_getheaders_sent.is_some());
+            && headers.first().is_none_or(|first| {
+                self.chain_state
+                    .get_block_index(&first.prev_blockhash)
+                    .is_some()
+            })
+            && self
+                .peers
+                .read()
+                .get(&id)
+                .is_some_and(|h| h.last_getheaders_sent.is_some());
         let last = headers.last().map(|h| h.block_hash());
         self.process_headers_at(id, headers, now);
         if short_reply {
@@ -9313,14 +9970,20 @@ impl PeerManager {
     /// the last header of the answer, its PRESYNC height, and, for an empty
     /// answer, the top of the locator we sent, which it then holds.
     fn note_headers_served(&self, id: PeerId, last: Option<bitcoin::BlockHash>) {
-        let last_height = last.and_then(|h| self.chain_state.get_block_index(&h)).map(|e| e.height);
+        let last_height = last
+            .and_then(|h| self.chain_state.get_block_index(&h))
+            .map(|e| e.height);
         let mut peers = self.peers.write();
         let Some(h) = peers.get_mut(&id) else {
             return;
         };
         let info = &mut h.info;
         let presync = u32::try_from(info.presync_height).ok();
-        let locator_top = if last.is_none() { info.behavior.last_locator_top } else { None };
+        let locator_top = if last.is_none() {
+            info.behavior.last_locator_top
+        } else {
+            None
+        };
         let served = [info.best_known_height, last_height, presync, locator_top]
             .into_iter()
             .flatten()
@@ -9338,9 +10001,11 @@ impl PeerManager {
         // outstanding request (`m_last_getheaders_timestamp = {}`). Headers
         // that do not connect cannot be an answer and leave it standing, so
         // a peer sending them cannot draw a `getheaders` per message.
-        let answers_getheaders = headers
-            .first()
-            .is_none_or(|first| self.chain_state.get_block_index(&first.prev_blockhash).is_some());
+        let answers_getheaders = headers.first().is_none_or(|first| {
+            self.chain_state
+                .get_block_index(&first.prev_blockhash)
+                .is_some()
+        });
         if answers_getheaders && let Some(h) = self.peers.write().get_mut(&id) {
             h.last_getheaders_sent = None;
         }
@@ -9379,12 +10044,21 @@ impl PeerManager {
                 && let Some(entry) = self.chain_state.get_block_index(&last.block_hash())
             {
                 already_validated_work = already_validated_work
-                    || self.chain_state.is_ancestor_of_best_header_or_tip(&last.block_hash(), entry.height);
+                    || self
+                        .chain_state
+                        .is_ancestor_of_best_header_or_tip(&last.block_hash(), entry.height);
             }
-            if self.peers.read().get(&id).is_some_and(|h| h.info.permissions.noban) {
+            if self
+                .peers
+                .read()
+                .get(&id)
+                .is_some_and(|h| h.info.permissions.noban)
+            {
                 already_validated_work = true;
             }
-            if !already_validated_work && self.try_low_work_headers_sync(id, &chain_start, &mut headers, now) {
+            if !already_validated_work
+                && self.try_low_work_headers_sync(id, &chain_start, &mut headers, now)
+            {
                 return;
             }
         }
@@ -9400,13 +10074,17 @@ impl PeerManager {
         // A locator from our own height rows would bring a peer whose chain
         // forks below them back to the fork point, and to the same batch.
         // A headers sync in progress asks for its own next batch.
-        let batch_connected = matches!(err, None | Some(crate::chain::state::ChainError::Duplicate));
+        let batch_connected =
+            matches!(err, None | Some(crate::chain::state::ChainError::Duplicate));
         if batch_connected
             && count >= crate::net::limits::MAX_HEADERS_RESULTS
             && !have_headers_sync
             && let Some(last) = headers.last()
         {
-            self.send_getheaders(id, sync::make_getheaders_after(&self.chain_state, last.block_hash()));
+            self.send_getheaders(
+                id,
+                sync::make_getheaders_after(&self.chain_state, last.block_hash()),
+            );
         }
         // Core's `UpdateBlockAvailability`: the peer has at least the last
         // header it sent, already known or not.
@@ -9541,7 +10219,10 @@ impl PeerManager {
         {
             return Some("header with invalid proof of work");
         }
-        if headers.windows(2).any(|w| w[1].prev_blockhash != w[0].block_hash()) {
+        if headers
+            .windows(2)
+            .any(|w| w[1].prev_blockhash != w[0].block_hash())
+        {
             return Some("non-continuous headers sequence");
         }
         None
@@ -9596,13 +10277,17 @@ impl PeerManager {
         let Some(sync) = syncs.get_mut(&id) else {
             return false;
         };
-        let result = sync.process_next_headers(headers, headers.len() == crate::net::limits::MAX_HEADERS_RESULTS);
+        let result = sync.process_next_headers(
+            headers,
+            headers.len() == crate::net::limits::MAX_HEADERS_RESULTS,
+        );
         let state = sync.state();
         let next = sync.next_request_start();
         let chain_start = sync.chain_start().hash;
         let stat = PresyncStat {
             work: sync.presync_work(),
-            presync: (state == State::Presync).then(|| (sync.presync_height(), sync.presync_time())),
+            presync: (state == State::Presync)
+                .then(|| (sync.presync_height(), sync.presync_time())),
         };
         let presync_height = sync.presync_height();
         if state == State::Final {
@@ -9619,7 +10304,10 @@ impl PeerManager {
         if result.request_more
             && let Some(first) = next
         {
-            self.send_getheaders(id, sync::make_headers_sync_getheaders(&self.chain_state, first, chain_start));
+            self.send_getheaders(
+                id,
+                sync::make_headers_sync_getheaders(&self.chain_state, first, chain_start),
+            );
             tracing::debug!("more getheaders (from {first}) to peer={id}");
         }
         if state == State::Final {
@@ -9643,10 +10331,17 @@ impl PeerManager {
         let report = {
             let mut presync = self.headers_presync.lock();
             presync.stats.insert(id, stat);
-            let best_updated = match presync.best.and_then(|b| presync.stats.get(&b).map(|s| (b, *s))) {
+            let best_updated = match presync
+                .best
+                .and_then(|b| presync.stats.get(&b).map(|s| (b, *s)))
+            {
                 // The best peer is gone: find the best of the rest.
                 None => {
-                    let best = presync.stats.iter().max_by_key(|(_, s)| **s).map(|(p, _)| *p);
+                    let best = presync
+                        .stats
+                        .iter()
+                        .max_by_key(|(_, s)| **s)
+                        .map(|(p, _)| *p);
                     presync.best = best;
                     best == Some(id)
                 }
@@ -9662,7 +10357,9 @@ impl PeerManager {
             // Core reports only while the best header has less than the
             // network's minimum chain work, at most four times a second.
             let now = Instant::now();
-            let due = presync.last_report.is_none_or(|t| now.saturating_duration_since(t) >= PRESYNC_REPORT_INTERVAL);
+            let due = presync
+                .last_report
+                .is_none_or(|t| now.saturating_duration_since(t) >= PRESYNC_REPORT_INTERVAL);
             match stat.presync {
                 Some(p) if best_updated && due && !self.best_header_has_minimum_chain_work() => {
                     presync.last_report = Some(now);
@@ -9687,7 +10384,10 @@ impl PeerManager {
     fn best_header_has_minimum_chain_work(&self) -> bool {
         let best = self.chain_state.best_header_hash();
         self.chain_state.get_block_index(&best).is_some_and(|e| {
-            crate::chain::state::compare_u256(&e.chainwork, &self.chain_state.network_minimum_chain_work()) >= 0
+            crate::chain::state::compare_u256(
+                &e.chainwork,
+                &self.chain_state.network_minimum_chain_work(),
+            ) >= 0
         })
     }
 
@@ -9711,25 +10411,22 @@ impl PeerManager {
         now: u64,
     ) -> bool {
         use crate::storage::blockindex::{add_u256, work_for_bits};
-        let total_work = headers
-            .iter()
-            .fold(chain_start.chainwork, |acc, h| add_u256(&acc, &work_for_bits(h.bits)));
+        let total_work = headers.iter().fold(chain_start.chainwork, |acc, h| {
+            add_u256(&acc, &work_for_bits(h.bits))
+        });
         let threshold = self.chain_state.anti_dos_work_threshold();
         if crate::chain::state::compare_u256(&total_work, &threshold) >= 0 {
             return false;
         }
         if headers.len() == crate::net::limits::MAX_HEADERS_RESULTS {
-            let start = self.chain_state.headers_sync_chain_start(&headers[0].prev_blockhash);
+            let start = self
+                .chain_state
+                .headers_sync_chain_start(&headers[0].prev_blockhash);
             if let Some(start) = start {
                 let network = self.chain_state.network;
                 let params = crate::net::headerssync::HeadersSyncParams::for_network(network);
                 match crate::net::headerssync::HeadersSyncState::new(
-                    id,
-                    network,
-                    params,
-                    start,
-                    threshold,
-                    now,
+                    id, network, params, start, threshold, now,
                 ) {
                     Ok(sync) => {
                         self.headers_syncs.lock().insert(id, sync);
@@ -9817,7 +10514,8 @@ impl PeerManager {
     fn assign_all_peers(&self) {
         let peer_ids: Vec<PeerId> = {
             let peers = self.peers.read();
-            peers.iter()
+            peers
+                .iter()
                 .filter(|(_, h)| h.info.state == PeerState::Connected)
                 .map(|(id, _)| *id)
                 .collect()
@@ -9851,7 +10549,12 @@ impl PeerManager {
     /// [`PeerInfo::last_unknown_block`], is now indexed, so it counts as
     /// announced.
     fn process_block_availability(&self, id: PeerId) {
-        let Some(Some(hash)) = self.peers.read().get(&id).map(|h| h.info.last_unknown_block) else {
+        let Some(Some(hash)) = self
+            .peers
+            .read()
+            .get(&id)
+            .map(|h| h.info.last_unknown_block)
+        else {
             return;
         };
         let Some(entry) = self.chain_state.get_block_index(&hash) else {
@@ -9861,7 +10564,9 @@ impl PeerManager {
             let mut peers = self.peers.write();
             match peers.get_mut(&id) {
                 // A later unknown announcement replaced it: that one waits.
-                Some(h) if h.info.last_unknown_block == Some(hash) => h.info.last_unknown_block = None,
+                Some(h) if h.info.last_unknown_block == Some(hash) => {
+                    h.info.last_unknown_block = None
+                }
                 _ => return,
             }
         }
@@ -9927,8 +10632,15 @@ impl PeerManager {
             if tip_entry.height <= entry.height {
                 return false;
             }
-            if self.chain_state.active_chain_hash_at_height_indexed(tip_entry.height) == Some(*tip) {
-                return self.chain_state.active_chain_hash_at_height_indexed(entry.height) == Some(hash);
+            if self
+                .chain_state
+                .active_chain_hash_at_height_indexed(tip_entry.height)
+                == Some(*tip)
+            {
+                return self
+                    .chain_state
+                    .active_chain_hash_at_height_indexed(entry.height)
+                    == Some(hash);
             }
             if tip_entry.height - entry.height > ANNOUNCE_ANCESTRY_WALK_LIMIT {
                 return false;
@@ -9993,11 +10705,19 @@ impl PeerManager {
     /// height, so the header just received stands in for it. That header
     /// has no more work than the best known block, so a peer protected here
     /// would be protected by Core too.
-    fn note_header_announcement(&self, id: PeerId, last: &bitcoin::BlockHash, received_new_header: bool) {
+    fn note_header_announcement(
+        &self,
+        id: PeerId,
+        last: &bitcoin::BlockHash,
+        received_new_header: bool,
+    ) {
         let Some(entry) = self.chain_state.get_block_index(last) else {
             return;
         };
-        let Some(tip) = self.chain_state.get_block_index(&self.chain_state.tip_hash()) else {
+        let Some(tip) = self
+            .chain_state
+            .get_block_index(&self.chain_state.tip_hash())
+        else {
             return;
         };
         let cmp = crate::chain::state::compare_u256(&entry.chainwork, &tip.chainwork);
@@ -10036,8 +10756,16 @@ impl PeerManager {
     /// only moves where availability is recorded, and it never loses work, so
     /// checking each block recorded there fires at the same point: the first
     /// time the peer shows a block past the minimum.
-    fn maybe_send_sendheaders(&self, id: PeerId, shown: &crate::storage::blockindex::BlockIndexEntry) {
-        if crate::chain::state::compare_u256(&shown.chainwork, &self.chain_state.minimum_chain_work()) <= 0 {
+    fn maybe_send_sendheaders(
+        &self,
+        id: PeerId,
+        shown: &crate::storage::blockindex::BlockIndexEntry,
+    ) {
+        if crate::chain::state::compare_u256(
+            &shown.chainwork,
+            &self.chain_state.minimum_chain_work(),
+        ) <= 0
+        {
             return;
         }
         let mut peers = self.peers.write();
@@ -10084,7 +10812,9 @@ impl PeerManager {
         };
         let peer_height = {
             let peers = self.peers.read();
-            let Some(handle) = peers.get(&peer_id) else { return };
+            let Some(handle) = peers.get(&peer_id) else {
+                return;
+            };
             // An addr-fetch connection exists to answer one `getaddr` and go;
             // Core excludes it from block download (`CanServeBlocks`), and
             // the sync loop's `getheaders` broadcasts already do. Registering
@@ -10100,7 +10830,8 @@ impl PeerManager {
             }
             // What the peer claimed at connect, or has announced since.
             (
-                (handle.info.best_height as i64).max(handle.info.best_known_height.map_or(-1, i64::from)),
+                (handle.info.best_height as i64)
+                    .max(handle.info.best_known_height.map_or(-1, i64::from)),
                 handle.info.is_depth_limited(),
             )
         };
@@ -10114,7 +10845,9 @@ impl PeerManager {
         // need can serve none of them. Core only downloads from a peer up to
         // its `pindexBestKnownBlock`; asking the rest parks the heights on
         // them until the stall timeout.
-        let Ok(max_height) = u32::try_from(peer_height) else { return };
+        let Ok(max_height) = u32::try_from(peer_height) else {
+            return;
+        };
         let mut ibd = self.ibd.write();
         if let Some(scheduler) = ibd.as_mut() {
             if max_height <= scheduler.connect_cursor() {
@@ -10170,10 +10903,8 @@ impl PeerManager {
         else {
             return false;
         };
-        let segwit_active = crate::validation::block::segwit_active_at(
-            self.chain_state.network,
-            parent.height + 1,
-        );
+        let segwit_active =
+            crate::validation::block::segwit_active_at(self.chain_state.network, parent.height + 1);
         if crate::validation::block::is_block_mutated(block, segwit_active) {
             tracing::warn!(hash = %block.block_hash(), id, "Rejecting mutated block");
             self.add_ban_score(id, 100, "mutated-block");
@@ -10294,7 +11025,11 @@ impl PeerManager {
                 && h.info.serves_deep_blocks()
                 && h.info.services.has(ServiceFlags::WITNESS)
             {
-                if h.info.is_limited() { intact.push(*id) } else { full.push(*id) }
+                if h.info.is_limited() {
+                    intact.push(*id)
+                } else {
+                    full.push(*id)
+                }
             }
         }
         if full.is_empty() { intact } else { full }
@@ -10304,7 +11039,10 @@ impl PeerManager {
     /// for `hash`, and the request has not expired.
     fn block_refetch_registered(&self, hash: &bitcoin::BlockHash, id: PeerId) -> bool {
         let pending = self.block_refetch.read();
-        !pending.is_empty() && pending.get(&(*hash, id)).is_some_and(|at| at.elapsed() < BLOCK_REFETCH_TTL)
+        !pending.is_empty()
+            && pending
+                .get(&(*hash, id))
+                .is_some_and(|at| at.elapsed() < BLOCK_REFETCH_TTL)
     }
 
     /// Route a block that `getblockfrompeer` asked for into the repair path.
@@ -10336,17 +11074,13 @@ impl PeerManager {
         // checkpoint and signet checks `repair_block_data` deliberately does
         // not perform. Diverting it here would leave it stored and never
         // connected.
-        if !self
-            .chain_state
-            .get_block_index(&hash)
-            .is_some_and(|e| {
-                matches!(
-                    e.status,
-                    crate::storage::blockindex::BlockStatus::DataStored
-                        | crate::storage::blockindex::BlockStatus::Valid
-                )
-            })
-        {
+        if !self.chain_state.get_block_index(&hash).is_some_and(|e| {
+            matches!(
+                e.status,
+                crate::storage::blockindex::BlockStatus::DataStored
+                    | crate::storage::blockindex::BlockStatus::Valid
+            )
+        }) {
             tracing::debug!(
                 %hash, id,
                 "getblockfrompeer: not a data hole; handing to the normal block path"
@@ -10434,10 +11168,11 @@ impl PeerManager {
     /// Whether this node has asked any peer for `hash` recently enough to
     /// still expect it: Core's `IsBlockRequested`.
     fn block_is_requested(&self, hash: &bitcoin::BlockHash) -> bool {
-        self.in_flight_blocks
-            .read()
-            .values()
-            .any(|asked| asked.get(hash).is_some_and(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL))
+        self.in_flight_blocks.read().values().any(|asked| {
+            asked
+                .get(hash)
+                .is_some_and(|r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL)
+        })
     }
 
     fn handle_block(
@@ -10488,9 +11223,14 @@ impl PeerManager {
         // own data, so the scheduler has nothing to ask this peer for that it
         // is not already getting. It is here so the invariant holds at every
         // ingress rather than at the ones that happen to matter today.
-        if crate::validation::pow::check_proof_of_work_bounded(&block.header, self.chain_state.network)
-            .is_ok()
-            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
+        if crate::validation::pow::check_proof_of_work_bounded(
+            &block.header,
+            self.chain_state.network,
+        )
+        .is_ok()
+            && let Some(parent) = self
+                .chain_state
+                .get_block_index(&block.header.prev_blockhash)
         {
             self.note_peer_height(id, parent.height + 1);
         }
@@ -10516,7 +11256,9 @@ impl PeerManager {
         // of the normal connect path — accept_block would reject a
         // below-tip block as a stale side branch.
         if let Some(bg) = self.chain_state.background()
-            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
+            && let Some(parent) = self
+                .chain_state
+                .get_block_index(&block.header.prev_blockhash)
             && parent.height < bg.snapshot_height()
         {
             let height = parent.height + 1;
@@ -10541,7 +11283,9 @@ impl PeerManager {
             return;
         }
         // Normal mode
-        let _ = self.block_tx.send((id, self.peer_stats(id), block, in_flight, requested, false));
+        let _ = self
+            .block_tx
+            .send((id, self.peer_stats(id), block, in_flight, requested, false));
     }
 
     /// While an AssumeUTXO background validator is attached, refuse to
@@ -10558,7 +11302,10 @@ impl PeerManager {
             Some(b) => b,
             None => return false,
         };
-        let height = match self.chain_state.get_block_index(&block.header.prev_blockhash) {
+        let height = match self
+            .chain_state
+            .get_block_index(&block.header.prev_blockhash)
+        {
             // Parent unknown — store_block rejects with BadPrevBlock and
             // never writes a height→hash mapping, so it cannot poison.
             None => return false,
@@ -10608,8 +11355,14 @@ impl PeerManager {
         // in the current block file until the tip reaches it, and keeps that
         // file from being pruned (#1154).
         if !requested
-            && let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash)
-            && self.ibd.read().as_ref().is_some_and(|s| !s.expects(parent.height + 1, &hash))
+            && let Some(parent) = self
+                .chain_state
+                .get_block_index(&block.header.prev_blockhash)
+            && self
+                .ibd
+                .read()
+                .as_ref()
+                .is_some_and(|s| !s.expects(parent.height + 1, &hash))
         {
             tracing::debug!(
                 %hash,
@@ -10629,10 +11382,18 @@ impl PeerManager {
         // is indexed on the store thread, which may wait for the accept lock
         // where this task must not.
         let mut header_only = false;
-        if let Some(parent) = self.chain_state.get_block_index(&block.header.prev_blockhash) {
+        if let Some(parent) = self
+            .chain_state
+            .get_block_index(&block.header.prev_blockhash)
+        {
             let height = parent.height + 1;
-            let canonical = self.chain_state.is_ancestor_of_best_header_or_tip(&hash, height);
-            match self.chain_state.peer_block_gate(&block.header, requested || canonical) {
+            let canonical = self
+                .chain_state
+                .is_ancestor_of_best_header_or_tip(&hash, height);
+            match self
+                .chain_state
+                .peer_block_gate(&block.header, requested || canonical)
+            {
                 crate::chain::state::PeerBlockGate::Process => {}
                 crate::chain::state::PeerBlockGate::TooLittleChainwork => {
                     tracing::debug!(%hash, height, peer = id, "IBD: block refused: too-little-chainwork");
@@ -10651,7 +11412,12 @@ impl PeerManager {
             .get_block_index(&block.header.prev_blockhash)
             .map(|parent| parent.height + 1)
             .filter(|&height| {
-                !header_only && self.ibd.write().as_mut().is_some_and(|s| s.block_arrived(id, height, hash))
+                !header_only
+                    && self
+                        .ibd
+                        .write()
+                        .as_mut()
+                        .is_some_and(|s| s.block_arrived(id, height, hash))
             });
         let size = block.total_size();
         let job = crate::net::ibd_store::IbdStoreJob {
@@ -10676,7 +11442,10 @@ impl PeerManager {
     pub(crate) fn wait_for_ibd_stores(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.ibd_store_queue.is_idle() {
-            assert!(Instant::now() < deadline, "the IBD store queue did not drain");
+            assert!(
+                Instant::now() < deadline,
+                "the IBD store queue did not drain"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -10717,7 +11486,9 @@ impl PeerManager {
         impl Drop for CloseOnExit<'_> {
             fn drop(&mut self) {
                 if std::thread::panicking() {
-                    tracing::error!("headers thread panicked; handling headers on the P2P task from now on");
+                    tracing::error!(
+                        "headers thread panicked; handling headers on the P2P task from now on"
+                    );
                 }
                 self.0.close();
             }
@@ -10790,7 +11561,11 @@ impl PeerManager {
                 }
             }
         }
-        let close = CloseOnExit { queue, peer_manager, current: std::cell::Cell::new(None) };
+        let close = CloseOnExit {
+            queue,
+            peer_manager,
+            current: std::cell::Cell::new(None),
+        };
         loop {
             if *shutdown.borrow() || peer_manager.strong_count() == 0 {
                 return;
@@ -10801,7 +11576,9 @@ impl PeerManager {
             let Some(pm) = peer_manager.upgrade() else {
                 return;
             };
-            close.current.set(job.arrived_at.map(|h| (h, job.block.block_hash())));
+            close
+                .current
+                .set(job.arrived_at.map(|h| (h, job.block.block_hash())));
             pm.store_ibd_block(job);
             close.current.set(None);
             drop(pm);
@@ -10814,12 +11591,23 @@ impl PeerManager {
     /// historical block additionally wakes the background connector. Runs on
     /// the IBD store thread, or inline when its queue is full.
     fn store_ibd_block(&self, job: crate::net::ibd_store::IbdStoreJob) {
-        let crate::net::ibd_store::IbdStoreJob { peer: id, block, arrived_at, in_flight, size: _, header_only } = job;
+        let crate::net::ibd_store::IbdStoreJob {
+            peer: id,
+            block,
+            arrived_at,
+            in_flight,
+            size: _,
+            header_only,
+        } = job;
         let hash = block.block_hash();
         if header_only {
             match self.chain_state.accept_header(&block.header) {
-                Ok(_) | Err(crate::chain::state::ChainError::Duplicate) => self.apply_header_row_changes(),
-                Err(e) => tracing::debug!(%hash, peer = id, error = %e, "IBD: unrequested block's header refused"),
+                Ok(_) | Err(crate::chain::state::ChainError::Duplicate) => {
+                    self.apply_header_row_changes()
+                }
+                Err(e) => {
+                    tracing::debug!(%hash, peer = id, error = %e, "IBD: unrequested block's header refused")
+                }
             }
             drop(in_flight);
             return;
@@ -10827,8 +11615,10 @@ impl PeerManager {
         let result = self.chain_state.store_block(&block);
         // A failed store leaves the height owed again, to time out and go to
         // another peer as it would have before the block arrived.
-        if !matches!(result, Ok(_) | Err(crate::chain::state::ChainError::Duplicate))
-            && let Some(height) = arrived_at
+        if !matches!(
+            result,
+            Ok(_) | Err(crate::chain::state::ChainError::Duplicate)
+        ) && let Some(height) = arrived_at
             && let Some(scheduler) = self.ibd.write().as_mut()
         {
             scheduler.block_store_failed(height, hash);
@@ -10975,7 +11765,11 @@ impl PeerManager {
     /// `noban`, manual and local peers in `add_ban_score`).
     fn punish_block_source(&self, hash: &bitcoin::BlockHash, reason: &str) {
         if let Some(id) = self.block_sources.lock().take(hash) {
-            self.add_ban_score(id, BAN_THRESHOLD, &format!("invalid block {hash}: {reason}"));
+            self.add_ban_score(
+                id,
+                BAN_THRESHOLD,
+                &format!("invalid block {hash}: {reason}"),
+            );
         }
     }
 
@@ -11002,7 +11796,9 @@ impl PeerManager {
         use crate::storage::blockindex::BlockStatus;
         let hash = block.block_hash();
         let invalid = |h: &bitcoin::BlockHash| {
-            self.chain_state.get_block_index(h).is_some_and(|x| x.status == BlockStatus::Invalid)
+            self.chain_state
+                .get_block_index(h)
+                .is_some_and(|x| x.status == BlockStatus::Invalid)
         };
         let mut failed = block.header.prev_blockhash;
         if !invalid(&failed) {
@@ -11012,7 +11808,10 @@ impl PeerManager {
             }
             return;
         }
-        while let Some(parent) = self.chain_state.get_block_index(&failed).map(|x| x.header.prev_blockhash)
+        while let Some(parent) = self
+            .chain_state
+            .get_block_index(&failed)
+            .map(|x| x.header.prev_blockhash)
             && invalid(&parent)
         {
             failed = parent;
@@ -11076,7 +11875,10 @@ impl PeerManager {
         self.bg_downloader.write().release_stale(now);
 
         // Heights we still need data for, within the read-ahead window.
-        let range = self.bg_downloader.read().wanted_range(cursor, snapshot_height);
+        let range = self
+            .bg_downloader
+            .read()
+            .wanted_range(cursor, snapshot_height);
         if range.is_empty() {
             return;
         }
@@ -11107,7 +11909,9 @@ impl PeerManager {
         }
 
         let assignments =
-            self.bg_downloader.write().assign(&needed, &peer_ids, BG_CATCHUP_PER_PEER, now);
+            self.bg_downloader
+                .write()
+                .assign(&needed, &peer_ids, BG_CATCHUP_PER_PEER, now);
         for (pid, hashes) in assignments {
             for chunk in hashes.chunks(128) {
                 self.send_to_peer(pid, sync::make_getdata_blocks(chunk));
@@ -11125,7 +11929,9 @@ impl PeerManager {
             .filter(|(_, h)| {
                 h.info.state == PeerState::Connected
                     && h.info.serves_blocks()
-                    && h.info.services.has(ServiceFlags::NETWORK | ServiceFlags::WITNESS)
+                    && h.info
+                        .services
+                        .has(ServiceFlags::NETWORK | ServiceFlags::WITNESS)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -11155,7 +11961,10 @@ impl PeerManager {
         restore.peers = peers.len();
         let stalled = restore.release_stale(now);
         if stalled > 0 {
-            tracing::debug!(stalled, "OP_RETURN restore: stalled requests given to other peers");
+            tracing::debug!(
+                stalled,
+                "OP_RETURN restore: stalled requests given to other peers"
+            );
         }
         let report = |restore: &crate::net::opreturn_restore::RestoreDownloader, status| {
             cs.set_opreturn_restore_status(status, Some(restore.progress()));
@@ -11174,7 +11983,9 @@ impl PeerManager {
                     if work.is_empty() {
                         // The last block is restored; the strip worker's
                         // finish step has yet to run.
-                        tracing::debug!("OP_RETURN restore: no stripped block to download in this pass");
+                        tracing::debug!(
+                            "OP_RETURN restore: no stripped block to download in this pass"
+                        );
                     } else {
                         tracing::info!(
                             blocks = work.len(),
@@ -11208,9 +12019,12 @@ impl PeerManager {
                         let descending = self.is_pruning();
                         tokio::task::spawn_blocking(move || {
                             // A read only: nothing it could leave half done.
-                            *slot.lock() = Some(load_restore_work(std::panic::AssertUnwindSafe(|| {
-                                chain.opreturn_restore_work(descending).map_err(|e| e.to_string())
-                            })));
+                            *slot.lock() =
+                                Some(load_restore_work(std::panic::AssertUnwindSafe(|| {
+                                    chain
+                                        .opreturn_restore_work(descending)
+                                        .map_err(|e| e.to_string())
+                                })));
                         });
                     }
                     report(restore, WorkerStatus::Restoring);
@@ -11275,9 +12089,15 @@ impl PeerManager {
         let test_free = (cs.network == bitcoin::Network::Regtest)
             .then(|| std::env::var_os(RESTORE_TEST_FREE_SPACE_ENV))
             .flatten()
-            .map(|path| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok()));
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            });
         if test_free.is_none()
-            && restore.disk_checked_at.is_some_and(|at| now.duration_since(at) < RECHECK)
+            && restore
+                .disk_checked_at
+                .is_some_and(|at| now.duration_since(at) < RECHECK)
         {
             return false;
         }
@@ -11291,10 +12111,16 @@ impl PeerManager {
             return true;
         };
         let (apparent, allocated) = cs.blocks_dir_usage().unwrap_or((0, 0));
-        let needed = apparent.saturating_sub(allocated).min(restore.remaining_bytes());
+        let needed = apparent
+            .saturating_sub(allocated)
+            .min(restore.remaining_bytes());
         if free >= needed.saturating_add(RESERVE) {
             if restore.disk_wait_since.take().is_some() {
-                tracing::info!(free, needed, "OP_RETURN restore: enough free space again; resuming");
+                tracing::info!(
+                    free,
+                    needed,
+                    "OP_RETURN restore: enough free space again; resuming"
+                );
             }
             restore.disk_checked_at = None;
             return true;
@@ -11342,7 +12168,10 @@ impl PeerManager {
             return;
         }
         let progress = restore.progress();
-        self.chain_state.set_opreturn_restore_status(crate::chain::state::WorkerStatus::Restoring, Some(progress));
+        self.chain_state.set_opreturn_restore_status(
+            crate::chain::state::WorkerStatus::Restoring,
+            Some(progress),
+        );
         let done = restore.restored_blocks();
         if done.is_multiple_of(RESTORE_PROGRESS_EVERY) {
             let rate = restore.rate(Instant::now());
@@ -11542,8 +12371,7 @@ impl PeerManager {
                             handoff_retry_failures += 1;
                             let failing_since =
                                 *handoff_first_failure.get_or_insert_with(Instant::now);
-                            handoff_backoff =
-                                (handoff_backoff * 2).min(timing.handoff_max_backoff);
+                            handoff_backoff = (handoff_backoff * 2).min(timing.handoff_max_backoff);
                             if failing_since.elapsed() >= timing.handoff_warn_after {
                                 // Raised again on every failure, not only the
                                 // first: a repeat raise refreshes the
@@ -11922,14 +12750,26 @@ impl PeerManager {
 
             // Drain all available blocks from the channel. Each block's
             // in-flight guard is counted out at the end of its iteration.
-            while let Ok((sender, sender_stats, block, _in_flight, requested, via_compact)) = rx.try_recv() {
+            while let Ok((sender, sender_stats, block, _in_flight, requested, via_compact)) =
+                rx.try_recv()
+            {
                 let hash = block.block_hash();
                 // A block whose parent has no index entry cannot connect yet,
                 // and `accept_block` would refuse it as `PrevBlockNotFound`.
                 // It skips that and the fee pass below, which looks up a coin
                 // per input.
-                if chain_state.get_block_index(&block.header.prev_blockhash).is_none() {
-                    Self::hold_for_parent(&mut orphan_blocks, sender, block, requested, network, &peer_manager);
+                if chain_state
+                    .get_block_index(&block.header.prev_blockhash)
+                    .is_none()
+                {
+                    Self::hold_for_parent(
+                        &mut orphan_blocks,
+                        sender,
+                        block,
+                        requested,
+                        network,
+                        &peer_manager,
+                    );
                     continue;
                 }
                 // Core's `AcceptBlock` gates, before anything is stored. A
@@ -12007,9 +12847,7 @@ impl PeerManager {
                         // `getblock` reports at `confirmations: -1`. The fee
                         // estimator would likewise sample a block that never
                         // confirmed.
-                        if let Some(height) =
-                            chain_state.connected_height(&acceptance)
-                        {
+                        if let Some(height) = chain_state.connected_height(&acceptance) {
                             fee_estimator.record_block(&fees);
                             mempool.remove_for_block(&block, height);
                             reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &block);
@@ -12042,7 +12880,12 @@ impl PeerManager {
                                             };
                                             fee_estimator.record_block(&b_fees);
                                             mempool.remove_for_block(&b, h);
-                                            reconsider_orphans_on_block(&orphanage, &mempool, &chain_state, &b);
+                                            reconsider_orphans_on_block(
+                                                &orphanage,
+                                                &mempool,
+                                                &chain_state,
+                                                &b,
+                                            );
                                             if let Some(pm) = peer_manager.upgrade() {
                                                 pm.forget_tx_requests_for_block(&b);
                                             }
@@ -12067,7 +12910,8 @@ impl PeerManager {
                         let _ = chain_state.flush_coin_cache();
 
                         // Periodic pruning
-                        if keep_blocks > 0 && height > keep_blocks
+                        if keep_blocks > 0
+                            && height > keep_blocks
                             && height / 1000 > last_prune_height / 1000
                         {
                             let deleted = chain_state.prune_blocks(keep_blocks);
@@ -12079,7 +12923,14 @@ impl PeerManager {
                     }
                     Err(crate::chain::state::ChainError::Duplicate) => {}
                     Err(crate::chain::state::ChainError::PrevBlockNotFound) => {
-                        Self::hold_for_parent(&mut orphan_blocks, sender, block, requested, network, &peer_manager);
+                        Self::hold_for_parent(
+                            &mut orphan_blocks,
+                            sender,
+                            block,
+                            requested,
+                            network,
+                            &peer_manager,
+                        );
                     }
                     // Core's `bad-prevblk`: nothing connects on a parent
                     // marked invalid until `reconsiderblock` clears it, so
@@ -12265,7 +13116,10 @@ impl PeerManager {
                     // in `main` as well, but only after this walk has gone
                     // on to its next block; checking here stops the walk
                     // at the target rather than past it (#873).
-                    if peer_manager.upgrade().is_some_and(|pm| pm.stop_if_at_height(block_height)) {
+                    if peer_manager
+                        .upgrade()
+                        .is_some_and(|pm| pm.stop_if_at_height(block_height))
+                    {
                         break;
                     }
                 }
@@ -12330,13 +13184,11 @@ impl PeerManager {
         // Weight-aware ETA estimator
         let target = ibd.read().as_ref().map(|s| s.target_height()).unwrap_or(0);
         let is_mainnet = network == Network::Bitcoin;
-        let mut eta_estimator = crate::ibd_eta::IbdEtaEstimator::new(
-            chain_state.tip_height(), target, is_mainnet,
-        );
+        let mut eta_estimator =
+            crate::ibd_eta::IbdEtaEstimator::new(chain_state.tip_height(), target, is_mainnet);
 
         // Start the prefetch pipeline
-        let store: Arc<dyn crate::storage::Store + Send + Sync> =
-            chain_state.store_ref().clone();
+        let store: Arc<dyn crate::storage::Store + Send + Sync> = chain_state.store_ref().clone();
         let assumevalid_active = chain_state.is_assumevalid_active();
         let primary_engine = chain_state.primary_engine();
         tracing::info!(?primary_engine, "Prefetch speculative verifier engine");
@@ -12509,8 +13361,14 @@ impl PeerManager {
                         elapsed_secs = start_time.elapsed().as_secs(),
                         "IBD batch complete, starting next batch"
                     );
-                    let effective_max_ahead = Self::resolve_max_ahead(max_ahead, headers_tip, tip_height);
-                    let new_sched = IbdScheduler::new(headers_tip, tip_height, chain_state, effective_max_ahead);
+                    let effective_max_ahead =
+                        Self::resolve_max_ahead(max_ahead, headers_tip, tip_height);
+                    let new_sched = IbdScheduler::new(
+                        headers_tip,
+                        tip_height,
+                        chain_state,
+                        effective_max_ahead,
+                    );
                     *ibd.write() = Some(new_sched);
                     connected_count = 0;
                     // Update prefetch cursor for the new batch
@@ -12524,7 +13382,9 @@ impl PeerManager {
                 // completion, so subsequent retries can attempt to
                 // checkpoint again. The BulkLoadGuard restores Normal
                 // write mode on any actual exit path.
-                chain_state.connect_phases().enter(ConnectPhase::FlushingCoinCache);
+                chain_state
+                    .connect_phases()
+                    .enter(ConnectPhase::FlushingCoinCache);
                 if let Err(e) = chain_state.flush_coin_cache() {
                     tracing::error!(
                         error = %e,
@@ -12534,7 +13394,9 @@ impl PeerManager {
                     std::thread::sleep(Duration::from_secs(2));
                     continue;
                 }
-                chain_state.connect_phases().enter(ConnectPhase::FlushDurable);
+                chain_state
+                    .connect_phases()
+                    .enter(ConnectPhase::FlushDurable);
                 if let Err(e) = chain_state.flush_durable() {
                     tracing::error!(
                         error = %e,
@@ -12558,7 +13420,9 @@ impl PeerManager {
                 Some(h) => h,
                 None => {
                     // No header for this height yet — wait
-                    chain_state.connect_phases().enter(ConnectPhase::WaitingForHeader);
+                    chain_state
+                        .connect_phases()
+                        .enter(ConnectPhase::WaitingForHeader);
                     let (lock, cvar) = &**connect_signal;
                     let mut ready = lock.lock();
                     *ready = false;
@@ -12573,20 +13437,27 @@ impl PeerManager {
                 let connect_start = Instant::now();
                 let connect_result = match prefetch_handle.take_block(next_height) {
                     Some(pre) if pre.hash == hash => {
-                        perf.prefetch_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        perf.prefetch_hits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let spec_count = pre.script_verified_txs.len() as u64;
                         if spec_count > 0 {
-                            perf.spec_verify_skipped.fetch_add(spec_count, std::sync::atomic::Ordering::Relaxed);
+                            perf.spec_verify_skipped
+                                .fetch_add(spec_count, std::sync::atomic::Ordering::Relaxed);
                         }
                         chain_state.connect_preprocessed_block(pre)
                     }
                     _ => {
-                        perf.prefetch_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        perf.prefetch_misses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         chain_state.connect_stored_block(&hash)
                     }
                 };
-                perf.connect_ns.fetch_add(connect_start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                perf.connect_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                perf.connect_ns.fetch_add(
+                    connect_start.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                perf.connect_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 match connect_result {
                     Ok(_) => {
@@ -12603,7 +13474,9 @@ impl PeerManager {
                         }
                         // Clear any prior connect-failure warnings now that
                         // we've made forward progress.
-                        chain_state.warnings().clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
+                        chain_state
+                            .warnings()
+                            .clear(crate::warnings::CONNECT_PERSISTENT_FAILURE);
                         chain_state.warnings().clear("connect.retry");
                         // Update scheduler connect cursor
                         {
@@ -12630,7 +13503,9 @@ impl PeerManager {
 
                         // Flush when the buffered delta reaches the budget (caps memory usage)
                         if chain_state.coin_cache_needs_flush() {
-                            chain_state.connect_phases().enter(ConnectPhase::FlushingCoinCache);
+                            chain_state
+                                .connect_phases()
+                                .enter(ConnectPhase::FlushingCoinCache);
                             if let Err(e) = chain_state.flush_coin_cache() {
                                 tracing::error!("Failed to flush cache: {}", e);
                                 chain_state.warnings().record(
@@ -12640,7 +13515,9 @@ impl PeerManager {
                                     serde_json::json!({ "height": next_height, "error": e.to_string() }),
                                 );
                             } else {
-                                chain_state.warnings().clear("storage.flush_coin_cache_failed");
+                                chain_state
+                                    .warnings()
+                                    .clear("storage.flush_coin_cache_failed");
                             }
                             chain_state.connect_phases().enter(ConnectPhase::Idle);
                         }
@@ -12651,32 +13528,40 @@ impl PeerManager {
                             let rate = connected_count / elapsed;
                             let (dl, inf, pend, _) = {
                                 let sched = ibd.read();
-                                sched.as_ref()
-                                    .map(|s| s.progress())
-                                    .unwrap_or((0, 0, 0, 0))
+                                sched.as_ref().map(|s| s.progress()).unwrap_or((0, 0, 0, 0))
                             };
                             // Transfer cache perf counters and report
                             {
                                 let store = chain_state.store_ref();
                                 perf.cache_dirty_hits.fetch_add(
-                                    store.perf_dirty_hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+                                    store
+                                        .perf_dirty_hits
+                                        .swap(0, std::sync::atomic::Ordering::Relaxed),
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
                                 perf.cache_clean_hits.fetch_add(
-                                    store.perf_clean_hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+                                    store
+                                        .perf_clean_hits
+                                        .swap(0, std::sync::atomic::Ordering::Relaxed),
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
                                 perf.cache_store_misses.fetch_add(
-                                    store.perf_store_misses.swap(0, std::sync::atomic::Ordering::Relaxed),
+                                    store
+                                        .perf_store_misses
+                                        .swap(0, std::sync::atomic::Ordering::Relaxed),
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
                             }
                             perf.report(next_height);
 
                             // Feed the ETA estimator with this interval's wall-clock time
-                            let interval_ms = perf.last_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+                            let interval_ms = perf
+                                .last_interval_ms
+                                .load(std::sync::atomic::Ordering::Relaxed);
                             eta_estimator.record_interval(next_height, interval_ms as f64 / 1000.0);
-                            let eta_str = match eta_estimator.estimate_eta(next_height, target_height) {
+                            let eta_str = match eta_estimator
+                                .estimate_eta(next_height, target_height)
+                            {
                                 Some(secs) => {
                                     ibd_eta_secs.store(secs, std::sync::atomic::Ordering::Relaxed);
                                     format!("ETA: {}", crate::ibd_eta::format_eta(secs))
@@ -12709,12 +13594,17 @@ impl PeerManager {
                             // always has the blocks it must reconnect.
                         }
                         // Periodic pruning
-                        if keep_blocks > 0 && next_height > keep_blocks
+                        if keep_blocks > 0
+                            && next_height > keep_blocks
                             && next_height / 1000 > *last_prune_height / 1000
                         {
                             let deleted = chain_state.prune_blocks(keep_blocks);
                             if deleted > 0 {
-                                tracing::info!(height = next_height, deleted, "Pruned old block files");
+                                tracing::info!(
+                                    height = next_height,
+                                    deleted,
+                                    "Pruned old block files"
+                                );
                             }
                             *last_prune_height = next_height;
                         }
@@ -12787,10 +13677,11 @@ impl PeerManager {
                             // pulls the fork (missing_blocks_for_best_header_
                             // chain) and runs ActivateBestChain — exactly what
                             // a restart would do, without the restart.
-                            if matches!(e,
-                                    crate::chain::state::ChainError::PrevBlockNotFound
-                                    | crate::chain::state::ChainError::BadPrevBlock)
-                                && chain_state.best_header_beats_active_tip()
+                            if matches!(
+                                e,
+                                crate::chain::state::ChainError::PrevBlockNotFound
+                                    | crate::chain::state::ChainError::BadPrevBlock
+                            ) && chain_state.best_header_beats_active_tip()
                             {
                                 // Gate on PrevBlockNotFound/BadPrevBlock specifically: best_header_
                                 // beats_active_tip() is true for ~all of IBD, so
@@ -12880,7 +13771,9 @@ impl PeerManager {
                                 &e,
                             );
                         }
-                        chain_state.connect_phases().enter(ConnectPhase::CondvarWait);
+                        chain_state
+                            .connect_phases()
+                            .enter(ConnectPhase::CondvarWait);
                         let (lock, cvar) = &**connect_signal;
                         let mut ready = lock.lock();
                         *ready = false;
@@ -12891,7 +13784,9 @@ impl PeerManager {
                 }
             } else {
                 // Next block not downloaded yet — wait for signal
-                chain_state.connect_phases().enter(ConnectPhase::WaitingForBlockData);
+                chain_state
+                    .connect_phases()
+                    .enter(ConnectPhase::WaitingForBlockData);
                 // Diagnostic for the wedge class where the connector spins
                 // forever on a HeaderOnly entry whose data never arrives.
                 // Once the wait on this height passes the threshold, log a
@@ -13068,8 +13963,14 @@ impl PeerManager {
         // orphan may pay for as a 1-parent-1-child package, but not two.
         // It looks each parent up by txid, as here.
         let hit = tip == validated_at
-            && (missing.iter().any(|p| rejects.contains(tip, p.as_byte_array(), false))
-                || missing.iter().filter(|p| rejects.contains_reconsiderable(tip, p.as_byte_array())).count() > 1);
+            && (missing
+                .iter()
+                .any(|p| rejects.contains(tip, p.as_byte_array(), false))
+                || missing
+                    .iter()
+                    .filter(|p| rejects.contains_reconsiderable(tip, p.as_byte_array()))
+                    .count()
+                    > 1);
         if hit {
             rejects.insert(tip, txid.as_byte_array(), Rejection::Rejected);
             rejects.insert(tip, wtxid.as_byte_array(), Rejection::Rejected);
@@ -13092,12 +13993,17 @@ impl PeerManager {
     /// carrying no witness, which may be a valid one stripped of its witness
     /// (`TX_WITNESS_STRIPPED`). Core spots that case by the spent outputs;
     /// leaving every witness-less script failure out costs at most a fetch.
-    fn rejection_kind(e: &MempoolError, has_witness: bool) -> Option<crate::net::recent_rejects::Rejection> {
+    fn rejection_kind(
+        e: &MempoolError,
+        has_witness: bool,
+    ) -> Option<crate::net::recent_rejects::Rejection> {
         use crate::net::recent_rejects::Rejection;
         match e {
             // The replacement refusal it wraps decides.
             MempoolError::SiblingEviction(inner) => Self::rejection_kind(inner, has_witness),
-            MempoolError::AlreadyExists | MempoolError::MissingInputs | MempoolError::Quarantined(_) => None,
+            MempoolError::AlreadyExists
+            | MempoolError::MissingInputs
+            | MempoolError::Quarantined(_) => None,
             MempoolError::Script(..) | MempoolError::PolicyScript(..) if !has_witness => None,
             // `TX_RECONSIDERABLE`: the fee, and nothing else, is short.
             MempoolError::InsufficientFee(..)
@@ -13117,16 +14023,28 @@ impl PeerManager {
     ///
     /// `validated_at` is the tip the mempool judged `tx` against; nothing
     /// is recorded if the tip has moved since.
-    fn record_rejection(&self, tx: &bitcoin::Transaction, e: &MempoolError, validated_at: bitcoin::BlockHash) {
+    fn record_rejection(
+        &self,
+        tx: &bitcoin::Transaction,
+        e: &MempoolError,
+        validated_at: bitcoin::BlockHash,
+    ) {
         let has_witness = tx.input.iter().any(|i| !i.witness.is_empty());
-        let Some(kind) = Self::rejection_kind(e, has_witness) else { return };
+        let Some(kind) = Self::rejection_kind(e, has_witness) else {
+            return;
+        };
         // Core's wtxid: for a transaction with no inputs, the txid
         // (`validation::decode::wtxid`), which is what peers announce it by.
         let mut hashes = vec![crate::validation::decode::wtxid(tx).to_byte_array()];
         if has_witness && matches!(e, MempoolError::NonStandardInputs(_)) {
             hashes.push(tx.compute_txid().to_byte_array());
         }
-        self.recent_rejects.lock().insert_if_tip(validated_at, self.chain_state.tip_hash(), &hashes, kind);
+        self.recent_rejects.lock().insert_if_tip(
+            validated_at,
+            self.chain_state.tip_hash(),
+            &hashes,
+            kind,
+        );
     }
 
     fn handle_tx(&self, id: PeerId, tx: bitcoin::Transaction) {
@@ -13150,7 +14068,11 @@ impl PeerManager {
         // Core's `AddKnownTx`: the sender has it, by the id it relays by, so
         // it is not announced back.
         if let Some(h) = self.peers.write().get_mut(&id) {
-            let hash = if h.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+            let hash = if h.info.wtxid_relay {
+                wtxid.to_byte_array()
+            } else {
+                txid.to_byte_array()
+            };
             h.tx_relay.add_known(&hash);
         }
         // Core's `TxDownloadManagerImpl::ReceivedTx`: the peer answered, by
@@ -13265,10 +14187,14 @@ impl PeerManager {
                         for peer in std::iter::once(id).chain(other_announcers) {
                             if let Some((info, wtxid_peers)) = self.tx_announcer(peer) {
                                 let now = crate::time::now_micros();
-                                let candidate = self
-                                    .tx_requests
-                                    .lock()
-                                    .add_orphan_resolution_candidate(peer, &parents, info, wtxid_peers, now);
+                                let candidate =
+                                    self.tx_requests.lock().add_orphan_resolution_candidate(
+                                        peer,
+                                        &parents,
+                                        info,
+                                        wtxid_peers,
+                                        now,
+                                    );
                                 if candidate && peer != id {
                                     self.orphanage.add_announcer(&wtxid, peer);
                                 }
@@ -13320,7 +14246,11 @@ impl PeerManager {
                     Self::rejection_kind(&e, has_witness),
                     Some(crate::net::recent_rejects::Rejection::Reconsiderable)
                 );
-                let package = if reconsiderable { self.find_1p1c_package(&tx, id) } else { None };
+                let package = if reconsiderable {
+                    self.find_1p1c_package(&tx, id)
+                } else {
+                    None
+                };
                 // Core's `MempoolRejectedTx` forgets the wtxid, and the txid
                 // only for `TX_INPUTS_NOT_STANDARD`, where no witness could
                 // make it acceptable: another peer may still offer a
@@ -13334,14 +14264,16 @@ impl PeerManager {
                 // so forgetting it would drop the other announcers of the
                 // txid, the peers that can send the witnessed copy. The
                 // sender's own announcement was answered above.
-                let witness_stripped =
-                    !has_witness && matches!(e, MempoolError::Script(..) | MempoolError::PolicyScript(..));
+                let witness_stripped = !has_witness
+                    && matches!(e, MempoolError::Script(..) | MempoolError::PolicyScript(..));
                 if matches!(e, MempoolError::AlreadyExists)
                     || (has_witness && matches!(e, MempoolError::NonStandardInputs(_)))
                 {
                     self.forget_tx_requests(txid, wtxid);
                 } else if !witness_stripped {
-                    self.tx_requests.lock().forget_tx_hash(&wtxid.to_byte_array());
+                    self.tx_requests
+                        .lock()
+                        .forget_tx_hash(&wtxid.to_byte_array());
                 }
                 // No refusal of a relayed transaction is misbehaviour: Core
                 // v30 removed `MaybePunishNodeForTx` (266dd0e10d), which
@@ -13355,7 +14287,8 @@ impl PeerManager {
                 // reconstruction (Core's first-time-reject insertion). A
                 // consensus-invalid transaction is not kept, and one we
                 // already hold is not a rejection.
-                let consensus_invalid = matches!(e, MempoolError::Script(..) | MempoolError::BadAmounts);
+                let consensus_invalid =
+                    matches!(e, MempoolError::Script(..) | MempoolError::BadAmounts);
                 if !consensus_invalid && !matches!(e, MempoolError::AlreadyExists) {
                     if package.is_some() {
                         self.keep_for_reconstruction(tx.clone());
@@ -13376,10 +14309,16 @@ impl PeerManager {
     /// children are looked at, so another peer cannot crowd the real one
     /// out with fakes. The newest goes first. A pairing already refused as
     /// a package, or a child refused outright, is passed over.
-    fn find_1p1c_package(&self, parent: &bitcoin::Transaction, peer: PeerId) -> Option<bitcoin::Transaction> {
+    fn find_1p1c_package(
+        &self,
+        parent: &bitcoin::Transaction,
+        peer: PeerId,
+    ) -> Option<bitcoin::Transaction> {
         let parent_wtxid = crate::validation::decode::wtxid(parent);
         let tip = self.chain_state.tip_hash();
-        let candidates = self.orphanage.children_from_peer(&parent.compute_txid(), peer);
+        let candidates = self
+            .orphanage
+            .children_from_peer(&parent.compute_txid(), peer);
         let mut rejects = self.recent_rejects.lock();
         candidates.into_iter().find(|child| {
             let child_wtxid = crate::validation::decode::wtxid(child);
@@ -13396,11 +14335,18 @@ impl PeerManager {
     /// transaction: announced, its requests forgotten, its orphans
     /// reconsidered. Each refused member is recorded by its own error, as a
     /// transaction refused on its own is.
-    fn submit_1p1c_package(&self, peer: PeerId, parent: bitcoin::Transaction, child: bitcoin::Transaction) {
+    fn submit_1p1c_package(
+        &self,
+        peer: PeerId,
+        parent: bitcoin::Transaction,
+        child: bitcoin::Transaction,
+    ) {
         let validated_at = self.chain_state.tip_hash();
         let members = [parent, child];
-        let ids: Vec<(bitcoin::Txid, bitcoin::Wtxid)> =
-            members.iter().map(|tx| (tx.compute_txid(), crate::validation::decode::wtxid(tx))).collect();
+        let ids: Vec<(bitcoin::Txid, bitcoin::Wtxid)> = members
+            .iter()
+            .map(|tx| (tx.compute_txid(), crate::validation::decode::wtxid(tx)))
+            .collect();
         let result = self.mempool.accept_package_from(
             members.to_vec(),
             &self.chain_state,
@@ -13444,7 +14390,9 @@ impl PeerManager {
                 tracing::debug!(%txid, %wtxid, peer, "was not accepted in its package: {}", e.state_string());
                 self.record_rejection(tx, e, validated_at);
                 if !matches!(e, MempoolError::MissingInputs) {
-                    self.tx_requests.lock().forget_tx_hash(&wtxid.to_byte_array());
+                    self.tx_requests
+                        .lock()
+                        .forget_tx_hash(&wtxid.to_byte_array());
                     self.orphanage.erase(wtxid);
                 }
             }
@@ -13566,9 +14514,11 @@ impl PeerManager {
                 }
                 let msg = match &compact {
                     Some(c) if handle.info.hb_from && handle.info.compact_blocks => {
-                        NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
-                            compact_block: (**c).clone(),
-                        })
+                        NetworkMessage::CmpctBlock(
+                            bitcoin::p2p::message_compact_blocks::CmpctBlock {
+                                compact_block: (**c).clone(),
+                            },
+                        )
                     }
                     _ if handle.info.prefers_headers => headers_msg.clone(),
                     _ => inv_msg.clone(),
@@ -13576,7 +14526,9 @@ impl PeerManager {
                 let is_compact = matches!(msg, NetworkMessage::CmpctBlock(_));
                 if handle.msg_tx.try_send(msg).is_ok() {
                     if is_compact {
-                        self.compact_stats.sent_announce.fetch_add(1, Ordering::Relaxed);
+                        self.compact_stats
+                            .sent_announce
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     announced.push(*id);
                 }
@@ -13614,7 +14566,11 @@ impl PeerManager {
         let wtxid = crate::validation::decode::wtxid(&entry.tx);
         let mut peers = self.peers.write();
         for handle in peers.values_mut() {
-            let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+            let hash = if handle.info.wtxid_relay {
+                wtxid.to_byte_array()
+            } else {
+                txid.to_byte_array()
+            };
             handle.tx_relay.queue(wtxid, &hash);
         }
         drop(peers);
@@ -13649,7 +14605,8 @@ impl PeerManager {
             return;
         };
         let info = &h.info;
-        h.tx_relay.due(now, false, || self.next_inv_send_time(info, now));
+        h.tx_relay
+            .due(now, false, || self.next_inv_send_time(info, now));
         h.tx_relay.finish(std::iter::empty(), Some(sequence));
     }
 
@@ -13668,7 +14625,12 @@ impl PeerManager {
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (if info.inbound_onion { "onion" } else { info.network() }).hash(&mut h);
+            (if info.inbound_onion {
+                "onion"
+            } else {
+                info.network()
+            })
+            .hash(&mut h);
             info.bind_addr.hash(&mut h);
             h.finish()
         };
@@ -13699,7 +14661,12 @@ impl PeerManager {
                     continue;
                 }
                 let info = &h.info;
-                if !h.tx_relay.due(now, info.permissions.noban || immediate, || self.next_inv_send_time(info, now)) {
+                if !h
+                    .tx_relay
+                    .due(now, info.permissions.noban || immediate, || {
+                        self.next_inv_send_time(info, now)
+                    })
+                {
                     continue;
                 }
                 let flush = h.tx_relay.take(h.info.relays_txs());
@@ -13708,16 +14675,25 @@ impl PeerManager {
         }
         for (id, flush, wtxid_relay, fee_filter) in due {
             let relay_hash = |txid: bitcoin::Txid, wtxid: bitcoin::Wtxid| {
-                if wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() }
+                if wtxid_relay {
+                    wtxid.to_byte_array()
+                } else {
+                    txid.to_byte_array()
+                }
             };
             // The BIP 35 answer: the whole mempool, as Core sends it.
             let mut answered: Vec<(Inventory, bitcoin::Wtxid, [u8; 32])> = Vec::new();
             if flush.mempool {
                 for (txid, wtxid) in self.mempool.relay_ids_above_feerate(fee_filter) {
-                    answered.push((tx_announcement(wtxid_relay, txid, wtxid), wtxid, relay_hash(txid, wtxid)));
+                    answered.push((
+                        tx_announcement(wtxid_relay, txid, wtxid),
+                        wtxid,
+                        relay_hash(txid, wtxid),
+                    ));
                 }
             }
-            let answered_ids: HashSet<bitcoin::Wtxid> = answered.iter().map(|(_, w, _)| *w).collect();
+            let answered_ids: HashSet<bitcoin::Wtxid> =
+                answered.iter().map(|(_, w, _)| *w).collect();
             let max = tx_relay::broadcast_max(flush.queued.len());
             let mut candidates = self.mempool.relay_candidates(&flush.queued);
             candidates.retain(|c| !answered_ids.contains(&c.wtxid));
@@ -13783,7 +14759,8 @@ impl PeerManager {
             // A peer that was not sent everything chosen keeps its
             // `last_inv_sequence`, so what it was not announced stays
             // unservable to it.
-            h.tx_relay.finish(unsent, failed.is_empty().then_some(sequence));
+            h.tx_relay
+                .finish(unsent, failed.is_empty().then_some(sequence));
         }
     }
 
@@ -13917,7 +14894,9 @@ impl PeerManager {
     pub fn next_rebroadcast_delay_secs(&self) -> u64 {
         use rand::Rng as _;
         match self.rebroadcast_interval_secs.load(Ordering::Relaxed) {
-            0 => rand::thread_rng().gen_range(REBROADCAST_AUTO_MIN_SECS..=REBROADCAST_AUTO_MAX_SECS),
+            0 => {
+                rand::thread_rng().gen_range(REBROADCAST_AUTO_MIN_SECS..=REBROADCAST_AUTO_MAX_SECS)
+            }
             n => n,
         }
     }
@@ -13957,7 +14936,11 @@ impl PeerManager {
                 continue;
             }
             for (txid, wtxid, _) in &pairs {
-                let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+                let hash = if handle.info.wtxid_relay {
+                    wtxid.to_byte_array()
+                } else {
+                    txid.to_byte_array()
+                };
                 handle.tx_relay.queue(*wtxid, &hash);
             }
         }
@@ -14025,7 +15008,9 @@ impl PeerManager {
             return;
         }
         let mut peers = self.peers.write();
-        let Some(handle) = peers.get_mut(&id) else { return };
+        let Some(handle) = peers.get_mut(&id) else {
+            return;
+        };
         if handle.info.state != PeerState::Connected
             || handle.info.direction != Direction::Outbound
             || !handle.info.relays_txs()
@@ -14034,7 +15019,11 @@ impl PeerManager {
         }
         // Queued for the peer's first flush, which applies its fee filter.
         for (txid, wtxid, _) in pairs {
-            let hash = if handle.info.wtxid_relay { wtxid.to_byte_array() } else { txid.to_byte_array() };
+            let hash = if handle.info.wtxid_relay {
+                wtxid.to_byte_array()
+            } else {
+                txid.to_byte_array()
+            };
             handle.tx_relay.queue(wtxid, &hash);
         }
         drop(peers);
@@ -14067,7 +15056,10 @@ impl PeerManager {
             return;
         };
         let threshold = self.broadcast_confirm_peers.load(Ordering::Relaxed) as usize;
-        if self.mempool.record_broadcast_witness(&txid, witness_ip, threshold) {
+        if self
+            .mempool
+            .record_broadcast_witness(&txid, witness_ip, threshold)
+        {
             tracing::debug!(%txid, "local tx confirmed propagated; rebroadcast stopped");
         }
     }
@@ -14118,12 +15110,7 @@ impl PeerManager {
     /// Orphans admitted here are not relayed — peers will naturally
     /// re-announce, and the block-connect path has no peer context.
     pub fn reconsider_orphans_for_block(&self, block: &bitcoin::Block) {
-        reconsider_orphans_on_block(
-            &self.orphanage,
-            &self.mempool,
-            &self.chain_state,
-            block,
-        );
+        reconsider_orphans_on_block(&self.orphanage, &self.mempool, &self.chain_state, block);
     }
 
     /// Core's `PrepareBlockFilterRequest`: the checks a BIP 157 request
@@ -14163,7 +15150,9 @@ impl PeerManager {
                 return None;
             }
             _ => {
-                tracing::debug!("peer requested invalid block hash: {stop_hash}, disconnecting peer={id}");
+                tracing::debug!(
+                    "peer requested invalid block hash: {stop_hash}, disconnecting peer={id}"
+                );
                 self.disconnect_peer(id, "invalid-filter-request");
                 return None;
             }
@@ -14185,7 +15174,10 @@ impl PeerManager {
             return None;
         }
         // Core: "Filter index for supported type not found", no disconnect.
-        self.filter_index.get().cloned().map(|idx| (stop_height, idx))
+        self.filter_index
+            .get()
+            .cloned()
+            .map(|idx| (stop_height, idx))
     }
 
     /// The half of Core's `BlockRequestAllowed` that admits a block off the
@@ -14196,7 +15188,10 @@ impl PeerManager {
     /// `BlockStatus::Valid` is written only by `connect_block` and survives
     /// the reorg that takes the block off the active chain, as Core's
     /// `BLOCK_VALID_SCRIPTS` does.
-    fn stale_block_request_allowed(&self, entry: &crate::storage::blockindex::BlockIndexEntry) -> bool {
+    fn stale_block_request_allowed(
+        &self,
+        entry: &crate::storage::blockindex::BlockIndexEntry,
+    ) -> bool {
         const STALE_RELAY_AGE_LIMIT: i64 = 30 * 24 * 60 * 60;
         if entry.status != crate::storage::blockindex::BlockStatus::Valid {
             return false;
@@ -14226,9 +15221,13 @@ impl PeerManager {
             start_height,
             stop_hash,
         } = req;
-        let Some((stop_height, idx)) =
-            self.prepare_block_filter_request(id, filter_type, start_height, stop_hash, MAX_GETCFILTERS_SIZE)
-        else {
+        let Some((stop_height, idx)) = self.prepare_block_filter_request(
+            id,
+            filter_type,
+            start_height,
+            stop_hash,
+            MAX_GETCFILTERS_SIZE,
+        ) else {
             return;
         };
         // Stream responses via an async task with backpressure. The
@@ -14415,8 +15414,10 @@ impl PeerManager {
             let Some(entry) = self.chain_state.get_block_index(&msg.stop_hash) else {
                 return;
             };
-            let on_active_chain =
-                self.chain_state.active_chain_hash_at_height_indexed(entry.height) == Some(msg.stop_hash);
+            let on_active_chain = self
+                .chain_state
+                .active_chain_hash_at_height_indexed(entry.height)
+                == Some(msg.stop_hash);
             if !on_active_chain && !self.stale_block_request_allowed(&entry) {
                 tracing::debug!(
                     "ignoring request from peer={id} for old block header that isn't in the main chain"
@@ -14434,16 +15435,17 @@ impl PeerManager {
         let mut headers = Vec::new();
         for h in start..end {
             if let Some(hash) = self.chain_state.get_block_hash_by_height(h)
-                && let Some(entry) = self.chain_state.get_block_index(&hash) {
-                    headers.push(entry.header);
-                    // Core's `nLimit`/`hashStop` loop pushes the header and
-                    // *then* breaks on the stop hash, so the stop block is
-                    // included. Ignoring `hashStop` entirely — as this did —
-                    // answers a narrow range request with up to 2000 headers.
-                    if hash == msg.stop_hash {
-                        break;
-                    }
+                && let Some(entry) = self.chain_state.get_block_index(&hash)
+            {
+                headers.push(entry.header);
+                // Core's `nLimit`/`hashStop` loop pushes the header and
+                // *then* breaks on the stop hash, so the stop block is
+                // included. Ignoring `hashStop` entirely — as this did —
+                // answers a narrow range request with up to 2000 headers.
+                if hash == msg.stop_hash {
+                    break;
                 }
+            }
         }
 
         // Always send a Headers reply, even when empty. Bitcoin Core and
@@ -14453,11 +15455,7 @@ impl PeerManager {
         self.send_to_peer(id, NetworkMessage::Headers(headers));
     }
 
-    fn handle_getblocks(
-        &self,
-        id: PeerId,
-        msg: bitcoin::p2p::message_blockdata::GetBlocksMessage,
-    ) {
+    fn handle_getblocks(&self, id: PeerId, msg: bitcoin::p2p::message_blockdata::GetBlocksMessage) {
         if msg.locator_hashes.len() > MAX_LOCATOR_SZ {
             // Core disconnects, it does not ban: `net_processing.cpp` sets
             // `pfrom.fDisconnect = true` and returns, with no misbehaviour
@@ -14493,7 +15491,8 @@ impl PeerManager {
                 let limited = self.is_pruning()
                     || (self.chain_state.opreturn_prune_active() && !self.serves_intact_blocks());
                 if limited
-                    && (h + PRUNED_BLOCKS_LIKELY_TO_HAVE <= tip || !self.chain_state.has_block_data(&hash))
+                    && (h + PRUNED_BLOCKS_LIKELY_TO_HAVE <= tip
+                        || !self.chain_state.has_block_data(&hash))
                 {
                     break;
                 }
@@ -14516,7 +15515,9 @@ impl PeerManager {
             return None;
         }
         let entry = self.chain_state.get_block_index(hash)?;
-        if entry.height.saturating_add(compact::MAX_CMPCTBLOCK_DEPTH) < self.chain_state.tip_height() {
+        if entry.height.saturating_add(compact::MAX_CMPCTBLOCK_DEPTH)
+            < self.chain_state.tip_height()
+        {
             return None;
         }
         let compact = match self.cached_compact(hash) {
@@ -14531,7 +15532,9 @@ impl PeerManager {
         });
         let queued = self.send_to_peer(id, msg);
         if queued {
-            self.compact_stats.sent_getdata.fetch_add(1, Ordering::Relaxed);
+            self.compact_stats
+                .sent_getdata
+                .fetch_add(1, Ordering::Relaxed);
             self.note_peer_has_block(id, *hash);
         }
         Some(queued)
@@ -14541,7 +15544,11 @@ impl PeerManager {
         // Core's `MAX_INV_SZ` (`net_processing.cpp` GETDATA), checked before
         // anything in the request is looked at.
         if inventory.len() > MAX_INV_PER_MSG {
-            self.add_ban_score(id, 100, &format!("getdata message size = {}", inventory.len()));
+            self.add_ban_score(
+                id,
+                100,
+                &format!("getdata message size = {}", inventory.len()),
+            );
             return;
         }
         // Core's `ProcessMessage` line for every getdata.
@@ -14632,22 +15639,34 @@ impl PeerManager {
     /// block 50000 times, none of which queues a reply to stop the loop.
     fn block_request_refusal(&self, id: PeerId, hash: &bitcoin::BlockHash) -> Option<BlockRefusal> {
         let entry = self.chain_state.get_block_index(hash)?;
-        let on_active_chain = self.chain_state.active_chain_hash_at_height_indexed(entry.height) == Some(*hash);
+        let on_active_chain = self
+            .chain_state
+            .active_chain_hash_at_height_indexed(entry.height)
+            == Some(*hash);
         if !on_active_chain && !self.stale_block_request_allowed(&entry) {
-            tracing::debug!("ignoring request from peer={id} for old block that isn't in the main chain");
+            tracing::debug!(
+                "ignoring request from peer={id} for old block that isn't in the main chain"
+            );
             return Some(BlockRefusal::Ignore);
         }
         let services = self.local_services();
-        let below_limit = self.chain_state.tip_height().saturating_sub(entry.height) > NODE_NETWORK_LIMITED_MIN_BLOCKS + 2;
+        let below_limit = self.chain_state.tip_height().saturating_sub(entry.height)
+            > NODE_NETWORK_LIMITED_MIN_BLOCKS + 2;
         // `-pruneopreturnpeers=intact` serves deep blocks: a stripped one
         // reads as unavailable below and gets `notfound`, the peer staying.
         if !services.has(ServiceFlags::NETWORK)
             && services.has(ServiceFlags::NETWORK_LIMITED)
             && below_limit
             && !self.serves_intact_blocks()
-            && !self.peers.read().get(&id).is_some_and(|h| h.info.permissions.noban)
+            && !self
+                .peers
+                .read()
+                .get(&id)
+                .is_some_and(|h| h.info.permissions.noban)
         {
-            tracing::debug!("Ignore block request below NODE_NETWORK_LIMITED threshold, disconnecting peer={id}");
+            tracing::debug!(
+                "Ignore block request below NODE_NETWORK_LIMITED threshold, disconnecting peer={id}"
+            );
             return Some(BlockRefusal::Disconnect);
         }
         None
@@ -14740,10 +15759,13 @@ impl PeerManager {
             // exactly as if we did not hold it.
             Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_) => {
                 let (pooled, hash) = match inv {
-                    Inventory::WTx(wtxid) => (self.mempool.get_by_wtxid(&wtxid), wtxid.to_byte_array()),
-                    Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                        (self.mempool.get(&txid).map(|e| (txid, e)), txid.to_byte_array())
+                    Inventory::WTx(wtxid) => {
+                        (self.mempool.get_by_wtxid(&wtxid), wtxid.to_byte_array())
                     }
+                    Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => (
+                        self.mempool.get(&txid).map(|e| (txid, e)),
+                        txid.to_byte_array(),
+                    ),
                     _ => (None, [0; 32]),
                 };
                 // Announced to the peer (Core's `m_last_inv_sequence`). Both
@@ -14751,7 +15773,10 @@ impl PeerManager {
                 // between moves the sequence and clears the exceptions
                 // together.
                 let announced = |e: &crate::mempool::pool::MempoolEntry| {
-                    self.peers.read().get(&id).is_some_and(|h| h.tx_relay.was_announced(e.entry_sequence, &hash))
+                    self.peers
+                        .read()
+                        .get(&id)
+                        .is_some_and(|h| h.tx_relay.was_announced(e.entry_sequence, &hash))
                 };
                 let pooled = pooled.filter(|(_, e)| e.scope.assists_relay() && announced(e));
                 let (tx, pooled_txid) = match pooled {
@@ -14799,7 +15824,11 @@ impl PeerManager {
         header: &bitcoin::block::Header,
     ) -> Option<crate::storage::blockindex::BlockIndexEntry> {
         let hash = header.block_hash();
-        if self.chain_state.get_block_index(&header.prev_blockhash).is_none() {
+        if self
+            .chain_state
+            .get_block_index(&header.prev_blockhash)
+            .is_none()
+        {
             self.maybe_send_getheaders(id);
             return None;
         }
@@ -14808,7 +15837,9 @@ impl PeerManager {
         if let Some(parent) = self.chain_state.get_block_index(&header.prev_blockhash) {
             use crate::storage::blockindex::{add_u256, work_for_bits};
             let work = add_u256(&parent.chainwork, &work_for_bits(header.bits));
-            if crate::chain::state::compare_u256(&work, &self.chain_state.anti_dos_work_threshold()) < 0 {
+            if crate::chain::state::compare_u256(&work, &self.chain_state.anti_dos_work_threshold())
+                < 0
+            {
                 tracing::debug!("Ignoring low-work compact block from peer {id}");
                 return None;
             }
@@ -14898,7 +15929,9 @@ impl PeerManager {
         // One early announcement per height, and never for a lower one.
         if self
             .highest_fast_announce
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| (height > h).then_some(height))
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
+                (height > h).then_some(height)
+            })
             .is_err()
         {
             return;
@@ -14913,7 +15946,8 @@ impl PeerManager {
         let msg = NetworkMessage::CmpctBlock(bitcoin::p2p::message_compact_blocks::CmpctBlock {
             compact_block: (*compact).clone(),
         });
-        let has_header = self.peers_with_header(hash, self.chain_state.get_block_index(&hash).as_ref());
+        let has_header =
+            self.peers_with_header(hash, self.chain_state.get_block_index(&hash).as_ref());
         let mut announced = Vec::new();
         {
             let peers = self.peers.read();
@@ -14977,7 +16011,11 @@ impl PeerManager {
                 compact::prefill_candidates(block, &self.mempool, &extra)
             };
             match candidates {
-                Some(c) => compact::prefill_indexes(block, &c, self.compact_prefill_bytes.load(Ordering::Relaxed)),
+                Some(c) => compact::prefill_indexes(
+                    block,
+                    &c,
+                    self.compact_prefill_bytes.load(Ordering::Relaxed),
+                ),
                 None => {
                     tracing::debug!(%hash, "mempool busy; announcing without a prefill");
                     Vec::new()
@@ -15021,7 +16059,9 @@ impl PeerManager {
     /// for them).
     fn recent_block_tx(&self, inv: &Inventory) -> Option<bitcoin::Transaction> {
         let hash = match inv {
-            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => txid.to_byte_array(),
+            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                txid.to_byte_array()
+            }
             Inventory::WTx(wtxid) => wtxid.to_byte_array(),
             _ => return None,
         };
@@ -15032,7 +16072,10 @@ impl PeerManager {
     }
 
     /// The cached `cmpctblock` for `hash`, if it is the tip cache's block.
-    fn cached_compact(&self, hash: &bitcoin::BlockHash) -> Option<Arc<bitcoin::bip152::HeaderAndShortIds>> {
+    fn cached_compact(
+        &self,
+        hash: &bitcoin::BlockHash,
+    ) -> Option<Arc<bitcoin::bip152::HeaderAndShortIds>> {
         self.most_recent_block
             .read()
             .as_ref()
@@ -15073,8 +16116,11 @@ impl PeerManager {
                 hb.push_back(id);
                 return;
             }
-            let is_outbound =
-                |p: &PeerId| peers.get(p).is_some_and(|h| h.info.direction == Direction::Outbound);
+            let is_outbound = |p: &PeerId| {
+                peers
+                    .get(p)
+                    .is_some_and(|h| h.info.direction == Direction::Outbound)
+            };
             if handle.info.direction == Direction::Inbound
                 && hb.len() >= MAX_HB_PEERS
                 && hb.iter().filter(|p| is_outbound(p)).count() == 1
@@ -15084,7 +16130,11 @@ impl PeerManager {
                 // the pop below.
                 hb.swap(0, 1);
             }
-            let demoted = if hb.len() >= MAX_HB_PEERS { hb.pop_front() } else { None };
+            let demoted = if hb.len() >= MAX_HB_PEERS {
+                hb.pop_front()
+            } else {
+                None
+            };
             hb.push_back(id);
             (demoted, id)
         };
@@ -15099,10 +16149,25 @@ impl PeerManager {
         }
         if let Some(d) = demoted {
             tracing::debug!(peer = d, "demoting peer from high-bandwidth compact relay");
-            self.send_to_peer(d, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+            self.send_to_peer(
+                d,
+                NetworkMessage::SendCmpct(SendCmpct {
+                    send_compact: false,
+                    version: 2,
+                }),
+            );
         }
-        tracing::debug!(peer = promoted, "selecting peer for high-bandwidth compact relay");
-        self.send_to_peer(promoted, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }));
+        tracing::debug!(
+            peer = promoted,
+            "selecting peer for high-bandwidth compact relay"
+        );
+        self.send_to_peer(
+            promoted,
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: true,
+                version: 2,
+            }),
+        );
     }
 
     /// Compact block relay counters, for the metrics endpoint.
@@ -15114,7 +16179,8 @@ impl PeerManager {
     /// startup, before blocks are announced.
     pub fn set_compact_block_prefill(&self, enabled: bool, budget_bytes: usize) {
         self.compact_prefill.store(enabled, Ordering::Relaxed);
-        self.compact_prefill_bytes.store(budget_bytes, Ordering::Relaxed);
+        self.compact_prefill_bytes
+            .store(budget_bytes, Ordering::Relaxed);
     }
 
     /// Size the extra-transaction ring (`-blockreconstructionextratxn`).
@@ -15191,8 +16257,15 @@ impl PeerManager {
         // negotiated compact blocks, and Core v32 ignores its `cmpctblock`,
         // the header included (`m_provides_cmpctblocks`,
         // `net_processing.cpp:4795-4802` at v32.1).
-        if !self.peers.read().get(&id).is_some_and(|h| h.info.compact_blocks) {
-            tracing::debug!("peer={id} sent us a compact block despite never having sent us a SENDCMPCT!");
+        if !self
+            .peers
+            .read()
+            .get(&id)
+            .is_some_and(|h| h.info.compact_blocks)
+        {
+            tracing::debug!(
+                "peer={id} sent us a compact block despite never having sent us a SENDCMPCT!"
+            );
             return;
         }
 
@@ -15312,7 +16385,9 @@ impl PeerManager {
         // tip-following sweep leaves it alone; every path that gives up below
         // clears the mark, as does the block arriving or the sweep in
         // `expire_compact_state`.
-        self.compact_in_progress.write().insert(block_hash, Instant::now());
+        self.compact_in_progress
+            .write()
+            .insert(block_hash, Instant::now());
 
         // 9. Reconstruct from the mempool and the extra-transaction cache.
         let reconstruction = {
@@ -15337,7 +16412,9 @@ impl PeerManager {
                 // `READ_STATUS_FAILED` and fetches the full block without
                 // penalty; the full block then goes through `handle_block`'s
                 // mutation check, which does penalise, since we asked for it.
-                let segwit_active = self.segwit_active_after(&block.header.prev_blockhash).unwrap_or(true);
+                let segwit_active = self
+                    .segwit_active_after(&block.header.prev_blockhash)
+                    .unwrap_or(true);
                 if crate::validation::block::is_block_mutated(&block, segwit_active) {
                     tracing::debug!(
                         id, %block_hash,
@@ -15368,7 +16445,11 @@ impl PeerManager {
                     true,
                 ));
             }
-            compact::Reconstruction::Partial { txs, missing_indices, stats } => {
+            compact::Reconstruction::Partial {
+                txs,
+                missing_indices,
+                stats,
+            } => {
                 // 11. Ask the peer for what the mempool could not supply.
                 tracing::debug!(
                     %block_hash,
@@ -15409,11 +16490,7 @@ impl PeerManager {
     /// misbehaviour; a request naming no index at all disconnects the peer
     /// (Core #35832), since no honest peer sends one and answering it costs
     /// a block read, or a whole block upload when the block is deep.
-    fn handle_get_block_txn(
-        &self,
-        id: PeerId,
-        request: bitcoin::bip152::BlockTransactionsRequest,
-    ) {
+    fn handle_get_block_txn(&self, id: PeerId, request: bitcoin::bip152::BlockTransactionsRequest) {
         if request.indexes.is_empty() {
             tracing::debug!(id, hash = %request.block_hash, "getblocktxn received with no transaction indexes; disconnecting");
             self.disconnect_peer(id, "empty-getblocktxn");
@@ -15436,7 +16513,8 @@ impl PeerManager {
             tracing::debug!(id, hash = %request.block_hash, "getblocktxn for a block we don't have");
             return;
         };
-        if entry.height.saturating_add(compact::MAX_BLOCKTXN_DEPTH) < self.chain_state.tip_height() {
+        if entry.height.saturating_add(compact::MAX_BLOCKTXN_DEPTH) < self.chain_state.tip_height()
+        {
             tracing::debug!(
                 id, hash = %request.block_hash,
                 "getblocktxn for a block more than {} deep; sending the full block",
@@ -15464,11 +16542,9 @@ impl PeerManager {
             Ok(txns) => {
                 self.send_to_peer(
                     id,
-                    NetworkMessage::BlockTxn(
-                        bitcoin::p2p::message_compact_blocks::BlockTxn {
-                            transactions: txns,
-                        },
-                    ),
+                    NetworkMessage::BlockTxn(bitcoin::p2p::message_compact_blocks::BlockTxn {
+                        transactions: txns,
+                    }),
                 );
             }
             Err(e) => {
@@ -15501,7 +16577,9 @@ impl PeerManager {
         }
         let header = pending.header;
         let (height, since) = (pending.height, pending.since);
-        let segwit_active = self.segwit_active_after(&header.prev_blockhash).unwrap_or(true);
+        let segwit_active = self
+            .segwit_active_after(&header.prev_blockhash)
+            .unwrap_or(true);
         match compact::complete_pending(pending, &txns, segwit_active) {
             Ok((block, stats)) => {
                 self.log_reconstructed(id, &block_hash, height, &stats, true, since);
@@ -15531,9 +16609,10 @@ impl PeerManager {
                 self.log_abandoned(id, &block_hash, CompactAbandon::Merkle);
                 self.send_to_peer(id, sync::make_getdata_blocks(&[block_hash]));
                 self.note_blocks_requested(id, &[block_hash]);
-                self.pending_compact
-                    .write()
-                    .insert(id, compact::PendingCompact::failed(block_hash, header, height));
+                self.pending_compact.write().insert(
+                    id,
+                    compact::PendingCompact::failed(block_hash, header, height),
+                );
             }
         }
     }
@@ -15560,7 +16639,12 @@ impl PeerManager {
         self.maybe_send_getheaders_msg_at(id, Instant::now(), || msg)
     }
 
-    fn maybe_send_getheaders_msg_at(&self, id: PeerId, now: Instant, msg: impl FnOnce() -> NetworkMessage) -> bool {
+    fn maybe_send_getheaders_msg_at(
+        &self,
+        id: PeerId,
+        now: Instant,
+        msg: impl FnOnce() -> NetworkMessage,
+    ) -> bool {
         {
             let mut peers = self.peers.write();
             let Some(handle) = peers.get_mut(&id) else {
@@ -15586,7 +16670,11 @@ impl PeerManager {
         let NetworkMessage::GetHeaders(m) = msg else {
             return;
         };
-        let top = m.locator_hashes.first().and_then(|h| self.chain_state.get_block_index(h)).map(|e| e.height);
+        let top = m
+            .locator_hashes
+            .first()
+            .and_then(|h| self.chain_state.get_block_index(h))
+            .map(|e| e.height);
         if let Some(h) = self.peers.write().get_mut(&id) {
             h.info.behavior.last_locator_top = top;
         }
@@ -15651,7 +16739,9 @@ impl PeerManager {
                 .collect()
         };
         let can_serve = |i: usize, height: Option<u32>| {
-            let Some(height) = height.map(i64::from) else { return true };
+            let Some(height) = height.map(i64::from) else {
+                return true;
+            };
             let (best, limited) = reach[i];
             best >= height && !(limited && best - height >= i64::from(LIMITED_PEER_BLOCK_DEPTH))
         };
@@ -15682,11 +16772,13 @@ impl PeerManager {
             let height = self.chain_state.get_block_index(&hash).map(|e| e.height);
             let any_has_it = (0..peers.len()).any(|i| can_serve(i, height));
             let pick = |fresh_only: bool| {
-                (0..peers.len()).map(|k| (next + k) % peers.len()).find(|&i| {
-                    given[i].len() < SWEEP_BLOCKS_PER_PEER
-                        && !(fresh_only && before.contains(&peers[i]))
-                        && (!any_has_it || can_serve(i, height))
-                })
+                (0..peers.len())
+                    .map(|k| (next + k) % peers.len())
+                    .find(|&i| {
+                        given[i].len() < SWEEP_BLOCKS_PER_PEER
+                            && !(fresh_only && before.contains(&peers[i]))
+                            && (!any_has_it || can_serve(i, height))
+                    })
             };
             let Some(i) = pick(true).or_else(|| pick(false)) else {
                 continue;
@@ -15745,7 +16837,10 @@ impl PeerManager {
     /// Ask `id` for `to_request` as full blocks, and record the request.
     fn request_full_blocks(&self, id: PeerId, to_request: &[bitcoin::BlockHash]) {
         if !to_request.is_empty() {
-            tracing::debug!(count = to_request.len(), "Requesting blocks for best header chain");
+            tracing::debug!(
+                count = to_request.len(),
+                "Requesting blocks for best header chain"
+            );
             if self.send_to_peer(id, sync::make_getdata_blocks(to_request)) {
                 self.note_blocks_requested(id, to_request);
             }
@@ -15783,13 +16878,21 @@ impl PeerManager {
         if self.blocksonly() || !self.can_direct_fetch() {
             return false;
         }
-        if !self.peers.read().get(&id).is_some_and(|h| h.info.compact_blocks) {
+        if !self
+            .peers
+            .read()
+            .get(&id)
+            .is_some_and(|h| h.info.compact_blocks)
+        {
             return false;
         }
         let parent_connected = self
             .chain_state
             .get_block_index(hash)
-            .and_then(|entry| self.chain_state.get_block_index(&entry.header.prev_blockhash))
+            .and_then(|entry| {
+                self.chain_state
+                    .get_block_index(&entry.header.prev_blockhash)
+            })
             .is_some_and(|parent| parent.status == BlockStatus::Valid);
         parent_connected && self.nothing_else_in_flight(id, hash)
     }
@@ -15854,7 +16957,9 @@ impl PeerManager {
     /// in full.
     fn note_compact_requested(&self, id: PeerId, hash: bitcoin::BlockHash) {
         self.record_block_requests(id, &[hash], true);
-        self.compact_in_progress.write().insert(hash, Instant::now());
+        self.compact_in_progress
+            .write()
+            .insert(hash, Instant::now());
     }
 
     fn record_block_requests(&self, id: PeerId, hashes: &[bitcoin::BlockHash], compact: bool) {
@@ -15865,7 +16970,10 @@ impl PeerManager {
             if asked.len() >= MAX_IN_FLIGHT_BLOCKS_PER_PEER && !asked.contains_key(hash) {
                 asked.retain(|_, r| r.at.elapsed() < BLOCK_IN_FLIGHT_TTL);
                 if asked.len() >= MAX_IN_FLIGHT_BLOCKS_PER_PEER {
-                    tracing::debug!(id, "peer has too many blocks in flight to track; not recording");
+                    tracing::debug!(
+                        id,
+                        "peer has too many blocks in flight to track; not recording"
+                    );
                     break;
                 }
             }
@@ -15917,13 +17025,23 @@ impl PeerManager {
     fn forget_block_requests(&self, hash: &bitcoin::BlockHash) {
         // Read-only fast path: this runs for every block, IBD included, and
         // both tables are empty for all but the blocks at the tip.
-        if self.in_flight_blocks.read().values().any(|asked| asked.contains_key(hash)) {
+        if self
+            .in_flight_blocks
+            .read()
+            .values()
+            .any(|asked| asked.contains_key(hash))
+        {
             self.in_flight_blocks.write().retain(|_, asked| {
                 asked.remove(hash);
                 !asked.is_empty()
             });
         }
-        if self.pending_compact.read().values().any(|p| p.hash == *hash) {
+        if self
+            .pending_compact
+            .read()
+            .values()
+            .any(|p| p.hash == *hash)
+        {
             self.pending_compact.write().retain(|_, p| p.hash != *hash);
         }
     }
@@ -15943,7 +17061,11 @@ impl PeerManager {
                 .collect();
             stale
                 .into_iter()
-                .filter_map(|id| pending.remove(&id).map(|p| (id, p.hash, p.requested, p.failed)))
+                .filter_map(|id| {
+                    pending
+                        .remove(&id)
+                        .map(|p| (id, p.hash, p.requested, p.failed))
+                })
                 .collect()
         };
         for (id, hash, requested, failed) in expired {
@@ -15999,8 +17121,8 @@ impl PeerManager {
                 stalled.push(peer_id);
             }
             // Per-height timeout: catch heights stuck with an active peer
-            let (stale, charged) =
-                scheduler.release_stale_inflight_charging(Duration::from_secs(60), Duration::from_secs(15));
+            let (stale, charged) = scheduler
+                .release_stale_inflight_charging(Duration::from_secs(60), Duration::from_secs(15));
             // Silent peers are scanned AFTER releases so a
             // peer that hit its third release on this pass
             // gets dropped on the same tick.
@@ -16027,7 +17149,9 @@ impl PeerManager {
         let behavior = &info.behavior;
         tracing::debug!("peer behavior peer={id} {behavior}");
         #[cfg(test)]
-        self.retired_behavior.lock().push((id, behavior.disconnect_reason));
+        self.retired_behavior
+            .lock()
+            .push((id, behavior.disconnect_reason));
         #[cfg(test)]
         self.retired_flags.lock().push((id, info.flags.set()));
     }
@@ -16035,7 +17159,8 @@ impl PeerManager {
     /// Inbound connections per keyed network group within the crawler
     /// flag's window.
     fn netgroup_counts(&self) -> HashMap<u64, u32> {
-        let window = Duration::from_secs(crate::net::flags::THRESHOLDS.crawler_netgroup_window_secs);
+        let window =
+            Duration::from_secs(crate::net::flags::THRESHOLDS.crawler_netgroup_window_secs);
         self.inbound_netgroups.lock().counts(Instant::now(), window)
     }
 
@@ -16047,11 +17172,18 @@ impl PeerManager {
     /// address book's and the window's, as everywhere).
     fn note_inbound_netgroup_locked(&self, info: &mut PeerInfo) {
         let ip = info.addr.ip();
-        if info.direction != Direction::Inbound || info.inbound_onion || !crate::net::is_routable(ip) {
+        if info.direction != Direction::Inbound
+            || info.inbound_onion
+            || !crate::net::is_routable(ip)
+        {
             return;
         }
         let group = self.addrman.read().group_key(ip);
-        let key = bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(self.netgroup_key.0, self.netgroup_key.1, &group);
+        let key = bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(
+            self.netgroup_key.0,
+            self.netgroup_key.1,
+            &group,
+        );
         info.flags.netgroup = Some(key);
         self.inbound_netgroups.lock().record(key, Instant::now());
     }
@@ -16083,7 +17215,11 @@ impl PeerManager {
             behavior: b,
             inbound,
             session_secs,
-            netgroup_seen: info.flags.netgroup.and_then(|k| netgroups.get(&k).copied()).unwrap_or(0),
+            netgroup_seen: info
+                .flags
+                .netgroup
+                .and_then(|k| netgroups.get(&k).copied())
+                .unwrap_or(0),
             addr_rate_limited: info.addr_rate.rate_limited,
             fingerprint: fp,
         };
@@ -16094,7 +17230,11 @@ impl PeerManager {
 
     /// One `net` line per flag a peer gains, with its evidence. The peer is
     /// named by id; its user agent is quoted and escaped.
-    fn log_gained_flags(id: PeerId, info: &PeerInfo, gained: &[(crate::net::flags::Flag, crate::net::flags::Evidence)]) {
+    fn log_gained_flags(
+        id: PeerId,
+        info: &PeerInfo,
+        gained: &[(crate::net::flags::Flag, crate::net::flags::Evidence)],
+    ) {
         for (flag, evidence) in gained {
             tracing::debug!(
                 "peer={id} flagged {} ({}): {} fingerprint={} subver={:?}",
@@ -16102,7 +17242,10 @@ impl PeerManager {
                 flag.name(),
                 crate::net::flags::EvidenceDisplay(evidence),
                 info.flags.fingerprint,
-                info.behavior.version.as_ref().map_or("", |v| v.user_agent.as_str()),
+                info.behavior
+                    .version
+                    .as_ref()
+                    .map_or("", |v| v.user_agent.as_str()),
             );
         }
     }
@@ -16138,9 +17281,15 @@ impl PeerManager {
     pub fn get_peer_behavior(&self, id: Option<PeerId>) -> Option<Vec<serde_json::Value>> {
         let peers = self.peers.read();
         let mut out: Vec<(PeerId, serde_json::Value)> = match id {
-            Some(id) => vec![(id, crate::net::flags::peer_json(
-                &peers.get(&id).filter(|h| !h.info.conn_type.is_measurement())?.info,
-            ))],
+            Some(id) => vec![(
+                id,
+                crate::net::flags::peer_json(
+                    &peers
+                        .get(&id)
+                        .filter(|h| !h.info.conn_type.is_measurement())?
+                        .info,
+                ),
+            )],
             None => peers
                 .iter()
                 .filter(|(_, h)| !h.info.conn_type.is_measurement())
@@ -16197,7 +17346,11 @@ impl PeerManager {
             Some(host) => self.manual_onion_hosts.read().contains(host),
             None => self.manual_addrs.read().contains(addr),
         };
-        if named { ConnType::Manual } else { ConnType::OutboundFullRelay }
+        if named {
+            ConnType::Manual
+        } else {
+            ConnType::OutboundFullRelay
+        }
     }
 
     /// The `-whitelist` permissions an outbound connection takes. Core
@@ -16250,8 +17403,8 @@ impl PeerManager {
         // peer lacking the desired services is dropped at the handshake, and
         // which outbound slots the peer counts against.
         if direction == Direction::Outbound {
-            info.conn_type = conn_type
-                .unwrap_or_else(|| self.untyped_outbound_conn_type(&addr, onion_host));
+            info.conn_type =
+                conn_type.unwrap_or_else(|| self.untyped_outbound_conn_type(&addr, onion_host));
             // An alt-slot dial's peer: a trial or a fallback.
             if info.conn_type == ConnType::OutboundFullRelay {
                 info.alt = self.take_alt_dial(&addr, onion_host);
@@ -16266,8 +17419,9 @@ impl PeerManager {
         // token asking for it. An inbound peer's permissions are set on the
         // accept path, which is where `-whitebind` is unioned in.
         info.permissions = match direction {
-            Direction::Inbound => self
-                .whitelist_permissions_for(addr.ip(), crate::net::permissions::Direction::IN),
+            Direction::Inbound => {
+                self.whitelist_permissions_for(addr.ip(), crate::net::permissions::Direction::IN)
+            }
             Direction::Outbound => {
                 self.outbound_whitelist_permissions(info.conn_type, &addr, onion_host)
             }
@@ -16303,7 +17457,7 @@ impl PeerManager {
             header_sync: Default::default(),
             last_mempool_served: None,
             tx_relay: Default::default(),
-                    fee_filter_sent: None,
+            fee_filter_sent: None,
             stats: PeerStats::new(self.net_totals.clone()),
         };
         {
@@ -16340,7 +17494,10 @@ impl PeerManager {
             if let Err(e) = manager.peer_task(id, transport, direction, msg_rx).await {
                 tracing::warn!(id, %addr, "Peer task ended: {}", e);
             }
-            let _ = manager.event_tx.send(NetEvent::PeerDisconnected { id }).await;
+            let _ = manager
+                .event_tx
+                .send(NetEvent::PeerDisconnected { id })
+                .await;
         });
     }
 
@@ -16351,7 +17508,11 @@ impl PeerManager {
     /// bytes are the network magic followed by the `version` command, and v2
     /// as soon as any byte departs from that prefix. The detection bytes are
     /// consumed off the socket and replayed into whichever transport is built.
-    async fn accept_transport(self: &Arc<Self>, id: PeerId, mut stream: TcpStream) -> Result<Connection, String> {
+    async fn accept_transport(
+        self: &Arc<Self>,
+        id: PeerId,
+        mut stream: TcpStream,
+    ) -> Result<Connection, String> {
         const V1_PREFIX_LEN: usize = 16;
         let magic = self.chain_state.p2p_magic();
         let timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
@@ -16448,7 +17609,8 @@ impl PeerManager {
     /// the functional tests, whose nodes talk over a private range with a
     /// placeholder proxy that never accepts.
     async fn dial_direct(&self, addr: SocketAddr) -> Result<TcpStream, String> {
-        let connect_timeout = Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
+        let connect_timeout =
+            Duration::from_millis(self.connect_timeout_ms.load(Ordering::Relaxed));
         let use_proxy = self.dials_through_proxy(addr);
         if let Some(ref proxy_addr) = self.proxy {
             if use_proxy {
@@ -16456,9 +17618,14 @@ impl PeerManager {
                 // circuit (see `socks_cred`).
                 let cred = self.socks_cred();
                 let cred_ref = cred.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-                return proxy::connect_socks5(proxy_addr, addr, cred_ref, self.socks_dial_timeouts())
-                    .await
-                    .map_err(|e| format!("connect to {addr} via proxy: {e}"));
+                return proxy::connect_socks5(
+                    proxy_addr,
+                    addr,
+                    cred_ref,
+                    self.socks_dial_timeouts(),
+                )
+                .await
+                .map_err(|e| format!("connect to {addr} via proxy: {e}"));
             }
             let _ = proxy_addr; // suppress unused warning on the direct path
         }
@@ -16566,7 +17733,9 @@ impl PeerManager {
         .await;
         match v2 {
             Ok(Ok((cipher, leftover))) => Ok((
-                Connection::v2(crate::net::v2transport::V2Connection::new(stream, cipher, leftover)),
+                Connection::v2(crate::net::v2transport::V2Connection::new(
+                    stream, cipher, leftover,
+                )),
                 id,
             )),
             _ => {
@@ -16639,7 +17808,9 @@ impl PeerManager {
         }
 
         // Perform handshake with timeout
-        let version = self.perform_handshake(id, &mut conn, direction, connected_at).await?;
+        let version = self
+            .perform_handshake(id, &mut conn, direction, connected_at)
+            .await?;
 
         // The handshake is done, so record it here rather than waiting for the
         // manager to drain the event below. The manager still gets the event
@@ -16664,11 +17835,7 @@ impl PeerManager {
         // `verack`.
         self.start_tx_relay(id);
         self.event_tx
-            .send(NetEvent::PeerConnected {
-                id,
-                addr,
-                version,
-            })
+            .send(NetEvent::PeerConnected { id, addr, version })
             .await
             .map_err(|e| e.to_string())?;
         // Have the manager take the new peer now, not on its next tick: Core
@@ -16729,9 +17896,7 @@ impl PeerManager {
             // the rest (`start_header_syncs`).
             let getheaders = sync::make_initial_getheaders(&self.chain_state);
             self.note_getheaders_sent(id, &getheaders);
-            writer.send(getheaders)
-                .await
-                .map_err(|e| e.to_string())?;
+            writer.send(getheaders).await.map_err(|e| e.to_string())?;
         }
 
         // Negotiate compact block support (BIP 152, version 2 = with witness)
@@ -16740,10 +17905,12 @@ impl PeerManager {
         // that became our tip (`maybe_set_peer_as_hb`).
         if !quiet {
             writer
-                .send(NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
-                    send_compact: false,
-                    version: 2,
-                }))
+                .send(NetworkMessage::SendCmpct(
+                    bitcoin::p2p::message_compact_blocks::SendCmpct {
+                        send_compact: false,
+                        version: 2,
+                    },
+                ))
                 .await
                 .map_err(|e| format!("send sendcmpct: {}", e))?;
         }
@@ -16763,7 +17930,8 @@ impl PeerManager {
         // completes — that is when it sends its one-shot `getaddr` — and
         // skips block-relay-only peers. Inbound links latch lazily instead,
         // in the addr handlers.
-        let relays_addrs = direction == Direction::Outbound && !quiet && self.setup_address_relay(id);
+        let relays_addrs =
+            direction == Direction::Outbound && !quiet && self.setup_address_relay(id);
 
         // The one-shot `getaddr` to every outbound peer that relays addresses,
         // as Core sends it (`ProcessMessage`, VERSION). satd sent it only over
@@ -16775,7 +17943,8 @@ impl PeerManager {
         // `getaddr` already.
         if relays_addrs && conn_type != ConnType::AddrFetch {
             self.note_getaddr_sent(id);
-            writer.send(NetworkMessage::GetAddr)
+            writer
+                .send(NetworkMessage::GetAddr)
                 .await
                 .map_err(|e| format!("send getaddr: {}", e))?;
         }
@@ -16841,11 +18010,7 @@ impl PeerManager {
             // closes, the peer's lock is no longer taken here.
             let mut capturing = true;
             loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(600),
-                    reader.recv(),
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::from_secs(600), reader.recv()).await
                 {
                     Ok(Ok(msg)) => {
                         log_received(id, &msg);
@@ -16931,7 +18096,9 @@ impl PeerManager {
         if let Some(wake) = drain_now {
             wake.notify_one();
         }
-        let timed_out = tokio::time::timeout(MAX_PONG_WAIT, flow.wait_idle()).await.is_err();
+        let timed_out = tokio::time::timeout(MAX_PONG_WAIT, flow.wait_idle())
+            .await
+            .is_err();
         tracing::trace!(
             "pong peer={id}: waited {:?} for {in_flight} message(s) ahead of it",
             start.elapsed()
@@ -17364,13 +18531,13 @@ impl PeerManager {
         if crate::time::now_secs() <= connected_at.saturating_add(timeout) {
             return None;
         }
-        let (received, sent) = self
-            .peers
-            .read()
-            .get(&id)
-            .map_or((true, true), |h| (h.stats.bytes_recv() > 0, h.stats.bytes_sent() > 0));
+        let (received, sent) = self.peers.read().get(&id).map_or((true, true), |h| {
+            (h.stats.bytes_recv() > 0, h.stats.bytes_sent() > 0)
+        });
         if received && sent {
-            return Some(format!("version handshake timeout, disconnecting peer={id}"));
+            return Some(format!(
+                "version handshake timeout, disconnecting peer={id}"
+            ));
         }
         let mut never = String::new();
         if !received {
@@ -17379,7 +18546,9 @@ impl PeerManager {
         if !sent {
             never.push_str(", never sent to peer");
         }
-        Some(format!("socket no message in first {timeout} seconds{never}, disconnecting peer={id}"))
+        Some(format!(
+            "socket no message in first {timeout} seconds{never}, disconnecting peer={id}"
+        ))
     }
 
     /// Core's `HasAllDesirableServiceFlags` for an outbound full-relay,
@@ -17485,7 +18654,9 @@ impl PeerManager {
                     && h.info.local_nonce == Some(their_version.nonce)
             }) || self.is_crawl_nonce(their_version.nonce);
             if to_self {
-                let addr = conn.peer_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
+                let addr = conn
+                    .peer_addr()
+                    .map_or_else(|_| "?".to_string(), |a| a.to_string());
                 tracing::info!("connected to self at {addr}, disconnecting");
                 return Err("connected to self".to_string());
             }
@@ -17496,14 +18667,23 @@ impl PeerManager {
         // outbound peer's `version` states what its address offers now,
         // over what gossip said.
         if direction == Direction::Outbound {
-            let dialled = self.peers.read().get(&id).and_then(|h| Self::dialled_book_addr(&h.info));
+            let dialled = self
+                .peers
+                .read()
+                .get(&id)
+                .and_then(|h| Self::dialled_book_addr(&h.info));
             if let Some(addr) = dialled {
-                self.addrman.write().set_services(&addr, their_version.services.to_u64());
+                self.addrman
+                    .write()
+                    .set_services(&addr, their_version.services.to_u64());
             }
         }
 
         if direction == Direction::Outbound
-            && matches!(conn_type, ConnType::OutboundFullRelay | ConnType::BlockRelay | ConnType::AddrFetch)
+            && matches!(
+                conn_type,
+                ConnType::OutboundFullRelay | ConnType::BlockRelay | ConnType::AddrFetch
+            )
             && let Some(wanted) = self.missing_desirable_services(their_version.services)
         {
             tracing::debug!(
@@ -17517,7 +18697,9 @@ impl PeerManager {
         // Core's `m_relays_txs` and `m_has_all_wanted_services`, set on the
         // peer's `version` (`net_processing.cpp`, v32.1).
         let tx_relay_requested = conn_type.wants_tx_relay() && their_version.relay;
-        let has_all_wanted_services = self.missing_desirable_services(their_version.services).is_none();
+        let has_all_wanted_services = self
+            .missing_desirable_services(their_version.services)
+            .is_none();
         if let Some(h) = self.peers.write().get_mut(&id) {
             h.info.tx_relay_requested = tx_relay_requested;
             h.info.has_all_wanted_services = has_all_wanted_services;
@@ -17546,7 +18728,11 @@ impl PeerManager {
                     // `net_processing.cpp:3785`), a feeler before it is
                     // dropped. The handle goes below, before the
                     // `PeerConnected` that marks the others.
-                    let dialled = self.peers.read().get(&id).and_then(|h| Self::dialled_book_addr(&h.info));
+                    let dialled = self
+                        .peers
+                        .read()
+                        .get(&id)
+                        .and_then(|h| Self::dialled_book_addr(&h.info));
                     if let Some(addr) = dialled {
                         self.addrman.write().mark_good(addr, now_unix_secs());
                     }
@@ -17560,7 +18746,8 @@ impl PeerManager {
                     self.peers.write().remove(&id);
                     return Err("feeler connection: closing after version".to_string());
                 }
-                self.send_feature_negotiation(conn, wtxid_relay_version).await?;
+                self.send_feature_negotiation(conn, wtxid_relay_version)
+                    .await?;
                 conn.send(NetworkMessage::Verack)
                     .await
                     .map_err(|e| format!("send verack: {}", e))?;
@@ -17569,7 +18756,8 @@ impl PeerManager {
                 conn.send(NetworkMessage::Version(our_version))
                     .await
                     .map_err(|e| format!("send version: {}", e))?;
-                self.send_feature_negotiation(conn, wtxid_relay_version).await?;
+                self.send_feature_negotiation(conn, wtxid_relay_version)
+                    .await?;
                 // Core's `MaybeDisconnectForTxRelayCapacity` before its
                 // `verack` (v32.1 `net_processing.cpp:4002`): past the
                 // inbound tx-relay cap, another tx-relaying inbound peer
@@ -17631,16 +18819,12 @@ impl PeerManager {
             }
         }
 
-        if peer_wants_addrv2
-            && let Some(handle) = self.peers.write().get_mut(&id)
-        {
+        if peer_wants_addrv2 && let Some(handle) = self.peers.write().get_mut(&id) {
             handle.info.wants_addrv2 = true;
         }
         // Set before the peer is marked connected, so it is never announced a
         // transaction by txid once it has asked for wtxids.
-        if peer_wtxid_relay
-            && let Some(handle) = self.peers.write().get_mut(&id)
-        {
+        if peer_wtxid_relay && let Some(handle) = self.peers.write().get_mut(&id) {
             handle.info.wtxid_relay = true;
         }
 
@@ -17652,10 +18836,12 @@ impl PeerManager {
     /// transcript is still open.
     fn capture_handshake(&self, id: PeerId, msg: &NetworkMessage) -> bool {
         let reply = self.is_reply_to_us(id, msg);
-        self.peers
-            .write()
-            .get_mut(&id)
-            .is_some_and(|h| h.info.behavior.handshake.observe(crate::net::behavior::wire_command(msg), reply))
+        self.peers.write().get_mut(&id).is_some_and(|h| {
+            h.info
+                .behavior
+                .handshake
+                .observe(crate::net::behavior::wire_command(msg), reply)
+        })
     }
 
     /// Whether `msg` answers a request of ours: a `pong`, a `headers` while
@@ -17665,9 +18851,11 @@ impl PeerManager {
     fn is_reply_to_us(&self, id: PeerId, msg: &NetworkMessage) -> bool {
         match msg {
             NetworkMessage::Pong(_) => true,
-            NetworkMessage::Headers(_) => {
-                self.peers.read().get(&id).is_some_and(|h| h.last_getheaders_sent.is_some())
-            }
+            NetworkMessage::Headers(_) => self
+                .peers
+                .read()
+                .get(&id)
+                .is_some_and(|h| h.last_getheaders_sent.is_some()),
             // One lock at a time: a guard held across the next would set a
             // lock order on this per-message path that nothing else keeps.
             NetworkMessage::NotFound(_) => {
@@ -17675,12 +18863,17 @@ impl PeerManager {
                 if txs_out {
                     return true;
                 }
-                let blocks_out = self.in_flight_blocks.read().get(&id).is_some_and(|m| !m.is_empty());
+                let blocks_out = self
+                    .in_flight_blocks
+                    .read()
+                    .get(&id)
+                    .is_some_and(|m| !m.is_empty());
                 if blocks_out {
                     return true;
                 }
                 let ibd = self.ibd.read();
-                ibd.as_ref().is_some_and(|s| !s.peer_inflight_heights(id).is_empty())
+                ibd.as_ref()
+                    .is_some_and(|s| !s.peer_inflight_heights(id).is_empty())
             }
             _ => false,
         }
@@ -17688,7 +18881,11 @@ impl PeerManager {
 
     /// `wtxidrelay` (BIP 339) then `sendaddrv2` (BIP 155), Core's order, when
     /// the common version reaches 70016; nothing below it.
-    async fn send_feature_negotiation(&self, conn: &mut Connection, at_70016: bool) -> Result<(), String> {
+    async fn send_feature_negotiation(
+        &self,
+        conn: &mut Connection,
+        at_70016: bool,
+    ) -> Result<(), String> {
         if !at_70016 {
             return Ok(());
         }
@@ -17848,7 +19045,11 @@ fn nap_pull_via(conn_type: ConnType) -> Option<crate::nap::pull::Via> {
         ConnType::NapPull => Some(Via::Pull),
         ConnType::OutboundFullRelay | ConnType::Manual => Some(Via::Outbound),
         ConnType::Inbound => Some(Via::Inbound),
-        ConnType::BlockRelay | ConnType::AddrFetch | ConnType::Feeler | ConnType::Survey | ConnType::Crawl => None,
+        ConnType::BlockRelay
+        | ConnType::AddrFetch
+        | ConnType::Feeler
+        | ConnType::Survey
+        | ConnType::Crawl => None,
     }
 }
 
@@ -17929,9 +19130,9 @@ mod crawl_conn;
 
 #[path = "manager_altslots.rs"]
 mod altslot_conn;
-pub use survey_conn::{SurveyConfig, SurveyMetrics};
-pub use crawl_conn::{CrawlHold, CrawlMetrics};
 pub use altslot_conn::AltSlotCounts;
+pub use crawl_conn::{CrawlHold, CrawlMetrics};
+pub use survey_conn::{SurveyConfig, SurveyMetrics};
 
 #[cfg(test)]
 #[path = "manager_survey_tests.rs"]
@@ -17965,8 +19166,11 @@ pub fn reconsider_orphans_on_block(
     // Core's `EraseForBlock`: the orphans the block includes or conflicts
     // with go.
     orphanage.erase_for_block(block);
-    let mut queue: VecDeque<bitcoin::Wtxid> =
-        block.txdata.iter().flat_map(|tx| orphanage.children_of(&tx.compute_txid())).collect();
+    let mut queue: VecDeque<bitcoin::Wtxid> = block
+        .txdata
+        .iter()
+        .flat_map(|tx| orphanage.children_of(&tx.compute_txid()))
+        .collect();
     while let Some(wtxid) = queue.pop_front() {
         let Some(child) = orphanage.entry(&wtxid) else {
             continue;
@@ -18058,7 +19262,8 @@ impl Drop for BulkLoadGuard<'_> {
                  store (DataStored -> Valid replay path)."
             );
         }
-        self.chain_state.set_write_mode(crate::storage::WriteMode::Normal);
+        self.chain_state
+            .set_write_mode(crate::storage::WriteMode::Normal);
         tracing::info!("BulkLoadGuard: restored Normal write mode");
     }
 }
@@ -18112,7 +19317,10 @@ impl TxBroadcaster for PeerManager {
 /// download only, as Core does.
 fn log_tx_inv(ibd: bool, label: Option<&str>, have: bool, peer: PeerId) {
     if !ibd && let Some(label) = label {
-        tracing::debug!("got inv: {label} {} peer={peer}", if have { "have" } else { "new" });
+        tracing::debug!(
+            "got inv: {label} {} peer={peer}",
+            if have { "have" } else { "new" }
+        );
     }
 }
 
@@ -18154,13 +19362,21 @@ mod tests {
     fn maintenance_runs_on_time_under_a_queue_that_stays_full() {
         for drain in [Duration::from_millis(20), Duration::from_millis(600)] {
             let ran = maintenance_under_a_full_queue(drain, 30);
-            let slowest = ran.windows(2).map(|w| w[1] - w[0]).max().unwrap_or_default();
+            let slowest = ran
+                .windows(2)
+                .map(|w| w[1] - w[0])
+                .max()
+                .unwrap_or_default();
             assert!(
                 slowest <= MAINTENANCE_INTERVAL + drain,
                 "{drain:?} drains: maintenance {slowest:?} apart"
             );
             let expected = 30_000 / (MAINTENANCE_INTERVAL + drain).as_millis() as usize;
-            assert!(ran.len() >= expected, "{drain:?} drains: {} passes, want {expected}", ran.len());
+            assert!(
+                ran.len() >= expected,
+                "{drain:?} drains: {} passes, want {expected}",
+                ran.len()
+            );
         }
     }
 
@@ -18170,14 +19386,25 @@ mod tests {
     fn a_full_queue_is_drained_again_until_maintenance_is_due() {
         let t0 = Instant::now();
         let mut pacer = DrainPacer::default();
-        assert_eq!(pacer.after_drain(EVENTS_PER_DRAIN, t0), AfterDrain::Maintain, "first pass");
+        assert_eq!(
+            pacer.after_drain(EVENTS_PER_DRAIN, t0),
+            AfterDrain::Maintain,
+            "first pass"
+        );
         pacer.maintained(t0);
         for ms in [1, 100, 499] {
             let at = t0 + Duration::from_millis(ms);
-            assert_eq!(pacer.after_drain(EVENTS_PER_DRAIN, at), AfterDrain::DrainAgain, "{ms} ms");
+            assert_eq!(
+                pacer.after_drain(EVENTS_PER_DRAIN, at),
+                AfterDrain::DrainAgain,
+                "{ms} ms"
+            );
         }
         let due = t0 + MAINTENANCE_INTERVAL;
-        assert_eq!(pacer.after_drain(EVENTS_PER_DRAIN, due), AfterDrain::Maintain);
+        assert_eq!(
+            pacer.after_drain(EVENTS_PER_DRAIN, due),
+            AfterDrain::Maintain
+        );
     }
 
     /// A drained queue waits for the next wake until maintenance is due.
@@ -18193,7 +19420,10 @@ mod tests {
             let at = t0 + Duration::from_millis(ms);
             assert_eq!(pacer.after_drain(1, at), AfterDrain::Wait, "{ms} ms");
         }
-        assert_eq!(pacer.after_drain(0, t0 + MAINTENANCE_INTERVAL), AfterDrain::Maintain);
+        assert_eq!(
+            pacer.after_drain(0, t0 + MAINTENANCE_INTERVAL),
+            AfterDrain::Maintain
+        );
     }
 
     /// An idle loop runs maintenance at every interval tick, as before,
@@ -18228,7 +19458,11 @@ mod tests {
         let t0 = Instant::now();
         let mut wait = None;
         assert!(!StuckWait::should_warn(&mut wait, 100, t0));
-        assert!(!StuckWait::should_warn(&mut wait, 100, t0 + Duration::from_secs(1)));
+        assert!(!StuckWait::should_warn(
+            &mut wait,
+            100,
+            t0 + Duration::from_secs(1)
+        ));
         // The next height starts its own wait, so waits just under the
         // threshold, such as one a stale-block release ends at 15 s, never
         // add up.
@@ -18251,11 +19485,23 @@ mod tests {
         assert!(!StuckWait::should_warn(&mut wait, 100, just_before));
         let first = t0 + STUCK_WAIT_WARN_AFTER;
         assert!(StuckWait::should_warn(&mut wait, 100, first));
-        assert!(!StuckWait::should_warn(&mut wait, 100, first + Duration::from_secs(1)));
+        assert!(!StuckWait::should_warn(
+            &mut wait,
+            100,
+            first + Duration::from_secs(1)
+        ));
         let second = first + STUCK_WAIT_WARN_EVERY;
-        assert!(!StuckWait::should_warn(&mut wait, 100, second - Duration::from_millis(1)));
+        assert!(!StuckWait::should_warn(
+            &mut wait,
+            100,
+            second - Duration::from_millis(1)
+        ));
         assert!(StuckWait::should_warn(&mut wait, 100, second));
-        assert!(!StuckWait::should_warn(&mut wait, 100, second + Duration::from_secs(1)));
+        assert!(!StuckWait::should_warn(
+            &mut wait,
+            100,
+            second + Duration::from_secs(1)
+        ));
     }
 
     /// Moving to another height ends the wait, warned or not: the new
@@ -18265,11 +19511,23 @@ mod tests {
         let t0 = Instant::now();
         let mut wait = None;
         assert!(!StuckWait::should_warn(&mut wait, 100, t0));
-        assert!(StuckWait::should_warn(&mut wait, 100, t0 + Duration::from_secs(30)));
+        assert!(StuckWait::should_warn(
+            &mut wait,
+            100,
+            t0 + Duration::from_secs(30)
+        ));
         let moved = t0 + Duration::from_secs(31);
         assert!(!StuckWait::should_warn(&mut wait, 101, moved));
-        assert!(!StuckWait::should_warn(&mut wait, 101, moved + Duration::from_secs(5)));
-        assert!(StuckWait::should_warn(&mut wait, 101, moved + STUCK_WAIT_WARN_AFTER));
+        assert!(!StuckWait::should_warn(
+            &mut wait,
+            101,
+            moved + Duration::from_secs(5)
+        ));
+        assert!(StuckWait::should_warn(
+            &mut wait,
+            101,
+            moved + STUCK_WAIT_WARN_AFTER
+        ));
     }
 
     fn bh(byte: u8) -> bitcoin::BlockHash {
@@ -18318,14 +19576,29 @@ mod tests {
         // Above the snapshot height the block is not part of the fixed
         // historical mapping and is always storable (forward IBD).
         assert!(historical_block_storable(800_000, 800_001, None, bh(9)));
-        assert!(historical_block_storable(800_000, 800_001, Some(bh(1)), bh(9)));
+        assert!(historical_block_storable(
+            800_000,
+            800_001,
+            Some(bh(1)),
+            bh(9)
+        ));
     }
 
     #[test]
     fn historical_block_storable_snapshot_boundary_requires_canonical() {
         // Exactly at the snapshot height the canonical check still applies.
-        assert!(historical_block_storable(800_000, 800_000, Some(bh(7)), bh(7)));
-        assert!(!historical_block_storable(800_000, 800_000, Some(bh(7)), bh(8)));
+        assert!(historical_block_storable(
+            800_000,
+            800_000,
+            Some(bh(7)),
+            bh(7)
+        ));
+        assert!(!historical_block_storable(
+            800_000,
+            800_000,
+            Some(bh(7)),
+            bh(8)
+        ));
     }
 
     /// Core's rounder: a node in IBD sends 0.09936506 BTC/kvB, the top bucket
@@ -18355,7 +19628,7 @@ mod tests {
             header_sync: Default::default(),
             last_mempool_served: None,
             tx_relay: Default::default(),
-                    fee_filter_sent: None,
+            fee_filter_sent: None,
             stats: PeerStats::new(NetTotals::new()),
         }
     }
@@ -18367,25 +19640,45 @@ mod tests {
         // Inbound + Connected: counts.
         peers.insert(
             1,
-            mk_handle(1, SocketAddr::new(ip, 8333), Direction::Inbound, PeerState::Connected),
+            mk_handle(
+                1,
+                SocketAddr::new(ip, 8333),
+                Direction::Inbound,
+                PeerState::Connected,
+            ),
         );
         // Outbound + Connected: not counted as inbound.
         peers.insert(
             2,
-            mk_handle(2, SocketAddr::new(ip, 8333), Direction::Outbound, PeerState::Connected),
+            mk_handle(
+                2,
+                SocketAddr::new(ip, 8333),
+                Direction::Outbound,
+                PeerState::Connected,
+            ),
         );
         // Inbound + Connecting (handshake in progress): F4 fix — must
         // count toward the cap, otherwise concurrent handshake bursts
         // from one IP bypass the limit until handshakes complete.
         peers.insert(
             3,
-            mk_handle(3, SocketAddr::new(ip, 8333), Direction::Inbound, PeerState::Connecting),
+            mk_handle(
+                3,
+                SocketAddr::new(ip, 8333),
+                Direction::Inbound,
+                PeerState::Connecting,
+            ),
         );
         // Inbound + Disconnected: stale entry, no real socket, doesn't
         // count.
         peers.insert(
             4,
-            mk_handle(4, SocketAddr::new(ip, 8333), Direction::Inbound, PeerState::Disconnected),
+            mk_handle(
+                4,
+                SocketAddr::new(ip, 8333),
+                Direction::Inbound,
+                PeerState::Disconnected,
+            ),
         );
         let (total, same_ip) = PeerManager::count_inbound(&peers, ip);
         assert_eq!(total, 2);
@@ -18512,7 +19805,10 @@ mod tests {
             let _g = PendingGuard { set: &set, addr };
             // ... pretend a dial happens here ...
         }
-        assert!(!set.read().contains(&addr), "guard should release slot on drop");
+        assert!(
+            !set.read().contains(&addr),
+            "guard should release slot on drop"
+        );
     }
 
     #[test]
@@ -18571,7 +19867,7 @@ mod tests {
                 header_sync: Default::default(),
                 last_mempool_served: None,
                 tx_relay,
-                    fee_filter_sent: None,
+                fee_filter_sent: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
             rx,
@@ -18657,15 +19953,20 @@ mod tests {
                 4,
                 Default::default(),
                 Default::default(),
-            Default::default(),
+                Default::default(),
             )
             .unwrap(),
         );
         let mempool = Arc::new(Mempool::new(1_000_000, 0));
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let pm =
-            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        let pm = PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        );
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         // The tx pays a fee rate of 0: only a peer whose fee_filter is also
@@ -18680,7 +19981,11 @@ mod tests {
             peers.insert(3, h3);
         }
 
-        let txid = pm.mempool.insert_scoped_for_test(7, 0, crate::mempool::pool::QuarantineScope::acting());
+        let txid = pm.mempool.insert_scoped_for_test(
+            7,
+            0,
+            crate::mempool::pool::QuarantineScope::acting(),
+        );
         pm.announce_tx(txid);
         flush_invs(&pm);
 
@@ -18692,9 +19997,15 @@ mod tests {
             other => panic!("connected fee-permitting peer should receive a tx inv, got {other:?}"),
         }
         // Fee filter above the tx rate → skipped.
-        assert!(rx2.try_recv().is_err(), "high-fee-filter peer must be skipped");
+        assert!(
+            rx2.try_recv().is_err(),
+            "high-fee-filter peer must be skipped"
+        );
         // Not yet Connected → skipped.
-        assert!(rx3.try_recv().is_err(), "non-Connected peer must be skipped");
+        assert!(
+            rx3.try_recv().is_err(),
+            "non-Connected peer must be skipped"
+        );
     }
 
     /// A block that fails validation must not, on its own, get the relaying
@@ -18734,9 +20045,17 @@ mod tests {
         let mempool = Arc::new(Mempool::new(1_000_000, 0));
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let pm =
-            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
-        assert!(pm.ibd.read().is_none(), "test assumes IBD inactive (normal mode)");
+        let pm = PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        );
+        assert!(
+            pm.ibd.read().is_none(),
+            "test assumes IBD inactive (normal mode)"
+        );
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         pm.peers.write().insert(
@@ -18749,14 +20068,16 @@ mod tests {
         // mutation gate but cannot connect. The regtest genesis block reparented
         // to an unknown hash is exactly such a block.
         let mut block = bitcoin::constants::genesis_block(Network::Regtest);
-        block.header.prev_blockhash =
-            bitcoin::BlockHash::from_byte_array([0x42u8; 32]);
+        block.header.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x42u8; 32]);
 
         pm.handle_block(1, block, crate::net::flow::InFlight::new(pm.peer_flow(1)));
 
         let peers = pm.peers.read();
         let handle = peers.get(&1).expect("peer session must stay up");
-        assert_eq!(handle.info.ban_score, 0, "an unconnectable block must not be ban-scored");
+        assert_eq!(
+            handle.info.ban_score, 0,
+            "an unconnectable block must not be ban-scored"
+        );
     }
 
     /// A peer that announces headers we cannot connect is not misbehaving.
@@ -18830,7 +20151,7 @@ mod tests {
                 4,
                 Default::default(),
                 Default::default(),
-            Default::default(),
+                Default::default(),
             )
             .unwrap(),
         );
@@ -18847,8 +20168,22 @@ mod tests {
 
         // fee_rate 0 entries; the peer's fee_filter is 0 so the only thing that
         // can suppress an INV is the relay scope.
-        let relay_q = mempool.insert_scoped_for_test(1, 0, QuarantineScope { relay: true, template: false });
-        let template_q = mempool.insert_scoped_for_test(2, 0, QuarantineScope { relay: false, template: true });
+        let relay_q = mempool.insert_scoped_for_test(
+            1,
+            0,
+            QuarantineScope {
+                relay: true,
+                template: false,
+            },
+        );
+        let template_q = mempool.insert_scoped_for_test(
+            2,
+            0,
+            QuarantineScope {
+                relay: false,
+                template: true,
+            },
+        );
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
@@ -18857,12 +20192,18 @@ mod tests {
         // announce_tx: relay-quarantined → nothing on the wire.
         pm.announce_tx(relay_q);
         flush_invs(&pm);
-        assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be announced");
+        assert!(
+            rx1.try_recv().is_err(),
+            "relay-quarantined tx must not be announced"
+        );
 
         // broadcast_inv (peer-relay fan-out): same.
         pm.broadcast_inv(99, relay_q);
         flush_invs(&pm);
-        assert!(rx1.try_recv().is_err(), "relay-quarantined tx must not be relayed");
+        assert!(
+            rx1.try_recv().is_err(),
+            "relay-quarantined tx must not be relayed"
+        );
 
         // getdata: peer asking for it gets NotFound, never the Tx.
         pm.handle_getdata(1, vec![Inventory::WitnessTransaction(relay_q)]);
@@ -18963,21 +20304,32 @@ mod tests {
         // 2. `hashStop` is the block at height 3: the peer gets 1 and 2 and
         //    not the stop block itself.
         pm.handle_getblocks(1, GetBlocksMessage::new(vec![genesis], chain[2]));
-        assert_eq!(sent_invs(&mut rx1), chain[..2], "stop hash is not announced");
+        assert_eq!(
+            sent_invs(&mut rx1),
+            chain[..2],
+            "stop hash is not announced"
+        );
 
         // 3. A locator entry on a stale fork is not a fork point. Roll the
         //    chain back and re-mine so `stale` is a known block that is no
         //    longer on the active chain.
-        pm.chain_state.invalidate_block(chain[2]).expect("invalidate");
+        pm.chain_state
+            .invalidate_block(chain[2])
+            .expect("invalidate");
         assert_eq!(pm.chain_state.tip_height(), 2);
         let stale = chain[2];
         pm.chain_state.reconsider_block(stale).expect("reconsider");
         // `reconsider` puts the original chain back; take a block from the
         // *other* side by invalidating the tip and mining a replacement.
-        pm.chain_state.invalidate_block(chain[4]).expect("invalidate tip");
+        pm.chain_state
+            .invalidate_block(chain[4])
+            .expect("invalidate tip");
         let forked = mine_onto(&pm, 1, 1);
         assert_eq!(pm.chain_state.tip_height(), 5);
-        assert_ne!(forked[0], chain[4], "the new height-5 block is a different one");
+        assert_ne!(
+            forked[0], chain[4],
+            "the new height-5 block is a different one"
+        );
         assert!(
             pm.chain_state.get_block_index(&chain[4]).is_some(),
             "the displaced block is still in the index"
@@ -19046,7 +20398,10 @@ mod tests {
         let pm = empty_peer_manager();
         let sa: SocketAddr = "10.0.0.7:18444".parse().unwrap();
         assert!(pm.addnode_add("10.0.0.7:18444", PeerAddr::Socket(sa)));
-        assert!(pm.manual_addrs.read().contains(&sa), "added nodes are manual");
+        assert!(
+            pm.manual_addrs.read().contains(&sa),
+            "added nodes are manual"
+        );
 
         assert!(pm.addnode_remove(&PeerAddr::Socket(sa)));
         assert!(
@@ -19056,7 +20411,10 @@ mod tests {
 
         // Same for an onion entry, which is tracked in its own set.
         let host = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
-        let onion = PeerAddr::Onion { host: host.to_string(), port: 8333 };
+        let onion = PeerAddr::Onion {
+            host: host.to_string(),
+            port: 8333,
+        };
         assert!(pm.addnode_add(&format!("{host}:8333"), onion.clone()));
         assert!(pm.manual_onion_hosts.read().contains(host));
         assert!(pm.addnode_remove(&onion));
@@ -19164,7 +20522,7 @@ mod tests {
                 4,
                 Default::default(),
                 Default::default(),
-            Default::default(),
+                Default::default(),
             )
             .unwrap(),
         );
@@ -19173,7 +20531,9 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // Leak the TempDir so the blocks dir outlives the manager for the test.
         std::mem::forget(dir);
-        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         PeerManager::with_config(
             chain_state,
             mempool,
@@ -19215,7 +20575,10 @@ mod tests {
 
         // Whereas an added node is, and keeps the operator's own spelling of
         // the address rather than the resolved form.
-        assert!(pm.addnode_add("localhost:18444", PeerAddr::Socket("127.0.0.1:18444".parse().unwrap())));
+        assert!(pm.addnode_add(
+            "localhost:18444",
+            PeerAddr::Socket("127.0.0.1:18444".parse().unwrap())
+        ));
         let info = pm.get_added_node_info();
         assert_eq!(info.len(), 1);
         assert_eq!(info[0]["addednode"], "localhost:18444");
@@ -19226,14 +20589,19 @@ mod tests {
     /// resolver.
     fn set_test_resolver(
         pm: &PeerManager,
-        resolve: impl Fn(&str) -> Result<PeerAddr, crate::net::dns::PeerTargetError> + Send + Sync + 'static,
+        resolve: impl Fn(&str) -> Result<PeerAddr, crate::net::dns::PeerTargetError>
+        + Send
+        + Sync
+        + 'static,
     ) {
         *pm.test_resolver.write() = Some(Arc::new(resolve));
     }
 
     /// Wait up to `within` for one TCP connection on `listener`.
     async fn accepts_within(listener: &TcpListener, within: Duration) -> bool {
-        tokio::time::timeout(within, listener.accept()).await.is_ok()
+        tokio::time::timeout(within, listener.accept())
+            .await
+            .is_ok()
     }
 
     /// Core's `CConnman::AddNode` stores the string without looking it up,
@@ -19246,13 +20614,20 @@ mod tests {
     fn an_added_node_that_does_not_resolve_is_listed_and_removable() {
         let pm = empty_peer_manager();
         assert!(pm.addnode_add_unresolved("tank-0001:18444"));
-        assert!(!pm.addnode_add_unresolved("tank-0001:18444"), "the same string is one entry");
+        assert!(
+            !pm.addnode_add_unresolved("tank-0001:18444"),
+            "the same string is one entry"
+        );
 
         let info = pm.get_added_node_info();
         assert_eq!(info.len(), 1);
         assert_eq!(info[0]["addednode"], "tank-0001:18444");
         assert_eq!(info[0]["connected"], false);
-        assert_eq!(info[0]["addresses"], serde_json::json!([]), "Core lists addresses only when connected");
+        assert_eq!(
+            info[0]["addresses"],
+            serde_json::json!([]),
+            "Core lists addresses only when connected"
+        );
 
         assert!(pm.addnode_remove_target("tank-0001:18444", None));
         assert!(pm.get_added_node_info().is_empty());
@@ -19268,8 +20643,14 @@ mod tests {
         let pm = empty_peer_manager();
         let sa: SocketAddr = "10.0.0.9:18444".parse().unwrap();
         pm.add_peer_addr(PeerAddr::Socket(sa));
-        assert!(pm.addnode_add("10.0.0.9:18444", PeerAddr::Socket(sa)), "a dial candidate is not an added node");
-        assert!(!pm.addnode_add("10.0.0.9", PeerAddr::Socket(sa)), "same numeric address, default port");
+        assert!(
+            pm.addnode_add("10.0.0.9:18444", PeerAddr::Socket(sa)),
+            "a dial candidate is not an added node"
+        );
+        assert!(
+            !pm.addnode_add("10.0.0.9", PeerAddr::Socket(sa)),
+            "same numeric address, default port"
+        );
         assert_eq!(pm.get_added_node_info().len(), 1);
     }
 
@@ -19294,7 +20675,10 @@ mod tests {
             dial,
             vec![
                 PeerAddr::Socket("10.0.0.7:18444".parse().unwrap()),
-                PeerAddr::Onion { host: onion.to_string(), port: 18444 },
+                PeerAddr::Onion {
+                    host: onion.to_string(),
+                    port: 18444
+                },
             ]
         );
         let listed: Vec<String> = pm
@@ -19302,8 +20686,18 @@ mod tests {
             .iter()
             .map(|e| e["addednode"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(listed, ["10.0.0.7".to_string(), format!("{onion}:18444"), "tank-0000:18444".to_string()]);
-        assert!(pm.manual_targets_due(Instant::now()), "the name is due its lookup");
+        assert_eq!(
+            listed,
+            [
+                "10.0.0.7".to_string(),
+                format!("{onion}:18444"),
+                "tank-0000:18444".to_string()
+            ]
+        );
+        assert!(
+            pm.manual_targets_due(Instant::now()),
+            "the name is due its lookup"
+        );
     }
 
     /// `-stopatheight` on the connects that emit no chain event (#873):
@@ -19311,7 +20705,10 @@ mod tests {
     /// all when no target is set.
     #[test]
     fn reaching_stop_at_height_asks_for_shutdown() {
-        assert!(!empty_peer_manager().stop_if_at_height(u32::MAX), "no target set");
+        assert!(
+            !empty_peer_manager().stop_if_at_height(u32::MAX),
+            "no target set"
+        );
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let pm = empty_peer_manager_stopping_at(Some((100, tx)));
@@ -19339,14 +20736,22 @@ mod tests {
             if flag.load(Ordering::SeqCst) {
                 Ok(PeerAddr::Socket(target))
             } else {
-                Err(crate::net::dns::PeerTargetError::Lookup("no such host yet".into()))
+                Err(crate::net::dns::PeerTargetError::Lookup(
+                    "no such host yet".into(),
+                ))
             }
         });
         assert!(pm.addnode_add_unresolved("tank-0000"));
 
         Arc::clone(&pm).refresh_manual_targets().await;
-        assert!(!accepts_within(&listener, Duration::from_millis(300)).await, "nothing to dial yet");
-        assert!(pm.manual_targets_due(Instant::now()), "an unresolved name stays due");
+        assert!(
+            !accepts_within(&listener, Duration::from_millis(300)).await,
+            "nothing to dial yet"
+        );
+        assert!(
+            pm.manual_targets_due(Instant::now()),
+            "an unresolved name stays due"
+        );
 
         resolvable.store(true, Ordering::SeqCst);
         Arc::clone(&pm).refresh_manual_targets().await;
@@ -19354,7 +20759,10 @@ mod tests {
             accepts_within(&listener, Duration::from_secs(5)).await,
             "the name resolved, so the peer must be dialled"
         );
-        assert!(pm.manual_addrs.read().contains(&target), "and dialled as a manual peer");
+        assert!(
+            pm.manual_addrs.read().contains(&target),
+            "and dialled as a manual peer"
+        );
         // Still the operator's entry, not a second one.
         assert_eq!(pm.get_added_node_info().len(), 1);
     }
@@ -19373,7 +20781,10 @@ mod tests {
 
         Arc::clone(&pm).refresh_manual_targets().await;
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);
-        assert!(pm.may_dial(&target.into()), "a -connect peer stays dialable under -connect");
+        assert!(
+            pm.may_dial(&target.into()),
+            "a -connect peer stays dialable under -connect"
+        );
     }
 
     /// Startup and a config reload register `-connect` entries through
@@ -19389,13 +20800,29 @@ mod tests {
         set_test_resolver(&pm, move |s| match s {
             "tank-0005" => Ok(PeerAddr::Socket(up)),
             "tank-0006" => Err(PeerTargetError::Lookup("no such host yet".into())),
-            _ => Err(PeerTargetError::Refused("name lookups are disabled (-dns=0)".into())),
+            _ => Err(PeerTargetError::Refused(
+                "name lookups are disabled (-dns=0)".into(),
+            )),
         });
 
-        assert_eq!(pm.register_connect_target("tank-0005").await, Some(PeerAddr::Socket(up)));
-        assert!(pm.manual_addrs.read().contains(&up), "dialled as a manual peer");
-        assert_eq!(pm.register_connect_target("tank-0006").await, None, "nothing to dial yet");
-        assert_eq!(pm.register_connect_target("tank-0007").await, None, "refused");
+        assert_eq!(
+            pm.register_connect_target("tank-0005").await,
+            Some(PeerAddr::Socket(up))
+        );
+        assert!(
+            pm.manual_addrs.read().contains(&up),
+            "dialled as a manual peer"
+        );
+        assert_eq!(
+            pm.register_connect_target("tank-0006").await,
+            None,
+            "nothing to dial yet"
+        );
+        assert_eq!(
+            pm.register_connect_target("tank-0007").await,
+            None,
+            "refused"
+        );
 
         let tracked: Vec<(String, bool)> = pm
             .addnode_entries
@@ -19405,11 +20832,20 @@ mod tests {
             .collect();
         assert_eq!(
             tracked,
-            [("tank-0005".to_string(), true), ("tank-0006".to_string(), false)],
+            [
+                ("tank-0005".to_string(), true),
+                ("tank-0006".to_string(), false)
+            ],
             "both names are tracked; the refused one is not"
         );
-        assert!(pm.manual_targets_due(Instant::now()), "the unresolved name is due its lookup");
-        assert!(pm.get_added_node_info().is_empty(), "a -connect entry is not an added node");
+        assert!(
+            pm.manual_targets_due(Instant::now()),
+            "the unresolved name is due its lookup"
+        );
+        assert!(
+            pm.get_added_node_info().is_empty(),
+            "a -connect entry is not an added node"
+        );
     }
 
     /// A resolved name whose peer is gone is looked up again, and when the
@@ -19479,7 +20915,10 @@ mod tests {
             pm.add_peer_addr(PeerAddr::Socket(addr)),
             "being learned does not make an address the operator's"
         );
-        assert!(!pm.add_peer_addr(PeerAddr::Socket(addr)), "registering twice is one entry");
+        assert!(
+            !pm.add_peer_addr(PeerAddr::Socket(addr)),
+            "registering twice is one entry"
+        );
         assert!(
             pm.may_dial(&addr.into()),
             "an explicitly configured peer must stay dialable under -connect"
@@ -19509,18 +20948,33 @@ mod tests {
         pm.add_learned_addr(learned);
         assert!(pm.addrman.read().contains(&learned.into()));
         pm.add_peer_addr(PeerAddr::Socket(named));
-        assert_eq!(pm.untyped_outbound_conn_type(&learned, None), ConnType::OutboundFullRelay);
-        assert_eq!(pm.untyped_outbound_conn_type(&named, None), ConnType::Manual);
+        assert_eq!(
+            pm.untyped_outbound_conn_type(&learned, None),
+            ConnType::OutboundFullRelay
+        );
+        assert_eq!(
+            pm.untyped_outbound_conn_type(&named, None),
+            ConnType::Manual
+        );
 
         let named_host = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
         let learned_host = "2bqghnldu6mcug4pikzprwhtjjnsyederctvci6klcwzepnjd46ikjyd.onion";
-        pm.add_peer_addr(PeerAddr::Onion { host: named_host.to_string(), port: 8333 });
-        pm.add_learned_peer_addr(&PeerAddr::Onion { host: learned_host.to_string(), port: 8333 });
+        pm.add_peer_addr(PeerAddr::Onion {
+            host: named_host.to_string(),
+            port: 8333,
+        });
+        pm.add_learned_peer_addr(&PeerAddr::Onion {
+            host: learned_host.to_string(),
+            port: 8333,
+        });
         let placeholder: SocketAddr = ([0, 0, 0, 0], 8333).into();
         // An operator entry for the placeholder itself must not reach an
         // onion peer that shares it.
         pm.add_peer_addr(PeerAddr::Socket(placeholder));
-        assert_eq!(pm.untyped_outbound_conn_type(&placeholder, Some(named_host)), ConnType::Manual);
+        assert_eq!(
+            pm.untyped_outbound_conn_type(&placeholder, Some(named_host)),
+            ConnType::Manual
+        );
         assert_eq!(
             pm.untyped_outbound_conn_type(&placeholder, Some(learned_host)),
             ConnType::OutboundFullRelay
@@ -19538,7 +20992,10 @@ mod tests {
             crate::net::permissions::WhitelistEntry::parse("noban,out@0.0.0.0/0").unwrap(),
         ]);
         let peer: SocketAddr = "127.0.0.1:18463".parse().unwrap();
-        assert!(pm.outbound_whitelist_permissions(ConnType::Manual, &peer, None).noban);
+        assert!(
+            pm.outbound_whitelist_permissions(ConnType::Manual, &peer, None)
+                .noban
+        );
         assert_eq!(
             pm.outbound_whitelist_permissions(ConnType::OutboundFullRelay, &peer, None),
             crate::net::permissions::NetPermissions::NONE
@@ -19563,13 +21020,28 @@ mod tests {
         let target = listener.local_addr().unwrap();
         pm.add_learned_addr(target);
 
-        pm.connect_peer_addr(&PeerAddr::Socket(target)).await.expect("the onetry dial connects");
+        pm.connect_peer_addr(&PeerAddr::Socket(target))
+            .await
+            .expect("the onetry dial connects");
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);
-        assert_eq!(conn_type_at(&pm, target), Some(ConnType::Manual), "an onetry dial is manual");
-        assert!(!pm.manual_addrs.read().contains(&target), "and leaves no registration behind");
-        assert_eq!(pm.untyped_outbound_conn_type(&target, None), ConnType::OutboundFullRelay);
+        assert_eq!(
+            conn_type_at(&pm, target),
+            Some(ConnType::Manual),
+            "an onetry dial is manual"
+        );
+        assert!(
+            !pm.manual_addrs.read().contains(&target),
+            "and leaves no registration behind"
+        );
+        assert_eq!(
+            pm.untyped_outbound_conn_type(&target, None),
+            ConnType::OutboundFullRelay
+        );
         pm.set_automatic_outbound(false);
-        assert!(!pm.may_dial(&target.into()), "a learned address stays undialable under -connect");
+        assert!(
+            !pm.may_dial(&target.into()),
+            "a learned address stays undialable under -connect"
+        );
     }
 
     /// A DNS or fixed seed is the node's own bootstrap source, not a peer
@@ -19588,13 +21060,21 @@ mod tests {
         // dates a seed's answers. satd left seeds out of the book.
         {
             let book = pm.addrman.read();
-            let entry = book.iter().find(|e| e.addr == seed.into()).expect("the seed is in the address book");
+            let entry = book
+                .iter()
+                .find(|e| e.addr == seed.into())
+                .expect("the seed is in the address book");
             assert!(!entry.tried);
             let age = now_unix_secs() - entry.last_seen;
-            assert!((SEED_ADDR_MIN_AGE_SECS..=SEED_ADDR_MAX_AGE_SECS + 5).contains(&age), "age {age}");
+            assert!(
+                (SEED_ADDR_MIN_AGE_SECS..=SEED_ADDR_MAX_AGE_SECS + 5).contains(&age),
+                "age {age}"
+            );
         }
 
-        pm.connect_peer_addr_automatic(&PeerAddr::Socket(seed)).await.expect("the seed dial connects");
+        pm.connect_peer_addr_automatic(&PeerAddr::Socket(seed))
+            .await
+            .expect("the seed dial connects");
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);
         assert_eq!(conn_type_at(&pm, seed), Some(ConnType::OutboundFullRelay));
 
@@ -19622,14 +21102,19 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let zero: SocketAddr = ([0, 0, 0, 0], port).into();
 
-        assert!(pm.connect_peer_addr(&PeerAddr::Socket(zero)).await.is_err(), "manual");
+        assert!(
+            pm.connect_peer_addr(&PeerAddr::Socket(zero)).await.is_err(),
+            "manual"
+        );
         assert!(pm.connect_outbound(zero).await.is_err(), "automatic");
         assert!(
             !accepts_within(&listener, Duration::from_millis(500)).await,
             "0.0.0.0 must not be dialled"
         );
         // The same listener does take a dial to an address that names it.
-        pm.connect_outbound(listener.local_addr().unwrap()).await.expect("a valid address is dialled");
+        pm.connect_outbound(listener.local_addr().unwrap())
+            .await
+            .expect("a valid address is dialled");
         assert!(accepts_within(&listener, Duration::from_secs(5)).await);
     }
 
@@ -19642,7 +21127,13 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // Leak the sender so the channel stays open for the manager's life.
         std::mem::forget(shutdown_tx);
-        PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+        PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        )
     }
 
     /// Issue #582, stored-tail half: a connector that tears down leaving
@@ -19670,13 +21161,20 @@ mod tests {
         assert_eq!(accepted, 2, "fixture: headers must be accepted ({err:?})");
         store_block_without_connecting(&cs, &b2, 2);
         store_block_without_connecting(&cs, &b3, 3);
-        assert_eq!(cs.tip_height(), 1, "fixture: the tail must start unconnected");
+        assert_eq!(
+            cs.tip_height(),
+            1,
+            "fixture: the tail must start unconnected"
+        );
         assert_eq!(
             cs.next_block_to_connect(2),
             Some(b2.block_hash()),
             "fixture: the frontier must name the stored block"
         );
-        assert!(cs.has_block_data(&b2.block_hash()), "fixture: data must be stored");
+        assert!(
+            cs.has_block_data(&b2.block_hash()),
+            "fixture: data must be stored"
+        );
 
         // Gap of 2 is far under the +24 scheduler-creation threshold, so
         // only the steady-state drain can connect these.
@@ -19725,8 +21223,13 @@ mod tests {
         let mempool = Arc::new(Mempool::new(1_000_000, 0));
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(shutdown);
-        let pm =
-            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        let pm = PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        );
         (pm, shutdown_tx)
     }
 
@@ -19751,7 +21254,10 @@ mod tests {
         headers_ahead_of_the_tip(&cs, 30, true);
         let chain_state = Arc::new(cs);
         let (pm, _shutdown_tx) = peer_manager_with_shutdown(chain_state.clone(), true);
-        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        assert!(
+            pm.ibd.read().is_some(),
+            "fixture: the manager must start in IBD"
+        );
 
         assert!(
             pm.join_connectors(Duration::from_secs(10)),
@@ -19777,7 +21283,10 @@ mod tests {
         headers_ahead_of_the_tip(&cs, 30, false);
         let chain_state = Arc::new(cs);
         let (pm, shutdown_tx) = peer_manager_with_shutdown(chain_state.clone(), false);
-        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        assert!(
+            pm.ibd.read().is_some(),
+            "fixture: the manager must start in IBD"
+        );
         // Let the connector reach its wait for block 1.
         std::thread::sleep(Duration::from_millis(200));
 
@@ -19824,16 +21333,27 @@ mod tests {
             8,
             None,
         );
-        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        assert!(
+            pm.ibd.read().is_some(),
+            "fixture: the manager must start in IBD"
+        );
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(chain_state.tip_height(), 0, "fixture: the connector must be paused");
+        assert_eq!(
+            chain_state.tip_height(),
+            0,
+            "fixture: the connector must be paused"
+        );
 
         shutdown_tx.send_replace(true);
         assert!(
             pm.join_connectors(Duration::from_secs(10)),
             "the connector threads must exit on shutdown"
         );
-        assert_eq!(chain_state.tip_height(), 0, "no block may connect once shutdown is signalled");
+        assert_eq!(
+            chain_state.tip_height(),
+            0,
+            "no block may connect once shutdown is signalled"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -19878,8 +21398,15 @@ mod tests {
             pm.join_connectors(Duration::from_secs(20)),
             "the connector must stop once it reaches the target"
         );
-        assert!(*shutdown_tx.borrow(), "reaching the target asks for shutdown");
-        assert_eq!(chain_state.tip_height(), 10, "the connector stops at the target, not past it");
+        assert!(
+            *shutdown_tx.borrow(),
+            "reaching the target asks for shutdown"
+        );
+        assert_eq!(
+            chain_state.tip_height(),
+            10,
+            "the connector stops at the target, not past it"
+        );
         // Checked last: an IBD that stops for shutdown keeps its scheduler,
         // one that runs to the end clears it.
         assert!(
@@ -19933,13 +21460,19 @@ mod tests {
 
         let chain_state = Arc::new(cs);
         let (pm, shutdown_tx) = peer_manager_with_shutdown(chain_state.clone(), false);
-        assert!(pm.ibd.read().is_some(), "fixture: the manager must start in IBD");
+        assert!(
+            pm.ibd.read().is_some(),
+            "fixture: the manager must start in IBD"
+        );
         gate.wait_entered();
 
         shutdown_tx.send_replace(true);
         let stopped = pm.join_connectors(Duration::from_secs(10));
         gate.release();
-        assert!(stopped, "the connector must not wait for the parked prefetch worker");
+        assert!(
+            stopped,
+            "the connector must not wait for the parked prefetch worker"
+        );
         assert_eq!(chain_state.tip_height(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -19953,7 +21486,10 @@ mod tests {
     fn the_steady_state_block_processor_exits_on_shutdown() {
         let (cs, dir) = crate::chain::state::tests::make_chain_state();
         let (pm, shutdown_tx) = peer_manager_with_shutdown(Arc::new(cs), false);
-        assert!(pm.ibd.read().is_none(), "fixture: the manager must not be in IBD");
+        assert!(
+            pm.ibd.read().is_none(),
+            "fixture: the manager must not be in IBD"
+        );
         std::thread::sleep(Duration::from_millis(100));
 
         shutdown_tx.send_replace(true);
@@ -19975,7 +21511,11 @@ mod tests {
             !pm.join_connectors(Duration::from_millis(200)),
             "without a shutdown signal the connectors keep running"
         );
-        assert_eq!(pm.connector_threads.lock().len(), 4, "all four threads must be kept");
+        assert_eq!(
+            pm.connector_threads.lock().len(),
+            4,
+            "all four threads must be kept"
+        );
 
         shutdown_tx.send_replace(true);
         assert!(pm.join_connectors(Duration::from_secs(10)));
@@ -20000,7 +21540,10 @@ mod tests {
         // Constructed at tip == headers tip, so the startup resume path
         // arms nothing — the parked state is created after construction.
         let pm = peer_manager_over(chain_state.clone());
-        assert!(pm.ibd.read().is_none(), "fixture: no scheduler at construction");
+        assert!(
+            pm.ibd.read().is_none(),
+            "fixture: no scheduler at construction"
+        );
 
         let mut headers = Vec::new();
         let mut parent = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
@@ -20011,7 +21554,10 @@ mod tests {
         }
         let (accepted, err) = chain_state.accept_headers(&headers);
         assert_eq!(accepted, 30, "fixture: headers must be accepted ({err:?})");
-        assert!(pm.ibd.read().is_none(), "fixture: accepting headers directly must not arm");
+        assert!(
+            pm.ibd.read().is_none(),
+            "fixture: accepting headers directly must not arm"
+        );
 
         let pm_run = pm.clone();
         let run = tokio::spawn(async move { pm_run.run().await });
@@ -20115,13 +21661,23 @@ mod tests {
         }
         let headers: Vec<_> = blocks.iter().map(|b| b.header).collect();
         let (accepted, err) = cs.accept_headers(&headers);
-        assert_eq!(accepted as usize, headers.len(), "fixture: headers accepted ({err:?})");
+        assert_eq!(
+            accepted as usize,
+            headers.len(),
+            "fixture: headers accepted ({err:?})"
+        );
         let b2 = blocks.swap_remove(0);
         store_block_without_connecting(&cs, &b2, 2);
         roll_append_file(&cs);
         std::fs::remove_file(cs.blocks_dir().join("blk00000.dat")).unwrap();
-        assert!(cs.has_block_data(&b2.block_hash()), "fixture: the index says stored");
-        assert!(!cs.block_data_readable(&b2.block_hash()), "fixture: the record is gone");
+        assert!(
+            cs.has_block_data(&b2.block_hash()),
+            "fixture: the index says stored"
+        );
+        assert!(
+            !cs.block_data_readable(&b2.block_hash()),
+            "fixture: the record is gone"
+        );
         (Arc::new(cs), b2, dir)
     }
 
@@ -20194,7 +21750,11 @@ mod tests {
             1,
             "the connector must ask a peer for block 2"
         );
-        pm.handle_message(7, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
+        pm.handle_message(
+            7,
+            NetworkMessage::Block(b2.clone()),
+            crate::net::flow::InFlight::new(None),
+        );
         assert!(
             tip_reaches(&cs, 2, Duration::from_secs(10)),
             "block 2 must connect from the repaired record"
@@ -20214,7 +21774,10 @@ mod tests {
     fn the_stored_tail_drain_fetches_again_a_stored_block_it_cannot_read() {
         let (cs, b2, dir) = a_chain_whose_next_block_has_no_record(2);
         let pm = peer_manager_over(cs.clone());
-        assert!(pm.ibd.read().is_none(), "fixture: a one-block gap is the drain's");
+        assert!(
+            pm.ibd.read().is_none(),
+            "fixture: a one-block gap is the drain's"
+        );
         let mut rx = attach_block_serving_peer(&pm, 7);
 
         assert_eq!(
@@ -20222,7 +21785,11 @@ mod tests {
             1,
             "the drain must ask a peer for block 2"
         );
-        pm.handle_message(7, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
+        pm.handle_message(
+            7,
+            NetworkMessage::Block(b2.clone()),
+            crate::net::flow::InFlight::new(None),
+        );
         assert!(
             tip_reaches(&cs, 2, Duration::from_secs(10)),
             "block 2 must connect from the repaired record"
@@ -20246,7 +21813,10 @@ mod tests {
 
         pm.refetch_unreadable_block(hash, 5);
         pm.refetch_unreadable_block(hash, 5);
-        assert_eq!(count_getdata(&mut rx, hash, Duration::from_millis(500), false), 1);
+        assert_eq!(
+            count_getdata(&mut rx, hash, Duration::from_millis(500), false),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20272,7 +21842,10 @@ mod tests {
         // A peer that would answer, well inside the interval.
         let mut rx = attach_block_serving_peer(&pm, 7);
         pm.refetch_unreadable_block(hash, 5);
-        assert_eq!(count_getdata(&mut rx, hash, Duration::from_millis(500), false), 0);
+        assert_eq!(
+            count_getdata(&mut rx, hash, Duration::from_millis(500), false),
+            0
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20303,7 +21876,10 @@ mod tests {
         // Block 2 is connected and its record is gone: a hole below the tip,
         // which no connector will touch.
         std::fs::remove_file(cs.blocks_dir().join("blk00000.dat")).unwrap();
-        assert!(!cs.block_data_readable(&h2), "fixture: block 2 has no record");
+        assert!(
+            !cs.block_data_readable(&h2),
+            "fixture: block 2 has no record"
+        );
 
         let cs = Arc::new(cs);
         let pm = peer_manager_over(cs.clone());
@@ -20313,11 +21889,22 @@ mod tests {
         pm.request_block_from_peer(h2, 7).expect("ask peer 7");
         pm.request_block_from_peer(h2, 8).expect("then peer 8");
 
-        pm.handle_message(9, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
+        pm.handle_message(
+            9,
+            NetworkMessage::Block(b2.clone()),
+            crate::net::flow::InFlight::new(None),
+        );
         assert!(!cs.block_data_readable(&h2), "peer 9 was not asked");
 
-        pm.handle_message(7, NetworkMessage::Block(b2.clone()), crate::net::flow::InFlight::new(None));
-        assert!(cs.block_data_readable(&h2), "peer 7 was asked, before peer 8");
+        pm.handle_message(
+            7,
+            NetworkMessage::Block(b2.clone()),
+            crate::net::flow::InFlight::new(None),
+        );
+        assert!(
+            cs.block_data_readable(&h2),
+            "peer 7 was asked, before peer 8"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20353,7 +21940,11 @@ mod tests {
         for (b, h) in &tail {
             store_block_without_connecting(&cs, b, *h);
         }
-        assert_eq!(cs.tip_height(), 1, "fixture: 30-block tail stored, none connected");
+        assert_eq!(
+            cs.tip_height(),
+            1,
+            "fixture: 30-block tail stored, none connected"
+        );
 
         let chain_state = Arc::new(cs);
         let mempool = Arc::new(Mempool::new(1_000_000, 0));
@@ -20368,7 +21959,11 @@ mod tests {
             &std::sync::Weak::new(),
         );
         assert_eq!(first, 24, "one wakeup must connect exactly the cap");
-        assert_eq!(chain_state.tip_height(), 25, "tip must stop at the cap boundary");
+        assert_eq!(
+            chain_state.tip_height(),
+            25,
+            "tip must stop at the cap boundary"
+        );
 
         let second = PeerManager::connect_stored_tail(
             &chain_state,
@@ -20378,7 +21973,11 @@ mod tests {
             &std::sync::Weak::new(),
         );
         assert_eq!(second, 6, "the next wakeup must finish the remainder");
-        assert_eq!(chain_state.tip_height(), 31, "the whole tail must connect across wakeups");
+        assert_eq!(
+            chain_state.tip_height(),
+            31,
+            "the whole tail must connect across wakeups"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -20483,7 +22082,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(got, expected, "one BlockConnected per drained block, in order: {events:?}");
+        assert_eq!(
+            got, expected,
+            "one BlockConnected per drained block, in order: {events:?}"
+        );
         assert_eq!(events.len(), expected.len(), "and nothing else: {events:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20528,7 +22130,10 @@ mod tests {
             });
             let deadline = Instant::now() + Duration::from_secs(10);
             while chain_state.tip_height() < 2 {
-                assert!(Instant::now() < deadline, "the drain never connected block 2");
+                assert!(
+                    Instant::now() < deadline,
+                    "the drain never connected block 2"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
             // The tip moves under the lock, so from here the drain either
@@ -20573,7 +22178,10 @@ mod tests {
         // (which deliberately does not check the frontier) arms nothing.
         let chain_state = Arc::new(cs);
         let pm = peer_manager_over(chain_state.clone());
-        assert!(pm.ibd.read().is_none(), "fixture: no scheduler at construction");
+        assert!(
+            pm.ibd.read().is_none(),
+            "fixture: no scheduler at construction"
+        );
 
         // Chain B: a 30-header competing branch forking at genesis. More
         // work than A, so it becomes the best header chain and owns the
@@ -20587,7 +22195,10 @@ mod tests {
             headers.push(b.header);
         }
         let (accepted, err) = chain_state.accept_headers(&headers);
-        assert_eq!(accepted, 30, "fixture: fork headers must be accepted ({err:?})");
+        assert_eq!(
+            accepted, 30,
+            "fixture: fork headers must be accepted ({err:?})"
+        );
         assert!(
             !chain_state.frontier_connects_to_tip(),
             "fixture: the frontier must actually be fork-blocked"
@@ -20631,8 +22242,14 @@ mod tests {
             all_blocks.push(b);
         }
         let (accepted, err) = chain_state.accept_headers(&headers[..30]);
-        assert_eq!(accepted, 30, "fixture: first batch must be accepted ({err:?})");
-        assert!(pm.maybe_start_ibd(), "fixture: the first batch must arm a scheduler");
+        assert_eq!(
+            accepted, 30,
+            "fixture: first batch must be accepted ({err:?})"
+        );
+        assert!(
+            pm.maybe_start_ibd(),
+            "fixture: the first batch must arm a scheduler"
+        );
 
         // Give the live scheduler observable state a replacement would lose.
         let assigned = {
@@ -20642,7 +22259,10 @@ mod tests {
             sched.register_peer(1);
             sched.assign_blocks(1)
         };
-        assert!(!assigned.is_empty(), "fixture: peer 1 must hold assignments");
+        assert!(
+            !assigned.is_empty(),
+            "fixture: peer 1 must hold assignments"
+        );
 
         // Second batch through the real headers handler (no peer 7 exists;
         // outbound sends are best-effort no-ops).
@@ -20653,7 +22273,10 @@ mod tests {
             let sched = ibd.as_ref().expect("scheduler must still exist");
             (sched.target_height(), sched.peer_inflight_count(1))
         };
-        assert_eq!(target, 60, "the live scheduler must extend to the new headers tip");
+        assert_eq!(
+            target, 60,
+            "the live scheduler must extend to the new headers tip"
+        );
         assert_eq!(
             inflight,
             assigned.len(),
@@ -20690,7 +22313,11 @@ mod tests {
 
         let drained = pm.drain_promotion_queue();
         assert_eq!(drained, PROMOTION_DRAIN_PER_TICK, "one tick drains the cap");
-        assert_eq!(pm.promotion_queue_len(), 5, "the overflow waits for the next tick");
+        assert_eq!(
+            pm.promotion_queue_len(),
+            5,
+            "the overflow waits for the next tick"
+        );
 
         let drained = pm.drain_promotion_queue();
         assert_eq!(drained, 5);
@@ -20704,9 +22331,11 @@ mod tests {
     fn promotion_drain_announces_to_peers() {
         let pm = empty_peer_manager();
         // An acting tx in the mempool (fee_rate 0).
-        let txid = pm
-            .mempool
-            .insert_scoped_for_test(1, 0, crate::mempool::pool::QuarantineScope::acting());
+        let txid = pm.mempool.insert_scoped_for_test(
+            1,
+            0,
+            crate::mempool::pool::QuarantineScope::acting(),
+        );
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
@@ -20753,15 +22382,20 @@ mod tests {
                 4,
                 Default::default(),
                 Default::default(),
-            Default::default(),
+                Default::default(),
             )
             .unwrap(),
         );
         let mempool = Arc::new(Mempool::new(1_000_000, 0));
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let pm =
-            PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        let pm = PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        );
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
@@ -20782,14 +22416,21 @@ mod tests {
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
         };
 
         assert!(
-            pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false).is_err(),
+            pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false)
+                .is_err(),
             "tx with missing inputs must be rejected"
         );
-        assert!(rx1.try_recv().is_err(), "a rejected tx must not be announced to peers");
+        assert!(
+            rx1.try_recv().is_err(),
+            "a rejected tx must not be announced to peers"
+        );
     }
 
     /// Resubmitting a tx that is already in the mempool must succeed and
@@ -20842,7 +22483,11 @@ mod tests {
 
         let result = pm.submit_and_announce(tx, crate::mempool::pool::TxSource::Rpc, false);
         flush_invs(&pm);
-        assert_eq!(result.ok(), Some(txid), "resubmit of a mempool tx must succeed");
+        assert_eq!(
+            result.ok(),
+            Some(txid),
+            "resubmit of a mempool tx must succeed"
+        );
         match rx1.try_recv() {
             Ok(NetworkMessage::Inv(inv)) => {
                 assert_eq!(inv, vec![Inventory::WitnessTransaction(txid)]);
@@ -20859,7 +22504,8 @@ mod tests {
     fn a_resubmit_with_another_witness_reannounces_the_resident_one() {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
-        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h1, mut rx1) =
+            mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         h1.info.wtxid_relay = true;
         pm.peers.write().insert(1, h1);
 
@@ -20874,9 +22520,20 @@ mod tests {
 
         let result = pm.submit_and_announce(other, crate::mempool::pool::TxSource::Rpc, false);
         flush_invs(&pm);
-        assert_eq!(result.ok(), Some(txid), "a resubmit with another witness must succeed");
-        expect_inv(&mut rx1, &[Inventory::WTx(resident.compute_wtxid())], "the resident witness");
-        assert!(pm.mempool.is_unbroadcast(&txid), "and it is rebroadcast like any resubmit");
+        assert_eq!(
+            result.ok(),
+            Some(txid),
+            "a resubmit with another witness must succeed"
+        );
+        expect_inv(
+            &mut rx1,
+            &[Inventory::WTx(resident.compute_wtxid())],
+            "the resident witness",
+        );
+        assert!(
+            pm.mempool.is_unbroadcast(&txid),
+            "and it is rebroadcast like any resubmit"
+        );
     }
 
     /// Minimal regtest `PeerManager` for the rebroadcast / echo tests.
@@ -20904,13 +22561,19 @@ mod tests {
                 4,
                 Default::default(),
                 Default::default(),
-            Default::default(),
+                Default::default(),
             )
             .unwrap(),
         );
         let fee_estimator = Arc::new(FeeEstimator::new());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+        let pm = PeerManager::new(
+            chain_state,
+            mempool,
+            fee_estimator,
+            Network::Regtest,
+            shutdown_rx,
+        );
         (pm, dir)
     }
 
@@ -20927,8 +22590,9 @@ mod tests {
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
         pm.peers.write().insert(1, h1);
 
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([3u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [3u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         pm.rebroadcast_unbroadcast_txs();
@@ -20964,8 +22628,9 @@ mod tests {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
         pm.set_rebroadcast_config(0, 1);
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [7u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         let addr: SocketAddr = "10.0.0.2:8333".parse().unwrap();
@@ -20974,7 +22639,10 @@ mod tests {
 
         // An inbound inv for a tx we already hold, from a peer, counts as a witness.
         pm.handle_inv(2, vec![Inventory::WitnessTransaction(txid)]);
-        assert!(!pm.mempool.is_unbroadcast(&txid), "inv echo at threshold 1 clears the set");
+        assert!(
+            !pm.mempool.is_unbroadcast(&txid),
+            "inv echo at threshold 1 clears the set"
+        );
     }
 
     /// Reconnecting from the same host must not stack witnesses: a fresh
@@ -20985,8 +22653,9 @@ mod tests {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
         pm.set_rebroadcast_config(0, 2); // require two distinct witnesses
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([8u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [8u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         let addr: SocketAddr = "10.0.0.3:8333".parse().unwrap();
@@ -21021,8 +22690,9 @@ mod tests {
     fn announce_unbroadcast_to_new_peer_respects_state() {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([4u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [4u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
@@ -21045,7 +22715,10 @@ mod tests {
 
         pm.announce_unbroadcast_to_peer(2);
         flush_invs(&pm);
-        assert!(rx2.try_recv().is_err(), "a not-yet-Connected peer must be skipped");
+        assert!(
+            rx2.try_recv().is_err(),
+            "a not-yet-Connected peer must be skipped"
+        );
     }
 
     /// The on-connect re-announce is outbound-only: an unsolicited inv of
@@ -21056,8 +22729,9 @@ mod tests {
     fn announce_unbroadcast_skips_inbound_peers() {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [5u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         let addr: SocketAddr = "10.0.0.9:8333".parse().unwrap();
@@ -21075,7 +22749,7 @@ mod tests {
                 header_sync: Default::default(),
                 last_mempool_served: None,
                 tx_relay: Default::default(),
-                    fee_filter_sent: None,
+                fee_filter_sent: None,
                 stats: PeerStats::new(NetTotals::new()),
             },
         );
@@ -21095,8 +22769,9 @@ mod tests {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([5u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [5u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         // No mempool permission → request ignored.
@@ -21104,7 +22779,10 @@ mod tests {
         pm.peers.write().insert(1, h1);
         pm.handle_mempool_request(1);
         flush_invs(&pm);
-        assert!(rx1.try_recv().is_err(), "peer without mempool permission gets no dump");
+        assert!(
+            rx1.try_recv().is_err(),
+            "peer without mempool permission gets no dump"
+        );
 
         // With the mempool permission → inv of the mempool txid.
         let (mut h2, mut rx2) = mk_handle_rx(2, addr, PeerState::Connected, 0);
@@ -21139,22 +22817,23 @@ mod tests {
         // Leave IBD: the tip has to be recent, or every filter is the maximum
         // and the mempool's minimum never reaches this code.
         let tip = pm.chain_state.tip_hash();
-        let block = crate::chain::state::tests::build_test_block(
-            tip,
-            1,
-            crate::time::now_secs() as u32,
-        );
+        let block =
+            crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
         pm.chain_state.accept_block(&block).expect("block connects");
         assert!(
             !pm.chain_state.is_initial_block_download(),
             "in IBD every filter is the maximum and this proves nothing"
         );
 
-        let idle = pm.fee_filter_for(1).expect("a tx-relay peer is sent a filter");
+        let idle = pm
+            .fee_filter_for(1)
+            .expect("a tx-relay peer is sent a filter");
 
         // An eviction raises the rolling minimum well past the static floor.
         pm.mempool.raise_rolling_min_for_test(200_000);
-        let raised = pm.fee_filter_for(1).expect("a tx-relay peer is sent a filter");
+        let raised = pm
+            .fee_filter_for(1)
+            .expect("a tx-relay peer is sent a filter");
         assert!(
             raised > idle,
             "the filter ignored the rolling minimum ({idle} -> {raised})"
@@ -21167,15 +22846,19 @@ mod tests {
         let (pm, _dir) = mk_test_pm();
         let addr: SocketAddr = "10.0.0.2:8333".parse().unwrap();
         // Entry at fee rate 0; peer's filter is 1000 sat/kvB → excluded.
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([6u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [6u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         let (mut h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 1000);
         h.info.permissions.mempool = true;
         pm.peers.write().insert(1, h);
         pm.handle_mempool_request(1);
-        assert!(rx.try_recv().is_err(), "a tx below the peer's fee filter is not advertised");
+        assert!(
+            rx.try_recv().is_err(),
+            "a tx below the peer's fee filter is not advertised"
+        );
     }
 
     /// Repeated `mempool` requests from the same peer inside the cooldown
@@ -21186,8 +22869,9 @@ mod tests {
         use bitcoin::hashes::Hash;
         let (pm, _dir) = mk_test_pm();
         let addr: SocketAddr = "10.0.0.3:8333".parse().unwrap();
-        let txid =
-            bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]));
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [7u8; 32],
+        ));
         pm.mempool.insert_unbroadcast_for_test(txid, 0);
 
         let (mut h, mut rx) = mk_handle_rx(1, addr, PeerState::Connected, 0);
@@ -21264,10 +22948,16 @@ mod tests {
         // another: a peer that has been announced a transaction knows it and
         // is not announced it again.
         let fresh = |a: PeerId| {
-            let (mut h1, rx1) = mk_handle_rx(a, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+            let (mut h1, rx1) =
+                mk_handle_rx(a, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
             h1.info.wtxid_relay = true;
             h1.info.permissions.mempool = true;
-            let (mut h2, rx2) = mk_handle_rx(a + 1, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+            let (mut h2, rx2) = mk_handle_rx(
+                a + 1,
+                "10.0.0.2:8333".parse().unwrap(),
+                PeerState::Connected,
+                0,
+            );
             h2.info.permissions.mempool = true;
             let mut peers = pm.peers.write();
             peers.clear();
@@ -21279,9 +22969,16 @@ mod tests {
         let (mut rx1, mut rx2) = fresh(1);
         pm.announce_tx(txid);
         flush_invs(&pm);
-        expect_inv(&mut rx1, &by_wtxid, "local broadcast to the wtxid relay peer");
+        expect_inv(
+            &mut rx1,
+            &by_wtxid,
+            "local broadcast to the wtxid relay peer",
+        );
         expect_inv(&mut rx2, &by_txid, "local broadcast to the other peer");
-        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err(), "one announcement");
+        assert!(
+            rx1.try_recv().is_err() && rx2.try_recv().is_err(),
+            "one announcement"
+        );
 
         let (mut rx1, mut rx2) = fresh(3);
         pm.broadcast_inv(99, txid);
@@ -21300,8 +22997,16 @@ mod tests {
         pm.announce_unbroadcast_to_peer(7);
         pm.announce_unbroadcast_to_peer(8);
         flush_invs(&pm);
-        expect_inv(&mut rx1, &by_wtxid, "on-connect announcement to the wtxid relay peer");
-        expect_inv(&mut rx2, &by_txid, "on-connect announcement to the other peer");
+        expect_inv(
+            &mut rx1,
+            &by_wtxid,
+            "on-connect announcement to the wtxid relay peer",
+        );
+        expect_inv(
+            &mut rx2,
+            &by_txid,
+            "on-connect announcement to the other peer",
+        );
 
         let (mut rx1, mut rx2) = fresh(9);
         pm.handle_mempool_request(9);
@@ -21310,7 +23015,10 @@ mod tests {
         expect_inv(&mut rx1, &by_wtxid, "mempool reply to the wtxid relay peer");
         expect_inv(&mut rx2, &by_txid, "mempool reply to the other peer");
 
-        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err(), "one announcement per path");
+        assert!(
+            rx1.try_recv().is_err() && rx2.try_recv().is_err(),
+            "one announcement per path"
+        );
     }
 
     /// BIP 339: a `getdata` for `MSG_WTX` is served by wtxid. The same txid
@@ -21323,19 +23031,29 @@ mod tests {
         let (pm, _dir) = mk_test_pm();
         pm.set_rebroadcast_config(0, 1);
         let tx = witness_tx(1, 0xaa);
-        let txid = pm.mempool.insert_tx_scoped_for_test(tx.clone(), QuarantineScope::acting());
+        let txid = pm
+            .mempool
+            .insert_tx_scoped_for_test(tx.clone(), QuarantineScope::acting());
         pm.mempool.mark_unbroadcast(txid);
         let quarantined = witness_tx(2, 0xaa);
-        pm.mempool
-            .insert_tx_scoped_for_test(quarantined.clone(), QuarantineScope { relay: true, template: false });
+        pm.mempool.insert_tx_scoped_for_test(
+            quarantined.clone(),
+            QuarantineScope {
+                relay: true,
+                template: false,
+            },
+        );
 
-        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h1, mut rx1) =
+            mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         h1.info.wtxid_relay = true;
         pm.peers.write().insert(1, h1);
 
         pm.handle_getdata(1, vec![Inventory::WTx(tx.compute_wtxid())]);
         match rx1.try_recv() {
-            Ok(NetworkMessage::Tx(served)) => assert_eq!(served.compute_wtxid(), tx.compute_wtxid()),
+            Ok(NetworkMessage::Tx(served)) => {
+                assert_eq!(served.compute_wtxid(), tx.compute_wtxid())
+            }
             other => panic!("a getdata by wtxid must be served the tx, got {other:?}"),
         }
         assert!(
@@ -21370,25 +23088,34 @@ mod tests {
         let block =
             crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
         pm.chain_state.accept_block(&block).expect("block connects");
-        assert!(!pm.is_ibd(), "no transaction is fetched in IBD, and this would prove nothing");
+        assert!(
+            !pm.is_ibd(),
+            "no transaction is fetched in IBD, and this would prove nothing"
+        );
         pm.set_rebroadcast_config(0, 1);
 
         let resident = witness_tx(1, 0xaa);
-        let resident_txid = pm.mempool.insert_tx_scoped_for_test(resident.clone(), QuarantineScope::acting());
+        let resident_txid = pm
+            .mempool
+            .insert_tx_scoped_for_test(resident.clone(), QuarantineScope::acting());
         pm.mempool.mark_unbroadcast(resident_txid);
         let new = witness_tx(2, 0xaa);
         let (new_txid, new_wtxid) = (new.compute_txid(), new.compute_wtxid());
 
         // Preferred announcers (outbound, serving blocks), so a `MSG_WTX` is
         // requested at once.
-        let (mut h1, mut rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h1, mut rx1) =
+            mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         h1.info.wtxid_relay = true;
         h1.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let (mut h2, mut rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h2, mut rx2) =
+            mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
         h2.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let (mut h3, mut rx3) = mk_handle_rx(3, "10.0.0.3:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h3, mut rx3) =
+            mk_handle_rx(3, "10.0.0.3:8333".parse().unwrap(), PeerState::Connected, 0);
         h3.info.conn_type = ConnType::BlockRelay;
-        let (mut h4, _rx4) = mk_handle_rx(4, "10.0.0.4:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h4, _rx4) =
+            mk_handle_rx(4, "10.0.0.4:8333".parse().unwrap(), PeerState::Connected, 0);
         h4.info.conn_type = ConnType::BlockRelay;
         h4.info.wtxid_relay = true;
         {
@@ -21404,21 +23131,38 @@ mod tests {
         let mut clock = super::txrequest_tests::MockClock::install();
         let txid_relay_delay = crate::net::txrequest::TXID_RELAY_DELAY;
 
-        pm.handle_inv(1, vec![Inventory::Transaction(new_txid), Inventory::WTx(new_wtxid)]);
-        expect_getdata(&mut rx1, &[Inventory::WTx(new_wtxid)], "a wtxid relay peer's MSG_WTX, not its MSG_TX");
+        pm.handle_inv(
+            1,
+            vec![Inventory::Transaction(new_txid), Inventory::WTx(new_wtxid)],
+        );
+        expect_getdata(
+            &mut rx1,
+            &[Inventory::WTx(new_wtxid)],
+            "a wtxid relay peer's MSG_WTX, not its MSG_TX",
+        );
         // Core skips only `MSG_TX` on a wtxid link; `MSG_WITNESS_TX` is a
         // getdata type that nothing announces, and passes -- by txid, so
         // after `TXID_RELAY_DELAY`.
         pm.handle_inv(1, vec![Inventory::WitnessTransaction(new_txid)]);
-        assert!(rx1.try_recv().is_err(), "a txid announcement waits while wtxid peers are connected");
+        assert!(
+            rx1.try_recv().is_err(),
+            "a txid announcement waits while wtxid peers are connected"
+        );
         clock.advance(txid_relay_delay);
         pm.send_all_tx_requests();
-        expect_getdata(&mut rx1, &[Inventory::WitnessTransaction(new_txid)], "MSG_WITNESS_TX");
+        expect_getdata(
+            &mut rx1,
+            &[Inventory::WitnessTransaction(new_txid)],
+            "MSG_WITNESS_TX",
+        );
 
         // The other peer's `MSG_TX` only. It names the txid already asked of
         // peer 1, so peer 2 is the fallback, asked once peer 1 says
         // `notfound`.
-        pm.handle_inv(2, vec![Inventory::WTx(new_wtxid), Inventory::Transaction(new_txid)]);
+        pm.handle_inv(
+            2,
+            vec![Inventory::WTx(new_wtxid), Inventory::Transaction(new_txid)],
+        );
         clock.advance(txid_relay_delay);
         pm.send_all_tx_requests();
         assert!(rx2.try_recv().is_err(), "one request at a time for a txid");
@@ -21427,7 +23171,11 @@ mod tests {
             NetworkMessage::NotFound(vec![Inventory::WitnessTransaction(new_txid)]),
             crate::net::flow::InFlight::new(None),
         );
-        expect_getdata(&mut rx2, &[Inventory::WitnessTransaction(new_txid)], "the other peer's MSG_TX only");
+        expect_getdata(
+            &mut rx2,
+            &[Inventory::WitnessTransaction(new_txid)],
+            "the other peer's MSG_TX only",
+        );
 
         pm.handle_inv(3, vec![Inventory::WTx(new_wtxid)]);
         assert!(rx3.try_recv().is_err());
@@ -21442,7 +23190,10 @@ mod tests {
         );
 
         pm.handle_inv(1, vec![Inventory::WTx(resident.compute_wtxid())]);
-        assert!(rx1.try_recv().is_err(), "a resident tx is not fetched again");
+        assert!(
+            rx1.try_recv().is_err(),
+            "a resident tx is not fetched again"
+        );
         assert!(
             !pm.mempool.is_unbroadcast(&resident_txid),
             "a wtxid relay peer announcing the local tx back is a propagation witness"
@@ -21458,12 +23209,15 @@ mod tests {
     ) {
         let (pm, dir) = mk_test_pm();
         let tip = pm.chain_state.tip_hash();
-        let block = crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+        let block =
+            crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
         pm.chain_state.accept_block(&block).expect("block connects");
-        let (mut h1, rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h1, rx1) =
+            mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         h1.info.wtxid_relay = true;
         h1.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let (mut h2, rx2) = mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h2, rx2) =
+            mk_handle_rx(2, "10.0.0.2:8333".parse().unwrap(), PeerState::Connected, 0);
         h2.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         pm.peers.write().insert(1, h1);
         pm.peers.write().insert(2, h2);
@@ -21491,7 +23245,11 @@ mod tests {
         pm.handle_inv(2, vec![Inventory::Transaction(txid)]);
         wait();
         pm.send_all_tx_requests();
-        expect_getdata(&mut rx2, &[Inventory::WitnessTransaction(txid)], "fetched the first time");
+        expect_getdata(
+            &mut rx2,
+            &[Inventory::WitnessTransaction(txid)],
+            "fetched the first time",
+        );
 
         pm.handle_tx(2, bad);
         pm.handle_inv(1, vec![Inventory::WTx(wtxid)]);
@@ -21502,10 +23260,18 @@ mod tests {
         assert!(rx2.try_recv().is_err(), "nor by txid");
 
         let tip = pm.chain_state.tip_hash();
-        let block = crate::chain::state::tests::build_test_block(tip, 2, crate::time::now_secs() as u32 + 1);
+        let block = crate::chain::state::tests::build_test_block(
+            tip,
+            2,
+            crate::time::now_secs() as u32 + 1,
+        );
         pm.chain_state.accept_block(&block).expect("block connects");
         pm.handle_inv(1, vec![Inventory::WTx(wtxid)]);
-        expect_getdata(&mut rx1, &[Inventory::WTx(wtxid)], "a new tip forgets the refusal");
+        expect_getdata(
+            &mut rx1,
+            &[Inventory::WTx(wtxid)],
+            "a new tip forgets the refusal",
+        );
     }
 
     /// A transaction with no inputs (#1242) is refused and recorded under
@@ -21515,13 +23281,19 @@ mod tests {
     fn a_refused_transaction_with_no_inputs_is_recorded_by_cores_wtxid() {
         let mut clock = super::txrequest_tests::MockClock::install();
         let (pm, _dir, mut rx1, _rx2) = rejects_pm();
-        let empty = crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-            .expect("Core reads it");
+        let empty =
+            crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .expect("Core reads it");
         let txid = empty.compute_txid();
         assert_ne!(empty.compute_wtxid().to_byte_array(), txid.to_byte_array());
         pm.handle_tx(2, empty);
         assert!(pm.recently_rejected(&txid.to_byte_array()));
-        pm.handle_inv(1, vec![Inventory::WTx(bitcoin::Wtxid::from_byte_array(txid.to_byte_array()))]);
+        pm.handle_inv(
+            1,
+            vec![Inventory::WTx(bitcoin::Wtxid::from_byte_array(
+                txid.to_byte_array(),
+            ))],
+        );
         clock.advance(crate::net::txrequest::TXID_RELAY_DELAY);
         pm.send_all_tx_requests();
         assert!(rx1.try_recv().is_err(), "not fetched again by its wtxid");
@@ -21532,13 +23304,18 @@ mod tests {
     /// sender a point for each.
     #[test]
     fn a_large_orphan_costs_its_sender_nothing() {
-        let config = crate::mempool::pool::MempoolConfig { accept_non_std_txn: true, ..Default::default() };
+        let config = crate::mempool::pool::MempoolConfig {
+            accept_non_std_txn: true,
+            ..Default::default()
+        };
         let (pm, _dir) = mk_test_pm_with_mempool(Arc::new(Mempool::with_config(config)));
         // Out of initial sync, as in `rejects_pm`, or the tx is not looked at.
         let tip = pm.chain_state.tip_hash();
-        let block = crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
+        let block =
+            crate::chain::state::tests::build_test_block(tip, 1, crate::time::now_secs() as u32);
         pm.chain_state.accept_block(&block).expect("block connects");
-        let (mut h1, _rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
+        let (mut h1, _rx1) =
+            mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         h1.info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         pm.peers.write().insert(1, h1);
         let mut big = witness_tx(0x51, 0xaa);
@@ -21556,12 +23333,21 @@ mod tests {
         let (pm, _dir, _rx1, _rx2) = rejects_pm();
         let orphan = witness_tx(0x31, 0xaa);
         pm.handle_tx(1, orphan.clone());
-        assert!(pm.orphanage.contains(&orphan.compute_txid()), "an unknown parent makes it an orphan");
+        assert!(
+            pm.orphanage.contains(&orphan.compute_txid()),
+            "an unknown parent makes it an orphan"
+        );
 
         let other = witness_tx(0x32, 0xaa);
-        pm.note_rejected(&other.compute_wtxid().to_byte_array(), crate::net::recent_rejects::Rejection::Rejected);
+        pm.note_rejected(
+            &other.compute_wtxid().to_byte_array(),
+            crate::net::recent_rejects::Rejection::Rejected,
+        );
         pm.handle_tx(1, other.clone());
-        assert!(!pm.orphanage.contains(&other.compute_txid()), "refused before, so not looked at");
+        assert!(
+            !pm.orphanage.contains(&other.compute_txid()),
+            "refused before, so not looked at"
+        );
     }
 
     /// Core keeps no orphan whose parent it refused, and refuses the orphan's
@@ -21584,12 +23370,23 @@ mod tests {
         let (pm, _dir, _rx1, _rx2) = rejects_pm();
         let child = witness_tx(0x47, 0xaa);
         pm.note_rejected(&[0x47; 32], crate::net::recent_rejects::Rejection::Rejected);
-        let missing: std::collections::HashSet<_> = [bitcoin::Txid::from_byte_array([0x47; 32])].into();
+        let missing: std::collections::HashSet<_> =
+            [bitcoin::Txid::from_byte_array([0x47; 32])].into();
         let former = bitcoin::BlockHash::from_byte_array([9; 32]);
-        assert!(!pm.condemn_orphan_of_rejected_parent(&missing, child.compute_txid(), child.compute_wtxid(), former));
+        assert!(!pm.condemn_orphan_of_rejected_parent(
+            &missing,
+            child.compute_txid(),
+            child.compute_wtxid(),
+            former
+        ));
         assert!(!pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
         let tip = pm.chain_state.tip_hash();
-        assert!(pm.condemn_orphan_of_rejected_parent(&missing, child.compute_txid(), child.compute_wtxid(), tip));
+        assert!(pm.condemn_orphan_of_rejected_parent(
+            &missing,
+            child.compute_txid(),
+            child.compute_wtxid(),
+            tip
+        ));
         assert!(pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
     }
 
@@ -21599,9 +23396,15 @@ mod tests {
     fn an_orphan_of_a_fee_refused_parent_is_kept() {
         let (pm, _dir, _rx1, _rx2) = rejects_pm();
         let child = witness_tx(0x45, 0xaa);
-        pm.note_rejected(&[0x45; 32], crate::net::recent_rejects::Rejection::Reconsiderable);
+        pm.note_rejected(
+            &[0x45; 32],
+            crate::net::recent_rejects::Rejection::Reconsiderable,
+        );
         pm.handle_tx(1, child.clone());
-        assert!(pm.orphanage.contains(&child.compute_txid()), "kept, waiting for its parent");
+        assert!(
+            pm.orphanage.contains(&child.compute_txid()),
+            "kept, waiting for its parent"
+        );
         assert!(!pm.recently_rejected(&child.compute_wtxid().to_byte_array()));
     }
 
@@ -21613,13 +23416,32 @@ mod tests {
     fn refusals_are_recorded_as_core_records_them() {
         use crate::net::recent_rejects::Rejection;
         let kind = PeerManager::rejection_kind;
-        assert_eq!(kind(&MempoolError::InsufficientFee(1, 2), true), Some(Rejection::Reconsiderable));
-        assert_eq!(kind(&MempoolError::MempoolMinFeeNotMet(1, 2), false), Some(Rejection::Reconsiderable));
-        assert_eq!(kind(&MempoolError::MempoolFull, true), Some(Rejection::Reconsiderable));
+        assert_eq!(
+            kind(&MempoolError::InsufficientFee(1, 2), true),
+            Some(Rejection::Reconsiderable)
+        );
+        assert_eq!(
+            kind(&MempoolError::MempoolMinFeeNotMet(1, 2), false),
+            Some(Rejection::Reconsiderable)
+        );
+        assert_eq!(
+            kind(&MempoolError::MempoolFull, true),
+            Some(Rejection::Reconsiderable)
+        );
         assert_eq!(kind(&MempoolError::Dust, true), Some(Rejection::Rejected));
-        assert_eq!(kind(&MempoolError::Script("x".into(), None), true), Some(Rejection::Rejected));
-        assert_eq!(kind(&MempoolError::Script("x".into(), None), false), None, "maybe witness-stripped");
-        assert_eq!(kind(&MempoolError::PolicyScript("x".into(), None), false), None);
+        assert_eq!(
+            kind(&MempoolError::Script("x".into(), None), true),
+            Some(Rejection::Rejected)
+        );
+        assert_eq!(
+            kind(&MempoolError::Script("x".into(), None), false),
+            None,
+            "maybe witness-stripped"
+        );
+        assert_eq!(
+            kind(&MempoolError::PolicyScript("x".into(), None), false),
+            None
+        );
         assert_eq!(kind(&MempoolError::MissingInputs, true), None);
         assert_eq!(kind(&MempoolError::AlreadyExists, true), None);
 
@@ -21628,10 +23450,20 @@ mod tests {
         let a = witness_tx(0x51, 0xaa);
         pm.record_rejection(&a, &MempoolError::Dust, tip);
         assert!(pm.recently_rejected(&a.compute_wtxid().to_byte_array()));
-        assert!(!pm.recently_rejected(&a.compute_txid().to_byte_array()), "another witness may pass");
+        assert!(
+            !pm.recently_rejected(&a.compute_txid().to_byte_array()),
+            "another witness may pass"
+        );
         let b = witness_tx(0x52, 0xaa);
-        pm.record_rejection(&b, &MempoolError::NonStandardInputs("input 0 script unknown".into()), tip);
-        assert!(pm.recently_rejected(&b.compute_txid().to_byte_array()), "no witness changes what it spends");
+        pm.record_rejection(
+            &b,
+            &MempoolError::NonStandardInputs("input 0 script unknown".into()),
+            tip,
+        );
+        assert!(
+            pm.recently_rejected(&b.compute_txid().to_byte_array()),
+            "no witness changes what it spends"
+        );
 
         // A verdict reached under a tip that has since moved is not recorded.
         let c = witness_tx(0x53, 0xaa);
@@ -21647,7 +23479,11 @@ mod tests {
         let (pm, _dir) = mk_test_pm();
         let (h1, _rx1) = mk_handle_rx(1, "10.0.0.1:8333".parse().unwrap(), PeerState::Connected, 0);
         pm.peers.write().insert(1, h1);
-        pm.handle_message(1, NetworkMessage::WtxidRelay, crate::net::flow::InFlight::new(None));
+        pm.handle_message(
+            1,
+            NetworkMessage::WtxidRelay,
+            crate::net::flow::InFlight::new(None),
+        );
         assert!(!pm.peers.read().contains_key(&1));
     }
 
@@ -21697,10 +23533,14 @@ mod tests {
         }
 
         for direction in [Direction::Inbound, Direction::Outbound] {
-            for (version, send_wtxidrelay, negotiated) in
-                [(70016, true, true), (70016, false, false), (70015, true, false)]
-            {
-                let case = format!("{direction:?}, peer at {version}, peer sends wtxidrelay: {send_wtxidrelay}");
+            for (version, send_wtxidrelay, negotiated) in [
+                (70016, true, true),
+                (70016, false, false),
+                (70015, true, false),
+            ] {
+                let case = format!(
+                    "{direction:?}, peer at {version}, peer sends wtxidrelay: {send_wtxidrelay}"
+                );
                 let (pm, _dir) = mk_test_pm();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let dialer = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
@@ -21710,7 +23550,9 @@ mod tests {
                     Direction::Inbound => (accepted, dialed),
                     Direction::Outbound => (dialed, accepted),
                 };
-                pm.peers.write().insert(1, mk_handle(1, peer_addr, direction, PeerState::Connecting));
+                pm.peers
+                    .write()
+                    .insert(1, mk_handle(1, peer_addr, direction, PeerState::Connecting));
                 let mut ours = Connection::with_magic(ours, Magic::REGTEST);
                 let mut theirs = Connection::with_magic(theirs, Magic::REGTEST);
 
@@ -21720,7 +23562,10 @@ mod tests {
                 );
                 handshake.unwrap_or_else(|e| panic!("{case}: handshake failed: {e}"));
 
-                let version_at = seen.iter().position(|c| *c == "version").expect("satd sent version");
+                let version_at = seen
+                    .iter()
+                    .position(|c| *c == "version")
+                    .expect("satd sent version");
                 for negotiation in ["wtxidrelay", "sendaddrv2"] {
                     let at = seen.iter().position(|c| *c == negotiation);
                     if version >= WTXID_RELAY_VERSION {
@@ -21729,7 +23574,10 @@ mod tests {
                             "{case}: satd must send {negotiation} between its version and verack, sent {seen:?}"
                         );
                     } else {
-                        assert_eq!(at, None, "{case}: no {negotiation} below 70016, sent {seen:?}");
+                        assert_eq!(
+                            at, None,
+                            "{case}: no {negotiation} below 70016, sent {seen:?}"
+                        );
                     }
                 }
                 assert_eq!(pm.peers.read()[&1].info.wtxid_relay, negotiated, "{case}");
@@ -21826,7 +23674,9 @@ mod tests {
         let pm = empty_peer_manager();
         let block = regtest_child_of_genesis(&pm, 1);
         let hash = block.block_hash();
-        pm.chain_state.accept_header(&block.header).expect("header accepted");
+        pm.chain_state
+            .accept_header(&block.header)
+            .expect("header accepted");
 
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (h1, mut rx1) = mk_handle_rx(1, addr, PeerState::Connected, 0);
@@ -21848,7 +23698,10 @@ mod tests {
         pm.expire_compact_state();
 
         let pending = pm.pending_compact.read();
-        assert!(!pending.contains_key(&1) && !pending.contains_key(&2), "stale entries dropped");
+        assert!(
+            !pending.contains_key(&1) && !pending.contains_key(&2),
+            "stale entries dropped"
+        );
         assert!(pending.contains_key(&3), "a fresh entry is kept");
         drop(pending);
 
@@ -21858,7 +23711,10 @@ mod tests {
             }
             other => panic!("the requested block must be fetched in full, got {other:?}"),
         }
-        assert!(rx2.try_recv().is_err(), "an unrequested push earns no getdata");
+        assert!(
+            rx2.try_recv().is_err(),
+            "an unrequested push earns no getdata"
+        );
     }
 
     /// A departed peer's reconstruction can never complete; it must not keep
@@ -21869,17 +23725,33 @@ mod tests {
         let block = regtest_child_of_genesis(&pm, 2);
         let hash = block.block_hash();
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
-        pm.peers.write().insert(1, mk_handle(1, addr, Direction::Inbound, PeerState::Connected));
-        pm.peers.write().insert(2, mk_handle(2, addr, Direction::Inbound, PeerState::Connected));
-        pm.pending_compact.write().insert(1, stale_pending(hash, block.header, false));
-        pm.pending_compact.write().insert(2, stale_pending(hash, block.header, false));
+        pm.peers.write().insert(
+            1,
+            mk_handle(1, addr, Direction::Inbound, PeerState::Connected),
+        );
+        pm.peers.write().insert(
+            2,
+            mk_handle(2, addr, Direction::Inbound, PeerState::Connected),
+        );
+        pm.pending_compact
+            .write()
+            .insert(1, stale_pending(hash, block.header, false));
+        pm.pending_compact
+            .write()
+            .insert(2, stale_pending(hash, block.header, false));
         pm.note_blocks_requested(1, &[hash]);
 
         pm.handle_peer_disconnected(1);
 
         assert!(!pm.pending_compact.read().contains_key(&1));
-        assert!(pm.pending_compact.read().contains_key(&2), "other peers are untouched");
-        assert!(!pm.block_requested_from(1, &hash), "the peer's requests are forgotten too");
+        assert!(
+            pm.pending_compact.read().contains_key(&2),
+            "other peers are untouched"
+        );
+        assert!(
+            !pm.block_requested_from(1, &hash),
+            "the peer's requests are forgotten too"
+        );
     }
 
     /// The in-flight table is charged to the peer that fills it. An `inv` is
@@ -21913,7 +23785,11 @@ mod tests {
         assert_eq!(nth as usize, 4000, "the peer announced more than the cap");
 
         let in_flight = pm.in_flight_blocks.read();
-        assert_eq!(in_flight.len(), 1, "one entry per peer, not one per announced hash");
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "one entry per peer, not one per announced hash"
+        );
         let asked = in_flight.get(&1).expect("the peer's records");
         assert!(
             asked.len() <= MAX_IN_FLIGHT_BLOCKS_PER_PEER,
@@ -22017,7 +23893,10 @@ mod tests {
         let pm = empty_peer_manager();
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         for id in [1, 2] {
-            pm.peers.write().insert(id, mk_handle(id, addr, Direction::Inbound, PeerState::Connected));
+            pm.peers.write().insert(
+                id,
+                mk_handle(id, addr, Direction::Inbound, PeerState::Connected),
+            );
         }
         let height_of = |pm: &PeerManager, id| pm.peers.read()[&id].info.best_known_height;
 
@@ -22036,12 +23915,20 @@ mod tests {
             "precondition: the header must be free under the unbounded check"
         );
         pm.handle_block(1, forged, crate::net::flow::InFlight::new(pm.peer_flow(1)));
-        assert_eq!(height_of(&pm, 1), None, "a free header must not move the belief");
+        assert_eq!(
+            height_of(&pm, 1),
+            None,
+            "a free header must not move the belief"
+        );
 
         // A real regtest block does, so the gate is not refusing everything.
         let honest = regtest_child_of_genesis(&pm, 8);
         pm.handle_block(2, honest, crate::net::flow::InFlight::new(pm.peer_flow(2)));
-        assert_eq!(height_of(&pm, 2), Some(1), "a block with real work records its height");
+        assert_eq!(
+            height_of(&pm, 2),
+            Some(1),
+            "a block with real work records its height"
+        );
     }
 
     /// However a block arrives, every partial reconstruction of it is moot.
@@ -22053,10 +23940,17 @@ mod tests {
         let hash = block.block_hash();
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         for id in 1..=3 {
-            pm.peers.write().insert(id, mk_handle(id, addr, Direction::Inbound, PeerState::Connected));
+            pm.peers.write().insert(
+                id,
+                mk_handle(id, addr, Direction::Inbound, PeerState::Connected),
+            );
         }
-        pm.pending_compact.write().insert(1, stale_pending(hash, block.header, false));
-        pm.pending_compact.write().insert(2, stale_pending(hash, block.header, false));
+        pm.pending_compact
+            .write()
+            .insert(1, stale_pending(hash, block.header, false));
+        pm.pending_compact
+            .write()
+            .insert(2, stale_pending(hash, block.header, false));
         pm.pending_compact
             .write()
             .insert(3, stale_pending(other.block_hash(), other.header, false));
@@ -22066,7 +23960,10 @@ mod tests {
 
         let pending = pm.pending_compact.read();
         assert!(!pending.contains_key(&1) && !pending.contains_key(&2));
-        assert!(pending.contains_key(&3), "a reconstruction of another block survives");
+        assert!(
+            pending.contains_key(&3),
+            "a reconstruction of another block survives"
+        );
         assert!(!pm.block_requested_from(1, &hash));
     }
 
@@ -22077,20 +23974,44 @@ mod tests {
         use bitcoin::p2p::message_compact_blocks::SendCmpct;
         let pm = empty_peer_manager();
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
-        pm.peers.write().insert(1, mk_handle(1, addr, Direction::Inbound, PeerState::Connected));
+        pm.peers.write().insert(
+            1,
+            mk_handle(1, addr, Direction::Inbound, PeerState::Connected),
+        );
         let info = |pm: &PeerManager| {
             let peers = pm.peers.read();
             let h = &peers[&1].info;
             (h.compact_blocks, h.hb_from)
         };
 
-        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 1 }), crate::net::flow::InFlight::new(pm.peer_flow(1)));
+        pm.handle_message(
+            1,
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: true,
+                version: 1,
+            }),
+            crate::net::flow::InFlight::new(pm.peer_flow(1)),
+        );
         assert_eq!(info(&pm), (false, false), "version 1 is ignored");
 
-        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }), crate::net::flow::InFlight::new(pm.peer_flow(1)));
+        pm.handle_message(
+            1,
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            }),
+            crate::net::flow::InFlight::new(pm.peer_flow(1)),
+        );
         assert_eq!(info(&pm), (true, false), "low-bandwidth v2");
 
-        pm.handle_message(1, NetworkMessage::SendCmpct(SendCmpct { send_compact: true, version: 2 }), crate::net::flow::InFlight::new(pm.peer_flow(1)));
+        pm.handle_message(
+            1,
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: true,
+                version: 2,
+            }),
+            crate::net::flow::InFlight::new(pm.peer_flow(1)),
+        );
         assert_eq!(info(&pm), (true, true), "high-bandwidth v2");
     }
 
@@ -22103,15 +24024,17 @@ mod tests {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
         let pm = empty_peer_manager();
         let announcer: SocketAddr = "203.0.113.9:8333".parse().unwrap();
-        pm.peers
-            .write()
-            .insert(1, mk_handle(1, announcer, Direction::Inbound, PeerState::Connected));
+        pm.peers.write().insert(
+            1,
+            mk_handle(1, announcer, Direction::Inbound, PeerState::Connected),
+        );
         // Two addresses from one peer: past the address rate limit's first
         // token, so the peer has the `addr` permission.
         pm.peers.write().get_mut(&1).unwrap().info.permissions.addr = true;
 
         let v1: SocketAddr = "198.51.100.1:8333".parse().unwrap();
-        let v1_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
+        let v1_services =
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
         pm.handle_message(
             1,
             NetworkMessage::Addr(vec![(1, Address::new(&v1, v1_services))]),
@@ -22136,17 +24059,16 @@ mod tests {
         };
         assert_eq!(entry("198.51.100.1").services, v1_services.to_u64());
         assert_eq!(entry("198.51.100.1").source, announcer.ip().into());
-        assert_eq!(entry("198.51.100.2").services, ServiceFlags::NETWORK_LIMITED.to_u64());
+        assert_eq!(
+            entry("198.51.100.2").services,
+            ServiceFlags::NETWORK_LIMITED.to_u64()
+        );
         assert_eq!(entry("198.51.100.2").source, announcer.ip().into());
     }
 
     // ---- BIP 152 high-bandwidth peer selection ----
 
-    fn hb_peer(
-        pm: &PeerManager,
-        id: PeerId,
-        dir: Direction,
-    ) -> mpsc::Receiver<NetworkMessage> {
+    fn hb_peer(pm: &PeerManager, id: PeerId, dir: Direction) -> mpsc::Receiver<NetworkMessage> {
         let addr: SocketAddr = "10.0.0.1:8333".parse().unwrap();
         let (mut h, rx) = mk_handle_rx(id, addr, PeerState::Connected, 0);
         h.info.direction = dir;
@@ -22206,7 +24128,10 @@ mod tests {
         // it into the second slot, so inbound 3 is demoted instead.
         pm.maybe_set_peer_as_hb(5);
         assert_eq!(deque(&pm), vec![1, 4, 5]);
-        assert_eq!(sendcmpct_flags(rx.get_mut(&3).unwrap()).last(), Some(&false));
+        assert_eq!(
+            sendcmpct_flags(rx.get_mut(&3).unwrap()).last(),
+            Some(&false)
+        );
         assert!(!sendcmpct_flags(rx.get_mut(&1).unwrap()).contains(&false));
 
         // No v2 compact block support: never selected.
@@ -22232,20 +24157,34 @@ mod tests {
         let pm = empty_peer_manager();
         let mut rx = hb_peer(&pm, 1, Direction::Outbound);
         let tip = pm.chain_state.tip_hash();
-        *pm.ibd.write() = Some(crate::net::ibd::IbdScheduler::new(0, 0, &pm.chain_state, 1000));
+        *pm.ibd.write() = Some(crate::net::ibd::IbdScheduler::new(
+            0,
+            0,
+            &pm.chain_state,
+            1000,
+        ));
 
         // Headers far ahead: initial block download.
         pm.headers_tip.store(1000, Ordering::Relaxed);
         pm.block_sources.lock().record(tip, 1);
         pm.ibd_block_connected(&tip);
-        assert!(pm.hb_peers.lock().is_empty(), "no high-bandwidth peer is chosen during IBD");
-        assert!(pm.block_sources.lock().take(&tip).is_none(), "the source is forgotten either way");
+        assert!(
+            pm.hb_peers.lock().is_empty(),
+            "no high-bandwidth peer is chosen during IBD"
+        );
+        assert!(
+            pm.block_sources.lock().take(&tip).is_none(),
+            "the source is forgotten either way"
+        );
 
         // Caught up, the scheduler still present with nothing in flight.
         pm.headers_tip.store(1, Ordering::Relaxed);
         pm.block_sources.lock().record(tip, 1);
         pm.ibd_block_connected(&tip);
-        assert_eq!(pm.hb_peers.lock().iter().copied().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            pm.hb_peers.lock().iter().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
         assert_eq!(sendcmpct_flags(&mut rx), vec![true]);
     }
 
@@ -22286,9 +24225,17 @@ mod tests {
         deliver(
             &pm,
             1,
-            NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: sendcmpct_version }),
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: sendcmpct_version,
+            }),
         );
-        CompactFetch { pm, tip, rx, _dir: dir }
+        CompactFetch {
+            pm,
+            tip,
+            rx,
+            _dir: dir,
+        }
     }
 
     /// [`compact_fetch_fixture_with`] with a tip mined now, so Core's
@@ -22327,7 +24274,11 @@ mod tests {
     /// A child of `parent` holding only its coinbase: a `cmpctblock` of it
     /// is complete without any help from the mempool.
     fn coinbase_only_child(parent: &bitcoin::Block, height: u32) -> bitcoin::Block {
-        crate::chain::state::tests::build_test_block(parent.block_hash(), height, parent.header.time + 1)
+        crate::chain::state::tests::build_test_block(
+            parent.block_hash(),
+            height,
+            parent.header.time + 1,
+        )
     }
 
     /// A child of `parent` carrying one transaction nobody has, so rebuilding
@@ -22340,7 +24291,10 @@ mod tests {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::new(bitcoin::Txid::from_byte_array([salt; 32]), 0),
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([salt; 32]),
+                    0,
+                ),
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::new(),
@@ -22386,7 +24340,10 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         while !t.is_finished() {
-            assert!(Instant::now() < deadline, "{what} held up the P2P task while accept_lock was held");
+            assert!(
+                Instant::now() < deadline,
+                "{what} held up the P2P task while accept_lock was held"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         t.join().unwrap();
@@ -22408,15 +24365,33 @@ mod tests {
         drain(&mut f.rx);
 
         let held = f.pm.chain_state.hold_accept_lock_for_test();
-        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
-        assert!(!flow.is_idle(), "a pong behind the queued batch must still wait for it");
-        assert!(f.pm.chain_state.get_block_index(&h2).is_none(), "nothing is committed under a held lock");
+        handle_returns_promptly(
+            &f.pm,
+            1,
+            NetworkMessage::Headers(vec![b2.header]),
+            "a headers message",
+        );
+        assert!(
+            !flow.is_idle(),
+            "a pong behind the queued batch must still wait for it"
+        );
+        assert!(
+            f.pm.chain_state.get_block_index(&h2).is_none(),
+            "nothing is committed under a held lock"
+        );
 
         drop(held);
         f.pm.wait_for_headers();
-        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "the batch is committed once the lock is free");
+        assert!(
+            f.pm.chain_state.get_block_index(&h2).is_some(),
+            "the batch is committed once the lock is free"
+        );
         assert!(flow.is_idle(), "and its message is counted out");
-        assert_eq!(block_requests(&drain(&mut f.rx), h2), vec![true], "and its block is asked for");
+        assert_eq!(
+            block_requests(&drain(&mut f.rx), h2),
+            vec![true],
+            "and its block is asked for"
+        );
     }
 
     /// An `inv` for a block, arriving behind a `headers` batch still waiting
@@ -22434,18 +24409,37 @@ mod tests {
         drain(&mut f.rx);
 
         let held = f.pm.chain_state.hold_accept_lock_for_test();
-        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
-        handle_returns_promptly(&f.pm, 1, NetworkMessage::Inv(vec![Inventory::Block(h2)]), "a block inv");
-        assert!(drain(&mut f.rx).is_empty(), "nothing is answered while the batch waits");
+        handle_returns_promptly(
+            &f.pm,
+            1,
+            NetworkMessage::Headers(vec![b2.header]),
+            "a headers message",
+        );
+        handle_returns_promptly(
+            &f.pm,
+            1,
+            NetworkMessage::Inv(vec![Inventory::Block(h2)]),
+            "a block inv",
+        );
+        assert!(
+            drain(&mut f.rx).is_empty(),
+            "nothing is answered while the batch waits"
+        );
         drop(held);
         f.pm.wait_for_headers();
 
         let msgs = drain(&mut f.rx);
         assert!(
-            !msgs.iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+            !msgs
+                .iter()
+                .any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
             "the inv was handled before the batch it followed: {msgs:?}"
         );
-        assert_eq!(block_requests(&msgs, h2), vec![true], "the block is asked for once: {msgs:?}");
+        assert_eq!(
+            block_requests(&msgs, h2),
+            vec![true],
+            "the block is asked for once: {msgs:?}"
+        );
     }
 
     /// Messages a headers thread that has gone left queued are handled by
@@ -22463,22 +24457,47 @@ mod tests {
         let flow = f.pm.peer_flow(1).expect("peer 1 is connected");
 
         let held = f.pm.chain_state.hold_accept_lock_for_test();
-        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
-        handle_returns_promptly(&f.pm, 1, NetworkMessage::Inv(vec![Inventory::Block(h2)]), "a block inv");
+        handle_returns_promptly(
+            &f.pm,
+            1,
+            NetworkMessage::Headers(vec![b2.header]),
+            "a headers message",
+        );
+        handle_returns_promptly(
+            &f.pm,
+            1,
+            NetworkMessage::Inv(vec![Inventory::Block(h2)]),
+            "a block inv",
+        );
         // The thread goes once it has finished the batch in hand, leaving the
         // `inv` queued behind it.
         f.pm.headers_queue.close();
         drop(held);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !f.pm.connector_threads.lock().iter().any(|(n, t)| *n == "headers" && t.is_finished()) {
+        while !f
+            .pm
+            .connector_threads
+            .lock()
+            .iter()
+            .any(|(n, t)| *n == "headers" && t.is_finished())
+        {
             assert!(Instant::now() < deadline, "the headers thread did not exit");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "fixture: the batch in hand was handled");
-        assert!(!flow.is_idle(), "fixture: the inv is stranded, its count held");
+        assert!(
+            f.pm.chain_state.get_block_index(&h2).is_some(),
+            "fixture: the batch in hand was handled"
+        );
+        assert!(
+            !flow.is_idle(),
+            "fixture: the inv is stranded, its count held"
+        );
 
         f.pm.drain_stranded_headers();
-        assert!(flow.is_idle(), "the stranded inv is handled and counted out");
+        assert!(
+            flow.is_idle(),
+            "the stranded inv is handled and counted out"
+        );
         assert!(f.pm.headers_queue.is_idle());
     }
 
@@ -22490,15 +24509,32 @@ mod tests {
         let f = compact_fetch_fixture();
         let b2 = coinbase_only_child(&f.tip, 2);
         let held = f.pm.chain_state.hold_accept_lock_for_test();
-        handle_returns_promptly(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]), "a headers message");
-        assert!(!f.pm.headers_queue.is_idle(), "fixture: the batch is waiting");
+        handle_returns_promptly(
+            &f.pm,
+            1,
+            NetworkMessage::Headers(vec![b2.header]),
+            "a headers message",
+        );
+        assert!(
+            !f.pm.headers_queue.is_idle(),
+            "fixture: the batch is waiting"
+        );
         let txid = bitcoin::Txid::from_byte_array([0x5a; 32]);
-        assert!(!f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::WitnessTransaction(txid)])));
-        assert!(f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::Block(b2.block_hash())])));
+        assert!(!f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![
+            Inventory::WitnessTransaction(txid)
+        ])));
+        assert!(
+            f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::Block(
+                b2.block_hash()
+            )]))
+        );
         drop(held);
         f.pm.wait_for_headers();
         assert!(
-            !f.pm.headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::Block(b2.block_hash())])),
+            !f.pm
+                .headers_queue_takes(&NetworkMessage::Inv(vec![Inventory::Block(
+                    b2.block_hash()
+                )])),
             "an idle queue holds nothing back"
         );
     }
@@ -22516,8 +24552,15 @@ mod tests {
         let h2 = b2.block_hash();
 
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]));
-        assert_eq!(block_requests(&drain(&mut f.rx), h2), vec![true], "one request, for a cmpctblock");
-        assert!(!f.pm.peers.read()[&1].info.hb_to, "precondition: a low-bandwidth peer");
+        assert_eq!(
+            block_requests(&drain(&mut f.rx), h2),
+            vec![true],
+            "one request, for a cmpctblock"
+        );
+        assert!(
+            !f.pm.peers.read()[&1].info.hb_to,
+            "precondition: a low-bandwidth peer"
+        );
 
         deliver(&f.pm, 1, cmpctblock_of(&b2));
         let msgs = drain(&mut f.rx);
@@ -22530,8 +24573,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(asked, vec![vec![1]], "the transaction the mempool lacks is asked for: {msgs:?}");
-        assert!(block_requests(&msgs, h2).is_empty(), "and the block is not fetched in full");
+        assert_eq!(
+            asked,
+            vec![vec![1]],
+            "the transaction the mempool lacks is asked for: {msgs:?}"
+        );
+        assert!(
+            block_requests(&msgs, h2).is_empty(),
+            "and the block is not fetched in full"
+        );
 
         deliver(
             &f.pm,
@@ -22543,7 +24593,10 @@ mod tests {
                 },
             }),
         );
-        assert!(!f.pm.block_requested_from(1, &h2), "a rebuilt block is no longer in flight");
+        assert!(
+            !f.pm.block_requested_from(1, &h2),
+            "a rebuilt block is no longer in flight"
+        );
         assert!(
             f.pm.compact_reconstruction_in_flight(&h2),
             "the sweep leaves it alone until the connector has it"
@@ -22570,12 +24623,18 @@ mod tests {
         assert_eq!(block_requests(&drain(&mut f.rx), h2), vec![true]);
 
         deliver(&f.pm, 1, cmpctblock_of(&b2));
-        assert!(!f.pm.block_requested_from(1, &h2), "the rebuilt block is no longer in flight");
+        assert!(
+            !f.pm.block_requested_from(1, &h2),
+            "the rebuilt block is no longer in flight"
+        );
         wait_for_tip(&f.pm, h2);
 
         let b3 = coinbase_only_child(&b2, 3);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b3.header]));
-        assert_eq!(block_requests(&drain(&mut f.rx), b3.block_hash()), vec![true]);
+        assert_eq!(
+            block_requests(&drain(&mut f.rx), b3.block_hash()),
+            vec![true]
+        );
     }
 
     /// A rebuilt block is on its way to the connect thread, not stored, and
@@ -22597,9 +24656,15 @@ mod tests {
 
         let held = f.pm.chain_state.hold_accept_lock_for_test();
         deliver(&f.pm, 1, cmpctblock_of(&b2));
-        assert!(!f.pm.chain_state.has_block_data(&h2), "precondition: not stored yet");
+        assert!(
+            !f.pm.chain_state.has_block_data(&h2),
+            "precondition: not stored yet"
+        );
         f.pm.request_missing_blocks(1);
-        assert!(block_requests(&drain(&mut f.rx), h2).is_empty(), "the sweep must not fetch it again");
+        assert!(
+            block_requests(&drain(&mut f.rx), h2).is_empty(),
+            "the sweep must not fetch it again"
+        );
         drop(held);
         wait_for_tip(&f.pm, h2);
     }
@@ -22624,10 +24689,16 @@ mod tests {
         deliver(&f.pm, 1, cmpctblock_of(&b2));
         let msgs = drain(&mut f.rx);
         assert!(
-            !msgs.iter().any(|m| matches!(m, NetworkMessage::GetBlockTxn(_))),
+            !msgs
+                .iter()
+                .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_))),
             "the cap holds: this peer does not rebuild the block"
         );
-        assert_eq!(block_requests(&msgs, h2), vec![false], "the full block is asked for instead");
+        assert_eq!(
+            block_requests(&msgs, h2),
+            vec![false],
+            "the full block is asked for instead"
+        );
     }
 
     /// A block asked for as a `cmpctblock` is on its way in compactly, so the
@@ -22667,7 +24738,11 @@ mod tests {
         let mut f = compact_fetch_fixture();
         let b2 = coinbase_only_child(&f.tip, 2);
         let b3 = coinbase_only_child(&b2, 3);
-        deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header, b3.header]));
+        deliver(
+            &f.pm,
+            1,
+            NetworkMessage::Headers(vec![b2.header, b3.header]),
+        );
         let msgs = drain(&mut f.rx);
         assert_eq!(block_requests(&msgs, b2.block_hash()), vec![false]);
         assert_eq!(block_requests(&msgs, b3.block_hash()), vec![false]);
@@ -22693,7 +24768,10 @@ mod tests {
             vec![child.block_hash()],
             "precondition: the announced block is the only one missing"
         );
-        assert_eq!(block_requests(&drain(&mut f.rx), child.block_hash()), vec![false]);
+        assert_eq!(
+            block_requests(&drain(&mut f.rx), child.block_hash()),
+            vec![false]
+        );
     }
 
     /// Core's `m_provides_cmpctblocks`: a peer that never sent a version-2
@@ -22704,7 +24782,10 @@ mod tests {
         let mut f = compact_fetch_fixture_with(crate::time::now_secs() as u32, 1);
         let b2 = coinbase_only_child(&f.tip, 2);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]));
-        assert_eq!(block_requests(&drain(&mut f.rx), b2.block_hash()), vec![false]);
+        assert_eq!(
+            block_requests(&drain(&mut f.rx), b2.block_hash()),
+            vec![false]
+        );
     }
 
     /// Core's `m_provides_cmpctblocks` on receipt (v32.1
@@ -22720,13 +24801,26 @@ mod tests {
         let tip = f.pm.chain_state.tip_hash();
 
         deliver(&f.pm, 1, cmpctblock_of(&b2));
-        assert!(f.pm.chain_state.get_block_index(&h2).is_none(), "no header row");
+        assert!(
+            f.pm.chain_state.get_block_index(&h2).is_none(),
+            "no header row"
+        );
         assert_eq!(f.pm.chain_state.tip_hash(), tip);
         assert!(drain(&mut f.rx).is_empty(), "nothing asked of the peer");
 
-        deliver(&f.pm, 1, NetworkMessage::SendCmpct(SendCmpct { send_compact: false, version: 2 }));
+        deliver(
+            &f.pm,
+            1,
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            }),
+        );
         deliver(&f.pm, 1, cmpctblock_of(&b2));
-        assert!(f.pm.chain_state.get_block_index(&h2).is_some(), "a negotiated peer's header is taken");
+        assert!(
+            f.pm.chain_state.get_block_index(&h2).is_some(),
+            "a negotiated peer's header is taken"
+        );
     }
 
     /// Core's `!m_opts.ignore_incoming_txs`: under `-blocksonly` the mempool
@@ -22738,7 +24832,10 @@ mod tests {
         f.pm.set_blocksonly(true);
         let b2 = coinbase_only_child(&f.tip, 2);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![b2.header]));
-        assert_eq!(block_requests(&drain(&mut f.rx), b2.block_hash()), vec![false]);
+        assert_eq!(
+            block_requests(&drain(&mut f.rx), b2.block_hash()),
+            vec![false]
+        );
     }
 
     /// Core's `CanDirectFetch`: a tip older than twenty block intervals
@@ -22768,7 +24865,9 @@ mod tests {
         use crate::chain::state::tests::build_test_block;
         let mut f = compact_fetch_fixture();
         let best = coinbase_only_child(&f.tip, 2);
-        f.pm.chain_state.accept_header(&best.header).expect("best header");
+        f.pm.chain_state
+            .accept_header(&best.header)
+            .expect("best header");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
         let sibling = build_test_block(genesis, 1, f.tip.header.time + 2);
         deliver(&f.pm, 1, NetworkMessage::Headers(vec![sibling.header]));
@@ -22786,9 +24885,15 @@ mod tests {
         let other = bitcoin::BlockHash::from_byte_array([0x5a; 32]);
         type Setup = fn(&PeerManager, bitcoin::BlockHash);
         let cases: [(&str, Setup); 4] = [
-            ("a block requested from another peer", |pm, other| pm.note_blocks_requested(2, &[other])),
+            ("a block requested from another peer", |pm, other| {
+                pm.note_blocks_requested(2, &[other])
+            }),
             ("a reconstruction awaiting blocktxn", |pm, other| {
-                let mut pending = stale_pending(other, bitcoin::constants::genesis_block(Network::Regtest).header, false);
+                let mut pending = stale_pending(
+                    other,
+                    bitcoin::constants::genesis_block(Network::Regtest).header,
+                    false,
+                );
                 pending.since = Instant::now();
                 pm.pending_compact.write().insert(2, pending);
             }),
@@ -22796,7 +24901,9 @@ mod tests {
                 pm.compact_in_progress.write().insert(other, Instant::now());
             }),
             ("a background download", |pm, _| {
-                pm.bg_downloader.write().mark_in_flight(5, 2, Instant::now());
+                pm.bg_downloader
+                    .write()
+                    .mark_in_flight(5, 2, Instant::now());
             }),
         ];
         let fetched_compactly: Vec<&str> = cases
@@ -22810,7 +24917,10 @@ mod tests {
             })
             .map(|(what, _)| what)
             .collect();
-        assert!(fetched_compactly.is_empty(), "not fetched in full despite {fetched_compactly:?}");
+        assert!(
+            fetched_compactly.is_empty(),
+            "not fetched in full despite {fetched_compactly:?}"
+        );
     }
 
     /// The block being asked for does not count against itself: announced
@@ -22856,7 +24966,9 @@ mod tests {
     }
 
     fn sendheaders_count(msgs: &[NetworkMessage]) -> usize {
-        msgs.iter().filter(|m| matches!(m, NetworkMessage::SendHeaders)).count()
+        msgs.iter()
+            .filter(|m| matches!(m, NetworkMessage::SendHeaders))
+            .count()
     }
 
     /// Core's `MaybeSendSendHeaders`: an inbound peer is sent `sendheaders`
@@ -22867,7 +24979,11 @@ mod tests {
     fn sendheaders_goes_to_an_inbound_peer_once() {
         let mut f = compact_fetch_fixture();
         let mut rx = versioned_peer(&f.pm, 2, Direction::Inbound, 70016);
-        assert_eq!(sendheaders_count(&drain(&mut rx)), 0, "nothing before the peer shows a block");
+        assert_eq!(
+            sendheaders_count(&drain(&mut rx)),
+            0,
+            "nothing before the peer shows a block"
+        );
 
         deliver(&f.pm, 2, NetworkMessage::Headers(vec![f.tip.header]));
         assert_eq!(sendheaders_count(&drain(&mut rx)), 1);
@@ -22876,7 +24992,11 @@ mod tests {
         deliver(&f.pm, 2, NetworkMessage::Headers(vec![b2.header]));
         deliver(&f.pm, 2, NetworkMessage::Headers(vec![f.tip.header]));
         deliver(&f.pm, 2, cmpctblock_of(&b2));
-        assert_eq!(sendheaders_count(&drain(&mut rx)), 0, "sent once per connection");
+        assert_eq!(
+            sendheaders_count(&drain(&mut rx)),
+            0,
+            "sent once per connection"
+        );
         let _ = drain(&mut f.rx);
     }
 
@@ -22906,7 +25026,11 @@ mod tests {
         let mut rx = versioned_peer(&pm, 1, Direction::Inbound, 70016);
         let genesis = bitcoin::constants::genesis_block(Network::Bitcoin);
         deliver(&pm, 1, NetworkMessage::Headers(vec![genesis.header]));
-        assert_eq!(pm.peers.read()[&1].info.best_known_height, Some(0), "precondition: genesis is recorded");
+        assert_eq!(
+            pm.peers.read()[&1].info.best_known_height,
+            Some(0),
+            "precondition: genesis is recorded"
+        );
         assert_eq!(sendheaders_count(&drain(&mut rx)), 0);
         assert!(!pm.peers.read()[&1].info.sent_sendheaders);
     }
@@ -22919,7 +25043,11 @@ mod tests {
             let mut f = compact_fetch_fixture();
             let mut rx = versioned_peer(&f.pm, 2, Direction::Inbound, version);
             deliver(&f.pm, 2, NetworkMessage::Headers(vec![f.tip.header]));
-            assert_eq!(sendheaders_count(&drain(&mut rx)), expected, "version {version}");
+            assert_eq!(
+                sendheaders_count(&drain(&mut rx)),
+                expected,
+                "version {version}"
+            );
             let _ = drain(&mut f.rx);
         }
     }
@@ -22933,11 +25061,18 @@ mod tests {
     fn a_known_block_announced_by_inv_counts_as_shown() {
         let mut f = compact_fetch_fixture();
         let mut rx = versioned_peer(&f.pm, 2, Direction::Outbound, 70016);
-        deliver(&f.pm, 2, NetworkMessage::Inv(vec![Inventory::Block(f.tip.block_hash())]));
+        deliver(
+            &f.pm,
+            2,
+            NetworkMessage::Inv(vec![Inventory::Block(f.tip.block_hash())]),
+        );
         assert_eq!(f.pm.peers.read()[&2].info.best_known_height, Some(1));
         let msgs = drain(&mut rx);
         assert_eq!(sendheaders_count(&msgs), 1);
-        assert!(block_requests(&msgs, f.tip.block_hash()).is_empty(), "a block we have is not fetched");
+        assert!(
+            block_requests(&msgs, f.tip.block_hash()).is_empty(),
+            "a block we have is not fetched"
+        );
         let _ = drain(&mut f.rx);
     }
 }

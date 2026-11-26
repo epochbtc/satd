@@ -96,7 +96,11 @@ pub fn dump_mempool(mempool: &Mempool, net_datadir: &Path) -> std::io::Result<us
     for (txid, e) in &entries {
         buf.extend_from_slice(&e.time.to_le_bytes());
         buf.extend_from_slice(&e.fee_delta.to_le_bytes());
-        let flags = if unbroadcast.contains(txid) { FLAG_UNBROADCAST } else { 0 };
+        let flags = if unbroadcast.contains(txid) {
+            FLAG_UNBROADCAST
+        } else {
+            0
+        };
         buf.push(flags);
         let tx_bytes = bitcoin::consensus::serialize(&e.tx);
         buf.extend_from_slice(&(tx_bytes.len() as u32).to_le_bytes());
@@ -595,7 +599,13 @@ mod tests {
         let cs = empty_chainstate(&dir);
         let fresh = Mempool::new(300_000_000, 1000);
         let stats = load_mempool(&fresh, &cs, &NoopVerifier, &dir).unwrap();
-        assert_eq!(stats, LoadStats { file_read: true, ..LoadStats::default() });
+        assert_eq!(
+            stats,
+            LoadStats {
+                file_read: true,
+                ..LoadStats::default()
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -673,15 +683,27 @@ mod tests {
         let (cs, mp, dir) = funded(&[3], 0);
         let tx = funded_spend(3, 1_000);
         let resident = tx.compute_txid();
-        mp.accept_persisted_transaction(tx, &cs, &NoopVerifier, crate::time::now_secs() - 60).unwrap();
+        mp.accept_persisted_transaction(tx, &cs, &NoopVerifier, crate::time::now_secs() - 60)
+            .unwrap();
         mp.prioritise_transaction(&resident, 700).unwrap();
         let absent = dummy_tx(9).compute_txid();
         mp.prioritise_transaction(&absent, 300).unwrap();
         dump_mempool(&mp, &dir).unwrap();
 
         let written = parse(&std::fs::read(dir.join("mempool.dat")).unwrap()).unwrap();
-        assert_eq!(written.records.iter().map(|r| r.fee_delta).collect::<Vec<_>>(), [700]);
-        assert_eq!(written.deltas, vec![(absent, 300)], "the resident delta must not ride in the trailer too");
+        assert_eq!(
+            written
+                .records
+                .iter()
+                .map(|r| r.fee_delta)
+                .collect::<Vec<_>>(),
+            [700]
+        );
+        assert_eq!(
+            written.deltas,
+            vec![(absent, 300)],
+            "the resident delta must not ride in the trailer too"
+        );
 
         let fresh = Mempool::new(300_000_000, 0);
         load_mempool(&fresh, &cs, &NoopVerifier, &dir).unwrap();
@@ -708,15 +730,26 @@ mod tests {
         buf.extend_from_slice(&[0xcd; 20]); // the second delta, cut short
         let parsed = parse(&buf).unwrap();
         assert_eq!(parsed.records.len(), 1);
-        assert_eq!(parsed.deltas, vec![(bitcoin::Txid::from_byte_array([0xab; 32]), -5)]);
-        assert!(parsed.truncation.as_deref().is_some_and(|t| t.contains("delta 1")));
+        assert_eq!(
+            parsed.deltas,
+            vec![(bitcoin::Txid::from_byte_array([0xab; 32]), -5)]
+        );
+        assert!(
+            parsed
+                .truncation
+                .as_deref()
+                .is_some_and(|t| t.contains("delta 1"))
+        );
     }
 
     #[test]
     fn future_version_is_rejected() {
         let mut buf = frame(&[]);
         buf[4..8].copy_from_slice(&(VERSION + 1).to_le_bytes());
-        assert!(parse(&buf).is_err(), "unknown future format must not be guessed at");
+        assert!(
+            parse(&buf).is_err(),
+            "unknown future format must not be guessed at"
+        );
     }
 
     #[test]
@@ -732,7 +765,10 @@ mod tests {
 
     /// A regtest chain holding one coin per `tag`, and an empty pool under
     /// `min_fee_rate`.
-    pub(super) fn funded(tags: &[u8], min_fee_rate: u64) -> (ChainState, Mempool, std::path::PathBuf) {
+    pub(super) fn funded(
+        tags: &[u8],
+        min_fee_rate: u64,
+    ) -> (ChainState, Mempool, std::path::PathBuf) {
         let coins: Vec<(OutPoint, crate::storage::coinview::Coin)> = tags
             .iter()
             .map(|t| {
@@ -779,7 +815,10 @@ mod tests {
     pub(super) fn funded_spend(tag: u8, fee: u64) -> bitcoin::Transaction {
         let mut tx = dummy_tx(tag);
         tx.input[0].previous_output = funded_prev(tag);
-        tx.output[0] = TxOut { value: Amount::from_sat(100_000 - fee), script_pubkey: p2wpkh(tag) };
+        tx.output[0] = TxOut {
+            value: Amount::from_sat(100_000 - fee),
+            script_pubkey: p2wpkh(tag),
+        };
         tx
     }
 
@@ -817,7 +856,10 @@ mod tests {
 
         let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
         assert_eq!((stats.accepted, stats.skipped, stats.expired), (1, 0, 1));
-        assert!(mp.get(&old_txid).is_none(), "an expired record must not re-enter");
+        assert!(
+            mp.get(&old_txid).is_none(),
+            "an expired record must not re-enter"
+        );
         assert!(mp.get(&fresh_txid).is_some(), "a fresh record does");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -841,7 +883,10 @@ mod tests {
         let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
         assert_eq!(stats.accepted, 1);
         assert_eq!(mp.get(&lifted_txid).expect("re-admitted").fee_delta, 10_000);
-        assert!(mp.get(&plain_txid).is_none(), "without the delta the floor still refuses it");
+        assert!(
+            mp.get(&plain_txid).is_none(),
+            "without the delta the floor still refuses it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -859,7 +904,13 @@ mod tests {
         let cs = empty_chainstate(&dir);
         let mp = Mempool::new(300_000_000, 1000);
         let stats = load_mempool(&mp, &cs, &NoopVerifier, &dir).unwrap();
-        assert_eq!(stats, LoadStats { file_read: true, ..LoadStats::default() });
+        assert_eq!(
+            stats,
+            LoadStats {
+                file_read: true,
+                ..LoadStats::default()
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -14,18 +14,23 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // title
-            Constraint::Length(5),   // progress
-            Constraint::Length(12),  // block map
-            Constraint::Length(9),   // sparklines + stats
+            Constraint::Length(1),  // title
+            Constraint::Length(5),  // progress
+            Constraint::Length(12), // block map
+            Constraint::Length(9),  // sparklines + stats
             Constraint::Min(5),     // peers
-            Constraint::Length(1),   // footer
+            Constraint::Length(1),  // footer
         ])
         .split(size);
 
     // Title bar
     let title = Line::from(vec![
-        Span::styled(" satd IBD ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " satd IBD ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!(" {} ", state.chain_name),
             Style::default().fg(Color::White),
@@ -55,7 +60,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::styled(": quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("h", Style::default().fg(Color::White)),
         Span::styled(": help  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(crate::ui::view_keys(state), Style::default().fg(Color::White)),
+        Span::styled(
+            crate::ui::view_keys(state),
+            Style::default().fg(Color::White),
+        ),
         Span::styled(": switch view  ", Style::default().fg(Color::DarkGray)),
         Span::raw("\u{2191}\u{2193}"),
         Span::styled(": scroll peers", Style::default().fg(Color::DarkGray)),
@@ -79,16 +87,14 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
         progress * 100.0
     );
 
-    let eta_str = state.eta_secs
+    let eta_str = state
+        .eta_secs
         .map(|s| format!("ETA: {}", format_duration(s)))
         .unwrap_or_else(|| "ETA: --".to_string());
 
     let stats_line = format!(
         "{}   blk/s: {:.0}   hdr/s: {:.0}   peers: {}",
-        eta_str,
-        state.blocks_per_sec,
-        state.headers_per_sec,
-        state.connections,
+        eta_str, state.blocks_per_sec, state.headers_per_sec, state.connections,
     );
 
     let block = Block::default()
@@ -96,23 +102,41 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Block Sync ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if inner.height >= 3 {
-        let gauge_area = Rect { height: 1, y: inner.y, ..inner };
+        let gauge_area = Rect {
+            height: 1,
+            y: inner.y,
+            ..inner
+        };
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
             .ratio(progress.min(1.0))
-            .label(Span::styled(&label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+            .label(Span::styled(
+                &label,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
         f.render_widget(gauge, gauge_area);
 
-        let stats_area = Rect { y: inner.y + 2, height: 1, ..inner };
+        let stats_area = Rect {
+            y: inner.y + 2,
+            height: 1,
+            ..inner
+        };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(stats_line, Style::default().fg(Color::Yellow)))),
+            Paragraph::new(Line::from(Span::styled(
+                stats_line,
+                Style::default().fg(Color::Yellow),
+            ))),
             stats_area,
         );
     }
@@ -127,7 +151,9 @@ fn draw_block_map(f: &mut Frame, area: Rect, state: &AppState) {
                 .border_style(Style::default().fg(Color::DarkGray))
                 .title(Span::styled(
                     " Block Map ",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ));
             f.render_widget(block, area);
             return;
@@ -136,10 +162,15 @@ fn draw_block_map(f: &mut Frame, area: Rect, state: &AppState) {
 
     let bpc = if bitmap.target_height > 0 {
         let cells = (area.width.saturating_sub(4) as u32) * (area.height.saturating_sub(4) as u32);
-        if cells > 0 { bitmap.target_height / cells } else { 1 }
+        if cells > 0 {
+            bitmap.target_height / cells
+        } else {
+            1
+        }
     } else {
         1
-    }.max(1);
+    }
+    .max(1);
 
     let title = format!(
         " Block Map -- {} / {} -- each \u{2588} \u{2248} {} blocks ",
@@ -153,7 +184,9 @@ fn draw_block_map(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -215,7 +248,9 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Sync Rate ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let spark_inner = spark_block.inner(chunks[0]);
     f.render_widget(spark_block, chunks[0]);
@@ -227,17 +262,22 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
         let bps_spark = Sparkline::default()
             .data(&bps_data)
             .style(Style::default().fg(Color::Yellow));
-        let spark1_area = Rect { height: (spark_inner.height / 2).saturating_sub(1).max(1), ..spark_inner };
+        let spark1_area = Rect {
+            height: (spark_inner.height / 2).saturating_sub(1).max(1),
+            ..spark_inner
+        };
         f.render_widget(bps_spark, spark1_area);
 
-        let bps_label = Rect { y: spark1_area.y + spark1_area.height, height: 1, ..spark_inner };
+        let bps_label = Rect {
+            y: spark1_area.y + spark1_area.height,
+            height: 1,
+            ..spark_inner
+        };
         f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("peak: {}    now: {:.0}", peak_bps, state.blocks_per_sec),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])),
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("peak: {}    now: {:.0}", peak_bps, state.blocks_per_sec),
+                Style::default().fg(Color::DarkGray),
+            )])),
             bps_label,
         );
 
@@ -247,11 +287,23 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
             .data(&dl_data)
             .style(Style::default().fg(Color::Cyan));
         let spark2_y = bps_label.y + 1;
-        let spark2_h = spark_inner.height.saturating_sub(spark2_y - spark_inner.y).saturating_sub(1).max(1);
-        let spark2_area = Rect { y: spark2_y, height: spark2_h, ..spark_inner };
+        let spark2_h = spark_inner
+            .height
+            .saturating_sub(spark2_y - spark_inner.y)
+            .saturating_sub(1)
+            .max(1);
+        let spark2_area = Rect {
+            y: spark2_y,
+            height: spark2_h,
+            ..spark_inner
+        };
         f.render_widget(dl_spark, spark2_area);
 
-        let dl_label = Rect { y: spark2_y + spark2_h, height: 1, ..spark_inner };
+        let dl_label = Rect {
+            y: spark2_y + spark2_h,
+            height: 1,
+            ..spark_inner
+        };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("dl: {:.0} blk/s", state.dl_blocks_per_sec),
@@ -267,14 +319,20 @@ fn draw_sparklines_and_stats(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Stats ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let stats_inner = stats_block.inner(chunks[1]);
     f.render_widget(stats_block, chunks[1]);
 
     let target = state.sync_target();
     let headers_val = if target > 0 {
-        format!("{} ({:.0}%)", format_num(state.headers as u64), state.headers as f64 / target as f64 * 100.0)
+        format!(
+            "{} ({:.0}%)",
+            format_num(state.headers as u64),
+            state.headers as f64 / target as f64 * 100.0
+        )
     } else {
         format_num(state.headers as u64)
     };
@@ -334,21 +392,27 @@ fn draw_resources(f: &mut Frame, area: Rect, state: &AppState) {
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " Resources ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rss_str = state.rss_bytes
+    let rss_str = state
+        .rss_bytes
         .map(format_bytes)
         .unwrap_or_else(|| "-".into());
-    let dirty_str = state.cache_dirty
+    let dirty_str = state
+        .cache_dirty
         .map(|d| format_num(d as u64))
         .unwrap_or_else(|| "-".into());
-    let clean_str = state.cache_clean
+    let clean_str = state
+        .cache_clean
         .map(|c| format_num(c as u64))
         .unwrap_or_else(|| "-".into());
-    let threads_str = state.thread_count
+    let threads_str = state
+        .thread_count
         .map(|t| t.to_string())
         .unwrap_or_else(|| "-".into());
 

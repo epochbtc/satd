@@ -1,22 +1,26 @@
 use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::consensus::serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::chain::state::ChainState;
 use crate::mempool::pool::Mempool;
 use crate::mining::fee_profile::{BlockFeeProfile, sat_per_vb_core, truncated_median};
 use crate::rpc::amounts::{annotate_units, default_unit, format_amount};
 use crate::rpc::util::univalue_double;
-use crate::storage::{RecentHeightWindow, Store};
 use crate::storage::blockindex::{BlockIndexEntry, target_to_difficulty};
+use crate::storage::{RecentHeightWindow, Store};
 
 /// True when the active chain holds exactly `hash` at `height`.
 ///
 /// A block can be valid, fully stored, and still not be on the active chain —
 /// a stale block from a losing branch. Core distinguishes the two everywhere it
 /// reports `confirmations`, and tooling reasoning about forks depends on it.
-pub(crate) fn is_on_active_chain(chain_state: &ChainState, hash: &bitcoin::BlockHash, height: u32) -> bool {
+pub(crate) fn is_on_active_chain(
+    chain_state: &ChainState,
+    hash: &bitcoin::BlockHash,
+    height: u32,
+) -> bool {
     is_on_active_chain_at(chain_state, hash, height, chain_state.tip_height())
 }
 
@@ -193,7 +197,9 @@ pub fn opreturn_prune_json(chain_state: &ChainState, detailed: bool) -> Value {
         // The height the worker's scan is heading for: every block below it
         // is past the strip depth.
         out["examine_target_height"] = json!(config.map(|c| {
-            chain_state.tip_height().saturating_sub(c.depth.saturating_add(2))
+            chain_state
+                .tip_height()
+                .saturating_sub(c.depth.saturating_add(2))
         }));
         out["filesystem_block_size"] = json!(chain_state.opreturn_strip_fs_block());
         out["probe"] = match (config, chain_state.opreturn_strip_fs_block()) {
@@ -240,7 +246,13 @@ pub fn get_blockchain_info(chain_state: &ChainState, prune: PruneMode) -> Value 
                 cw_hex,
             )
         } else {
-            (bitcoin::CompactTarget::from_consensus(0), 0.0, 0u64, 0u64, "0".to_string())
+            (
+                bitcoin::CompactTarget::from_consensus(0),
+                0.0,
+                0u64,
+                0u64,
+                "0".to_string(),
+            )
         };
 
     // Core's latched `IsInitialBlockDownload`: tip age and minimum chain
@@ -695,10 +707,7 @@ pub fn get_storage_footprint(chain_state: &ChainState) -> Value {
 }
 
 /// `getblockhash` — return the block hash at a given height.
-pub fn get_block_hash(
-    chain_state: &ChainState,
-    height: u32,
-) -> Result<Value, String> {
+pub fn get_block_hash(chain_state: &ChainState, height: u32) -> Result<Value, String> {
     if height > chain_state.tip_height() {
         return Err("Block height out of range".to_string());
     }
@@ -1004,7 +1013,11 @@ pub fn get_tx_out_view(
                 ActingOutpointView::Created { .. } | ActingOutpointView::NotInPool => {}
             }
         }
-        (tip_hash, tip_height, Found::Chain(chain_state.get_coin(&outpoint)))
+        (
+            tip_hash,
+            tip_height,
+            Found::Chain(chain_state.get_coin(&outpoint)),
+        )
     }) else {
         // -32603 (internal error), NOT -5: -5 is what a permanently absent
         // key returns, and a client that special-cases it would misread a
@@ -1079,7 +1092,10 @@ const SPECIFIC_HEIGHT_NEEDS_INDEX: &str = "Querying specific block heights requi
 
 /// Core's `ParseHashOrHeight` (`src/rpc/blockchain.cpp`): a number is a
 /// height on the active chain, anything else is read as a block hash.
-pub(crate) fn parse_hash_or_height(chain_state: &ChainState, param: &Value) -> Result<BlockHash, (i32, String)> {
+pub(crate) fn parse_hash_or_height(
+    chain_state: &ChainState,
+    param: &Value,
+) -> Result<BlockHash, (i32, String)> {
     if let Value::Number(n) = param {
         // `getInt<int>`: a fraction or a value outside `int` is refused.
         let height = n
@@ -1091,7 +1107,10 @@ pub(crate) fn parse_hash_or_height(chain_state: &ChainState, param: &Value) -> R
         }
         let tip = chain_state.tip_height();
         if height as u32 > tip {
-            return Err((-8, format!("Target block height {height} after current tip {tip}")));
+            return Err((
+                -8,
+                format!("Target block height {height} after current tip {tip}"),
+            ));
         }
         return chain_state
             .get_block_hash_by_height(height as u32)
@@ -1146,7 +1165,8 @@ pub fn get_tx_out_set_info_with(
             if hash_type == Some("hash_serialized_3") {
                 return Err((
                     -8,
-                    "hash_serialized_3 hash type cannot be queried for a specific block".to_string(),
+                    "hash_serialized_3 hash type cannot be queried for a specific block"
+                        .to_string(),
                 ));
             }
             if args.use_index == Some(false) {
@@ -1161,7 +1181,9 @@ pub fn get_tx_out_set_info_with(
     if let Some(t @ ("muhash" | "hash_serialized_3")) = hash_type {
         return Err((
             -8,
-            format!("satd does not compute a UTXO set hash; hash_type '{t}' is not supported (use 'none')"),
+            format!(
+                "satd does not compute a UTXO set hash; hash_type '{t}' is not supported (use 'none')"
+            ),
         ));
     }
     let response = get_tx_out_set_info(chain_state)?;
@@ -1226,7 +1248,11 @@ fn age_bucket(age: u32) -> usize {
 fn heights_in_age_bucket(lo: u32, hi: u32, tip: u32, bucket: usize) -> u64 {
     // Bucket `b` holds ages `[min_age, max_age)`, i.e. heights
     // `(tip - max_age, tip - min_age]`. Signed so neither end underflows.
-    let min_age = if bucket == 0 { 0 } else { i64::from(AGE_BUCKET_EDGES[bucket - 1]) };
+    let min_age = if bucket == 0 {
+        0
+    } else {
+        i64::from(AGE_BUCKET_EDGES[bucket - 1])
+    };
     let top = i64::from(tip) - min_age;
     let bottom = match AGE_BUCKET_EDGES.get(bucket) {
         Some(&max_age) => i64::from(tip) - i64::from(max_age) + 1,
@@ -1362,10 +1388,7 @@ pub fn get_block_stats_error_code(message: &str) -> i32 {
 }
 
 /// `getblockstats` — return per-block statistics.
-pub fn get_block_stats(
-    chain_state: &ChainState,
-    hash_or_height: &str,
-) -> Result<Value, String> {
+pub fn get_block_stats(chain_state: &ChainState, hash_or_height: &str) -> Result<Value, String> {
     // Parse as height or hash
     let hash = if let Ok(height) = hash_or_height.parse::<u32>() {
         chain_state
@@ -1417,7 +1440,11 @@ pub fn get_block_stats(
             let profile = BlockFeeProfile::from_undo(&block, &undo).map_err(|e| {
                 format!("undo data for block {hash} is inconsistent with the block ({e}); fee statistics unavailable")
             })?;
-            let spent: i64 = undo.spent_coins.iter().map(|c| utxo_size(&c.script_pubkey)).sum();
+            let spent: i64 = undo
+                .spent_coins
+                .iter()
+                .map(|c| utxo_size(&c.script_pubkey))
+                .sum();
             (profile, spent)
         }
         None => {
@@ -1463,8 +1490,8 @@ pub fn get_block_stats(
     let mut utxo_size_inc_actual: i64 = 0;
     let mut utxos_actual: i64 = 0;
     let mut inputs: i64 = 0;
-    let coinbase_not_in_set =
-        entry.height == 0 || crate::chain::connect::bip30_exempt(chain_state.network, entry.height, &hash);
+    let coinbase_not_in_set = entry.height == 0
+        || crate::chain::connect::bip30_exempt(chain_state.network, entry.height, &hash);
 
     for tx in &block.txdata {
         utxo_increase += tx.output.len() as i64;
@@ -1538,12 +1565,20 @@ pub fn get_block_stats(
     }
 
     let non_coinbase = num_txs.saturating_sub(1) as u64;
-    let avg_fee = if non_coinbase > 0 { total_fee / non_coinbase } else { 0 };
+    let avg_fee = if non_coinbase > 0 {
+        total_fee / non_coinbase
+    } else {
+        0
+    };
     // Core: `totalfee * 4 / total_weight`, over the non-coinbase weight
     // (v32.1 `src/rpc/blockchain.cpp:2205`).
     let avg_fee_rate = sat_per_vb_core(total_fee, total_weight);
     // Core: `total_size / (vtx.size() - 1)` (v32.1 `:2206`).
-    let avg_tx_size = if non_coinbase > 0 { total_size / non_coinbase } else { 0 };
+    let avg_tx_size = if non_coinbase > 0 {
+        total_size / non_coinbase
+    } else {
+        0
+    };
 
     // A real median, not the mean wearing its name. With fees now actually
     // computed the two differ sharply on any block with a fee outlier, which is
@@ -1620,12 +1655,14 @@ pub fn get_chain_tips(chain_state: &ChainState) -> Value {
 
     let (active_tip_hash, _active_tip_height) = chain_state.tip_snapshot();
 
-    let mut tips: Vec<(bitcoin::BlockHash, crate::storage::blockindex::BlockIndexEntry)> =
-        chain_state
-            .chain_tip_hashes()
-            .into_iter()
-            .filter_map(|h| chain_state.get_block_index(&h).map(|e| (h, e)))
-            .collect();
+    let mut tips: Vec<(
+        bitcoin::BlockHash,
+        crate::storage::blockindex::BlockIndexEntry,
+    )> = chain_state
+        .chain_tip_hashes()
+        .into_iter()
+        .filter_map(|h| chain_state.get_block_index(&h).map(|e| (h, e)))
+        .collect();
 
     // Height descending, then hash — Core sorts by height and breaks ties on
     // the block-index pointer, which is arbitrary but stable within a process.
@@ -1789,10 +1826,7 @@ pub fn get_chain_tx_stats(
         "window_final_block_hash".to_string(),
         json!(final_hash.to_string()),
     );
-    obj.insert(
-        "window_final_block_height".to_string(),
-        json!(final_height),
-    );
+    obj.insert("window_final_block_height".to_string(), json!(final_height));
     obj.insert("window_block_count".to_string(), json!(window));
     // Core emits the window fields only when `blockcount > 0`.
     if window == 0 {
@@ -1810,11 +1844,9 @@ pub fn get_chain_tx_stats(
     // Only the eleven heights under each endpoint are kept: the default window
     // walks a month of blocks.
     let mtp_lowest = start_height.saturating_sub(10);
-    let in_mtp_window = |hh: u32| {
-        hh + 10 >= final_height || (hh <= start_height && hh + 10 >= start_height)
-    };
-    let mut ts_by_height: std::collections::HashMap<u32, u32> =
-        std::collections::HashMap::new();
+    let in_mtp_window =
+        |hh: u32| hh + 10 >= final_height || (hh <= start_height && hh + 10 >= start_height);
+    let mut ts_by_height: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     ts_by_height.insert(final_height, final_entry.header.time);
     let mut start_hash: Option<bitcoin::BlockHash> = None;
     let mut cur = final_entry.header.prev_blockhash;
@@ -1880,9 +1912,7 @@ pub fn get_mempool_ancestors(
     txid_str: &str,
     verbose: bool,
 ) -> Result<Value, String> {
-    let txid: bitcoin::Txid = txid_str
-        .parse()
-        .map_err(|_| "Invalid txid".to_string())?;
+    let txid: bitcoin::Txid = txid_str.parse().map_err(|_| "Invalid txid".to_string())?;
 
     let ancestors = mempool
         .get_ancestors(&txid)
@@ -1909,9 +1939,7 @@ pub fn get_mempool_descendants(
     txid_str: &str,
     verbose: bool,
 ) -> Result<Value, String> {
-    let txid: bitcoin::Txid = txid_str
-        .parse()
-        .map_err(|_| "Invalid txid".to_string())?;
+    let txid: bitcoin::Txid = txid_str.parse().map_err(|_| "Invalid txid".to_string())?;
 
     let descendants = mempool
         .get_descendants(&txid)
@@ -1975,13 +2003,8 @@ pub fn get_mempool_feerate_diagram(mempool: &Mempool) -> Value {
 }
 
 /// `getmempoolentry` — return detailed info about a single mempool transaction.
-pub fn get_mempool_entry(
-    mempool: &Mempool,
-    txid_str: &str,
-) -> Result<Value, String> {
-    let txid: bitcoin::Txid = txid_str
-        .parse()
-        .map_err(|_| "Invalid txid".to_string())?;
+pub fn get_mempool_entry(mempool: &Mempool, txid_str: &str) -> Result<Value, String> {
+    let txid: bitcoin::Txid = txid_str.parse().map_err(|_| "Invalid txid".to_string())?;
 
     mempool
         .get_entry_verbose(&txid)
@@ -1997,7 +2020,9 @@ pub fn get_mempool_entries_bulk(mempool: &Mempool, txid_strs: &[String]) -> Valu
     let mut chunks = crate::mempool::pool::ChunkCache::default();
     for s in txid_strs {
         let entry = match s.parse::<bitcoin::Txid>() {
-            Ok(txid) => mempool.get_entry_verbose_cached(&txid, &mut chunks).unwrap_or(Value::Null),
+            Ok(txid) => mempool
+                .get_entry_verbose_cached(&txid, &mut chunks)
+                .unwrap_or(Value::Null),
             Err(_) => Value::Null,
         };
         out.insert(s.clone(), entry);
@@ -2017,7 +2042,9 @@ pub fn precious_block(
     let hash: bitcoin::BlockHash = hash_str
         .parse()
         .map_err(|_| (-8, "blockhash must be hexadecimal string".to_string()))?;
-    chain_state.precious_block(hash).map_err(map_invalidate_err)?;
+    chain_state
+        .precious_block(hash)
+        .map_err(map_invalidate_err)?;
     Ok(Value::Null)
 }
 
@@ -2159,27 +2186,25 @@ pub fn prune_blockchain(
 
 /// `invalidateblock` — mark a block invalid and re-activate the best valid
 /// chain. Returns `null` on success (Core parity).
-pub fn invalidate_block(
-    chain_state: &ChainState,
-    hash_str: &str,
-) -> Result<Value, (i32, String)> {
+pub fn invalidate_block(chain_state: &ChainState, hash_str: &str) -> Result<Value, (i32, String)> {
     let hash: bitcoin::BlockHash = hash_str
         .parse()
         .map_err(|_| (-8, "blockhash must be hexadecimal string".to_string()))?;
-    chain_state.invalidate_block(hash).map_err(map_invalidate_err)?;
+    chain_state
+        .invalidate_block(hash)
+        .map_err(map_invalidate_err)?;
     Ok(Value::Null)
 }
 
 /// `reconsiderblock` — clear a block's invalid mark (and its descendants') and
 /// re-activate the best valid chain. Returns `null` on success (Core parity).
-pub fn reconsider_block(
-    chain_state: &ChainState,
-    hash_str: &str,
-) -> Result<Value, (i32, String)> {
+pub fn reconsider_block(chain_state: &ChainState, hash_str: &str) -> Result<Value, (i32, String)> {
     let hash: bitcoin::BlockHash = hash_str
         .parse()
         .map_err(|_| (-8, "blockhash must be hexadecimal string".to_string()))?;
-    chain_state.reconsider_block(hash).map_err(map_invalidate_err)?;
+    chain_state
+        .reconsider_block(hash)
+        .map_err(map_invalidate_err)?;
     Ok(Value::Null)
 }
 
@@ -2202,7 +2227,11 @@ pub fn verify_chain(chain_state: &ChainState, check_level: u32, nblocks: u32) ->
     // same shape `get_chain_tx_stats` and `active_chain_range` already use —
     // and `is_pruned` fixes the third.
     let (tip_hash, tip_height) = chain_state.tip_snapshot();
-    let check_blocks = if nblocks == 0 { tip_height } else { nblocks.min(tip_height) };
+    let check_blocks = if nblocks == 0 {
+        tip_height
+    } else {
+        nblocks.min(tip_height)
+    };
 
     let mut hash = tip_hash;
     for _ in 0..=check_blocks {
@@ -2345,8 +2374,8 @@ pub fn load_txout_set(
         .map_err(|e| (-22, format!("invalid snapshot header: {e}")))?;
     drop(header_reader);
 
-    let anchor = assumeutxo::lookup_by_blockhash(chain_state.network, &meta.base_blockhash)
-        .ok_or((
+    let anchor =
+        assumeutxo::lookup_by_blockhash(chain_state.network, &meta.base_blockhash).ok_or((
             -22,
             format!(
                 "unknown snapshot: base block {} is not a recognized AssumeUTXO anchor for this \
@@ -2408,18 +2437,23 @@ mod tests {
         // Exactly on both sides of every young edge, with a distinct count
         // each so a coin landing in the neighbouring bucket shows.
         let recent = [
-            (tip, 1),        // age 0      -> <1h
-            (tip - 5, 2),    // age 5      -> <1h
-            (tip - 6, 4),    // age 6      -> <1d
-            (tip - 143, 8),  // age 143    -> <1d
-            (tip - 144, 16), // age 144    -> <1w
-            (tip - 1007, 32), // age 1007  -> <1w
-            (tip - 1008, 64), // age 1008  -> <1mo
+            (tip, 1),          // age 0      -> <1h
+            (tip - 5, 2),      // age 5      -> <1h
+            (tip - 6, 4),      // age 6      -> <1d
+            (tip - 143, 8),    // age 143    -> <1d
+            (tip - 144, 16),   // age 144    -> <1w
+            (tip - 1007, 32),  // age 1007  -> <1w
+            (tip - 1008, 64),  // age 1008  -> <1mo
             (tip - 4319, 128), // age 4319 -> <1mo
         ];
         // Older coins in the same chunks as the young ones and below the
         // window: they must not leak into the young buckets.
-        let older = [(tip - 4320, 256), (tip - 4600, 512), (1_500, 1_024), (3, 2_048)];
+        let older = [
+            (tip - 4320, 256),
+            (tip - 4600, 512),
+            (1_500, 1_024),
+            (3, 2_048),
+        ];
         let coins: Vec<(u32, u64)> = recent.iter().chain(older.iter()).copied().collect();
         let (hist, window) = age_inputs(&coins);
 
@@ -2432,7 +2466,11 @@ mod tests {
         // Ages 4320 and 4600 are exact too (the window's margin holds
         // them), and every older coin is at most 10k blocks old.
         assert_eq!(buckets[4], 256 + 512 + 1_024 + 2_048);
-        assert_eq!(buckets.iter().sum::<u64>(), total(&coins), "every coin once");
+        assert_eq!(
+            buckets.iter().sum::<u64>(),
+            total(&coins),
+            "every coin once"
+        );
     }
 
     #[test]
@@ -2508,7 +2546,10 @@ mod tests {
     fn age_buckets_at_genesis_are_empty() {
         let window = RecentHeightWindow::empty([0; 32]);
         assert_eq!(height_hist_to_age_buckets(&[], 0, None), ([0; 8], false));
-        assert_eq!(height_hist_to_age_buckets(&[], 0, Some(&window)), ([0; 8], true));
+        assert_eq!(
+            height_hist_to_age_buckets(&[], 0, Some(&window)),
+            ([0; 8], true)
+        );
     }
 
     #[test]
@@ -2581,10 +2622,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
         (cs, dir)
     }
@@ -2796,7 +2838,10 @@ mod tests {
 
         let e = prune_blockchain(&cs, PruneMode::Off, &100.into()).unwrap_err();
         assert_eq!(e.0, -1);
-        assert_eq!(e.1, "Cannot prune blocks because node is not in prune mode.");
+        assert_eq!(
+            e.1,
+            "Cannot prune blocks because node is not in prune mode."
+        );
 
         let e = prune_blockchain(&cs, PruneMode::Manual, &(-1).into()).unwrap_err();
         assert_eq!(e.0, -8);
@@ -2828,7 +2873,10 @@ mod tests {
             let e = prune_blockchain(&cs, PruneMode::Manual, &n).unwrap_err();
             assert_eq!(e, (-1, "JSON integer out of range".to_string()), "{text}");
             let e = prune_blockchain(&cs, PruneMode::Off, &n).unwrap_err();
-            assert_eq!(e.1, "Cannot prune blocks because node is not in prune mode.", "{text}");
+            assert_eq!(
+                e.1, "Cannot prune blocks because node is not in prune mode.",
+                "{text}"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3053,7 +3101,6 @@ pub fn scan_tx_out_set_start(
         .flush_coin_cache()
         .map_err(|e| (-32603, format!("Unable to flush coins: {e}")))?;
 
-
     let mut count: u64 = 0;
     let mut found: Vec<(bitcoin::OutPoint, crate::storage::coinview::Coin)> = Vec::new();
     let mut aborted = false;
@@ -3061,9 +3108,7 @@ pub fn scan_tx_out_set_start(
     let base = chain_state
         .for_each_coin_snapshot(&mut |outpoint, coin| {
             count += 1;
-            if count.is_multiple_of(8192)
-                && (SCAN_ABORT.load(Ordering::Acquire) || interrupted())
-            {
+            if count.is_multiple_of(8192) && (SCAN_ABORT.load(Ordering::Acquire) || interrupted()) {
                 aborted = true;
                 // The store has no cancel channel; unwinding via an error is
                 // how the iteration stops early. `aborted` distinguishes this

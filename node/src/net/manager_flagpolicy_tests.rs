@@ -32,7 +32,13 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     // Out of IBD, so the outbound target is the full-relay count.
     pm.headers_tip.store(1, Ordering::Relaxed);
     (pm, dir)
@@ -54,7 +60,8 @@ fn peer(id: PeerId, direction: Direction) -> PeerInfo {
 
 fn flagged(mut info: PeerInfo, flags: &[Flag]) -> PeerInfo {
     let fp = info.flags.fingerprint;
-    info.flags.update(fp, true, flags.iter().map(|f| (*f, Vec::new())).collect());
+    info.flags
+        .update(fp, true, flags.iter().map(|f| (*f, Vec::new())).collect());
     info
 }
 
@@ -107,7 +114,11 @@ async fn accept_one(pm: &Arc<PeerManager>) -> tokio::net::TcpStream {
 }
 
 fn loopback_peers(pm: &PeerManager) -> usize {
-    pm.peers.read().values().filter(|h| h.info.addr.ip().is_loopback()).count()
+    pm.peers
+        .read()
+        .values()
+        .filter(|h| h.info.addr.ip().is_loopback())
+        .count()
 }
 
 /// 30 inbound peers fill `-maxconnections=41`'s 30 inbound slots. Peer 1,
@@ -153,7 +164,12 @@ async fn each_eviction_flag_takes_a_protected_inbound_peer_first() {
 
         let gone: Vec<PeerId> = before.difference(&ids(&pm)).copied().collect();
         assert_eq!(gone, vec![1], "{flag:?}: the flagged peer, and only it");
-        assert!(pm.retired_behavior.lock().contains(&(1, Some("evicted-flagged"))), "{flag:?}");
+        assert!(
+            pm.retired_behavior
+                .lock()
+                .contains(&(1, Some("evicted-flagged"))),
+            "{flag:?}"
+        );
         assert_eq!(loopback_peers(&pm), 1, "{flag:?}: the newcomer is kept");
     }
 }
@@ -167,13 +183,23 @@ fn the_tx_relay_cap_takes_a_flagged_peer_first() {
     pm.set_max_connections(31);
     assert_eq!(pm.max_inbound_full_relay(), 10);
     for id in 1..=11 {
-        add(&pm, flagged(peer(id, Direction::Inbound), if id == 2 { &[Flag::Spy] } else { &[] }));
+        add(
+            &pm,
+            flagged(
+                peer(id, Direction::Inbound),
+                if id == 2 { &[Flag::Spy] } else { &[] },
+            ),
+        );
     }
     // Eleven candidates: Core protects every one.
     assert!(pm.evict_tx_peer_if_full(Some(11)));
     assert!(!ids(&pm).contains(&2), "the flagged peer went");
     assert_eq!(ids(&pm).len(), 10);
-    assert!(pm.retired_behavior.lock().contains(&(2, Some("evicted-flagged"))));
+    assert!(
+        pm.retired_behavior
+            .lock()
+            .contains(&(2, Some("evicted-flagged")))
+    );
 }
 
 /// The other flags (`A`, `H`, `N`, `T`) change nothing under `evict`.
@@ -185,7 +211,16 @@ fn the_other_flags_change_nothing() {
     let core = victim(&pm);
     assert!(matches!(core, EvictionVictim::Peer(_, f) if f.is_empty()));
     for id in 1..=30 {
-        set_flags(&pm, id, &[Flag::AddrAbuse, Flag::HeightLie, Flag::NotfoundPattern, Flag::Stalling]);
+        set_flags(
+            &pm,
+            id,
+            &[
+                Flag::AddrAbuse,
+                Flag::HeightLie,
+                Flag::NotfoundPattern,
+                Flag::Stalling,
+            ],
+        );
     }
     assert_eq!(victim(&pm), core);
 }
@@ -207,7 +242,11 @@ fn a_peer_with_noban_or_relay_permission_is_exempt() {
         full_inbound_set(&pm);
         grant(&mut pm.peers.write().get_mut(&1).unwrap().info.permissions);
         let core = victim(&pm);
-        set_flags(&pm, 1, &[Flag::Crawler, Flag::Spy, Flag::FingerprintMismatch]);
+        set_flags(
+            &pm,
+            1,
+            &[Flag::Crawler, Flag::Spy, Flag::FingerprintMismatch],
+        );
         grant(&mut pm.peers.write().get_mut(&1).unwrap().info.permissions);
         assert_eq!(victim(&pm), core, "{name}");
         assert!(!matches!(core, EvictionVictim::Peer(1, _)), "{name}");
@@ -222,7 +261,10 @@ async fn no_disconnect_while_slots_are_free() {
     pm.set_flag_policy(FlagPolicy::Evict);
     pm.set_max_connections(41);
     for id in 1..=29 {
-        add(&pm, flagged(peer(id, Direction::Inbound), &[Flag::Crawler, Flag::Spy]));
+        add(
+            &pm,
+            flagged(peer(id, Direction::Inbound), &[Flag::Crawler, Flag::Spy]),
+        );
     }
     let before = ids(&pm);
     pm.evaluate_peer_flags();
@@ -244,16 +286,25 @@ fn outbound_peers_are_untouched() {
     for id in 40..45 {
         add(&pm, flagged(peer(id, Direction::Outbound), &all));
     }
-    assert!(matches!(victim(&pm), EvictionVictim::Peer(id, f) if (1..=30).contains(&id) && f.is_empty()));
+    assert!(
+        matches!(victim(&pm), EvictionVictim::Peer(id, f) if (1..=30).contains(&id) && f.is_empty())
+    );
 
     let surplus = |policy: FlagPolicy| {
         let (pm, _dir) = mk_pm();
         pm.set_flag_policy(policy);
         for id in 1..=9 {
-            add(&pm, flagged(peer(id, Direction::Outbound), if id % 2 == 0 { &all } else { &[] }));
+            add(
+                &pm,
+                flagged(
+                    peer(id, Direction::Outbound),
+                    if id % 2 == 0 { &all } else { &[] },
+                ),
+            );
         }
         assert!(!pm.is_ibd());
-        pm.evict_extra_outbound_peer().expect("one over the target of 8")
+        pm.evict_extra_outbound_peer()
+            .expect("one over the target of 8")
     };
     assert_eq!(surplus(FlagPolicy::Evict), surplus(FlagPolicy::Observe));
 }
@@ -283,7 +334,10 @@ fn observe_leaves_the_eviction_as_it_was() {
         }
         let core = victim(&pm);
         for id in 1..=n {
-            let flags: Vec<Flag> = Flag::ALL.into_iter().filter(|_| rng.gen_bool(0.3)).collect();
+            let flags: Vec<Flag> = Flag::ALL
+                .into_iter()
+                .filter(|_| rng.gen_bool(0.3))
+                .collect();
             set_flags(&pm, id, &flags);
         }
         assert_eq!(victim(&pm), core);
@@ -294,5 +348,8 @@ fn observe_leaves_the_eviction_as_it_was() {
         }
         pm.set_flag_policy(FlagPolicy::Observe);
     }
-    assert!(differs_under_evict > 0, "fixture: the flags would have mattered under evict");
+    assert!(
+        differs_under_evict > 0,
+        "fixture: the flags would have mattered under evict"
+    );
 }

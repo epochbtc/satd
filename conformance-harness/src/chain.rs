@@ -32,11 +32,11 @@ use bitcoin::{Block, BlockHash, Network};
 use node::chain::state::{AssumeValid, ChainError, ChainState};
 use node::net::orphan_blocks::OrphanBlocks;
 use node::storage::blockindex::BlockStatus;
-use node::validation::script::{self, TestActivationOverrides};
 use node::validation::ValidationError;
-use serde_json::{json, Value};
+use node::validation::script::{self, TestActivationOverrides};
+use serde_json::{Value, json};
 
-use crate::{bad_request, field_hex, Fail, Fields};
+use crate::{Fail, Fields, bad_request, field_hex};
 
 /// The operations a [`Worker`] answers.
 pub const OPS: &[&str] = &[
@@ -58,7 +58,8 @@ pub struct Worker {
 
 impl Worker {
     pub fn spawn() -> Result<Worker, Fail> {
-        let exe = std::env::current_exe().map_err(|e| internal(format!("locating the harness: {e}")))?;
+        let exe =
+            std::env::current_exe().map_err(|e| internal(format!("locating the harness: {e}")))?;
         let mut child = Command::new(exe)
             .arg("--chain-worker")
             .stdin(Stdio::piped())
@@ -68,7 +69,11 @@ impl Worker {
             .map_err(|e| internal(format!("starting the chain worker: {e}")))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        Ok(Worker { child, stdin: Some(stdin), stdout })
+        Ok(Worker {
+            child,
+            stdin: Some(stdin),
+            stdout,
+        })
     }
 
     /// Pass one request line on and return the worker's response line.
@@ -105,7 +110,10 @@ impl Drop for Worker {
 }
 
 fn internal(message: impl Into<String>) -> Fail {
-    Fail { code: "internal", message: message.into() }
+    Fail {
+        code: "internal",
+        message: message.into(),
+    }
 }
 
 /// One chain, from `chain_reset` until the process exits.
@@ -137,7 +145,10 @@ pub fn dispatch(chain: &mut Option<Chain>, op: &str, req: &Fields) -> Result<Fie
         "chain_tip" => Ok(chain.tip()),
         "chain_tips" => Ok(chain.tips()),
         "utxo_hash" => chain.utxo_hash(),
-        _ => Err(Fail { code: "unsupported_op", message: format!("satd does not answer {op}") }),
+        _ => Err(Fail {
+            code: "unsupported_op",
+            message: format!("satd does not answer {op}"),
+        }),
     }
 }
 
@@ -148,7 +159,11 @@ fn reset(req: &Fields) -> Result<(Chain, BlockHash), Fail> {
         Some("testnet4") => Network::Testnet4,
         Some("signet") => Network::Signet,
         Some("regtest") => Network::Regtest,
-        _ => return Err(bad_request("network must be main, testnet3, testnet4, signet or regtest")),
+        _ => {
+            return Err(bad_request(
+                "network must be main, testnet3, testnet4, signet or regtest",
+            ));
+        }
     };
     let empty = Fields::new();
     let options = match req.get("options") {
@@ -167,7 +182,9 @@ fn reset(req: &Fields) -> Result<(Chain, BlockHash), Fail> {
                 script::set_test_activation_overrides(overrides).map_err(internal)?;
             }
             "test" => {
-                let names = value.as_array().ok_or_else(|| bad_request("test must be an array"))?;
+                let names = value
+                    .as_array()
+                    .ok_or_else(|| bad_request("test must be an array"))?;
                 for name in names {
                     match name.as_str() {
                         Some("bip94") if network == Network::Regtest => {
@@ -177,7 +194,10 @@ fn reset(req: &Fields) -> Result<(Chain, BlockHash), Fail> {
                         name => {
                             return Err(Fail {
                                 code: "unsupported_op",
-                                message: format!("satd has no -test={} option", name.unwrap_or("?")),
+                                message: format!(
+                                    "satd has no -test={} option",
+                                    name.unwrap_or("?")
+                                ),
                             });
                         }
                     }
@@ -218,12 +238,21 @@ fn reset(req: &Fields) -> Result<(Chain, BlockHash), Fail> {
     )
     .map_err(|e| internal(format!("creating the chain: {e}")))?;
     let genesis = cs.tip_hash();
-    Ok((Chain { cs, orphans: OrphanBlocks::new(), _dir: dir }, genesis))
+    Ok((
+        Chain {
+            cs,
+            orphans: OrphanBlocks::new(),
+            _dir: dir,
+        },
+        genesis,
+    ))
 }
 
 /// Core's `-testactivationheight=name@height`, for the five names it takes.
 fn activation_overrides(value: &Value) -> Result<TestActivationOverrides, Fail> {
-    let map = value.as_object().ok_or_else(|| bad_request("testactivationheight must be an object"))?;
+    let map = value
+        .as_object()
+        .ok_or_else(|| bad_request("testactivationheight must be an object"))?;
     let mut o = TestActivationOverrides::default();
     for (name, height) in map {
         let height = height
@@ -297,7 +326,9 @@ impl Outcome {
 fn refusal(cs: &ChainState, hash: &BlockHash, e: ChainError) -> Result<Outcome, Fail> {
     Ok(match e {
         ChainError::Duplicate => {
-            let invalid = cs.get_block_index(hash).is_some_and(|entry| entry.status == BlockStatus::Invalid);
+            let invalid = cs
+                .get_block_index(hash)
+                .is_some_and(|entry| entry.status == BlockStatus::Invalid);
             if invalid {
                 Outcome::Invalid("duplicate-invalid".into())
             } else {
@@ -325,7 +356,9 @@ impl Chain {
         let p2p = via_p2p(req)?;
         let requested = match req.get("requested") {
             None => true,
-            Some(v) => v.as_bool().ok_or_else(|| bad_request("requested must be a bool"))?,
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| bad_request("requested must be a bool"))?,
         };
         let bytes = field_hex(req, "block")?;
         let outcome = match node::validation::decode::deserialize_block(&bytes) {
@@ -347,7 +380,8 @@ impl Chain {
             // unknown-parent branch (`hold_for_parent`).
             match self.cs.get_block_index(&block.header.prev_blockhash) {
                 Some(parent) => {
-                    let segwit = node::validation::block::segwit_active_at(network, parent.height + 1);
+                    let segwit =
+                        node::validation::block::segwit_active_at(network, parent.height + 1);
                     if node::validation::block::is_block_mutated(&block, segwit) {
                         return Ok(Outcome::Mutated("mutated-block".into()));
                     }
@@ -404,8 +438,10 @@ impl Chain {
         // `accept_headers` skips a header it already knows without counting
         // it, so the refused header's position comes from what was known
         // before the call.
-        let known_before: Vec<bool> =
-            headers.iter().map(|h| self.cs.get_block_index(&h.block_hash()).is_some()).collect();
+        let known_before: Vec<bool> = headers
+            .iter()
+            .map(|h| self.cs.get_block_index(&h.block_hash()).is_some())
+            .collect();
         let mut fields = Fields::new();
         let (accepted, refused) = if p2p {
             // `PeerManager::handle_headers`.
@@ -440,7 +476,10 @@ impl Chain {
         };
         self.activate();
         outcome.into_fields(&mut fields);
-        fields.insert("best_header".into(), json!(self.cs.best_header_hash().to_string()));
+        fields.insert(
+            "best_header".into(),
+            json!(self.cs.best_header_hash().to_string()),
+        );
         Ok(fields)
     }
 
@@ -453,7 +492,9 @@ impl Chain {
             .ok_or_else(|| bad_request("hash must be a block hash"))?;
         match self.cs.invalidate_block(hash) {
             Ok(()) => {}
-            Err(ChainError::BlockNotFound) => return Err(bad_request(format!("unknown block {hash}"))),
+            Err(ChainError::BlockNotFound) => {
+                return Err(bad_request(format!("unknown block {hash}")));
+            }
             Err(e) => return Err(internal(format!("invalidate_block: {e}"))),
         }
         let mut fields = Fields::new();
@@ -477,7 +518,11 @@ impl Chain {
     fn tip(&self) -> Fields {
         let mut fields = Fields::new();
         self.insert_tip(&mut fields);
-        let chainwork = self.cs.get_block_index(&self.cs.tip_hash()).map(|e| e.chainwork).unwrap_or([0; 32]);
+        let chainwork = self
+            .cs
+            .get_block_index(&self.cs.tip_hash())
+            .map(|e| e.chainwork)
+            .unwrap_or([0; 32]);
         fields.insert("chainwork".into(), json!(hex::encode(chainwork)));
         fields
     }
@@ -498,16 +543,21 @@ impl Chain {
     }
 
     fn utxo_hash(&self) -> Result<Fields, Fail> {
-        self.cs.flush_coin_cache().map_err(|e| internal(format!("flushing the coin cache: {e}")))?;
+        self.cs
+            .flush_coin_cache()
+            .map_err(|e| internal(format!("flushing the coin cache: {e}")))?;
         // `hash_utxo_set`'s pass, counting the coins as it goes so the count
         // and the hash come from the same view.
         let mut hasher = node::storage::compressed_coin::Hs3Hasher::new();
         let mut txouts = 0u64;
-        node::storage::Store::for_each_coin_snapshot(self.cs.store_ref().as_ref(), &mut |op, coin| {
-            hasher.visit(op, coin);
-            txouts += 1;
-            Ok(())
-        })
+        node::storage::Store::for_each_coin_snapshot(
+            self.cs.store_ref().as_ref(),
+            &mut |op, coin| {
+                hasher.visit(op, coin);
+                txouts += 1;
+                Ok(())
+            },
+        )
         .map_err(|e| internal(format!("reading the UTXO set: {e}")))?;
         let hash = hasher.finalize();
         let mut fields = Fields::new();

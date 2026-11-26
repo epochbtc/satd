@@ -63,30 +63,34 @@ pub fn draw(f: &mut Frame, st: &AppState) {
     let count_line = if is_download {
         // Bytes, not blocks: show human-readable sizes.
         if status.total > 0 {
-            format!("{} / {}", format_bytes(status.current), format_bytes(status.total))
+            format!(
+                "{} / {}",
+                format_bytes(status.current),
+                format_bytes(status.total)
+            )
         } else {
             format!("{} (size tbd)", format_bytes(status.current))
         }
     } else {
         match status.stop_height {
-        Some(stop) if status.total > stop => format!(
-            "{} / {}  (file tip: {})",
-            format_num(status.current),
-            format_num(stop),
-            format_num(status.total),
-        ),
-        Some(stop) => format!(
-            "{} / {}",
-            format_num(status.current),
-            format_num(stop),
-        ),
-        None => {
-            if status.total > 0 {
-                format!("{} / {}", format_num(status.current), format_num(status.total))
-            } else {
-                format!("{} (total tbd)", format_num(status.current))
+            Some(stop) if status.total > stop => format!(
+                "{} / {}  (file tip: {})",
+                format_num(status.current),
+                format_num(stop),
+                format_num(status.total),
+            ),
+            Some(stop) => format!("{} / {}", format_num(status.current), format_num(stop),),
+            None => {
+                if status.total > 0 {
+                    format!(
+                        "{} / {}",
+                        format_num(status.current),
+                        format_num(status.total)
+                    )
+                } else {
+                    format!("{} (total tbd)", format_num(status.current))
+                }
             }
-        }
         }
     };
     let header = Paragraph::new(vec![
@@ -169,19 +173,11 @@ pub fn draw(f: &mut Frame, st: &AppState) {
         // that reindex will halt at H even when the on-disk block files
         // extend past it. Highlighted because it materially changes
         // what the gauge above represents.
-        stat_lines.push(stat_line(
-            "Stop at",
-            format_num(stop),
-            Color::LightMagenta,
-        ));
+        stat_lines.push(stat_line("Stop at", format_num(stop), Color::LightMagenta));
     }
 
     if !status.phase.is_empty() {
-        stat_lines.push(stat_line(
-            "Phase id",
-            status.phase.clone(),
-            Color::DarkGray,
-        ));
+        stat_lines.push(stat_line("Phase id", status.phase.clone(), Color::DarkGray));
     }
 
     stat_lines.push(Line::from(""));

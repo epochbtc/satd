@@ -43,12 +43,16 @@ fn receiver_spend_key(
     let mut msg = ecdh.serialize().to_vec();
     msg.extend_from_slice(&k.to_be_bytes());
     let t_k = tagged_hash(b"BIP0352/SharedSecret", &msg);
-    let mut d = b_spend.add_tweak(&Scalar::from_be_bytes(t_k).unwrap()).unwrap();
+    let mut d = b_spend
+        .add_tweak(&Scalar::from_be_bytes(t_k).unwrap())
+        .unwrap();
     if let Some(m) = label {
         let mut lbuf = b_scan.secret_bytes().to_vec();
         lbuf.extend_from_slice(&m.to_be_bytes());
         let label_m = tagged_hash(b"BIP0352/Label", &lbuf);
-        d = d.add_tweak(&Scalar::from_be_bytes(label_m).unwrap()).unwrap();
+        d = d
+            .add_tweak(&Scalar::from_be_bytes(label_m).unwrap())
+            .unwrap();
     }
     d
 }
@@ -59,9 +63,9 @@ fn receiver_spend_key(
 /// `t_k` from its own ECDH `e·B_scan`, which must equal the receiver's `b_scan·T`.
 fn sender_output_key(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
-    e: &SecretKey,       // ephemeral input scalar; T = e·G
+    e: &SecretKey, // ephemeral input scalar; T = e·G
     b_scan_pub: &PublicKey,
-    b_pub: &PublicKey,   // receiver's B_spend (+ label·G for a labelled address)
+    b_pub: &PublicKey, // receiver's B_spend (+ label·G for a labelled address)
     k: u32,
 ) -> [u8; 32] {
     let ecdh = b_scan_pub
@@ -75,7 +79,10 @@ fn sender_output_key(
 }
 
 fn xonly(secp: &Secp256k1<bitcoin::secp256k1::All>, sk: &SecretKey) -> [u8; 32] {
-    PublicKey::from_secret_key(secp, sk).x_only_public_key().0.serialize()
+    PublicKey::from_secret_key(secp, sk)
+        .x_only_public_key()
+        .0
+        .serialize()
 }
 
 #[test]
@@ -93,7 +100,11 @@ fn unlabelled_output_round_trips() {
     for k in 0..3u32 {
         let output = sender_output_key(&secp, &e, &b_scan_pub, &b_spend_pub, k);
         let d = receiver_spend_key(&secp, &b_scan, &b_spend, &tweak_t, k, None);
-        assert_eq!(xonly(&secp, &d), output, "unlabelled derived key must control the output (k={k})");
+        assert_eq!(
+            xonly(&secp, &d),
+            output,
+            "unlabelled derived key must control the output (k={k})"
+        );
     }
 }
 

@@ -29,5 +29,7 @@ pub mod vardiff;
 #[cfg(test)]
 mod winning_block_tests;
 
-pub use config::{StratumConfig, V2Config, default_initial_difficulty, resolve_payout, should_issue_work};
+pub use config::{
+    StratumConfig, V2Config, default_initial_difficulty, resolve_payout, should_issue_work,
+};
 pub use server::{StratumHandle, StratumServer, StratumServerError, StratumStats};

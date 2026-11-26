@@ -80,10 +80,7 @@ pub enum EdgeIdentityError {
 impl EdgeIdentity {
     /// Construct from explicit values. `region` is parsed via
     /// [`Self::parse_region`].
-    pub fn new(
-        node_id: [u8; 16],
-        region: Option<&str>,
-    ) -> Result<Self, EdgeIdentityError> {
+    pub fn new(node_id: [u8; 16], region: Option<&str>) -> Result<Self, EdgeIdentityError> {
         let region = match region {
             Some(s) => Some(Self::parse_region(s)?),
             None => None,
@@ -170,8 +167,8 @@ mod stamp_serde_tests {
     fn stamp() -> EdgeStamp {
         EdgeStamp {
             node_id: [
-                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
-                0x89, 0xab, 0xcd, 0xef,
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef,
             ],
             region: Some(*b"us-east1"),
             edge_seen_at_ns: 12_345_678,
@@ -245,18 +242,14 @@ fn load_or_generate_node_id(datadir: &Path) -> Result<[u8; 16], EdgeIdentityErro
             if let Some(parent) = path.parent()
                 && !parent.exists()
             {
-                fs::create_dir_all(parent).map_err(|source| {
-                    EdgeIdentityError::NodeIdWrite {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-            }
-            fs::write(&path, hex::encode(id)).map_err(|source| {
-                EdgeIdentityError::NodeIdWrite {
+                fs::create_dir_all(parent).map_err(|source| EdgeIdentityError::NodeIdWrite {
                     path: path.clone(),
                     source,
-                }
+                })?;
+            }
+            fs::write(&path, hex::encode(id)).map_err(|source| EdgeIdentityError::NodeIdWrite {
+                path: path.clone(),
+                source,
             })?;
             Ok(id)
         }
@@ -809,9 +802,7 @@ mod tests {
     #[test]
     fn envelope_serializes_with_schema_version() {
         let body = NodeEventBody::Mempool(MempoolEvent::Enter {
-            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-                [1u8; 32],
-            )),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32])),
             fee: 100,
             vsize: 250,
             fee_rate_sat_per_kvb: 400,
@@ -833,9 +824,9 @@ mod tests {
         let env_m = NodeEvent::new(
             stamp(),
             NodeEventBody::Mempool(MempoolEvent::LeaveReplaced {
-                txid: Txid::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array([1u8; 32]),
-                ),
+                txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    [1u8; 32],
+                )),
                 replacing_txid: Txid::from_raw_hash(
                     bitcoin::hashes::sha256d::Hash::from_byte_array([2u8; 32]),
                 ),
@@ -845,9 +836,9 @@ mod tests {
         let env_c = NodeEvent::new(
             stamp(),
             NodeEventBody::Chain(ChainEvent::BlockConnected {
-                hash: BlockHash::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_byte_array([3u8; 32]),
-                ),
+                hash: BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                    [3u8; 32],
+                )),
                 height: 42,
             }),
         );
@@ -937,9 +928,9 @@ mod tests {
         let secp = Secp256k1::new();
         let pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x44; 32]).unwrap());
         node_sp_index::TweakEntry {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([7u8; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [7u8; 32],
+            )),
             tweak: pk,
             max_taproot_value: bitcoin::Amount::from_sat(12_345),
             taproot_outputs: vec![node_sp_index::TaprootOutput {
@@ -1002,15 +993,19 @@ mod tests {
             )),
             height: 808_080,
         });
-        let cur = body.derive_cursor(0xdead_beef_cafe_f00d, 42).expect("cursor");
+        let cur = body
+            .derive_cursor(0xdead_beef_cafe_f00d, 42)
+            .expect("cursor");
         assert_eq!(cur.height, 808_080);
         assert_eq!(cur.tx_index, 0);
         assert_eq!(cur.mempool_seq, 42);
         assert_eq!(cur.instance_id, 0xdead_beef_cafe_f00d);
         // Non-confirmed bodies advance no durable cursor.
-        assert!(NodeEventBody::Heartbeat { uptime_ns: 1 }
-            .derive_cursor(1, 2)
-            .is_none());
+        assert!(
+            NodeEventBody::Heartbeat { uptime_ns: 1 }
+                .derive_cursor(1, 2)
+                .is_none()
+        );
     }
 
     #[test]

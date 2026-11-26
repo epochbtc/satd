@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 
-use axum::Json;
 use axum::Extension;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
@@ -137,18 +137,19 @@ pub async fn txs_outspends(
 fn parse_txid_list(raw: &str) -> EsploraResult<Vec<Option<Txid>>> {
     let items: Vec<&str> = raw.split(',').collect();
     if items.len() > MAX_OUTSPENDS_TXIDS {
-        return Err(EsploraError::BadRequest("Too many txids requested".to_string()));
+        return Err(EsploraError::BadRequest(
+            "Too many txids requested".to_string(),
+        ));
     }
-    Ok(items.into_iter().map(|item| item.parse::<Txid>().ok()).collect())
+    Ok(items
+        .into_iter()
+        .map(|item| item.parse::<Txid>().ok())
+        .collect())
 }
 
 /// One outspend per output of `txid`, in output order. 404 for a transaction
 /// unknown as of `pin`.
-fn outspends_of(
-    state: &EsploraState,
-    pin: &Pin,
-    txid: &Txid,
-) -> EsploraResult<Vec<OutspendJson>> {
+fn outspends_of(state: &EsploraState, pin: &Pin, txid: &Txid) -> EsploraResult<Vec<OutspendJson>> {
     // Determine the tx's output count. For confirmed txs we look up the
     // tx body via txindex; for mempool txs we read it from the entry.
     // Either path returns the output count without serializing the body.
@@ -159,7 +160,9 @@ fn outspends_of(
     // whole-mempool map here copied every mempool transaction per request,
     // on a route anyone who can reach Esplora may call.
     let mempool_index = if pin.mempool {
-        state.mempool.acting_spenders_of_outputs(txid, output_count as u32)
+        state
+            .mempool
+            .acting_spenders_of_outputs(txid, output_count as u32)
     } else {
         HashMap::new()
     };
@@ -175,7 +178,12 @@ fn outspends_of(
     for vout in 0..output_count as u32 {
         out.push(match confirmed.get(&vout) {
             Some(sref) => confirmed_outspend(state, pin, sref),
-            None => build_outspend(state, pin, &OutPoint { txid: *txid, vout }, mempool_index.get(&vout))?,
+            None => build_outspend(
+                state,
+                pin,
+                &OutPoint { txid: *txid, vout },
+                mempool_index.get(&vout),
+            )?,
         });
     }
     Ok(out)
@@ -209,9 +217,10 @@ pub async fn tx_merkleblock_proof(
     // a P2P MerkleBlock and hex-stringified, matching upstream.
     // From the header and the stored txids, which a stripped block's
     // strip record holds.
-    let mb = MerkleBlock::from_header_txids_with_predicate(&block.block.header, &block.txids(), |t| {
-        *t == txid
-    });
+    let mb =
+        MerkleBlock::from_header_txids_with_predicate(&block.block.header, &block.txids(), |t| {
+            *t == txid
+        });
     Ok(hex::encode(serialize(&mb)))
 }
 
@@ -363,22 +372,16 @@ fn locate_confirmed_tx(
         .store_ref()
         .get_tx_location(txid)
         .ok_or(EsploraError::NotFound)?;
-    let block = state
-        .chain
-        .get_stored_block(&block_hash)
-        .ok_or_else(|| {
-            EsploraError::Internal(format!(
-                "txindex points at {block_hash} but block data is missing"
-            ))
-        })?;
-    let entry = state
-        .chain
-        .get_block_index(&block_hash)
-        .ok_or_else(|| {
-            EsploraError::Internal(format!(
-                "txindex points at {block_hash} but block index entry is missing"
-            ))
-        })?;
+    let block = state.chain.get_stored_block(&block_hash).ok_or_else(|| {
+        EsploraError::Internal(format!(
+            "txindex points at {block_hash} but block data is missing"
+        ))
+    })?;
+    let entry = state.chain.get_block_index(&block_hash).ok_or_else(|| {
+        EsploraError::Internal(format!(
+            "txindex points at {block_hash} but block index entry is missing"
+        ))
+    })?;
     // Confirmed above the pinned tip: unconfirmed as of the pin, and a
     // mempool transaction has no merkle proof.
     if !pin.covers(entry.height) {
@@ -419,8 +422,7 @@ fn compute_merkle_branch(txids: &[Txid], pos: usize) -> Vec<TxMerkleNode> {
             current.push(*current.last().unwrap());
         }
         let sib = current[idx ^ 1];
-        let sib_hash =
-            bitcoin::hashes::sha256d::Hash::from_byte_array(sib);
+        let sib_hash = bitcoin::hashes::sha256d::Hash::from_byte_array(sib);
         branch.push(TxMerkleNode::from_raw_hash(sib_hash));
 
         let mut next = Vec::with_capacity(current.len() / 2);
@@ -446,9 +448,7 @@ mod tests {
     use super::*;
 
     fn fixture_txid(byte: u8) -> Txid {
-        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [byte; 32],
-        ))
+        Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
     }
 
     /// Single-tx block: branch is empty (the tx hash IS the root).
@@ -470,14 +470,8 @@ mod tests {
         assert_eq!(path_a.len(), 1);
         assert_eq!(path_b.len(), 1);
         // a's sibling is b; b's sibling is a.
-        assert_eq!(
-            path_a[0].to_byte_array(),
-            b.to_raw_hash().to_byte_array()
-        );
-        assert_eq!(
-            path_b[0].to_byte_array(),
-            a.to_raw_hash().to_byte_array()
-        );
+        assert_eq!(path_a[0].to_byte_array(), b.to_raw_hash().to_byte_array());
+        assert_eq!(path_b[0].to_byte_array(), a.to_raw_hash().to_byte_array());
     }
 
     /// Three-tx block: odd-out path duplicates the last hash. Position 2
@@ -493,10 +487,7 @@ mod tests {
         // sibling is hash(a,b).
         let path_c = compute_merkle_branch(&txids, 2);
         assert_eq!(path_c.len(), 2);
-        assert_eq!(
-            path_c[0].to_byte_array(),
-            c.to_raw_hash().to_byte_array()
-        );
+        assert_eq!(path_c[0].to_byte_array(), c.to_raw_hash().to_byte_array());
     }
 
     /// Branches at heights computed are exactly `ceil(log2(n))` for
@@ -505,19 +496,11 @@ mod tests {
     fn merkle_branch_length_log2() {
         let txids: Vec<Txid> = (1u8..=4).map(fixture_txid).collect();
         for pos in 0..4 {
-            assert_eq!(
-                compute_merkle_branch(&txids, pos).len(),
-                2,
-                "pos={pos}"
-            );
+            assert_eq!(compute_merkle_branch(&txids, pos).len(), 2, "pos={pos}");
         }
         let txids: Vec<Txid> = (1u8..=8).map(fixture_txid).collect();
         for pos in 0..8 {
-            assert_eq!(
-                compute_merkle_branch(&txids, pos).len(),
-                3,
-                "pos={pos}"
-            );
+            assert_eq!(compute_merkle_branch(&txids, pos).len(), 3, "pos={pos}");
         }
     }
 }

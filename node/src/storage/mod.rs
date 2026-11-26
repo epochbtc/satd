@@ -6,6 +6,9 @@ pub mod compressed_coin;
 pub mod db;
 pub mod flatfile;
 pub mod opreturn_strip;
+#[cfg(test)]
+#[path = "opreturn_strip_store_tests.rs"]
+mod opreturn_strip_store_tests;
 pub mod profile;
 pub mod punch;
 pub mod recent_window;
@@ -13,9 +16,6 @@ pub mod rocksdb_store;
 pub mod split_store;
 #[cfg(test)]
 pub(crate) mod test_store;
-#[cfg(test)]
-#[path = "opreturn_strip_store_tests.rs"]
-mod opreturn_strip_store_tests;
 pub mod undo;
 
 use bitcoin::{BlockHash, OutPoint, Txid};
@@ -28,15 +28,14 @@ use crate::index::address::{
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::{FilterHeaderRow, FilterKey, FilterRow};
 use crate::index::outpoint_spend::SpendingRef;
-use node_index::SpentRow;
 use crate::storage::blockindex::BlockIndexEntry;
 use crate::storage::coinview::Coin;
 use crate::storage::undo::UndoData;
+use node_index::SpentRow;
 
 pub use recent_window::{
-    RECENT_WINDOW, RECENT_WINDOW_BUILD_RETRY_DELAYS, RECENT_WINDOW_LEN,
-    RECENT_WINDOW_REORG_MARGIN, RecentHeightWindow, RecentWindowBuild,
-    build_recent_window_with_retries,
+    RECENT_WINDOW, RECENT_WINDOW_BUILD_RETRY_DELAYS, RECENT_WINDOW_LEN, RECENT_WINDOW_REORG_MARGIN,
+    RecentHeightWindow, RecentWindowBuild, build_recent_window_with_retries,
 };
 
 /// Self-consistent base captured during [`Store::for_each_coin_snapshot`].
@@ -575,7 +574,8 @@ impl StoreBatch {
             self.opreturn_strip_removes.retain(|h| !drop.contains(h));
         }
         self.opreturn_strip_puts.extend(other.opreturn_strip_puts);
-        self.opreturn_strip_removes.extend(other.opreturn_strip_removes);
+        self.opreturn_strip_removes
+            .extend(other.opreturn_strip_removes);
         // Incoming wins only when it carries a value: a later batch with no
         // meta must not erase an earlier one.
         if other.opreturn_strip_meta.is_some() {
@@ -853,7 +853,10 @@ pub trait Store: Send + Sync {
     /// `meta` value is not one). No default, for the reason
     /// [`Self::get_opreturn_strip`] has none: a store that forgot it would
     /// report nothing stripped.
-    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError>;
+    fn for_each_opreturn_strip(
+        &self,
+        f: &mut dyn FnMut(&BlockHash, &[u8]),
+    ) -> Result<(), StoreError>;
     /// Remove the strip family, records and meta with it; nothing when it
     /// does not exist. For a node with no record left and the option off:
     /// without the family, a release that predates it opens the datadir
@@ -1088,13 +1091,16 @@ pub trait Store: Send + Sync {
                 index: k.vout,
             })
         });
-        let spending = self.iter_addr_spending(sh).into_iter().filter_map(|(k, _)| {
-            self.get_tx_seq(&k.txid).map(|txseq| AddrRowKey {
-                txseq,
-                spending: true,
-                index: k.vin,
-            })
-        });
+        let spending = self
+            .iter_addr_spending(sh)
+            .into_iter()
+            .filter_map(|(k, _)| {
+                self.get_tx_seq(&k.txid).map(|txseq| AddrRowKey {
+                    txseq,
+                    spending: true,
+                    index: k.vin,
+                })
+            });
         let mut rows: Vec<AddrRowKey> = funding
             .chain(spending)
             .filter(|r| below.is_none_or(|b| r.txseq < b))
@@ -1195,7 +1201,10 @@ pub trait Store: Send + Sync {
     /// prefix is for. Esplora's `/tx/:txid/outspends` uses it so an
     /// N-output transaction costs one txid lookup rather than N.
     /// Default: empty.
-    fn lookup_spends_of_tx(&self, _txid: &bitcoin::Txid) -> Result<Vec<(u32, SpendingRef)>, StoreError> {
+    fn lookup_spends_of_tx(
+        &self,
+        _txid: &bitcoin::Txid,
+    ) -> Result<Vec<(u32, SpendingRef)>, StoreError> {
         Ok(Vec::new())
     }
 

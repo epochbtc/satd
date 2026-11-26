@@ -118,10 +118,17 @@ impl Timings {
     /// the passive wait, then for a discovery session its `getaddr` and
     /// probes, then the close.
     pub fn session_cap(&self, kind: SessionKind, tor: bool) -> Duration {
-        let (connect, handshake) =
-            if tor { (self.tor_connect, self.tor_handshake) } else { (self.connect, self.handshake) };
+        let (connect, handshake) = if tor {
+            (self.tor_connect, self.tor_handshake)
+        } else {
+            (self.connect, self.handshake)
+        };
         let attempts = if kind == SessionKind::V1Recheck { 1 } else { 2 };
-        let extra = if kind == SessionKind::Discovery { self.discovery } else { Duration::ZERO };
+        let extra = if kind == SessionKind::Discovery {
+            self.discovery
+        } else {
+            Duration::ZERO
+        };
         (connect + handshake) * attempts + self.passive + extra + self.close
     }
 }
@@ -146,7 +153,11 @@ pub struct Limits {
 impl Limits {
     /// The limits asked for, each clamped to its ceiling.
     pub fn new(clearnet: usize, tor: usize, rate: u32) -> Self {
-        Limits { clearnet: clearnet.min(MAX_CONCURRENCY), tor: tor.min(MAX_CONCURRENCY), rate: rate.min(MAX_RATE) }
+        Limits {
+            clearnet: clearnet.min(MAX_CONCURRENCY),
+            tor: tor.min(MAX_CONCURRENCY),
+            rate: rate.min(MAX_RATE),
+        }
     }
 }
 
@@ -235,8 +246,12 @@ pub fn parse_network(s: &str) -> Result<Network, String> {
         "ipv4" => Ok(Network::Ipv4),
         "ipv6" => Ok(Network::Ipv6),
         "onion" => Ok(Network::Onion),
-        "i2p" | "cjdns" => Err(format!("-crawlnet={s}: the crawl never dials {s} addresses")),
-        _ => Err(format!("-crawlnet={s}: unknown network (ipv4, ipv6 or onion)")),
+        "i2p" | "cjdns" => Err(format!(
+            "-crawlnet={s}: the crawl never dials {s} addresses"
+        )),
+        _ => Err(format!(
+            "-crawlnet={s}: unknown network (ipv4, ipv6 or onion)"
+        )),
     }
 }
 
@@ -261,7 +276,9 @@ pub enum Netgroup {
 }
 
 pub fn netgroup(addr: &PeerAddr) -> Option<Netgroup> {
-    let PeerAddr::Socket(sa) = addr else { return None };
+    let PeerAddr::Socket(sa) = addr else {
+        return None;
+    };
     Some(match sa.ip().to_canonical() {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -336,8 +353,11 @@ impl Scheduler {
         if self.open.contains_key(addr) {
             return Err(Refusal::TargetBusy);
         }
-        let (open, limit) =
-            if addr.is_onion() { (self.tor, self.limits.tor) } else { (self.clearnet, self.limits.clearnet) };
+        let (open, limit) = if addr.is_onion() {
+            (self.tor, self.limits.tor)
+        } else {
+            (self.clearnet, self.limits.clearnet)
+        };
         if open >= limit {
             return Err(Refusal::Concurrency);
         }
@@ -372,7 +392,9 @@ impl Scheduler {
 
     /// The session to `addr` ended.
     pub fn finish(&mut self, addr: &PeerAddr) {
-        let Some(group) = self.open.remove(addr) else { return };
+        let Some(group) = self.open.remove(addr) else {
+            return;
+        };
         if let Some(g) = group
             && let Some(n) = self.groups.get_mut(&g)
         {
@@ -455,15 +477,20 @@ pub fn chain_check(
         return ChainCheck::Behind;
     };
     if first.prev_blockhash == *locator {
-        return if first.block_hash() == *stop { ChainCheck::OnChain } else { ChainCheck::Fork };
+        return if first.block_hash() == *stop {
+            ChainCheck::OnChain
+        } else {
+            ChainCheck::Fork
+        };
     }
     // An answer may start with a genesis header itself (no parent): judge
     // it by the genesis, which is ours or another chain's.
-    let anchor = if first.prev_blockhash == <bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros() {
-        first.block_hash()
-    } else {
-        first.prev_blockhash
-    };
+    let anchor =
+        if first.prev_blockhash == <bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros() {
+            first.block_hash()
+        } else {
+            first.prev_blockhash
+        };
     match ours(&anchor) {
         OurBlock::Unknown => ChainCheck::OtherChain,
         OurBlock::Stale => ChainCheck::Fork,

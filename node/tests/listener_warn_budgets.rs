@@ -80,9 +80,12 @@ async fn tls_listener(dir: &std::path::Path) -> (std::net::SocketAddr, watch::Se
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-    let acceptor =
-        tls_config::build_acceptor(&cert_path, &key_path, &tls_config::ClientAuthPolicy::Disabled)
-            .unwrap();
+    let acceptor = tls_config::build_acceptor(
+        &cert_path,
+        &key_path,
+        &tls_config::ClientAuthPolicy::Disabled,
+    )
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (sd_tx, sd_rx) = watch::channel(false);
@@ -93,7 +96,14 @@ async fn tls_listener(dir: &std::path::Path) -> (std::net::SocketAddr, watch::Se
         allow: tls_config::ClientAllowList::default(),
     });
     let router = axum::Router::new();
-    tokio::spawn(serve_http_listener("test-tls", listener, transport, router, limits(), sd_rx));
+    tokio::spawn(serve_http_listener(
+        "test-tls",
+        listener,
+        transport,
+        router,
+        limits(),
+        sd_rx,
+    ));
     (addr, sd_tx)
 }
 
@@ -110,7 +120,10 @@ async fn silent_sockets(addr: std::net::SocketAddr, n: usize) {
             tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await,
             Ok(Ok(0)) | Ok(Err(_))
         );
-        assert!(closed, "a silent socket must be dropped after the handshake budget");
+        assert!(
+            closed,
+            "a silent socket must be dropped after the handshake budget"
+        );
     }
 }
 

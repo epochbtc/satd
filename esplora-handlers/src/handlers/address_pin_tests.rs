@@ -108,7 +108,10 @@ fn asof_utxos_come_from_the_history_at_the_pin() {
         .collect();
     assert_eq!(
         got,
-        vec![(txid(2).to_string(), 0, true), (txid(3).to_string(), 1, true)]
+        vec![
+            (txid(2).to_string(), 0, true),
+            (txid(3).to_string(), 1, true)
+        ]
     );
     assert_eq!(build_utxos(&state, &asof(2), &SH).unwrap().len(), 0);
 }

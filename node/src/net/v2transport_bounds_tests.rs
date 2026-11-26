@@ -27,21 +27,33 @@ impl<R: AsyncRead + Unpin> AsyncRead for MaxAsk<R> {
 /// announced packet before reading any of it.
 #[tokio::test]
 async fn a_packet_buffer_grows_with_the_bytes_received() {
-    let mut reader = MaxAsk { inner: std::io::Cursor::new(vec![7u8; 1000]), max: 0 };
+    let mut reader = MaxAsk {
+        inner: std::io::Cursor::new(vec![7u8; 1000]),
+        max: 0,
+    };
     let mut leftover = vec![1u8; 10];
     let err = read_exact_buffered(&mut reader, &mut leftover, 4_000_000)
         .await
         .expect_err("the packet never arrives");
     assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-    assert!(reader.max <= MAX_RESERVE_AHEAD, "asked for {} bytes at once", reader.max);
+    assert!(
+        reader.max <= MAX_RESERVE_AHEAD,
+        "asked for {} bytes at once",
+        reader.max
+    );
 
     // And a packet that does arrive is read whole, leftover first.
     let mut reader = std::io::Cursor::new((0..600_000u32).map(|i| i as u8).collect::<Vec<u8>>());
     let mut leftover = vec![0xee; 3];
-    let got = read_exact_buffered(&mut reader, &mut leftover, 500_003).await.unwrap();
+    let got = read_exact_buffered(&mut reader, &mut leftover, 500_003)
+        .await
+        .unwrap();
     assert_eq!(got.len(), 500_003);
     assert_eq!(&got[..3], &[0xee; 3]);
-    assert_eq!(got[3..], (0..500_000u32).map(|i| i as u8).collect::<Vec<u8>>()[..]);
+    assert_eq!(
+        got[3..],
+        (0..500_000u32).map(|i| i as u8).collect::<Vec<u8>>()[..]
+    );
     assert!(leftover.is_empty());
 }
 
@@ -52,11 +64,15 @@ async fn a_send_counts_its_bytes_as_the_socket_takes_them() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
-        let (cipher, leftover) = responder_handshake(&mut sock, Network::Regtest, &[], 1, None).await.unwrap();
+        let (cipher, leftover) = responder_handshake(&mut sock, Network::Regtest, &[], 1, None)
+            .await
+            .unwrap();
         V2Connection::new(sock, cipher, leftover)
     });
     let mut client = TcpStream::connect(addr).await.unwrap();
-    let (cipher, leftover) = initiator_handshake(&mut client, Network::Regtest, 2, None).await.unwrap();
+    let (cipher, leftover) = initiator_handshake(&mut client, Network::Regtest, 2, None)
+        .await
+        .unwrap();
     let client = V2Connection::new(client, cipher, leftover);
     // The far end never reads.
     let _server = server.await.unwrap();

@@ -20,8 +20,8 @@
 //! the peer manager; the initiator (outbound) path and the operator
 //! toggles follow in later PRs of the v2 stack.
 
-use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::Network;
+use bitcoin::p2p::message::NetworkMessage;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -33,8 +33,8 @@ use tokio::net::TcpStream;
 use crate::net::stats::PeerStats;
 
 use bip324::{
-    CipherSession, GarbageResult, Handshake, InboundCipher, Initialized, OutboundCipher, PacketType,
-    ReceivedKey, Role, VersionResult,
+    CipherSession, GarbageResult, Handshake, InboundCipher, Initialized, OutboundCipher,
+    PacketType, ReceivedKey, Role, VersionResult,
 };
 
 /// Length of an ElligatorSwift public key in bytes.
@@ -112,8 +112,10 @@ pub fn decode_message(contents: &[u8]) -> Result<NetworkMessage, V2CodecError> {
     use bitcoin::p2p::message::CommandString;
     let (command, payload) = match contents[0] {
         0 => (
-            <CommandString as bitcoin::consensus::Decodable>::consensus_decode(&mut &contents[1..13])
-                .map_err(|e| V2CodecError::Deserialize(e.to_string()))?,
+            <CommandString as bitcoin::consensus::Decodable>::consensus_decode(
+                &mut &contents[1..13],
+            )
+            .map_err(|e| V2CodecError::Deserialize(e.to_string()))?,
             &contents[13..],
         ),
         id => match V2_MESSAGE_IDS.get(usize::from(id)) {
@@ -121,10 +123,15 @@ pub fn decode_message(contents: &[u8]) -> Result<NetworkMessage, V2CodecError> {
                 CommandString::try_from_static(name).expect("short ID names fit a command"),
                 &contents[1..],
             ),
-            _ => return Err(V2CodecError::Deserialize(format!("unknown short message id {id}"))),
+            _ => {
+                return Err(V2CodecError::Deserialize(format!(
+                    "unknown short message id {id}"
+                )));
+            }
         },
     };
-    crate::net::payload::decode_payload(command, payload).map_err(|e| V2CodecError::Deserialize(e.to_string()))
+    crate::net::payload::decode_payload(command, payload)
+        .map_err(|e| V2CodecError::Deserialize(e.to_string()))
 }
 
 /// BIP 324's short message-type ID for `addrv2`.
@@ -133,10 +140,35 @@ const ADDRV2_SHORT_ID: u8 = 28;
 /// Core's `V2_MESSAGE_IDS` (`src/net.cpp:917`): the message type each BIP 324
 /// short ID stands for, indexed by ID. IDs 29-32 are assigned but unused.
 const V2_MESSAGE_IDS: [&str; 29] = [
-    "", "addr", "block", "blocktxn", "cmpctblock", "feefilter", "filteradd", "filterclear",
-    "filterload", "getblocks", "getblocktxn", "getdata", "getheaders", "headers", "inv",
-    "mempool", "merkleblock", "notfound", "ping", "pong", "sendcmpct", "tx", "getcfilters",
-    "cfilter", "getcfheaders", "cfheaders", "getcfcheckpt", "cfcheckpt", "addrv2",
+    "",
+    "addr",
+    "block",
+    "blocktxn",
+    "cmpctblock",
+    "feefilter",
+    "filteradd",
+    "filterclear",
+    "filterload",
+    "getblocks",
+    "getblocktxn",
+    "getdata",
+    "getheaders",
+    "headers",
+    "inv",
+    "mempool",
+    "merkleblock",
+    "notfound",
+    "ping",
+    "pong",
+    "sendcmpct",
+    "tx",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "addrv2",
 ];
 
 /// The message type of v2 packet contents, for a log line: the short ID's
@@ -450,7 +482,8 @@ async fn drive_handshake_with<S: AsyncRead + AsyncWrite + Unpin>(
     // packet completes the handshake; decoys advance the cipher and loop.
     let mut leftover: Vec<u8> = garbage_buf[consumed..].to_vec();
     let mut greeting = V2Greeting {
-        garbage_len: u16::try_from(consumed.saturating_sub(GARBAGE_TERMINATOR_LEN)).unwrap_or(u16::MAX),
+        garbage_len: u16::try_from(consumed.saturating_sub(GARBAGE_TERMINATOR_LEN))
+            .unwrap_or(u16::MAX),
         ..V2Greeting::default()
     };
     loop {
@@ -470,7 +503,8 @@ async fn drive_handshake_with<S: AsyncRead + AsyncWrite + Unpin>(
             .map_err(handshake_io_err)?
         {
             VersionResult::Complete { cipher } => {
-                greeting.version_len = u32::try_from(packet_len.saturating_sub(MIN_PACKET_LEN)).unwrap_or(u32::MAX);
+                greeting.version_len =
+                    u32::try_from(packet_len.saturating_sub(MIN_PACKET_LEN)).unwrap_or(u32::MAX);
                 return Ok((cipher, leftover, greeting));
             }
             VersionResult::Decoy(h) => {
@@ -491,7 +525,8 @@ pub async fn responder_handshake(
     peer: u64,
     counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<(CipherSession, Vec<u8>)> {
-    let (cipher, leftover, _) = counted_handshake(stream, network, Role::Responder, prefetch, peer, counters).await?;
+    let (cipher, leftover, _) =
+        counted_handshake(stream, network, Role::Responder, prefetch, peer, counters).await?;
     Ok((cipher, leftover))
 }
 
@@ -502,7 +537,8 @@ pub async fn initiator_handshake(
     peer: u64,
     counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<(CipherSession, Vec<u8>)> {
-    let (cipher, leftover, _) = initiator_handshake_observed(stream, network, peer, counters).await?;
+    let (cipher, leftover, _) =
+        initiator_handshake_observed(stream, network, peer, counters).await?;
     Ok((cipher, leftover))
 }
 
@@ -525,8 +561,12 @@ async fn counted_handshake(
     peer: u64,
     counters: Option<&Arc<PeerStats>>,
 ) -> io::Result<(CipherSession, Vec<u8>, V2Greeting)> {
-    let mut counted = CountingStream { inner: stream, counters };
-    let (cipher, leftover, greeting) = drive_handshake(&mut counted, network, role, prefetch, peer).await?;
+    let mut counted = CountingStream {
+        inner: stream,
+        counters,
+    };
+    let (cipher, leftover, greeting) =
+        drive_handshake(&mut counted, network, role, prefetch, peer).await?;
     // Bytes read past the version packet belong to the next packet, which
     // the steady-state reader counts whole when it frames it.
     if let Some(c) = counters {
@@ -610,7 +650,13 @@ impl V2Connection {
     /// (handshake) path, counted once counters are attached.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let cmd = msg.cmd();
-        let n = send_v2(&mut self.stream, self.cipher.outbound(), msg, self.counters.as_ref()).await?;
+        let n = send_v2(
+            &mut self.stream,
+            self.cipher.outbound(),
+            msg,
+            self.counters.as_ref(),
+        )
+        .await?;
         if let Some(c) = &self.counters {
             c.attribute_sent(cmd, n);
         }
@@ -645,7 +691,13 @@ impl V2Writer {
     /// (ciphertext-framed) bytes if counters are set.
     pub async fn send(&mut self, msg: NetworkMessage) -> io::Result<()> {
         let cmd = msg.cmd();
-        let n = send_v2(&mut self.stream, &mut self.cipher, msg, self.counters.as_ref()).await?;
+        let n = send_v2(
+            &mut self.stream,
+            &mut self.cipher,
+            msg,
+            self.counters.as_ref(),
+        )
+        .await?;
         if let Some(c) = &self.counters {
             c.attribute_sent(cmd, n);
         }
@@ -687,8 +739,8 @@ impl V2Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::p2p::message::NetworkMessage;
     use bitcoin::Network;
+    use bitcoin::p2p::message::NetworkMessage;
     use tokio::net::TcpListener;
 
     /// The 1-byte short IDs are defined by BIP 324. Pin a representative
@@ -752,7 +804,10 @@ mod tests {
         // `sendcmpct` (short ID 20) with a flag byte of 2: Core reads true.
         let mut sendcmpct = vec![20u8, 2];
         sendcmpct.extend_from_slice(&2u64.to_le_bytes());
-        assert!(bip324::serde::deserialize(&sendcmpct).is_err(), "bip324 refuses it");
+        assert!(
+            bip324::serde::deserialize(&sendcmpct).is_err(),
+            "bip324 refuses it"
+        );
         assert_eq!(
             decode_message(&sendcmpct).unwrap(),
             NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
@@ -773,11 +828,21 @@ mod tests {
         version.extend_from_slice(&7u64.to_le_bytes());
         version.extend_from_slice(&[3, b'/', b'x', b'/']);
         version.extend_from_slice(&42i32.to_le_bytes());
-        assert!(bip324::serde::deserialize(&version).is_err(), "bip324 refuses it");
-        let NetworkMessage::Version(v) = decode_message(&version).unwrap() else { panic!("not version") };
-        assert_eq!((v.nonce, v.user_agent.as_str(), v.start_height, v.relay), (7, "/x/", 42, true));
+        assert!(
+            bip324::serde::deserialize(&version).is_err(),
+            "bip324 refuses it"
+        );
+        let NetworkMessage::Version(v) = decode_message(&version).unwrap() else {
+            panic!("not version")
+        };
+        assert_eq!(
+            (v.nonce, v.user_agent.as_str(), v.start_height, v.relay),
+            (7, "/x/", 42, true)
+        );
         version.extend_from_slice(&[0, 0xee, 0xee]);
-        let NetworkMessage::Version(v) = decode_message(&version).unwrap() else { panic!("not version") };
+        let NetworkMessage::Version(v) = decode_message(&version).unwrap() else {
+            panic!("not version")
+        };
         assert!(!v.relay);
 
         // A long-form `ping`: Core takes the type by name; `bip324` reads
@@ -785,7 +850,10 @@ mod tests {
         let mut ping = vec![0u8];
         ping.extend_from_slice(b"ping\0\0\0\0\0\0\0\0");
         ping.extend_from_slice(&5u64.to_le_bytes());
-        assert!(matches!(bip324::serde::deserialize(&ping), Ok(NetworkMessage::Unknown { .. })));
+        assert!(matches!(
+            bip324::serde::deserialize(&ping),
+            Ok(NetworkMessage::Unknown { .. })
+        ));
         assert_eq!(decode_message(&ping).unwrap(), NetworkMessage::Ping(5));
 
         // An unknown short ID is refused, and so skipped, as Core rejects it.
@@ -811,7 +879,10 @@ mod tests {
 
     /// Seal `contents` as one genuine packet, bypassing the encoder.
     async fn send_contents(conn: &mut V2Connection, contents: &[u8]) {
-        let packet = conn.cipher.outbound().encrypt_to_vec(contents, PacketType::Genuine, None);
+        let packet = conn
+            .cipher
+            .outbound()
+            .encrypt_to_vec(contents, PacketType::Genuine, None);
         conn.stream.write_all(&packet).await.unwrap();
     }
 
@@ -825,8 +896,13 @@ mod tests {
         contents.extend_from_slice(&crate::net::addrv2::payload_with_service_bit_26());
         send_contents(&mut client, &contents).await;
         client.send(NetworkMessage::Ping(9)).await.unwrap();
-        let NetworkMessage::AddrV2(addrs) = server.recv().await.unwrap() else { panic!("not addrv2") };
-        let ips: Vec<_> = addrs.iter().map(|a| a.socket_addr().unwrap().ip().to_string()).collect();
+        let NetworkMessage::AddrV2(addrs) = server.recv().await.unwrap() else {
+            panic!("not addrv2")
+        };
+        let ips: Vec<_> = addrs
+            .iter()
+            .map(|a| a.socket_addr().unwrap().ip().to_string())
+            .collect();
         assert_eq!(ips, ["1.2.3.4", "5.6.7.8", "9.9.9.9"]);
         assert_eq!(server.recv().await.unwrap(), NetworkMessage::Ping(9));
     }
@@ -888,7 +964,9 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (cipher, leftover) = initiator_handshake(&mut client, net, 0, None).await.unwrap();
+        let (cipher, leftover) = initiator_handshake(&mut client, net, 0, None)
+            .await
+            .unwrap();
         let mut conn = V2Connection::new(client, cipher, leftover);
 
         conn.send(NetworkMessage::Ping(7)).await.unwrap();
@@ -910,13 +988,15 @@ mod tests {
         let ss = server_stats.clone();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let (cipher, leftover) =
-                responder_handshake(&mut sock, net, &[], 1, Some(&ss)).await.unwrap();
+            let (cipher, leftover) = responder_handshake(&mut sock, net, &[], 1, Some(&ss))
+                .await
+                .unwrap();
             V2Connection::new(sock, cipher, leftover)
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (cipher, leftover) =
-            initiator_handshake(&mut client, net, 2, Some(&client_stats)).await.unwrap();
+        let (cipher, leftover) = initiator_handshake(&mut client, net, 2, Some(&client_stats))
+            .await
+            .unwrap();
         let client = V2Connection::new(client, cipher, leftover);
         (server.await.unwrap(), client, server_stats, client_stats)
     }
@@ -933,15 +1013,24 @@ mod tests {
         let ss = server_stats.clone();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let (cipher, leftover) = responder_handshake(&mut sock, Network::Regtest, &[], 1, Some(&ss)).await.unwrap();
+            let (cipher, leftover) =
+                responder_handshake(&mut sock, Network::Regtest, &[], 1, Some(&ss))
+                    .await
+                    .unwrap();
             V2Connection::new(sock, cipher, leftover)
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (_, _, greeting) = initiator_handshake_observed(&mut client, Network::Regtest, 2, None).await.unwrap();
+        let (_, _, greeting) = initiator_handshake_observed(&mut client, Network::Regtest, 2, None)
+            .await
+            .unwrap();
         let _server = server.await.unwrap();
         assert_eq!(greeting.decoys, 0);
         assert_eq!(greeting.version_len, 0);
-        assert_eq!(u64::from(greeting.garbage_len), server_stats.bytes_sent() - 100, "{greeting:?}");
+        assert_eq!(
+            u64::from(greeting.garbage_len),
+            server_stats.bytes_sent() - 100,
+            "{greeting:?}"
+        );
     }
 
     /// Decoy packets before the version packet are counted.
@@ -952,12 +1041,27 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let decoys: [&[u8]; 2] = [b"decoy", b""];
-            drive_handshake_with(&mut sock, Network::Regtest, Role::Responder, &[], 1, Some(&decoys)).await.unwrap()
+            drive_handshake_with(
+                &mut sock,
+                Network::Regtest,
+                Role::Responder,
+                &[],
+                1,
+                Some(&decoys),
+            )
+            .await
+            .unwrap()
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (_, _, greeting) = initiator_handshake_observed(&mut client, Network::Regtest, 2, None).await.unwrap();
+        let (_, _, greeting) = initiator_handshake_observed(&mut client, Network::Regtest, 2, None)
+            .await
+            .unwrap();
         server.await.unwrap();
-        assert_eq!((greeting.decoys, greeting.version_len), (2, 0), "{greeting:?}");
+        assert_eq!(
+            (greeting.decoys, greeting.version_len),
+            (2, 0),
+            "{greeting:?}"
+        );
     }
 
     /// Every byte one side of the handshake writes, the other counts as read.
@@ -983,7 +1087,8 @@ mod tests {
             sent.push(client_stats.bytes_sent());
         }
         assert!(
-            sent.iter().all(|n| (100..=100 + MAX_GARBAGE_LEN as u64).contains(n)),
+            sent.iter()
+                .all(|n| (100..=100 + MAX_GARBAGE_LEN as u64).contains(n)),
             "handshake sizes out of range: {sent:?}"
         );
         assert!(

@@ -82,7 +82,11 @@ fn the_filter_index_does_not_serve_while_a_backfill_is_not_quiescent() {
         BackfillState::Cancelled,
     ] {
         let idx = index_with_cursor(state);
-        assert!(!serves(&idx), "served with the backfill cursor {}", state.label());
+        assert!(
+            !serves(&idx),
+            "served with the backfill cursor {}",
+            state.label()
+        );
         assert!(matches!(
             idx.filter_at(FILTER_TYPE_BASIC, 1),
             Err(IndexError::Incomplete)
@@ -94,7 +98,11 @@ fn the_filter_index_does_not_serve_while_a_backfill_is_not_quiescent() {
 fn the_filter_index_serves_when_the_backfill_is_idle_or_completed() {
     for state in [BackfillState::Idle, BackfillState::Completed] {
         let idx = index_with_cursor(state);
-        assert!(serves(&idx), "refused with the backfill cursor {}", state.label());
+        assert!(
+            serves(&idx),
+            "refused with the backfill cursor {}",
+            state.label()
+        );
         assert_eq!(idx.filter_at(FILTER_TYPE_BASIC, 1).unwrap(), vec![1u8]);
     }
 }

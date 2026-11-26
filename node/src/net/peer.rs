@@ -1,5 +1,5 @@
-use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::message_network::VersionMessage;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::SystemTime;
@@ -196,13 +196,19 @@ impl ConnType {
     /// `version` is a full-relay one's.
     /// A crawl connection clears it: the connection closes in seconds.
     pub fn wants_tx_relay(self) -> bool {
-        !matches!(self, ConnType::BlockRelay | ConnType::Feeler | ConnType::NapPull | ConnType::Crawl)
+        !matches!(
+            self,
+            ConnType::BlockRelay | ConnType::Feeler | ConnType::NapPull | ConnType::Crawl
+        )
     }
 
     /// Whether we relay addresses over this connection. Core sets up a peer's
     /// address-relay state for everything except block-relay-only.
     pub fn relays_addrs(self) -> bool {
-        !matches!(self, ConnType::BlockRelay | ConnType::NapPull | ConnType::Survey | ConnType::Crawl)
+        !matches!(
+            self,
+            ConnType::BlockRelay | ConnType::NapPull | ConnType::Survey | ConnType::Crawl
+        )
     }
 
     /// A connection that only measures the network: the survey's and the
@@ -443,7 +449,8 @@ impl PeerInfo {
             addr_relay_enabled: false,
             addr_rate: crate::net::addr_rate::AddrTokenBucket::new(crate::time::now_micros()),
             fee_filter: 0,
-            conn_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(crate::time::now_secs()),
+            conn_time: std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(crate::time::now_secs()),
             permissions: crate::net::permissions::NetPermissions::NONE,
             bind_addr: None,
             onion_host: None,
@@ -518,7 +525,8 @@ impl PeerInfo {
     /// (`net_processing.cpp:1159-1163`), NODE_NETWORK_LIMITED without
     /// NODE_NETWORK.
     pub fn is_limited(&self) -> bool {
-        !self.services.has(ServiceFlags::NETWORK) && self.services.has(ServiceFlags::NETWORK_LIMITED)
+        !self.services.has(ServiceFlags::NETWORK)
+            && self.services.has(ServiceFlags::NETWORK_LIMITED)
     }
 
     /// Whether to ask this peer only for recent blocks: a limited peer
@@ -909,7 +917,13 @@ mod rpc_json_tests {
         // faithful rendering of the flags word.
         assert_eq!(
             names,
-            ["NETWORK", "WITNESS", "NETWORK_LIMITED", "INTACT_BLOCKS", "UNKNOWN[2^40]"],
+            [
+                "NETWORK",
+                "WITNESS",
+                "NETWORK_LIMITED",
+                "INTACT_BLOCKS",
+                "UNKNOWN[2^40]"
+            ],
             "{v}"
         );
     }
@@ -939,7 +953,10 @@ mod rpc_json_tests {
     /// Core emits only non-zero entries.
     #[test]
     fn per_message_counters_omit_zero_entries() {
-        let v = peer_json(Some("127.0.0.1:1"), &[("ping", 32), ("pong", 32), ("ping", 32)]);
+        let v = peer_json(
+            Some("127.0.0.1:1"),
+            &[("ping", 32), ("pong", 32), ("ping", 32)],
+        );
         let sent = v["bytessent_per_msg"].as_object().unwrap();
         assert_eq!(sent.len(), 2, "only the types actually sent: {sent:?}");
         assert_eq!(sent["ping"], 64);

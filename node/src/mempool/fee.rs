@@ -61,14 +61,22 @@ impl FeeEstimator {
     /// complete window (callers then fall back to [`Self::estimate_fee`]).
     pub fn history_estimate(&self, target: u32, conservative: bool) -> Option<u64> {
         let e = self.history.read().estimate(target)?;
-        Some(if conservative { e.conservative } else { e.economical })
+        Some(if conservative {
+            e.conservative
+        } else {
+            e.economical
+        })
     }
 
     /// The analog-window estimate at the deepest target up to `target` that
     /// has a window, the cap on a flat-percentile fallback at `target`.
     pub fn history_cap(&self, target: u32, conservative: bool) -> Option<u64> {
         let e = self.history.read().deepest_estimate_up_to(target)?;
-        Some(if conservative { e.conservative } else { e.economical })
+        Some(if conservative {
+            e.conservative
+        } else {
+            e.economical
+        })
     }
 
     /// The mempool block simulation, memoized with [`FEE_SIM_CACHE_TTL`].
@@ -132,11 +140,11 @@ impl FeeEstimator {
 
         // Map target to percentile: lower target = higher fee needed
         let percentile = match target {
-            0..=1 => 90,   // next block: 90th percentile
-            2..=3 => 75,   // 2-3 blocks: 75th
-            4..=6 => 50,   // 4-6 blocks: median
-            7..=12 => 25,  // 7-12 blocks: 25th
-            _ => 10,       // 13+ blocks: 10th percentile
+            0..=1 => 90,  // next block: 90th percentile
+            2..=3 => 75,  // 2-3 blocks: 75th
+            4..=6 => 50,  // 4-6 blocks: median
+            7..=12 => 25, // 7-12 blocks: 25th
+            _ => 10,      // 13+ blocks: 10th percentile
         };
 
         let idx = (sorted.len() * percentile / 100).min(sorted.len() - 1);
@@ -168,7 +176,10 @@ mod tests {
     #[test]
     fn smart_fee_estimate_ignores_template_quarantined() {
         use crate::mempool::pool::QuarantineScope;
-        let template_only = QuarantineScope { relay: false, template: true };
+        let template_only = QuarantineScope {
+            relay: false,
+            template: true,
+        };
 
         // Clean pool: two ordinary acting transactions.
         let clean = Mempool::new(300_000_000, 1_000);
@@ -192,8 +203,7 @@ mod tests {
 
         // Guard: had we (wrongly) simulated the full union, the high-fee tx
         // would have changed the result — proving the filter is load-bearing.
-        let union_est =
-            estimate_from_mempool(quar.get_all_entries(), MAX_SIM_DEPTH);
+        let union_est = estimate_from_mempool(quar.get_all_entries(), MAX_SIM_DEPTH);
         assert_ne!(
             serde_json::to_string(&*quar_est).unwrap(),
             serde_json::to_string(&union_est).unwrap(),
@@ -209,7 +219,10 @@ mod tests {
         let b = est.cached_mempool_estimate(&mempool);
         // Second call within the TTL returns the same cached Arc — no
         // re-simulation, no second mempool clone.
-        assert!(Arc::ptr_eq(&a, &b), "estimate must be cached within the TTL");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "estimate must be cached within the TTL"
+        );
         // And it is a usable (empty-mempool) simulation.
         assert!(a.sim_blocks.iter().all(|blk| blk.tx_count == 0));
     }

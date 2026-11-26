@@ -175,8 +175,10 @@ impl StartupProgress {
         // "chain_init") doesn't inherit the previous phase's target.
         self.stop_height.store(NO_STOP_HEIGHT, Ordering::Relaxed);
         // Reset timing so elapsed / rate / ETA reflect the new phase only.
-        self.phase_started_ms
-            .store(self.started_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.phase_started_ms.store(
+            self.started_at.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
         self.last_sample_ms.store(NEVER_SAMPLED, Ordering::Relaxed);
         self.eta_secs.store(NO_OVERRIDE, Ordering::Relaxed);
         self.samples.lock().clear();
@@ -371,7 +373,11 @@ mod tests {
         let s = p.snapshot();
         // The daemon owns the clock, so elapsed is meaningful on the very
         // first snapshot — no client-side warmup.
-        assert!(s.total_elapsed_secs >= 1, "total_elapsed={}", s.total_elapsed_secs);
+        assert!(
+            s.total_elapsed_secs >= 1,
+            "total_elapsed={}",
+            s.total_elapsed_secs
+        );
         assert!(s.elapsed_secs >= 1, "elapsed={}", s.elapsed_secs);
     }
 
@@ -383,7 +389,11 @@ mod tests {
         let s = p.snapshot();
         // Phase clock restarts at the transition; the overall clock keeps
         // running.
-        assert!(s.total_elapsed_secs >= 1, "total_elapsed={}", s.total_elapsed_secs);
+        assert!(
+            s.total_elapsed_secs >= 1,
+            "total_elapsed={}",
+            s.total_elapsed_secs
+        );
         assert_eq!(s.elapsed_secs, 0, "phase elapsed should reset on set_phase");
     }
 
@@ -398,7 +408,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // Second sample, one second later, with progress.
         p.set_current(2_000);
-        let r = p.snapshot().rate.expect("rate should be known after 2 samples");
+        let r = p
+            .snapshot()
+            .rate
+            .expect("rate should be known after 2 samples");
         // ~2000 items over ~1.1s.
         assert!(r > 500.0 && r < 4000.0, "rate={r}");
     }

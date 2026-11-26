@@ -283,7 +283,10 @@ mod tests {
 
     #[test]
     fn no_estimate_before_the_minimum_stint() {
-        assert_eq!(remaining_seconds(MIN_STINT - Duration::from_millis(1), 0.0, 0.5), None);
+        assert_eq!(
+            remaining_seconds(MIN_STINT - Duration::from_millis(1), 0.0, 0.5),
+            None
+        );
         assert!(remaining_seconds(MIN_STINT, 0.0, 0.5).is_some());
     }
 
@@ -333,7 +336,10 @@ mod tests {
         assert!(!m.is_anchored());
         {
             let _g = StintGuard::new(m.clone(), 0.25);
-            assert!(m.is_anchored(), "constructing the guard must anchor a stint");
+            assert!(
+                m.is_anchored(),
+                "constructing the guard must anchor a stint"
+            );
             // Back-date in place, so the anchor's *ratio* is still the one
             // the guard recorded. An anchor at 0.0 would give 3600s here.
             m.backdate_anchor(HOUR);

@@ -84,7 +84,9 @@ fn core_height_push_matches_cores_serialization_at_each_boundary() {
 /// Every payout the server can put in a coinbase: each standard address
 /// type a username can name, and the `--stratumaddress` fallback for one
 /// that names none.
-fn payouts(secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>) -> Vec<(&'static str, ScriptBuf)> {
+fn payouts(
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>,
+) -> Vec<(&'static str, ScriptBuf)> {
     let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x42; 32]).unwrap();
     let pk = bitcoin::PublicKey::new(sk.public_key(secp));
     let cpk = bitcoin::CompressedPublicKey::try_from(pk).unwrap();
@@ -101,13 +103,15 @@ fn payouts(secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::All>) -> Vec
     let mut out: Vec<(&'static str, ScriptBuf)> = named
         .into_iter()
         .map(|(kind, addr)| {
-            let payout = resolve_payout(&format!("{addr}.rig"), n, None).expect("a regtest address");
+            let payout =
+                resolve_payout(&format!("{addr}.rig"), n, None).expect("a regtest address");
             assert_eq!(payout.script, addr.script_pubkey(), "{kind}");
             (kind, payout.script)
         })
         .collect();
     let fallback = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
-    let payout = resolve_payout("not-an-address.rig", n, Some(&fallback)).expect("the fallback pays");
+    let payout =
+        resolve_payout("not-an-address.rig", n, Some(&fallback)).expect("the fallback pays");
     assert_eq!(payout.address, None);
     out.push(("fallback", payout.script));
     out
@@ -137,7 +141,10 @@ fn chain() -> (ChainState, Mempool, tempfile::TempDir) {
 /// witness script `OP_TRUE`: a real segwit spend, no signature needed.
 fn anyone_can_spend() -> (ScriptBuf, ScriptBuf) {
     let witness_script = Builder::new().push_opcode(OP_PUSHNUM_1).into_script();
-    (ScriptBuf::new_p2wsh(&witness_script.wscript_hash()), witness_script)
+    (
+        ScriptBuf::new_p2wsh(&witness_script.wscript_hash()),
+        witness_script,
+    )
 }
 
 /// Spend `coin` (worth `value`) into `outputs` equal outputs back to the
@@ -154,7 +161,12 @@ fn spend(coin: OutPoint, value: u64, outputs: u64, fee: u64) -> Transaction {
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[witness_script.as_bytes()]),
         }],
-        output: (0..outputs).map(|_| TxOut { value: Amount::from_sat(each), script_pubkey: spk.clone() }).collect(),
+        output: (0..outputs)
+            .map(|_| TxOut {
+                value: Amount::from_sat(each),
+                script_pubkey: spk.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -194,9 +206,18 @@ fn grind(job: &ActiveTemplate, extranonce: &[u8], ntime: u32, version: i32) -> (
 
 /// One found block, checked against every property the network enforces and
 /// every one the miner relies on.
-fn check_found(block: &Block, miner_header: &Header, job: &ActiveTemplate, payout: &ScriptBuf, what: &str) {
+fn check_found(
+    block: &Block,
+    miner_header: &Header,
+    job: &ActiveTemplate,
+    payout: &ScriptBuf,
+    what: &str,
+) {
     let height = job.work.height;
-    assert_eq!(block.header, *miner_header, "{what}: the node rebuilt a different header than the miner hashed");
+    assert_eq!(
+        block.header, *miner_header,
+        "{what}: the node rebuilt a different header than the miner hashed"
+    );
     assert_eq!(block.block_hash(), miner_header.block_hash(), "{what}");
     let coinbase = &block.txdata[0];
     let script_sig = coinbase.input[0].script_sig.as_bytes();
@@ -206,8 +227,15 @@ fn check_found(block: &Block, miner_header: &Header, job: &ActiveTemplate, payou
         hex::encode(script_sig),
         hex::encode(core_height_push(height))
     );
-    assert!((2..=100).contains(&script_sig.len()), "{what}: scriptSig length {}", script_sig.len());
-    assert_eq!(coinbase.output[0].script_pubkey, *payout, "{what}: the coinbase pays the miner");
+    assert!(
+        (2..=100).contains(&script_sig.len()),
+        "{what}: scriptSig length {}",
+        script_sig.len()
+    );
+    assert_eq!(
+        coinbase.output[0].script_pubkey, *payout,
+        "{what}: the coinbase pays the miner"
+    );
     let paid: u64 = coinbase.output.iter().map(|o| o.value.to_sat()).sum();
     assert_eq!(
         paid,
@@ -220,7 +248,10 @@ fn check_found(block: &Block, miner_header: &Header, job: &ActiveTemplate, payou
         coinbase.weight().to_wu()
     );
     assert!(block.check_merkle_root(), "{what}: merkle root");
-    assert!(block.check_witness_commitment(), "{what}: witness commitment");
+    assert!(
+        block.check_witness_commitment(),
+        "{what}: witness commitment"
+    );
     crate::validation::block::check_block(block, Network::Regtest, height)
         .unwrap_or_else(|e| panic!("{what}: check_block: {e}"));
 }
@@ -248,7 +279,14 @@ fn a_found_block_connects_at_every_bip34_encoding_boundary_for_every_payout() {
     for height in wanted {
         // Mine up to the block before, paying the anyone-can-spend script.
         while chain.tip_height() + 1 < height {
-            crate::mining::miner::mine_blocks_to_script(&chain, &mempool, anyone.clone(), 1, u64::MAX).unwrap();
+            crate::mining::miner::mine_blocks_to_script(
+                &chain,
+                &mempool,
+                anyone.clone(),
+                1,
+                u64::MAX,
+            )
+            .unwrap();
             let tip = chain.tip_height();
             let block = chain.get_block(&chain.tip_hash()).unwrap();
             spendable.push_back((
@@ -265,15 +303,27 @@ fn a_found_block_connects_at_every_bip34_encoding_boundary_for_every_payout() {
         let mut template = create_template(&chain, &mempool);
         assert_eq!(template.height, height);
         // A coinbase can be spent 100 blocks after its own.
-        let mature = spendable.front().is_some_and(|(mined, _, _)| mined + 100 <= height);
+        let mature = spendable
+            .front()
+            .is_some_and(|(mined, _, _)| mined + 100 <= height);
         if mature {
             let (_, coin, value) = spendable.pop_front().unwrap();
             let parent = spend(coin, value, 5, 1_000);
-            let child = spend(OutPoint::new(parent.compute_txid(), 2), parent.output[2].value.to_sat(), 2, 5_000);
+            let child = spend(
+                OutPoint::new(parent.compute_txid(), 2),
+                parent.output[2].value.to_sat(),
+                2,
+                5_000,
+            );
             for (tx, fee) in [(parent, 1_000u64), (child, 5_000)] {
                 template.coinbase_value += fee;
                 let weight = tx.weight().to_wu() as usize;
-                template.transactions.push(TemplateTx { tx, fee, weight, sigop_cost: 0 });
+                template.transactions.push(TemplateTx {
+                    tx,
+                    fee,
+                    weight,
+                    sigop_cost: 0,
+                });
             }
         }
         let prev_time = chain.get_block(&chain.tip_hash()).unwrap().header.time;
@@ -284,16 +334,27 @@ fn a_found_block_connects_at_every_bip34_encoding_boundary_for_every_payout() {
             // V1 is an 8-byte hole (4 from the server, 4 from the miner);
             // Stratum V2 extended channels reach 32.
             let extranonce_len = [8, 12, 16, 32][i % 4];
-            let job = ActiveTemplate::build(work.clone(), i as u32, payout.clone(), extranonce_len).unwrap();
+            let job = ActiveTemplate::build(work.clone(), i as u32, payout.clone(), extranonce_len)
+                .unwrap();
             let extranonce: Vec<u8> = (0..extranonce_len).map(|_| rng.r#gen()).collect();
             let rolled = rng.r#gen::<u32>() & ROLLING_MASK;
             let version = ((work.version as u32 & !ROLLING_MASK) | rolled) as i32;
             let ntime = work.cur_time + rng.gen_range(0..600);
             let (miner_header, nonce) = grind(&job, &extranonce, ntime, version);
-            let what = format!("height {height}, {kind}, {extranonce_len}-byte extranonce, version {version:#x}");
+            let what = format!(
+                "height {height}, {kind}, {extranonce_len}-byte extranonce, version {version:#x}"
+            );
             let easiest = [0xff; 32];
-            let result = validate_share(&job, &extranonce, ntime, nonce, version, &easiest, u64::from(ntime))
-                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let result = validate_share(
+                &job,
+                &extranonce,
+                ntime,
+                nonce,
+                version,
+                &easiest,
+                u64::from(ntime),
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
             let ShareResult::Block(block) = result else {
                 panic!("{what}: a header meeting the block target was not judged a block");
             };
@@ -320,8 +381,16 @@ fn a_found_block_connects_at_every_bip34_encoding_boundary_for_every_payout() {
         )
         .unwrap();
         assert_eq!(saved, block, "{what}: the saved copy is the block");
-        assert_eq!(submit_block(&chain, &mempool, &block), Ok(true), "{what}: submission");
-        assert_eq!(chain.tip_hash(), block.block_hash(), "{what}: the block is the tip");
+        assert_eq!(
+            submit_block(&chain, &mempool, &block),
+            Ok(true),
+            "{what}: submission"
+        );
+        assert_eq!(
+            chain.tip_hash(),
+            block.block_hash(),
+            "{what}: the block is the tip"
+        );
         submitted += 1;
     }
     assert_eq!(submitted, 28);
@@ -336,7 +405,9 @@ fn a_found_blocks_coinbase_commits_to_heights_no_test_chain_reaches() {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let payouts = payouts(&secp);
     let mut rng = StdRng::seed_from_u64(0x00b1_7c01);
-    for height in [32_767u32, 32_768, 65_535, 65_536, 8_388_607, 8_388_608, 968_181] {
+    for height in [
+        32_767u32, 32_768, 65_535, 65_536, 8_388_607, 8_388_608, 968_181,
+    ] {
         let template = crate::mining::template::BlockTemplate {
             version: 0x2000_0000,
             prev_hash: BlockHash::from_byte_array([7; 32]),
@@ -350,15 +421,31 @@ fn a_found_blocks_coinbase_commits_to_heights_no_test_chain_reaches() {
         let work = Arc::new(Work::new(template, Network::Regtest, 1_699_999_900));
         for (i, (kind, payout)) in payouts.iter().enumerate() {
             let extranonce_len = [8, 12, 16, 32][i % 4];
-            let job = ActiveTemplate::build(work.clone(), 1, payout.clone(), extranonce_len).unwrap();
+            let job =
+                ActiveTemplate::build(work.clone(), 1, payout.clone(), extranonce_len).unwrap();
             let extranonce: Vec<u8> = (0..extranonce_len).map(|_| rng.r#gen()).collect();
             let version = (0x2000_0000u32 | (rng.r#gen::<u32>() & ROLLING_MASK)) as i32;
             let (miner_header, nonce) = grind(&job, &extranonce, work.cur_time, version);
-            let result =
-                validate_share(&job, &extranonce, work.cur_time, nonce, version, &[0xff; 32], u64::from(work.cur_time))
-                    .unwrap();
-            let ShareResult::Block(block) = result else { panic!("height {height}, {kind}: not a block") };
-            check_found(&block, &miner_header, &job, payout, &format!("height {height}, {kind}"));
+            let result = validate_share(
+                &job,
+                &extranonce,
+                work.cur_time,
+                nonce,
+                version,
+                &[0xff; 32],
+                u64::from(work.cur_time),
+            )
+            .unwrap();
+            let ShareResult::Block(block) = result else {
+                panic!("height {height}, {kind}: not a block")
+            };
+            check_found(
+                &block,
+                &miner_header,
+                &job,
+                payout,
+                &format!("height {height}, {kind}"),
+            );
         }
     }
 }
@@ -375,9 +462,17 @@ fn a_reconstructed_block_is_the_block_the_miners_parts_describe() {
         let n_txs = rng.gen_range(0..12);
         let transactions = (0..n_txs)
             .map(|i| {
-                let coin = OutPoint::new(bitcoin::Txid::from_byte_array(rng.r#gen()), rng.gen_range(0..4));
+                let coin = OutPoint::new(
+                    bitcoin::Txid::from_byte_array(rng.r#gen()),
+                    rng.gen_range(0..4),
+                );
                 let tx = spend(coin, 100_000 + i, rng.gen_range(1..4), 500);
-                TemplateTx { weight: tx.weight().to_wu() as usize, tx, fee: 500, sigop_cost: 0 }
+                TemplateTx {
+                    weight: tx.weight().to_wu() as usize,
+                    tx,
+                    fee: 500,
+                    sigop_cost: 0,
+                }
             })
             .collect::<Vec<_>>();
         let height = rng.gen_range(1..2_000_000);
@@ -407,7 +502,8 @@ fn a_reconstructed_block_is_the_block_the_miners_parts_describe() {
         let mut bytes = job.coinbase_prefix.clone();
         bytes.extend_from_slice(&extranonce);
         bytes.extend_from_slice(&job.coinbase_suffix);
-        let mut coinbase: Transaction = bitcoin::consensus::deserialize(&bytes).expect("the halves are a transaction");
+        let mut coinbase: Transaction =
+            bitcoin::consensus::deserialize(&bytes).expect("the halves are a transaction");
         coinbase.input[0].witness = Witness::from_slice(&[[0u8; 32]]);
         let mut txdata = vec![coinbase];
         txdata.extend(work.txdata.iter().cloned());
@@ -424,8 +520,18 @@ fn a_reconstructed_block_is_the_block_the_miners_parts_describe() {
         };
         expected.header.merkle_root = expected.compute_merkle_root().unwrap();
         assert_eq!(block, expected, "round {round}");
-        assert_eq!(block.header.merkle_root, miner_merkle_root(&job, &extranonce), "round {round}");
+        assert_eq!(
+            block.header.merkle_root,
+            miner_merkle_root(&job, &extranonce),
+            "round {round}"
+        );
         assert!(block.check_witness_commitment(), "round {round}");
-        assert!(block.txdata[0].input[0].script_sig.as_bytes().starts_with(&core_height_push(height)), "round {round}");
+        assert!(
+            block.txdata[0].input[0]
+                .script_sig
+                .as_bytes()
+                .starts_with(&core_height_push(height)),
+            "round {round}"
+        );
     }
 }

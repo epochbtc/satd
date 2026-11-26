@@ -311,8 +311,8 @@ impl AsMap {
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| format!("reading asmap {}: {e}", path.display()))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| format!("reading asmap {}: {e}", path.display()))?;
         if bytes.is_empty() {
             return Err(format!("asmap {} is empty", path.display()));
         }
@@ -403,7 +403,10 @@ mod tests {
         // Any ip_bits → 12345.
         assert_eq!(interpret(&asmap, &[false; 128]), 12345);
         assert_eq!(interpret(&asmap, &[true; 128]), 12345);
-        assert_eq!(interpret(&asmap, &ip_to_bits("8.8.8.8".parse().unwrap())), 12345);
+        assert_eq!(
+            interpret(&asmap, &ip_to_bits("8.8.8.8".parse().unwrap())),
+            12345
+        );
     }
 
     #[test]
@@ -517,8 +520,14 @@ mod tests {
     #[test]
     fn sanity_check_accepts_valid_and_rejects_malformed() {
         // Valid single-RETURN maps (with <=7 zero padding bits) pass.
-        assert!(sanity_check_asmap(&AsMap::from_bytes(&[0x00, 0x00, 0x00]).bits, 128));
-        assert!(sanity_check_asmap(&AsMap::from_bytes(&[0x00, 0x00, 0x01]).bits, 128));
+        assert!(sanity_check_asmap(
+            &AsMap::from_bytes(&[0x00, 0x00, 0x00]).bits,
+            128
+        ));
+        assert!(sanity_check_asmap(
+            &AsMap::from_bytes(&[0x00, 0x00, 0x01]).bits,
+            128
+        ));
         // A one-byte file can't hold a full RETURN+ASN → ASN straddles EOF.
         assert!(!sanity_check_asmap(&AsMap::from_bytes(&[0x00]).bits, 128));
         // No terminal RETURN reachable (empty) → not sane.
@@ -534,6 +543,11 @@ mod tests {
 
         let good = dir.path().join("good.map");
         std::fs::write(&good, [0x00u8, 0x00, 0x00]).unwrap(); // RETURN(ASN=1)
-        assert_eq!(AsMap::load(&good).unwrap().lookup("9.9.9.9".parse().unwrap()), 1);
+        assert_eq!(
+            AsMap::load(&good)
+                .unwrap()
+                .lookup("9.9.9.9".parse().unwrap()),
+            1
+        );
     }
 }

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use bitcoin::BlockHash;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// How long satd may go without moving its tip before the run fails.
 const DEFAULT_STALL_SECS: u64 = 120;
@@ -108,7 +108,11 @@ fn parse(args: &[String]) -> Result<Args, Error> {
                 _ => return Err(format!("--options must be a JSON object, got {value}").into()),
             },
             "--stall-timeout" => {
-                stall = Duration::from_secs(value.parse().map_err(|_| format!("--stall-timeout: {value}"))?)
+                stall = Duration::from_secs(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--stall-timeout: {value}"))?,
+                )
             }
             other => return Err(format!("unknown argument {other}").into()),
         }
@@ -145,9 +149,13 @@ fn option_flags(options: &Map<String, Value>) -> Result<Vec<String>, String> {
     for (key, value) in options {
         match key.as_str() {
             "testactivationheight" => {
-                let map = value.as_object().ok_or("testactivationheight must be an object")?;
+                let map = value
+                    .as_object()
+                    .ok_or("testactivationheight must be an object")?;
                 for (name, height) in map {
-                    let height = height.as_u64().ok_or(format!("testactivationheight {name} is not a height"))?;
+                    let height = height
+                        .as_u64()
+                        .ok_or(format!("testactivationheight {name} is not a height"))?;
                     flags.push(format!("-testactivationheight={name}@{height}"));
                 }
             }
@@ -156,12 +164,19 @@ fn option_flags(options: &Map<String, Value>) -> Result<Vec<String>, String> {
                 for name in names {
                     match name.as_str() {
                         Some("bip94") => flags.push("-test=bip94".to_string()),
-                        name => return Err(format!("satd has no -test={} option", name.unwrap_or("?"))),
+                        name => {
+                            return Err(format!(
+                                "satd has no -test={} option",
+                                name.unwrap_or("?")
+                            ));
+                        }
                     }
                 }
             }
             "signetchallenge" => {
-                let challenge = value.as_str().ok_or("signetchallenge must be a hex string")?;
+                let challenge = value
+                    .as_str()
+                    .ok_or("signetchallenge must be a hex string")?;
                 flags.push(format!("-signetchallenge={challenge}"));
             }
             other => return Err(format!("unknown option {other}")),
@@ -195,7 +210,10 @@ fn run(args: &Args) -> Result<Value, Error> {
         match node.wait_ready(args.stall) {
             Ok(()) => break node,
             Err(e) if node.child.is_none() && attempt < START_ATTEMPTS => {
-                eprintln!("satd-conformance-harness: {}; starting satd again on another RPC port", e.message);
+                eprintln!(
+                    "satd-conformance-harness: {}; starting satd again on another RPC port",
+                    e.message
+                );
                 attempt += 1;
             }
             Err(e) => return Err(e),
@@ -204,7 +222,10 @@ fn run(args: &Args) -> Result<Value, Error> {
 
     let stop_at = args.stop_at.to_string();
     let height = node.sync_to(&stop_at, args.stall)?;
-    node.stop().map_err(|message| Error { message, tip: Some((stop_at.clone(), height)) })?;
+    node.stop().map_err(|message| Error {
+        message,
+        tip: Some((stop_at.clone(), height)),
+    })?;
 
     let (tip, hash) = utxo_hash(&net_dir)?;
     if tip != args.stop_at {
@@ -221,7 +242,10 @@ fn start(satd: &Path, flags: &[String], net_dir: &Path) -> Result<Node, Error> {
     let rpc_port = free_port()?;
     // satd's standard output goes to standard error: only the protocol's
     // lines may appear on ours.
-    let stderr = std::io::stderr().as_fd().try_clone_to_owned().map_err(|e| format!("duplicating stderr: {e}"))?;
+    let stderr = std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| format!("duplicating stderr: {e}"))?;
     let child = Command::new(satd)
         .args(flags)
         .arg(format!("-rpcport={rpc_port}"))
@@ -230,13 +254,21 @@ fn start(satd: &Path, flags: &[String], net_dir: &Path) -> Result<Node, Error> {
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| format!("starting {}: {e}", satd.display()))?;
-    Ok(Node { child: Some(child), rpc_port, cookie: net_dir.join(".cookie") })
+    Ok(Node {
+        child: Some(child),
+        rpc_port,
+        cookie: net_dir.join(".cookie"),
+    })
 }
 
 /// A port nothing listens on, for satd's RPC.
 fn free_port() -> Result<u16, String> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("finding a free port: {e}"))?;
-    listener.local_addr().map(|a| a.port()).map_err(|e| format!("finding a free port: {e}"))
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("finding a free port: {e}"))?;
+    listener
+        .local_addr()
+        .map(|a| a.port())
+        .map_err(|e| format!("finding a free port: {e}"))
 }
 
 struct Node {
@@ -259,7 +291,9 @@ impl Node {
                 return Ok(());
             }
             if started.elapsed() >= stall {
-                return Err(format!("satd's RPC did not answer within {} s", stall.as_secs()).into());
+                return Err(
+                    format!("satd's RPC did not answer within {} s", stall.as_secs()).into(),
+                );
             }
             std::thread::sleep(POLL);
         }
@@ -273,17 +307,25 @@ impl Node {
         let mut changed = Instant::now();
         loop {
             if let Some(status) = self.exited() {
-                return Err(Error { message: format!("satd exited ({status})"), tip: last });
+                return Err(Error {
+                    message: format!("satd exited ({status})"),
+                    tip: last,
+                });
             }
             // A failed call is tried again at the next poll; the stall timer
             // bounds a node that keeps failing them.
             if let Some(tip) = self.poll_tip(&mut last, &mut changed) {
                 match self.invalid_tip() {
                     Ok(Some(invalid)) => {
-                        return Err(Error { message: format!("satd marked block {invalid} invalid"), tip: last });
+                        return Err(Error {
+                            message: format!("satd marked block {invalid} invalid"),
+                            tip: last,
+                        });
                     }
                     // Only after a chain tips check that saw no invalid tip.
-                    Ok(None) if tip == stop_at => return Ok(last.map(|(_, h)| h).unwrap_or_default()),
+                    Ok(None) if tip == stop_at => {
+                        return Ok(last.map(|(_, h)| h).unwrap_or_default());
+                    }
                     _ => {}
                 }
             }
@@ -299,11 +341,19 @@ impl Node {
 
     /// satd's active tip, writing a progress line when it moved. `None`
     /// when an RPC call failed.
-    fn poll_tip(&mut self, last: &mut Option<(String, u64)>, changed: &mut Instant) -> Option<String> {
+    fn poll_tip(
+        &mut self,
+        last: &mut Option<(String, u64)>,
+        changed: &mut Instant,
+    ) -> Option<String> {
         let tip = self.call("getbestblockhash", json!([])).ok()?;
         let tip = tip.as_str().unwrap_or_default().to_string();
         if last.as_ref().map(|(t, _)| t) != Some(&tip) {
-            let height = self.call("getblockcount", json!([])).ok()?.as_u64().unwrap_or_default();
+            let height = self
+                .call("getblockcount", json!([]))
+                .ok()?
+                .as_u64()
+                .unwrap_or_default();
             println!("{}", json!({"event": "tip", "tip": tip, "height": height}));
             *last = Some((tip.clone(), height));
             *changed = Instant::now();
@@ -316,8 +366,12 @@ impl Node {
     fn invalid_tip(&mut self) -> Result<Option<String>, Error> {
         let tips = self.call("getchaintips", json!([]))?;
         Ok(tips.as_array().into_iter().flatten().find_map(|t| {
-            (t.get("status").and_then(Value::as_str) == Some("invalid"))
-                .then(|| t.get("hash").and_then(Value::as_str).unwrap_or("?").to_string())
+            (t.get("status").and_then(Value::as_str) == Some("invalid")).then(|| {
+                t.get("hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string()
+            })
         }))
     }
 
@@ -326,15 +380,25 @@ impl Node {
     /// down) is not a failure; the exit status decides.
     fn stop(&mut self) -> Result<(), String> {
         if let Err(e) = self.call("stop", json!([])) {
-            eprintln!("satd-conformance-harness: stop: {}; waiting for satd to exit", e.message);
+            eprintln!(
+                "satd-conformance-harness: stop: {}; waiting for satd to exit",
+                e.message
+            );
         }
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             if let Some(status) = self.exited() {
-                return if status.success() { Ok(()) } else { Err(format!("satd stopped with {status}")) };
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("satd stopped with {status}"))
+                };
             }
             if Instant::now() >= deadline {
-                return Err(format!("satd did not stop within {} s", STOP_TIMEOUT.as_secs()));
+                return Err(format!(
+                    "satd did not stop within {} s",
+                    STOP_TIMEOUT.as_secs()
+                ));
             }
             std::thread::sleep(POLL);
         }
@@ -362,12 +426,15 @@ impl Drop for Node {
 }
 
 fn rpc(port: u16, cookie: &Path, method: &str, params: Value) -> Result<Value, String> {
-    let credentials = std::fs::read_to_string(cookie).map_err(|e| format!("reading {}: {e}", cookie.display()))?;
+    let credentials = std::fs::read_to_string(cookie)
+        .map_err(|e| format!("reading {}: {e}", cookie.display()))?;
     let auth = base64::engine::general_purpose::STANDARD.encode(credentials.trim());
     let body = json!({"jsonrpc": "1.0", "id": 0, "method": method, "params": params}).to_string();
-    let mut stream =
-        TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connecting to satd's RPC: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .map_err(|e| format!("connecting to satd's RPC: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .map_err(|e| e.to_string())?;
     write!(
         stream,
         "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {auth}\r\n\
@@ -376,10 +443,17 @@ fn rpc(port: u16, cookie: &Path, method: &str, params: Value) -> Result<Value, S
     )
     .map_err(|e| format!("{method}: {e}"))?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).map_err(|e| format!("{method}: {e}"))?;
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| format!("{method}: {e}"))?;
     let response = String::from_utf8_lossy(&response);
-    let (head, body) = response.split_once("\r\n\r\n").ok_or(format!("{method}: no HTTP body"))?;
-    let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or(format!("{method}: no HTTP body"))?;
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         dechunk(body).ok_or(format!("{method}: bad chunked body"))?
     } else {
         body.to_string()
@@ -430,12 +504,27 @@ mod tests {
 
     #[test]
     fn activation_heights_become_satd_flags() {
-        let mut flags = option_flags(&options(json!({"testactivationheight": {"segwit": 432, "bip34": 2}}))).unwrap();
+        let mut flags = option_flags(&options(
+            json!({"testactivationheight": {"segwit": 432, "bip34": 2}}),
+        ))
+        .unwrap();
         flags.sort();
-        assert_eq!(flags, ["-testactivationheight=bip34@2", "-testactivationheight=segwit@432"]);
+        assert_eq!(
+            flags,
+            [
+                "-testactivationheight=bip34@2",
+                "-testactivationheight=segwit@432"
+            ]
+        );
         assert_eq!(option_flags(&Map::new()).unwrap(), Vec::<String>::new());
-        assert_eq!(option_flags(&options(json!({"test": []}))).unwrap(), Vec::<String>::new());
-        assert_eq!(option_flags(&options(json!({"test": ["bip94"]}))).unwrap(), ["-test=bip94"]);
+        assert_eq!(
+            option_flags(&options(json!({"test": []}))).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            option_flags(&options(json!({"test": ["bip94"]}))).unwrap(),
+            ["-test=bip94"]
+        );
     }
 
     #[test]
@@ -447,7 +536,10 @@ mod tests {
 
     #[test]
     fn chunked_bodies_are_joined() {
-        assert_eq!(dechunk("4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n").as_deref(), Some("{\"a\":1}"));
+        assert_eq!(
+            dechunk("4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n").as_deref(),
+            Some("{\"a\":1}")
+        );
         assert_eq!(dechunk("z\r\n"), None);
     }
 }

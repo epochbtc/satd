@@ -151,7 +151,10 @@ pub struct ExtraTxnCache {
 
 impl ExtraTxnCache {
     pub fn new(capacity: usize) -> Self {
-        Self { ring: vec![None; capacity], next: 0 }
+        Self {
+            ring: vec![None; capacity],
+            next: 0,
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -266,12 +269,16 @@ pub fn try_reconstruct(
     // via `getblocktxn` so the peer supplies the real, distinct transactions.
     // Core hard-fails reconstruction on this collision and re-requests; routing
     // the individual slots is the same outcome with less bandwidth.
-    let mut short_id_counts: HashMap<ShortId, u32> = HashMap::with_capacity(compact.short_ids.len());
+    let mut short_id_counts: HashMap<ShortId, u32> =
+        HashMap::with_capacity(compact.short_ids.len());
     for short_id in &compact.short_ids {
         *short_id_counts.entry(*short_id).or_insert(0) += 1;
     }
-    let prefilled_wtxids: std::collections::HashSet<bitcoin::Wtxid> =
-        compact.prefilled_txs.iter().map(|p| crate::validation::decode::wtxid(&p.tx)).collect();
+    let prefilled_wtxids: std::collections::HashSet<bitcoin::Wtxid> = compact
+        .prefilled_txs
+        .iter()
+        .map(|p| crate::validation::decode::wtxid(&p.tx))
+        .collect();
     let mut stats = ReconstructStats::default();
     // Prefilled transactions we already held. A set, because a transaction
     // can be in the mempool and the extra cache at once.
@@ -425,7 +432,11 @@ pub fn complete_pending(
         return Err(CompleteError::Invalid);
     }
 
-    for (tx, &idx) in block_txns.transactions.iter().zip(pending.missing_indices.iter()) {
+    for (tx, &idx) in block_txns
+        .transactions
+        .iter()
+        .zip(pending.missing_indices.iter())
+    {
         let i = idx as usize;
         if i >= txs.len() {
             return Err(CompleteError::Invalid);
@@ -452,7 +463,10 @@ pub fn complete_pending(
 }
 
 /// Create a GetBlockTxn request for missing transactions.
-pub fn make_get_block_txn(block_hash: BlockHash, missing_indices: &[u64]) -> BlockTransactionsRequest {
+pub fn make_get_block_txn(
+    block_hash: BlockHash,
+    missing_indices: &[u64],
+) -> BlockTransactionsRequest {
     BlockTransactionsRequest {
         block_hash,
         indexes: missing_indices.to_vec(),
@@ -496,7 +510,11 @@ pub struct PrefillCandidates {
 /// transactions from the mempool, after which every one looks missing.
 /// `None` when the mempool is write-locked -- the caller is about to announce
 /// the block, and a prefill is not worth delaying the announcement for.
-pub fn prefill_candidates(block: &Block, mempool: &Mempool, extra: &ExtraTxnCache) -> Option<PrefillCandidates> {
+pub fn prefill_candidates(
+    block: &Block,
+    mempool: &Mempool,
+    extra: &ExtraTxnCache,
+) -> Option<PrefillCandidates> {
     let absent: Vec<usize> = mempool.try_with_entries(|entries| {
         block
             .txdata
@@ -524,7 +542,9 @@ pub fn prefill_indexes(block: &Block, candidates: &PrefillCandidates, budget: us
     let mut used = 0usize;
     let mut chosen: Vec<usize> = Vec::new();
     for &i in candidates.needed.iter().chain(&candidates.extra) {
-        let Some(tx) = block.txdata.get(i) else { continue };
+        let Some(tx) = block.txdata.get(i) else {
+            continue;
+        };
         if i == 0 || chosen.contains(&i) {
             continue;
         }
@@ -551,9 +571,9 @@ pub fn make_prefilled_compact_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::Network;
     use bitcoin::bip152::BlockTransactions;
     use bitcoin::constants::genesis_block;
-    use bitcoin::Network;
 
     fn regtest_genesis() -> Block {
         genesis_block(Network::Regtest)
@@ -662,7 +682,10 @@ mod tests {
         };
         let (block, stats) = complete_pending(pending, &block_txns, false)
             .unwrap_or_else(|e| panic!("expected a completed block, got {e:?}"));
-        assert_eq!(stats.requested, 2, "the two blocktxn transactions are counted as requested");
+        assert_eq!(
+            stats.requested, 2,
+            "the two blocktxn transactions are counted as requested"
+        );
         assert_eq!(block.header, header);
         assert_eq!(block.txdata.len(), 3);
         assert_eq!(block.txdata[0], tx0);
@@ -719,7 +742,9 @@ mod tests {
         let compact = make_compact_block(&block).unwrap();
         let mempool = Mempool::new(300_000_000, 1_000);
         match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
-            Ok(Reconstruction::Partial { missing_indices, .. }) => {
+            Ok(Reconstruction::Partial {
+                missing_indices, ..
+            }) => {
                 assert_eq!(missing_indices, vec![1]);
             }
             _ => panic!("expected a partial reconstruction with missing transactions"),
@@ -733,7 +758,10 @@ mod tests {
     #[test]
     fn reconstruct_uses_quarantined_txs() {
         use crate::mempool::pool::QuarantineScope;
-        let full_quarantine = QuarantineScope { relay: true, template: true };
+        let full_quarantine = QuarantineScope {
+            relay: true,
+            template: true,
+        };
 
         let mut block = regtest_genesis();
         let extra_tx = make_test_tx(4321);
@@ -770,8 +798,7 @@ mod tests {
 
         // One mempool tx; compute the short ID the peer would announce for it.
         let mempool_tx = make_test_tx(4321);
-        let sid =
-            ShortId::with_siphash_keys(&mempool_tx.compute_wtxid().to_raw_hash(), keys);
+        let sid = ShortId::with_siphash_keys(&mempool_tx.compute_wtxid().to_raw_hash(), keys);
 
         // Coinbase prefilled at index 0, then the SAME short ID announced twice
         // (slots 1 and 2). A valid block never repeats a transaction, so two
@@ -781,18 +808,23 @@ mod tests {
         let compact = HeaderAndShortIds {
             header,
             nonce,
-            prefilled_txs: vec![PrefilledTransaction { idx: 0, tx: coinbase.clone() }],
+            prefilled_txs: vec![PrefilledTransaction {
+                idx: 0,
+                tx: coinbase.clone(),
+            }],
             short_ids: vec![sid, sid],
         };
 
         let mempool = Mempool::new(300_000_000, 1_000);
-        mempool.insert_tx_scoped_for_test(
-            mempool_tx,
-            crate::mempool::pool::QuarantineScope::acting(),
-        );
+        mempool
+            .insert_tx_scoped_for_test(mempool_tx, crate::mempool::pool::QuarantineScope::acting());
 
         match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
-            Ok(Reconstruction::Partial { txs, missing_indices, .. }) => {
+            Ok(Reconstruction::Partial {
+                txs,
+                missing_indices,
+                ..
+            }) => {
                 assert_eq!(
                     missing_indices,
                     vec![1, 2],
@@ -810,10 +842,7 @@ mod tests {
         }
     }
 
-    fn compact_with(
-        short_ids: usize,
-        prefilled: Vec<(u16, Transaction)>,
-    ) -> HeaderAndShortIds {
+    fn compact_with(short_ids: usize, prefilled: Vec<(u16, Transaction)>) -> HeaderAndShortIds {
         use bitcoin::bip152::PrefilledTransaction;
         HeaderAndShortIds {
             header: regtest_genesis().header,
@@ -882,9 +911,15 @@ mod tests {
         }
 
         // The boundaries themselves are well-formed.
-        assert_eq!(check_shape(&compact_with(1, vec![(1, make_test_tx(1))])), Ok(()));
         assert_eq!(
-            check_shape(&compact_with(MAX_COMPACT_BLOCK_TXS - 1, vec![(0, make_test_tx(1))])),
+            check_shape(&compact_with(1, vec![(1, make_test_tx(1))])),
+            Ok(())
+        );
+        assert_eq!(
+            check_shape(&compact_with(
+                MAX_COMPACT_BLOCK_TXS - 1,
+                vec![(0, make_test_tx(1))]
+            )),
             Ok(())
         );
     }
@@ -940,7 +975,9 @@ mod tests {
     fn reconstruct_reads_the_mempool_without_cloning_it() {
         let src = include_str!("compact.rs");
         let body = &src[..src.find("#[cfg(test)]").expect("test module")];
-        let fn_start = body.find("pub fn try_reconstruct(").expect("try_reconstruct");
+        let fn_start = body
+            .find("pub fn try_reconstruct(")
+            .expect("try_reconstruct");
         let fn_body = &body[fn_start..];
         let fn_body = &fn_body[..fn_body.find("\n}\n").expect("end of try_reconstruct")];
         assert!(
@@ -988,9 +1025,15 @@ mod tests {
         for v in 1..=4u64 {
             cache.insert(make_test_tx(v));
         }
-        let kept: Vec<u64> = cache.iter().map(|(_, tx)| tx.output[0].value.to_sat()).collect();
+        let kept: Vec<u64> = cache
+            .iter()
+            .map(|(_, tx)| tx.output[0].value.to_sat())
+            .collect();
         assert_eq!(cache.len(), 3);
-        assert!(!kept.contains(&1), "the oldest entry is overwritten: {kept:?}");
+        assert!(
+            !kept.contains(&1),
+            "the oldest entry is overwritten: {kept:?}"
+        );
         for v in 2..=4 {
             assert!(kept.contains(&v), "{v} is kept: {kept:?}");
         }
@@ -1006,7 +1049,8 @@ mod tests {
     #[test]
     fn extra_txn_cache_refuses_an_oversized_transaction() {
         let mut big = make_test_tx(1);
-        big.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a; MAX_EXTRA_TXN_BYTES]);
+        big.output[0].script_pubkey =
+            bitcoin::ScriptBuf::from_bytes(vec![0x6a; MAX_EXTRA_TXN_BYTES]);
         let mut cache = ExtraTxnCache::new(4);
         cache.insert(big);
         assert!(cache.is_empty());
@@ -1031,14 +1075,20 @@ mod tests {
         match try_reconstruct(&compact, &mempool, &extra) {
             Ok(Reconstruction::Complete(b, stats)) => {
                 assert_eq!(b.txdata[1], replaced);
-                assert_eq!((stats.prefilled, stats.mempool, stats.extra), (1, 1, 1), "{stats:?}");
+                assert_eq!(
+                    (stats.prefilled, stats.mempool, stats.extra),
+                    (1, 1, 1),
+                    "{stats:?}"
+                );
                 assert_eq!(stats.extra_bytes, replaced.total_size() as u64);
             }
             _ => panic!("the cached tx must fill its slot"),
         }
         // Without the cache the same block needs a round trip.
         match try_reconstruct(&compact, &mempool, &ExtraTxnCache::new(0)) {
-            Ok(Reconstruction::Partial { missing_indices, .. }) => assert_eq!(missing_indices, vec![1]),
+            Ok(Reconstruction::Partial {
+                missing_indices, ..
+            }) => assert_eq!(missing_indices, vec![1]),
             _ => panic!("without the cache the slot must be requested"),
         }
     }
@@ -1049,15 +1099,22 @@ mod tests {
     #[test]
     fn a_kept_transaction_with_no_inputs_matches_cores_short_id() {
         let genesis = regtest_genesis();
-        let empty = crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-            .expect("Core reads it");
+        let empty =
+            crate::validation::decode::deserialize_transaction(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .expect("Core reads it");
         let nonce = 7;
         let keys = ShortId::calculate_siphash_keys(&genesis.header, nonce);
         let compact = HeaderAndShortIds {
             header: genesis.header,
             nonce,
-            short_ids: vec![ShortId::with_siphash_keys(&empty.compute_txid().to_raw_hash(), keys)],
-            prefilled_txs: vec![bitcoin::bip152::PrefilledTransaction { idx: 0, tx: genesis.txdata[0].clone() }],
+            short_ids: vec![ShortId::with_siphash_keys(
+                &empty.compute_txid().to_raw_hash(),
+                keys,
+            )],
+            prefilled_txs: vec![bitcoin::bip152::PrefilledTransaction {
+                idx: 0,
+                tx: genesis.txdata[0].clone(),
+            }],
         };
         let mut extra = ExtraTxnCache::new(4);
         extra.insert(empty.clone());
@@ -1089,18 +1146,25 @@ mod tests {
         let mut collision = Candidates::new();
         offer(&mut collision, sid, a.compute_wtxid(), &a, Source::Mempool);
         offer(&mut collision, sid, b.compute_wtxid(), &b, Source::Extra);
-        assert!(matches!(collision.get(&sid), Some(None)), "a mempool/cache collision is ambiguous");
+        assert!(
+            matches!(collision.get(&sid), Some(None)),
+            "a mempool/cache collision is ambiguous"
+        );
 
         let mut two_cached = Candidates::new();
         offer(&mut two_cached, sid, a.compute_wtxid(), &a, Source::Extra);
         offer(&mut two_cached, sid, b.compute_wtxid(), &b, Source::Extra);
-        assert!(matches!(two_cached.get(&sid), Some(None)), "two cached txs on one short ID are ambiguous");
+        assert!(
+            matches!(two_cached.get(&sid), Some(None)),
+            "two cached txs on one short ID are ambiguous"
+        );
     }
 
     /// A test transaction whose serialization is about `bytes` long.
     fn sized_tx(value: u64, bytes: usize) -> Transaction {
         let mut tx = make_test_tx(value);
-        tx.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a; bytes.saturating_sub(60)]);
+        tx.output[0].script_pubkey =
+            bitcoin::ScriptBuf::from_bytes(vec![0x6a; bytes.saturating_sub(60)]);
         tx
     }
 
@@ -1113,7 +1177,10 @@ mod tests {
     #[test]
     fn prefill_packs_needed_before_extra_each_in_block_order() {
         let block = block_of((1..=4).map(|v| sized_tx(v, 200)).collect());
-        let candidates = PrefillCandidates { needed: vec![2, 4], extra: vec![1] };
+        let candidates = PrefillCandidates {
+            needed: vec![2, 4],
+            extra: vec![1],
+        };
         // Room for two: both needed ones, not the extra-cache one before them.
         let budget = block.txdata[2].total_size() + block.txdata[4].total_size();
         assert_eq!(prefill_indexes(&block, &candidates, budget), vec![2, 4]);
@@ -1124,19 +1191,32 @@ mod tests {
     #[test]
     fn prefill_respects_its_budget_and_keeps_a_later_small_candidate() {
         let block = block_of(vec![sized_tx(1, 300), sized_tx(2, 5_000), sized_tx(3, 300)]);
-        let candidates = PrefillCandidates { needed: vec![1, 2, 3], extra: vec![] };
+        let candidates = PrefillCandidates {
+            needed: vec![1, 2, 3],
+            extra: vec![],
+        };
         let budget = 1_000;
         let chosen = prefill_indexes(&block, &candidates, budget);
-        assert_eq!(chosen, vec![1, 3], "the oversize middle one is skipped, the small last one kept");
+        assert_eq!(
+            chosen,
+            vec![1, 3],
+            "the oversize middle one is skipped, the small last one kept"
+        );
         let used: usize = chosen.iter().map(|&i| block.txdata[i].total_size()).sum();
         assert!(used <= budget);
-        assert!(prefill_indexes(&block, &candidates, 0).is_empty(), "a zero budget prefills nothing beyond the coinbase");
+        assert!(
+            prefill_indexes(&block, &candidates, 0).is_empty(),
+            "a zero budget prefills nothing beyond the coinbase"
+        );
     }
 
     #[test]
     fn prefill_never_names_the_coinbase_or_an_index_past_the_block() {
         let block = block_of(vec![sized_tx(1, 100)]);
-        let candidates = PrefillCandidates { needed: vec![0, 1, 7], extra: vec![1] };
+        let candidates = PrefillCandidates {
+            needed: vec![0, 1, 7],
+            extra: vec![1],
+        };
         assert_eq!(prefill_indexes(&block, &candidates, 10_000), vec![1]);
     }
 
@@ -1167,7 +1247,13 @@ mod tests {
         let mut extra = ExtraTxnCache::new(10);
         extra.insert(replaced);
         let candidates = prefill_candidates(&block, &mempool, &extra).unwrap();
-        assert_eq!(candidates, PrefillCandidates { needed: vec![3], extra: vec![2] });
+        assert_eq!(
+            candidates,
+            PrefillCandidates {
+                needed: vec![3],
+                extra: vec![2]
+            }
+        );
     }
 
     #[test]
@@ -1176,9 +1262,16 @@ mod tests {
         let block = block_of(vec![make_test_tx(8), unseen.clone()]);
         let plain = make_prefilled_compact_block(&block, 42, &[]).unwrap();
         let prefilled = make_prefilled_compact_block(&block, 42, &[2]).unwrap();
-        assert_eq!(prefilled.short_ids, plain.short_ids[..1], "same nonce, same IDs for what is not prefilled");
+        assert_eq!(
+            prefilled.short_ids,
+            plain.short_ids[..1],
+            "same nonce, same IDs for what is not prefilled"
+        );
         let mempool = Mempool::new(300_000_000, 1_000);
-        mempool.insert_tx_scoped_for_test(block.txdata[1].clone(), crate::mempool::pool::QuarantineScope::acting());
+        mempool.insert_tx_scoped_for_test(
+            block.txdata[1].clone(),
+            crate::mempool::pool::QuarantineScope::acting(),
+        );
         match try_reconstruct(&prefilled, &mempool, &ExtraTxnCache::new(0)) {
             Ok(Reconstruction::Complete(b, stats)) => {
                 assert_eq!(b.txdata[2], unseen);
@@ -1193,9 +1286,14 @@ mod tests {
     fn prefill_candidates_skip_rather_than_wait_on_a_write_locked_mempool() {
         let src = include_str!("compact.rs");
         let body = &src[..src.find("#[cfg(test)]").expect("test module")];
-        let start = body.find("pub fn prefill_candidates(").expect("prefill_candidates");
+        let start = body
+            .find("pub fn prefill_candidates(")
+            .expect("prefill_candidates");
         let f = &body[start..];
         let f = &f[..f.find("\n}\n").expect("end of prefill_candidates")];
-        assert!(f.contains("mempool.try_with_entries("), "must not block the announcement on the mempool lock");
+        assert!(
+            f.contains("mempool.try_with_entries("),
+            "must not block the announcement on the mempool lock"
+        );
     }
 }

@@ -69,7 +69,9 @@ const SILENCE_DEADLINE: Duration = Duration::from_secs(90);
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let endpoint = args.next().unwrap_or_else(|| "http://127.0.0.1:50051".into());
+    let endpoint = args
+        .next()
+        .unwrap_or_else(|| "http://127.0.0.1:50051".into());
 
     let mut builder = StreamClient::builder(endpoint).keepalive_default();
     // `bearer_token` refuses a plaintext endpoint: pass an `https://` one (see

@@ -42,7 +42,9 @@ async fn a_frame_over_four_million_bytes_is_refused() {
     let mut buf = Vec::new();
     let mut ok = Cursor::new(frame(unknown(4_000_000)));
     let got = recv_message(&mut ok, Magic::REGTEST, &mut buf, None).await;
-    assert!(matches!(got, Ok(NetworkMessage::Unknown { ref payload, .. }) if payload.len() == 4_000_000));
+    assert!(
+        matches!(got, Ok(NetworkMessage::Unknown { ref payload, .. }) if payload.len() == 4_000_000)
+    );
 
     let mut over = Cursor::new(frame(unknown(4_000_001)));
     let err = recv_message(&mut over, Magic::REGTEST, &mut buf, None)
@@ -59,14 +61,25 @@ async fn a_frame_over_four_million_bytes_is_refused() {
 async fn the_payload_buffer_grows_with_the_bytes_received() {
     let mut bytes = frame(unknown(4_000_000));
     bytes.truncate(HEADER_SIZE + 1000);
-    let mut reader = MaxAsk { inner: Cursor::new(bytes), max: 0 };
+    let mut reader = MaxAsk {
+        inner: Cursor::new(bytes),
+        max: 0,
+    };
     let mut buf = Vec::new();
     let err = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
         .await
         .expect_err("the payload never arrives");
     assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-    assert!(reader.max <= PAYLOAD_ALLOC_STEP, "asked for {} bytes at once", reader.max);
-    assert!(buf.capacity() <= HEADER_SIZE + 2 * PAYLOAD_ALLOC_STEP, "holding {} bytes", buf.capacity());
+    assert!(
+        reader.max <= PAYLOAD_ALLOC_STEP,
+        "asked for {} bytes at once",
+        reader.max
+    );
+    assert!(
+        buf.capacity() <= HEADER_SIZE + 2 * PAYLOAD_ALLOC_STEP,
+        "holding {} bytes",
+        buf.capacity()
+    );
 }
 
 /// The receive buffer is reused between messages, but not at the size of
@@ -77,10 +90,18 @@ async fn the_receive_buffer_is_released_after_a_large_message() {
     bytes.extend(frame(NetworkMessage::Ping(7)));
     let mut reader = Cursor::new(bytes);
     let mut buf = Vec::new();
-    let big = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    let big = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
+        .await
+        .unwrap();
     assert!(matches!(big, NetworkMessage::Unknown { .. }));
-    assert!(buf.capacity() <= RECV_BUF_KEEP, "kept {} bytes after a 1 MB message", buf.capacity());
-    let small = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    assert!(
+        buf.capacity() <= RECV_BUF_KEEP,
+        "kept {} bytes after a 1 MB message",
+        buf.capacity()
+    );
+    let small = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
+        .await
+        .unwrap();
     assert_eq!(small, NetworkMessage::Ping(7));
 }
 
@@ -103,7 +124,9 @@ async fn a_send_counts_its_bytes_as_the_socket_takes_them() {
 
     let msg_len = frame(unknown(3_900_000)).len() as u64;
     let mut completed = 0u64;
-    while let Ok(r) = tokio::time::timeout(Duration::from_millis(500), writer.send(unknown(3_900_000))).await {
+    while let Ok(r) =
+        tokio::time::timeout(Duration::from_millis(500), writer.send(unknown(3_900_000))).await
+    {
         r.unwrap();
         completed += msg_len;
         assert!(completed < 512 * 1024 * 1024, "the socket never filled");
@@ -128,12 +151,21 @@ async fn an_addrv2_with_a_high_service_bit_is_read_whole() {
     bytes.extend(frame(NetworkMessage::Ping(5)));
     let mut reader = Cursor::new(bytes);
     let mut buf = Vec::new();
-    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
-    let NetworkMessage::AddrV2(addrs) = got else { panic!("expected addrv2, got {got:?}") };
-    let ips: Vec<_> = addrs.iter().map(|a| a.socket_addr().unwrap().ip().to_string()).collect();
+    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
+        .await
+        .unwrap();
+    let NetworkMessage::AddrV2(addrs) = got else {
+        panic!("expected addrv2, got {got:?}")
+    };
+    let ips: Vec<_> = addrs
+        .iter()
+        .map(|a| a.socket_addr().unwrap().ip().to_string())
+        .collect();
     assert_eq!(ips, ["1.2.3.4", "5.6.7.8", "9.9.9.9"]);
     assert_eq!(addrs[1].services.to_u64(), 1 << 26 | 0x409);
-    let next = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    let next = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
+        .await
+        .unwrap();
     assert_eq!(next, NetworkMessage::Ping(5));
 }
 
@@ -149,7 +181,9 @@ async fn a_bad_checksum_addrv2_is_skipped() {
     bytes.extend(frame(NetworkMessage::Ping(6)));
     let mut reader = Cursor::new(bytes);
     let mut buf = Vec::new();
-    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
+        .await
+        .unwrap();
     assert_eq!(got, NetworkMessage::Ping(6));
 }
 
@@ -165,14 +199,26 @@ async fn a_version_without_a_relay_byte_is_read() {
     payload.extend_from_slice(&7u64.to_le_bytes());
     payload.extend_from_slice(&[3, b'/', b'x', b'/']);
     payload.extend_from_slice(&42i32.to_le_bytes());
-    let version = NetworkMessage::Unknown { command: CommandString::try_from_static("version").unwrap(), payload };
+    let version = NetworkMessage::Unknown {
+        command: CommandString::try_from_static("version").unwrap(),
+        payload,
+    };
     let mut bytes = frame(version);
     bytes.extend(frame(NetworkMessage::Ping(8)));
     let mut reader = Cursor::new(bytes);
     let mut buf = Vec::new();
-    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
-    let NetworkMessage::Version(v) = got else { panic!("expected version, got {got:?}") };
-    assert_eq!((v.user_agent.as_str(), v.start_height, v.relay), ("/x/", 42, true));
-    let next = recv_message(&mut reader, Magic::REGTEST, &mut buf, None).await.unwrap();
+    let got = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
+        .await
+        .unwrap();
+    let NetworkMessage::Version(v) = got else {
+        panic!("expected version, got {got:?}")
+    };
+    assert_eq!(
+        (v.user_agent.as_str(), v.start_height, v.relay),
+        ("/x/", 42, true)
+    );
+    let next = recv_message(&mut reader, Magic::REGTEST, &mut buf, None)
+        .await
+        .unwrap();
     assert_eq!(next, NetworkMessage::Ping(8));
 }

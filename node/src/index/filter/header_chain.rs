@@ -135,7 +135,11 @@ pub fn check_filter_header_chain(
             break;
         }
         if next.is_multiple_of(100_000) {
-            tracing::info!(height = next, rewritten, "filter index: header chain check progress");
+            tracing::info!(
+                height = next,
+                rewritten,
+                "filter index: header chain check progress"
+            );
         }
     }
     if rewritten > 0 {

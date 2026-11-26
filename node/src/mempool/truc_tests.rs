@@ -11,7 +11,11 @@ struct Pool(HashMap<Txid, Transaction>);
 
 impl Pool {
     fn with(txs: &[&Transaction]) -> Self {
-        Pool(txs.iter().map(|t| (t.compute_txid(), (*t).clone())).collect())
+        Pool(
+            txs.iter()
+                .map(|t| (t.compute_txid(), (*t).clone()))
+                .collect(),
+        )
     }
 
     fn parents(&self, tx: &Transaction) -> Vec<Txid> {
@@ -41,8 +45,12 @@ impl TrucView for Pool {
     }
 
     fn descends_from(&self, txid: &Txid, ancestor: &Txid) -> bool {
-        let Some(tx) = self.0.get(txid) else { return false };
-        self.parents(tx).iter().any(|p| p == ancestor || self.descends_from(p, ancestor))
+        let Some(tx) = self.0.get(txid) else {
+            return false;
+        };
+        self.parents(tx)
+            .iter()
+            .any(|p| p == ancestor || self.descends_from(p, ancestor))
     }
 
     fn descendants(&self, txid: &Txid, cap: usize) -> Vec<Txid> {
@@ -70,14 +78,20 @@ fn tx(version: i32, spends: &[(Txid, u32)], outs: usize, tag: u8) -> Transaction
         input: input
             .iter()
             .map(|(txid, vout)| TxIn {
-                previous_output: OutPoint { txid: *txid, vout: *vout },
+                previous_output: OutPoint {
+                    txid: *txid,
+                    vout: *vout,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             })
             .collect(),
         output: (0..outs)
-            .map(|_| TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::new() })
+            .map(|_| TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            })
             .collect(),
     }
 }
@@ -89,7 +103,8 @@ fn id(tx: &Transaction) -> String {
 /// Every member's package check, as a multi-transaction evaluation runs
 /// them: the first refusal.
 fn package(pool: &Pool, txs: &[&Transaction]) -> Option<String> {
-    txs.iter().find_map(|t| package_truc_checks(pool, t, 100, txs, &pool.parents(t)))
+    txs.iter()
+        .find_map(|t| package_truc_checks(pool, t, 100, txs, &pool.parents(t)))
 }
 
 #[test]
@@ -104,11 +119,19 @@ fn versions_are_checked_within_the_package() {
     assert_eq!(package(&none, &[&plain, &truc]), None);
     assert_eq!(
         package(&none, &[&plain, &truc_from_plain]),
-        Some(format!("version=3 tx {} cannot spend from non-version=3 tx {}", id(&truc_from_plain), id(&plain)))
+        Some(format!(
+            "version=3 tx {} cannot spend from non-version=3 tx {}",
+            id(&truc_from_plain),
+            id(&plain)
+        ))
     );
     assert_eq!(
         package(&none, &[&truc, &plain_from_truc]),
-        Some(format!("non-version=3 tx {} cannot spend from version=3 tx {}", id(&plain_from_truc), id(&truc)))
+        Some(format!(
+            "non-version=3 tx {} cannot spend from version=3 tx {}",
+            id(&plain_from_truc),
+            id(&truc)
+        ))
     );
 }
 
@@ -119,13 +142,19 @@ fn a_parent_has_one_child_within_the_package() {
     let first = tx(3, &[(parent.compute_txid(), 0)], 1, 2);
     let second = tx(3, &[(parent.compute_txid(), 1)], 1, 3);
     let unrelated = tx(3, &[], 1, 4);
-    let exceeds = Some(format!("tx {} would exceed descendant count limit", id(&parent)));
+    let exceeds = Some(format!(
+        "tx {} would exceed descendant count limit",
+        id(&parent)
+    ));
 
     assert_eq!(package(&none, &[&parent, &first, &second]), exceeds);
     // An unrelated member is not taken for a second child, nor does it hide
     // one.
     assert_eq!(package(&none, &[&parent, &first, &unrelated]), None);
-    assert_eq!(package(&none, &[&parent, &first, &second, &unrelated]), exceeds);
+    assert_eq!(
+        package(&none, &[&parent, &first, &second, &unrelated]),
+        exceeds
+    );
     // The same with the parent already in the mempool.
     let resident = Pool::with(&[&parent]);
     assert_eq!(package(&resident, &[&first, &second]), exceeds);
@@ -140,7 +169,10 @@ fn a_grandchild_is_refused_within_the_package() {
 
     assert_eq!(
         package(&none, &[&parent, &child, &grandchild]),
-        Some(format!("tx {} would have too many ancestors", id(&grandchild)))
+        Some(format!(
+            "tx {} would have too many ancestors",
+            id(&grandchild)
+        ))
     );
 }
 
@@ -153,11 +185,17 @@ fn a_child_of_a_parent_with_a_mempool_child_exceeds_the_limit() {
 
     assert_eq!(
         package(&pool, &[&second]),
-        Some(format!("tx {} would exceed descendant count limit", id(&parent)))
+        Some(format!(
+            "tx {} would exceed descendant count limit",
+            id(&parent)
+        ))
     );
     // On its own the same child is offered the sibling to evict.
     let single = single_truc_checks(&pool, &second, 100, &pool.parents(&second), &HashSet::new());
-    assert_eq!(single.map(|f| f.sibling), Some(Some(resident_child.compute_txid())));
+    assert_eq!(
+        single.map(|f| f.sibling),
+        Some(Some(resident_child.compute_txid()))
+    );
 }
 
 #[test]
@@ -165,14 +203,22 @@ fn no_sibling_is_offered_when_the_sibling_has_a_parent_of_its_own() {
     // A reorg can leave the sibling with a second unconfirmed parent.
     let parent = tx(3, &[], 2, 1);
     let other = tx(3, &[], 1, 2);
-    let sibling = tx(3, &[(parent.compute_txid(), 0), (other.compute_txid(), 0)], 1, 3);
+    let sibling = tx(
+        3,
+        &[(parent.compute_txid(), 0), (other.compute_txid(), 0)],
+        1,
+        3,
+    );
     let pool = Pool::with(&[&parent, &other, &sibling]);
     let second = tx(3, &[(parent.compute_txid(), 1)], 1, 4);
 
     let single = single_truc_checks(&pool, &second, 100, &pool.parents(&second), &HashSet::new())
         .expect("refused");
     assert_eq!(single.sibling, None);
-    assert_eq!(single.detail, format!("tx {} would exceed descendant count limit", id(&parent)));
+    assert_eq!(
+        single.detail,
+        format!("tx {} would exceed descendant count limit", id(&parent))
+    );
 }
 
 #[test]
@@ -182,6 +228,15 @@ fn non_truc_transactions_are_held_only_to_the_version_boundary() {
     let pool = Pool::with(&[&parent, &first]);
     let second = tx(2, &[(parent.compute_txid(), 1)], 1, 3);
 
-    assert_eq!(single_truc_checks(&pool, &second, 50_000, &pool.parents(&second), &HashSet::new()), None);
+    assert_eq!(
+        single_truc_checks(
+            &pool,
+            &second,
+            50_000,
+            &pool.parents(&second),
+            &HashSet::new()
+        ),
+        None
+    );
     assert_eq!(package(&pool, &[&second]), None);
 }

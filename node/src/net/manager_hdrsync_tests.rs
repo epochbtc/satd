@@ -31,7 +31,13 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     (pm, dir)
 }
 
@@ -90,7 +96,10 @@ fn header_chain(n: u32, time_base: u32) -> Vec<bitcoin::block::Header> {
 /// A peer whose active chain is `chain` answers a locator the way Core's
 /// `ProcessGetHeaders` does: from the first locator hash on its chain (or
 /// genesis), the next 2000 headers.
-fn serve(chain: &[bitcoin::block::Header], locator: &[bitcoin::BlockHash]) -> Vec<bitcoin::block::Header> {
+fn serve(
+    chain: &[bitcoin::block::Header],
+    locator: &[bitcoin::BlockHash],
+) -> Vec<bitcoin::block::Header> {
     let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
     let fork_height = locator
         .iter()
@@ -98,7 +107,10 @@ fn serve(chain: &[bitcoin::block::Header], locator: &[bitcoin::BlockHash]) -> Ve
             if *h == genesis {
                 return Some(0);
             }
-            chain.iter().position(|hdr| hdr.block_hash() == *h).map(|i| i + 1)
+            chain
+                .iter()
+                .position(|hdr| hdr.block_hash() == *h)
+                .map(|i| i + 1)
         })
         .unwrap_or(0);
     chain[fork_height..chain.len().min(fork_height + 2000)].to_vec()
@@ -120,7 +132,10 @@ fn full_headers_batch_continues_from_the_peers_last_header() {
     let mut branch_rx = add_peer(&pm, 1);
     pm.handle_headers(1, branch[..2000].to_vec());
     pm.handle_headers(1, branch[2000..].to_vec());
-    assert_eq!(pm.chain_state.best_header_hash(), branch.last().unwrap().block_hash());
+    assert_eq!(
+        pm.chain_state.best_header_hash(),
+        branch.last().unwrap().block_hash()
+    );
     drain(&mut branch_rx);
 
     let mut rx = add_peer(&pm, 2);
@@ -170,13 +185,22 @@ fn full_batch_of_known_headers_still_asks_for_the_next() {
             _ => None,
         })
         .collect();
-    assert_eq!(asked.len(), 1, "one getheaders to the peer that sent the full batch");
-    assert_eq!(asked[0].locator_hashes[0], chain.last().unwrap().block_hash());
+    assert_eq!(
+        asked.len(),
+        1,
+        "one getheaders to the peer that sent the full batch"
+    );
+    assert_eq!(
+        asked[0].locator_hashes[0],
+        chain.last().unwrap().block_hash()
+    );
 
     // A short batch is the end of the peer's chain: no follow-up.
     pm.handle_headers(2, chain[..10].to_vec());
     assert!(
-        !drain(&mut rx).iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+        !drain(&mut rx)
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
         "a batch under 2000 headers ends the exchange"
     );
 }
@@ -194,13 +218,27 @@ fn branch_locator_follows_the_branch_then_the_rows() {
     assert_eq!(cs.accept_headers(&side).0, 200);
 
     let tip = rows.last().unwrap().block_hash();
-    assert_eq!(sync::build_locator_for_branch(cs, tip).unwrap(), sync::build_locator(cs));
+    assert_eq!(
+        sync::build_locator_for_branch(cs, tip).unwrap(),
+        sync::build_locator(cs)
+    );
 
     let locator = sync::build_locator_for_branch(cs, side.last().unwrap().block_hash()).unwrap();
-    let height_of = |h: &bitcoin::BlockHash| side.iter().position(|s| s.block_hash() == *h).map(|i| i as u32 + 1);
+    let height_of = |h: &bitcoin::BlockHash| {
+        side.iter()
+            .position(|s| s.block_hash() == *h)
+            .map(|i| i as u32 + 1)
+    };
     let heights: Vec<u32> = locator.iter().filter_map(height_of).collect();
-    assert_eq!(heights[..11], [200, 199, 198, 197, 196, 195, 194, 193, 192, 191, 189]);
-    assert_eq!(heights.len(), locator.len() - 1, "every entry but genesis is on the branch");
+    assert_eq!(
+        heights[..11],
+        [200, 199, 198, 197, 196, 195, 194, 193, 192, 191, 189]
+    );
+    assert_eq!(
+        heights.len(),
+        locator.len() - 1,
+        "every entry but genesis is on the branch"
+    );
     assert_eq!(
         *locator.last().unwrap(),
         bitcoin::constants::genesis_block(Network::Regtest).block_hash()
@@ -220,20 +258,32 @@ fn a_full_batch_asks_only_its_own_peer_for_more() {
     let mut others: Vec<_> = (2..=4).map(|id| add_peer(&pm, id)).collect();
 
     pm.handle_headers(1, chain.clone());
-    assert_eq!(pm.chain_state.headers_tip_height(), 2000, "the batch was new");
+    assert_eq!(
+        pm.chain_state.headers_tip_height(),
+        2000,
+        "the batch was new"
+    );
 
-    let asked = drain(&mut rx1).iter().filter(|m| matches!(m, NetworkMessage::GetHeaders(_))).count();
+    let asked = drain(&mut rx1)
+        .iter()
+        .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
+        .count();
     assert_eq!(asked, 1, "the sending peer is asked for the next batch");
     for rx in &mut others {
         assert!(
-            !drain(rx).iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+            !drain(rx)
+                .iter()
+                .any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
             "no other peer is asked for headers on a batch"
         );
     }
 }
 
 fn getheaders_sent(rx: &mut mpsc::Receiver<NetworkMessage>) -> usize {
-    drain(rx).iter().filter(|m| matches!(m, NetworkMessage::GetHeaders(_))).count()
+    drain(rx)
+        .iter()
+        .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
+        .count()
 }
 
 fn add_inbound_peer(pm: &PeerManager, id: PeerId) -> mpsc::Receiver<NetworkMessage> {
@@ -272,13 +322,20 @@ fn a_sync_peer_that_runs_out_keeps_the_slot() {
     let chain = header_chain(100, 1_500_000_000);
     let mut rxs: Vec<_> = (1..=4).map(|id| add_peer(&pm, id)).collect();
     pm.start_header_syncs();
-    let first = rxs.iter_mut().position(|rx| getheaders_sent(rx) == 1).expect("one sync peer") as PeerId + 1;
+    let first = rxs
+        .iter_mut()
+        .position(|rx| getheaders_sent(rx) == 1)
+        .expect("one sync peer") as PeerId
+        + 1;
 
     pm.handle_headers(first, chain);
     assert_eq!(pm.chain_state.headers_tip_height(), 100);
     pm.start_header_syncs();
     let asked: usize = rxs.iter_mut().map(getheaders_sent).sum();
-    assert_eq!(asked, 0, "no other peer starts while the best header is old");
+    assert_eq!(
+        asked, 0,
+        "no other peer starts while the best header is old"
+    );
 }
 
 /// Once the best header is less than a day old, header sync runs with every
@@ -290,7 +347,11 @@ fn every_peer_syncs_once_the_best_header_is_recent() {
     let chain = header_chain(100, now - 3_600);
     let mut rxs: Vec<_> = (1..=4).map(|id| add_peer(&pm, id)).collect();
     pm.start_header_syncs();
-    let first = rxs.iter_mut().position(|rx| getheaders_sent(rx) == 1).expect("one sync peer") as PeerId + 1;
+    let first = rxs
+        .iter_mut()
+        .position(|rx| getheaders_sent(rx) == 1)
+        .expect("one sync peer") as PeerId
+        + 1;
 
     pm.handle_headers(first, chain);
     pm.start_header_syncs();
@@ -325,10 +386,18 @@ fn an_inbound_peer_syncs_once_the_outbound_one_leaves() {
 
     pm.handle_headers(2, header_chain(100, 1_500_000_000));
     pm.start_header_syncs();
-    assert_eq!(getheaders_sent(&mut inbound), 0, "the sync peer still holds the slot");
+    assert_eq!(
+        getheaders_sent(&mut inbound),
+        0,
+        "the sync peer still holds the slot"
+    );
     pm.handle_peer_disconnected(2);
     pm.start_header_syncs();
-    assert_eq!(getheaders_sent(&mut inbound), 1, "the inbound peer takes the slot");
+    assert_eq!(
+        getheaders_sent(&mut inbound),
+        1,
+        "the inbound peer takes the slot"
+    );
 }
 
 /// An outbound peer still in its version handshake does not hold back a
@@ -375,7 +444,11 @@ fn the_sync_peer_is_replaced_after_its_header_download_timeout() {
     let (pm, _dir) = mk_pm();
     let mut rxs: Vec<_> = (1..=3).map(|id| add_peer(&pm, id)).collect();
     pm.start_header_syncs();
-    let first = rxs.iter_mut().position(|rx| getheaders_sent(rx) == 1).expect("one sync peer") as PeerId + 1;
+    let first = rxs
+        .iter_mut()
+        .position(|rx| getheaders_sent(rx) == 1)
+        .expect("one sync peer") as PeerId
+        + 1;
     let HeadersTimeout::At(at) = pm.peers.read()[&first].header_sync.download_timeout else {
         panic!("no timeout set");
     };
@@ -384,12 +457,21 @@ fn the_sync_peer_is_replaced_after_its_header_download_timeout() {
     let now = crate::time::now_micros();
     let expected = (now / 1_000_000 - 1_296_688_602) / 600;
     let base = HEADERS_DOWNLOAD_TIMEOUT_BASE_MICROS + expected * 1_000;
-    assert!(at >= now - 5_000_000 + base && at <= now + base, "timeout {at}, now {now}, base {base}");
+    assert!(
+        at >= now - 5_000_000 + base && at <= now + base,
+        "timeout {at}, now {now}, base {base}"
+    );
 
     pm.check_headers_sync_timeouts(at);
-    assert!(pm.peers.read().contains_key(&first), "not before the timeout");
+    assert!(
+        pm.peers.read().contains_key(&first),
+        "not before the timeout"
+    );
     pm.check_headers_sync_timeouts(at + 1);
-    assert!(!pm.peers.read().contains_key(&first), "the sync peer was not disconnected");
+    assert!(
+        !pm.peers.read().contains_key(&first),
+        "the sync peer was not disconnected"
+    );
     pm.start_header_syncs();
     let next: usize = rxs.iter_mut().map(getheaders_sent).sum();
     assert_eq!(next, 1, "another peer takes the sync over");
@@ -410,10 +492,20 @@ fn a_noban_sync_peer_only_loses_the_slot() {
         panic!("no timeout set");
     };
     pm.check_headers_sync_timeouts(at + 1);
-    assert!(pm.peers.read().contains_key(&1), "a noban peer stays connected");
-    assert!(!pm.peers.read()[&1].header_sync.started, "but loses the sync slot");
+    assert!(
+        pm.peers.read().contains_key(&1),
+        "a noban peer stays connected"
+    );
+    assert!(
+        !pm.peers.read()[&1].header_sync.started,
+        "but loses the sync slot"
+    );
     pm.start_header_syncs();
-    assert_eq!(getheaders_sent(&mut rx1) + getheaders_sent(&mut rx2), 1, "the slot is free again");
+    assert_eq!(
+        getheaders_sent(&mut rx1) + getheaders_sent(&mut rx2),
+        1,
+        "the slot is free again"
+    );
 }
 
 /// The sync peer is kept when no other preferred-download peer could take
@@ -444,18 +536,38 @@ fn a_block_inv_brings_one_getheaders_per_block_before_sync() {
     let block_b = bitcoin::BlockHash::from_byte_array([0xb2; 32]);
 
     pm.handle_inv(2, vec![Inventory::Block(block_a)]);
-    assert_eq!(getheaders_sent(&mut rx2), 1, "the first announcer of a block is asked");
+    assert_eq!(
+        getheaders_sent(&mut rx2),
+        1,
+        "the first announcer of a block is asked"
+    );
     pm.handle_inv(3, vec![Inventory::Block(block_a)]);
-    assert_eq!(getheaders_sent(&mut rx3), 0, "the same block from another peer is not");
+    assert_eq!(
+        getheaders_sent(&mut rx3),
+        0,
+        "the same block from another peer is not"
+    );
     pm.handle_inv(2, vec![Inventory::Block(block_b)]);
-    assert_eq!(getheaders_sent(&mut rx2), 0, "once per peer before its sync starts");
+    assert_eq!(
+        getheaders_sent(&mut rx2),
+        0,
+        "once per peer before its sync starts"
+    );
     pm.handle_inv(3, vec![Inventory::Block(block_b)]);
-    assert_eq!(getheaders_sent(&mut rx3), 1, "a new block from a new peer is");
+    assert_eq!(
+        getheaders_sent(&mut rx3),
+        1,
+        "a new block from a new peer is"
+    );
 
     // The sync peer itself is asked on every new block, once its initial
     // `getheaders` is answered: until then that request covers the block.
     pm.handle_inv(1, vec![Inventory::Block(block_b)]);
-    assert_eq!(getheaders_sent(&mut sync_rx), 0, "the initial request is outstanding");
+    assert_eq!(
+        getheaders_sent(&mut sync_rx),
+        0,
+        "the initial request is outstanding"
+    );
     pm.handle_headers(1, Vec::new());
     pm.handle_inv(1, vec![Inventory::Block(block_b)]);
     assert_eq!(getheaders_sent(&mut sync_rx), 1);
@@ -473,7 +585,11 @@ fn the_catch_up_gap_runs_to_the_best_header() {
     pm.handle_headers(1, header_chain(2100, 1_500_000_000)[2000..].to_vec());
     assert_eq!(pm.chain_state.headers_tip_height(), 2100);
     assert_eq!(PeerManager::ibd_catchup_gap(&pm.chain_state, 2000), 2100);
-    assert_eq!(PeerManager::ibd_catchup_gap(&pm.chain_state, 2500), 2500, "a target past the headers counts");
+    assert_eq!(
+        PeerManager::ibd_catchup_gap(&pm.chain_state, 2500),
+        2500,
+        "a target past the headers counts"
+    );
 }
 
 /// Peer `id` with header sync started and nothing outstanding: the initial
@@ -481,7 +597,11 @@ fn the_catch_up_gap_runs_to_the_best_header() {
 fn synced_peer(pm: &PeerManager, id: PeerId) -> mpsc::Receiver<NetworkMessage> {
     let mut rx = add_peer(pm, id);
     pm.start_header_syncs();
-    assert_eq!(getheaders_sent(&mut rx), 1, "header sync starts with the peer");
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        1,
+        "header sync starts with the peer"
+    );
     pm.handle_headers(id, Vec::new());
     rx
 }
@@ -495,7 +615,12 @@ fn unconnecting_header() -> bitcoin::block::Header {
 /// Backdate the outstanding `getheaders` to `peer` by `secs`.
 fn age_getheaders(pm: &PeerManager, id: PeerId, secs: u64) {
     let mut peers = pm.peers.write();
-    let sent = peers.get_mut(&id).unwrap().last_getheaders_sent.as_mut().expect("one is outstanding");
+    let sent = peers
+        .get_mut(&id)
+        .unwrap()
+        .last_getheaders_sent
+        .as_mut()
+        .expect("one is outstanding");
     *sent = sent.checked_sub(Duration::from_secs(secs)).unwrap();
 }
 
@@ -511,18 +636,40 @@ fn announcement_spam_draws_one_getheaders_per_response_time() {
 
     for i in 0..20u8 {
         pm.handle_headers(1, vec![header]);
-        pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([i; 32]))]);
+        pm.handle_inv(
+            1,
+            vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+                [i; 32],
+            ))],
+        );
     }
-    assert_eq!(getheaders_sent(&mut rx), 1, "one getheaders for the whole burst");
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        1,
+        "one getheaders for the whole burst"
+    );
 
     age_getheaders(&pm, 1, 3);
     pm.handle_headers(1, vec![header]);
-    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0xee; 32]))]);
-    assert_eq!(getheaders_sent(&mut rx), 0, "3 s on, the request is still outstanding");
+    pm.handle_inv(
+        1,
+        vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+            [0xee; 32],
+        ))],
+    );
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        0,
+        "3 s on, the request is still outstanding"
+    );
 
     age_getheaders(&pm, 1, 118);
     pm.handle_headers(1, vec![header]);
-    assert_eq!(getheaders_sent(&mut rx), 1, "past HEADERS_RESPONSE_TIME a new one goes out");
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        1,
+        "past HEADERS_RESPONSE_TIME a new one goes out"
+    );
     pm.handle_headers(1, vec![header]);
     assert_eq!(getheaders_sent(&mut rx), 0, "and is outstanding in turn");
 }
@@ -541,7 +688,11 @@ fn unconnecting_headers_do_not_answer_the_getheaders() {
     let sent = pm.peers.read()[&1].last_getheaders_sent;
     assert!(sent.is_some());
     pm.handle_headers(1, vec![header]);
-    assert_eq!(pm.peers.read()[&1].last_getheaders_sent, sent, "the request stands");
+    assert_eq!(
+        pm.peers.read()[&1].last_getheaders_sent,
+        sent,
+        "the request stands"
+    );
     assert_eq!(getheaders_sent(&mut rx), 0);
 }
 
@@ -566,8 +717,17 @@ fn a_headers_reply_answers_the_getheaders() {
     assert_eq!(getheaders_sent(&mut rx), 1, "connecting headers answer it");
 
     pm.handle_headers(1, header_chain(5, 1_500_000_000));
-    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x77; 32]))]);
-    assert_eq!(getheaders_sent(&mut rx), 1, "so do known headers that connect, before a block inv");
+    pm.handle_inv(
+        1,
+        vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+            [0x77; 32],
+        ))],
+    );
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        1,
+        "so do known headers that connect, before a block inv"
+    );
 }
 
 /// A full batch answers the request and asks for the next one, which is
@@ -580,8 +740,17 @@ fn the_continuation_is_the_outstanding_getheaders() {
     pm.handle_headers(1, header_chain(2000, 1_500_000_000));
     assert_eq!(getheaders_sent(&mut rx), 1, "the continuation");
     pm.handle_headers(1, vec![unconnecting_header()]);
-    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x55; 32]))]);
-    assert_eq!(getheaders_sent(&mut rx), 0, "the continuation's answer covers the announcements");
+    pm.handle_inv(
+        1,
+        vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+            [0x55; 32],
+        ))],
+    );
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        0,
+        "the continuation's answer covers the announcements"
+    );
 }
 
 /// Starting header sync records its `getheaders` as outstanding, on both
@@ -595,8 +764,17 @@ fn the_opening_getheaders_is_outstanding() {
     assert!(pm.start_header_sync(1), "the peer takes the sync slot");
     assert!(pm.peers.read()[&1].last_getheaders_sent.is_some());
     pm.handle_headers(1, vec![unconnecting_header()]);
-    pm.handle_inv(1, vec![Inventory::Block(bitcoin::BlockHash::from_byte_array([0x33; 32]))]);
-    assert_eq!(getheaders_sent(&mut rx), 0, "the opening request covers the announcements");
+    pm.handle_inv(
+        1,
+        vec![Inventory::Block(bitcoin::BlockHash::from_byte_array(
+            [0x33; 32],
+        ))],
+    );
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        0,
+        "the opening request covers the announcements"
+    );
 }
 
 /// Core's `ConsiderEviction` (v32.1 `net_processing.cpp:5501`): an outbound
@@ -618,15 +796,28 @@ fn an_outbound_peer_behind_our_tip_is_disconnected() {
         h.info.conn_time = std::time::UNIX_EPOCH + Duration::from_secs(t0);
     }
     pm.consider_evictions(t0);
-    assert!(getheaders_sent(&mut rx) == 0, "the timer starts; nothing is sent yet");
+    assert!(
+        getheaders_sent(&mut rx) == 0,
+        "the timer starts; nothing is sent yet"
+    );
     pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS);
     assert_eq!(getheaders_sent(&mut rx), 0, "not before the timeout");
     pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS + 1);
-    assert_eq!(getheaders_sent(&mut rx), 1, "one getheaders when it expires");
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        1,
+        "one getheaders when it expires"
+    );
     pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS + 1 + HEADERS_RESPONSE_TIME.as_secs());
-    assert!(pm.peers.read().contains_key(&1), "the answer has until the response time");
+    assert!(
+        pm.peers.read().contains_key(&1),
+        "the answer has until the response time"
+    );
     pm.consider_evictions(t0 + CHAIN_SYNC_TIMEOUT_SECS + 2 + HEADERS_RESPONSE_TIME.as_secs());
-    assert!(!pm.peers.read().contains_key(&1), "the peer with an old chain was not disconnected");
+    assert!(
+        !pm.peers.read().contains_key(&1),
+        "the peer with an old chain was not disconnected"
+    );
 }
 
 /// A peer that shows our tip's work in time clears its timer, and a
@@ -647,17 +838,28 @@ fn a_peer_that_shows_our_tips_work_or_is_protected_is_kept() {
         h.header_sync.started = true;
         h.info.conn_time = std::time::UNIX_EPOCH + Duration::from_secs(t0);
     }
-    pm.peers.write().get_mut(&2).unwrap().info.chain_sync_protect = true;
+    pm.peers
+        .write()
+        .get_mut(&2)
+        .unwrap()
+        .info
+        .chain_sync_protect = true;
     pm.consider_evictions(t0);
     // Peer 1 announces our tip before the timeout.
     pm.peers.write().get_mut(&1).unwrap().info.best_known_block = Some(tip);
     pm.consider_evictions(t0 + 60);
-    assert!(pm.peers.read()[&1].header_sync.chain_sync.timeout.is_none(), "the timer is cleared");
+    assert!(
+        pm.peers.read()[&1].header_sync.chain_sync.timeout.is_none(),
+        "the timer is cleared"
+    );
     let late = t0 + CHAIN_SYNC_TIMEOUT_SECS + HEADERS_RESPONSE_TIME.as_secs() + 10;
     pm.consider_evictions(late);
     pm.consider_evictions(late + HEADERS_RESPONSE_TIME.as_secs() + 10);
     for id in 1..=3 {
-        assert!(pm.peers.read().contains_key(&id), "peer {id} was disconnected");
+        assert!(
+            pm.peers.read().contains_key(&id),
+            "peer {id} was disconnected"
+        );
     }
 }
 
@@ -677,8 +879,15 @@ fn the_first_chain_sync_timer_runs_from_first_candidacy() {
         h.info.conn_time = std::time::UNIX_EPOCH + Duration::from_secs(t0 - 3_600);
     }
     pm.consider_evictions(t0);
-    assert_eq!(pm.peers.read()[&1].header_sync.chain_sync.timeout, Some(t0 + CHAIN_SYNC_TIMEOUT_SECS));
-    assert_eq!(getheaders_sent(&mut rx), 0, "no challenge on first candidacy");
+    assert_eq!(
+        pm.peers.read()[&1].header_sync.chain_sync.timeout,
+        Some(t0 + CHAIN_SYNC_TIMEOUT_SECS)
+    );
+    assert_eq!(
+        getheaders_sent(&mut rx),
+        0,
+        "no challenge on first candidacy"
+    );
 }
 
 /// A peer that serves no blocks (no `NODE_NETWORK` or
@@ -693,7 +902,11 @@ fn a_peer_that_serves_no_blocks_never_syncs_headers() {
     assert_eq!(getheaders_sent(&mut light), 0);
     let mut full = add_inbound_peer(&pm, 2);
     pm.start_header_syncs();
-    assert_eq!(getheaders_sent(&mut full), 1, "a block-serving peer takes the slot");
+    assert_eq!(
+        getheaders_sent(&mut full),
+        1,
+        "a block-serving peer takes the slot"
+    );
 }
 
 /// Block announcements stop only during initial block download, by the IBD
@@ -723,6 +936,8 @@ fn blocks_are_announced_out_of_ibd_whatever_the_header_tip() {
     pm.refresh_headers_tip();
     let mut rx = add_peer(&pm, 1);
     pm.announce_block(tip.block_hash());
-    let announced = drain(&mut rx).iter().any(|m| matches!(m, NetworkMessage::Inv(_) | NetworkMessage::Headers(_)));
+    let announced = drain(&mut rx)
+        .iter()
+        .any(|m| matches!(m, NetworkMessage::Inv(_) | NetworkMessage::Headers(_)));
     assert!(announced, "the tip was not announced");
 }

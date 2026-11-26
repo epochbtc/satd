@@ -23,8 +23,8 @@
 //!   instance mismatch (daemon restart) while confirmed replay is unaffected.
 
 use std::io::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::client::{StreamClient, SubscribeOptions};
@@ -185,19 +185,27 @@ impl CursorStore for FileCursorStore {
 fn parse_cursor_line(text: &str) -> Result<Cursor, String> {
     let mut it = text.split_whitespace();
     let mut next_field = |field: &str| -> Result<&str, String> {
-        it.next().ok_or_else(|| format!("cursor store: missing {field}"))
+        it.next()
+            .ok_or_else(|| format!("cursor store: missing {field}"))
     };
     let parse = |s: &str, field: &str| -> Result<u64, String> {
-        s.parse::<u64>().map_err(|e| format!("cursor store: bad {field}: {e}"))
+        s.parse::<u64>()
+            .map_err(|e| format!("cursor store: bad {field}: {e}"))
     };
     let parse32 = |s: &str, field: &str| -> Result<u32, String> {
-        s.parse::<u32>().map_err(|e| format!("cursor store: bad {field}: {e}"))
+        s.parse::<u32>()
+            .map_err(|e| format!("cursor store: bad {field}: {e}"))
     };
     let height = parse32(next_field("height")?, "height")?;
     let tx_index = parse32(next_field("tx_index")?, "tx_index")?;
     let mempool_seq = parse(next_field("mempool_seq")?, "mempool_seq")?;
     let instance_id = parse(next_field("instance_id")?, "instance_id")?;
-    Ok(Cursor { height, tx_index, mempool_seq, instance_id })
+    Ok(Cursor {
+        height,
+        tx_index,
+        mempool_seq,
+        instance_id,
+    })
 }
 
 /// What the resilience loop does with a [`Lagged`](crate::Event::Lagged) notice.
@@ -408,7 +416,9 @@ impl ResilientSubscription {
     /// top of every [`next`](Self::next) (and by [`commit`](Self::commit)); it
     /// therefore can never run ahead of an event the caller has received.
     fn commit_due(&mut self) -> Result<(), StreamError> {
-        let Some(c) = self.commit_next else { return Ok(()) };
+        let Some(c) = self.commit_next else {
+            return Ok(());
+        };
         if self.committed == Some(c) {
             self.commit_next = None;
             return Ok(());
@@ -484,10 +494,7 @@ impl ResilientSubscription {
                     if let Some(max) = self.config.backoff.max_retries
                         && self.reconnect_attempts > max
                     {
-                        return Err(self
-                            .last_error
-                            .take()
-                            .unwrap_or(StreamError::ControlClosed));
+                        return Err(self.last_error.take().unwrap_or(StreamError::ControlClosed));
                     }
                     let delay = self.config.backoff.delay_for(self.reconnect_attempts - 1);
                     tokio::time::sleep(delay).await;
@@ -580,7 +587,9 @@ impl ResilientSubscription {
         }
 
         match ev {
-            Event::Lagged { resume_cursor, .. } if self.config.lag_policy == LagPolicy::AutoResume => {
+            Event::Lagged { resume_cursor, .. }
+                if self.config.lag_policy == LagPolicy::AutoResume =>
+            {
                 // Re-anchor from the notice's cursor (if any), then reconnect. A
                 // lag re-anchor is a recovery point the server handed us, not
                 // caller-delivered data, so persist it immediately (and supersede
@@ -685,10 +694,16 @@ mod tests {
         let path = dir.join("scan.cursor");
         let store = FileCursorStore::new(&path);
         store
-            .save(Cursor { height: 7, ..Default::default() })
+            .save(Cursor {
+                height: 7,
+                ..Default::default()
+            })
             .expect("save");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "cursor file must not be group- or world-readable");
+        assert_eq!(
+            mode, 0o600,
+            "cursor file must not be group- or world-readable"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -722,7 +737,10 @@ mod tests {
         }
 
         FileCursorStore::new(&path)
-            .save(Cursor { height: 7, ..Default::default() })
+            .save(Cursor {
+                height: 7,
+                ..Default::default()
+            })
             .expect("save");
 
         // Exactly one decoy is consumed -- renamed onto the cursor. If none was,
@@ -730,7 +748,9 @@ mod tests {
         // nothing, so say that rather than passing quietly.
         let consumed = (0..DECOYS)
             .filter(|n| {
-                !path.with_extension(format!("tmp.{}.{n}", std::process::id())).exists()
+                !path
+                    .with_extension(format!("tmp.{}.{n}", std::process::id()))
+                    .exists()
             })
             .count();
         assert_eq!(
@@ -778,8 +798,13 @@ mod tests {
     #[test]
     fn noop_store_roundtrips_to_none() {
         let s = NoopCursorStore;
-        s.save(Cursor { height: 9, tx_index: 1, mempool_seq: 2, instance_id: 3 })
-            .unwrap();
+        s.save(Cursor {
+            height: 9,
+            tx_index: 1,
+            mempool_seq: 2,
+            instance_id: 3,
+        })
+        .unwrap();
         assert!(s.load().unwrap().is_none());
     }
 
@@ -793,13 +818,23 @@ mod tests {
         // Missing file loads cleanly as None.
         assert!(store.load().unwrap().is_none());
 
-        let c = Cursor { height: 951_577, tx_index: 4, mempool_seq: 1234, instance_id: 99 };
+        let c = Cursor {
+            height: 951_577,
+            tx_index: 4,
+            mempool_seq: 1234,
+            instance_id: 99,
+        };
         store.save(c).unwrap();
         let got = store.load().unwrap().expect("cursor present after save");
         assert_eq!(got, c);
 
         // Overwrite is atomic and reflects the latest.
-        let c2 = Cursor { height: 951_578, tx_index: 0, mempool_seq: 5, instance_id: 99 };
+        let c2 = Cursor {
+            height: 951_578,
+            tx_index: 0,
+            mempool_seq: 5,
+            instance_id: 99,
+        };
         store.save(c2).unwrap();
         assert_eq!(store.load().unwrap().unwrap(), c2);
 
@@ -820,7 +855,15 @@ mod tests {
     #[test]
     fn parse_cursor_line_exact() {
         let c = parse_cursor_line("951577 4 1234 99\n").unwrap();
-        assert_eq!(c, Cursor { height: 951_577, tx_index: 4, mempool_seq: 1234, instance_id: 99 });
+        assert_eq!(
+            c,
+            Cursor {
+                height: 951_577,
+                tx_index: 4,
+                mempool_seq: 1234,
+                instance_id: 99
+            }
+        );
         assert!(parse_cursor_line("1 2 3").is_err()); // missing field
     }
 
@@ -988,7 +1031,12 @@ mod tests {
     fn mem_store_observes_saves() {
         let s = MemStore::default();
         assert!(s.load().unwrap().is_none());
-        let c = Cursor { height: 1, tx_index: 0, mempool_seq: 0, instance_id: 7 };
+        let c = Cursor {
+            height: 1,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 7,
+        };
         s.save(c).unwrap();
         assert_eq!(s.load().unwrap(), Some(c));
     }
@@ -1010,7 +1058,12 @@ mod tests {
     }
 
     fn cur(height: u32) -> Cursor {
-        Cursor { height, tx_index: 0, mempool_seq: 0, instance_id: 1 }
+        Cursor {
+            height,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 1,
+        }
     }
 
     #[tokio::test]
@@ -1023,26 +1076,53 @@ mod tests {
         sub.commit_due().unwrap();
         assert!(sub.take_pending().is_none());
         let out = sub
-            .handle_event(Event::BlockConnected { hash: vec![0xaa], height: 100 }, Some(c100))
+            .handle_event(
+                Event::BlockConnected {
+                    hash: vec![0xaa],
+                    height: 100,
+                },
+                Some(c100),
+            )
             .await
             .unwrap();
-        assert!(matches!(out, Some(Event::BlockConnected { height: 100, .. })));
+        assert!(matches!(
+            out,
+            Some(Event::BlockConnected { height: 100, .. })
+        ));
         sub.arm_commit();
         // The caller holds block@100 but has not returned: the store must NOT have
         // advanced — a crash here replays block@100 (at-least-once).
-        assert_eq!(store.load().unwrap(), None, "cursor must not commit before the next poll");
+        assert_eq!(
+            store.load().unwrap(),
+            None,
+            "cursor must not commit before the next poll"
+        );
 
         // Poll 2: returning for the next event acks block@100; deliver block@101.
         sub.commit_due().unwrap();
-        assert_eq!(store.load().unwrap(), Some(c100), "block@100 committed only on the next poll");
+        assert_eq!(
+            store.load().unwrap(),
+            Some(c100),
+            "block@100 committed only on the next poll"
+        );
         assert!(sub.take_pending().is_none());
         let out = sub
-            .handle_event(Event::BlockConnected { hash: vec![0xbb], height: 101 }, Some(c101))
+            .handle_event(
+                Event::BlockConnected {
+                    hash: vec![0xbb],
+                    height: 101,
+                },
+                Some(c101),
+            )
             .await
             .unwrap();
         assert!(out.is_some());
         sub.arm_commit();
-        assert_eq!(store.load().unwrap(), Some(c100), "block@101 still not committed");
+        assert_eq!(
+            store.load().unwrap(),
+            Some(c100),
+            "block@101 still not committed"
+        );
 
         // Poll 3: acks block@101.
         sub.commit_due().unwrap();
@@ -1054,9 +1134,15 @@ mod tests {
         let store = Arc::new(MemStore::default());
         let mut sub = sub_with(&store);
         let c = cur(10);
-        sub.handle_event(Event::BlockConnected { hash: vec![1], height: 10 }, Some(c))
-            .await
-            .unwrap();
+        sub.handle_event(
+            Event::BlockConnected {
+                hash: vec![1],
+                height: 10,
+            },
+            Some(c),
+        )
+        .await
+        .unwrap();
         sub.arm_commit();
         assert_eq!(store.load().unwrap(), None);
         // A clean shutdown checkpoints the last delivered event so it is not
@@ -1080,7 +1166,10 @@ mod tests {
         let recover = cur(75);
         let out = sub
             .handle_event(
-                Event::Lagged { dropped_count: 3, resume_cursor: Some(recover) },
+                Event::Lagged {
+                    dropped_count: 3,
+                    resume_cursor: Some(recover),
+                },
                 None,
             )
             .await
@@ -1088,7 +1177,11 @@ mod tests {
         assert!(out.is_none(), "an auto-resumed lag is consumed internally");
         // The re-anchor is a recovery point, persisted now (not deferred), and it
         // supersedes the armed commit so the deferred write cannot clobber it.
-        assert_eq!(store.load().unwrap(), Some(recover), "lag re-anchor persisted immediately");
+        assert_eq!(
+            store.load().unwrap(),
+            Some(recover),
+            "lag re-anchor persisted immediately"
+        );
         assert_eq!(sub.committed, Some(recover));
         assert!(sub.commit_next.is_none(), "deferred commit superseded");
         assert!(sub.stream.is_none(), "stream torn down for reconnect");
@@ -1109,24 +1202,50 @@ mod tests {
         // The server clamped replay: first confirmed block jumps to 5000.
         let gap_cur = cur(5000);
         let out = sub
-            .handle_event(Event::BlockConnected { hash: vec![0xcc], height: 5000 }, Some(gap_cur))
+            .handle_event(
+                Event::BlockConnected {
+                    hash: vec![0xcc],
+                    height: 5000,
+                },
+                Some(gap_cur),
+            )
             .await
             .unwrap();
         // `resume_height` is the height the cursor expected next (`100 + 1`).
         assert!(
-            matches!(out, Some(Event::ReplayGap { resume_height: 101, first_height: 5000 })),
+            matches!(
+                out,
+                Some(Event::ReplayGap {
+                    resume_height: 101,
+                    first_height: 5000
+                })
+            ),
             "a clamped replay surfaces a ReplayGap before the block"
         );
         sub.arm_commit(); // next() arms after delivering the gap notice
-        assert_eq!(sub.resume, Some(pre), "high-water stays at the pre-gap anchor across the gap");
+        assert_eq!(
+            sub.resume,
+            Some(pre),
+            "high-water stays at the pre-gap anchor across the gap"
+        );
 
         // Next poll: commit the pre-gap anchor (not the post-gap block), then
         // deliver the stashed block.
         sub.commit_due().unwrap();
-        assert_eq!(store.load().unwrap(), Some(pre), "must not commit past the gap");
-        let blk = sub.take_pending().expect("the stashed block is delivered next");
+        assert_eq!(
+            store.load().unwrap(),
+            Some(pre),
+            "must not commit past the gap"
+        );
+        let blk = sub
+            .take_pending()
+            .expect("the stashed block is delivered next");
         assert!(matches!(blk, Event::BlockConnected { height: 5000, .. }));
-        assert_eq!(sub.resume, Some(gap_cur), "high-water advances to the delivered block");
+        assert_eq!(
+            sub.resume,
+            Some(gap_cur),
+            "high-water advances to the delivered block"
+        );
 
         // The poll after that acks the post-gap block.
         sub.commit_due().unwrap();
@@ -1143,7 +1262,11 @@ mod tests {
         // committed, so re-arming the same anchor elides the redundant write.
         sub.seed_resume().unwrap();
         assert_eq!(sub.resume, Some(persisted));
-        assert_eq!(sub.committed, Some(persisted), "loaded cursor seeds `committed`");
+        assert_eq!(
+            sub.committed,
+            Some(persisted),
+            "loaded cursor seeds `committed`"
+        );
         // Re-arming the seeded anchor and polling writes nothing new.
         sub.arm_commit();
         sub.commit_due().unwrap();

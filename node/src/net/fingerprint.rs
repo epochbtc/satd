@@ -23,7 +23,7 @@
 
 use std::fmt;
 
-use crate::net::behavior::{is_handshake_announcement, HandshakeCapture, VersionFields};
+use crate::net::behavior::{HandshakeCapture, VersionFields, is_handshake_announcement};
 use crate::net::survey::{Probe, ProbeOutcome, ProbeResults};
 use crate::net::v2transport::V2Greeting;
 
@@ -233,12 +233,20 @@ pub struct Row {
 
 impl Row {
     fn matches_version(&self, p: &Phases, v: &VersionFields) -> bool {
-        self.traits.iter().filter(|t| t.of_version()).all(|t| t.holds(p, v))
+        self.traits
+            .iter()
+            .filter(|t| t.of_version())
+            .all(|t| t.holds(p, v))
     }
 
     /// The direction, and every trait but the `version` fields'.
     fn admits_session(&self, inbound: bool, p: &Phases, v: &VersionFields) -> bool {
-        self.direction.admits(inbound) && self.traits.iter().filter(|t| !t.of_version()).all(|t| t.holds(p, v))
+        self.direction.admits(inbound)
+            && self
+                .traits
+                .iter()
+                .filter(|t| !t.of_version())
+                .all(|t| t.holds(p, v))
     }
 }
 
@@ -460,7 +468,11 @@ pub const TABLE: &[Row] = &[
 pub const SETTLE_SECS: u64 = 10;
 
 /// The row a transcript matches, if any.
-pub fn matching_row(inbound: bool, capture: &HandshakeCapture, version: &VersionFields) -> Option<&'static Row> {
+pub fn matching_row(
+    inbound: bool,
+    capture: &HandshakeCapture,
+    version: &VersionFields,
+) -> Option<&'static Row> {
     matching_row_in(TABLE, inbound, capture, version)
 }
 
@@ -471,7 +483,9 @@ fn matching_row_in<'t>(
     version: &VersionFields,
 ) -> Option<&'t Row> {
     let phases = Phases::of(capture)?;
-    table.iter().find(|row| row.admits_session(inbound, &phases, version) && row.matches_version(&phases, version))
+    table.iter().find(|row| {
+        row.admits_session(inbound, &phases, version) && row.matches_version(&phases, version)
+    })
 }
 
 /// Judge a peer. `settled` is whether its transcript is final though still
@@ -507,17 +521,26 @@ fn classify_in(
     }
     let claimed = Family::claimed_by(&version.user_agent);
     let Some(row) = matching_row_in(table, inbound, capture, version) else {
-        return claimed.map_or(Fingerprint::Unknown, |f| Fingerprint::Known(f, Confidence::Claimed));
+        return claimed.map_or(Fingerprint::Unknown, |f| {
+            Fingerprint::Known(f, Confidence::Claimed)
+        });
     };
     let observed = row.family;
     match claimed {
         Some(claimed) if claimed != observed => Fingerprint::Mismatch { claimed, observed },
         _ => {
             let phases = Phases::of(capture).expect("a row matched");
-            let only_version_tells = table
-                .iter()
-                .any(|other| other.family != observed && other.admits_session(inbound, &phases, version));
-            Fingerprint::Known(observed, if only_version_tells { Confidence::Low } else { Confidence::High })
+            let only_version_tells = table.iter().any(|other| {
+                other.family != observed && other.admits_session(inbound, &phases, version)
+            });
+            Fingerprint::Known(
+                observed,
+                if only_version_tells {
+                    Confidence::Low
+                } else {
+                    Confidence::High
+                },
+            )
         }
     }
 }
@@ -606,7 +629,10 @@ impl Answer {
             (self, outcome),
             (Answer::Answered, ProbeOutcome::Answered(_))
                 | (Answer::Silent, ProbeOutcome::Silent)
-                | (Answer::Either, ProbeOutcome::Answered(_) | ProbeOutcome::Silent)
+                | (
+                    Answer::Either,
+                    ProbeOutcome::Answered(_) | ProbeOutcome::Silent
+                )
         )
     }
 }
@@ -634,7 +660,10 @@ impl Phases {
         }
         let verack = commands.iter().position(|c| c == "verack")?;
         let rest = &commands[verack + 1..];
-        let end = rest.iter().position(|c| !is_handshake_announcement(c)).unwrap_or(rest.len());
+        let end = rest
+            .iter()
+            .position(|c| !is_handshake_announcement(c))
+            .unwrap_or(rest.len());
         Some(Phases {
             negotiation: commands[1..verack].to_vec(),
             announcements: rest[..end].to_vec(),
@@ -692,7 +721,10 @@ pub enum Trait {
 impl Trait {
     /// A trait of the `version` fields, which alone make a match `low`.
     fn of_version(self) -> bool {
-        matches!(self, Trait::Protocol(_) | Trait::Relay(_) | Trait::ServicesZero(_))
+        matches!(
+            self,
+            Trait::Protocol(_) | Trait::Relay(_) | Trait::ServicesZero(_)
+        )
     }
 
     fn holds(self, p: &Phases, v: &VersionFields) -> bool {
@@ -702,7 +734,9 @@ impl Trait {
             Trait::NeverNegotiates(cmd) => !has(&p.negotiation, cmd),
             Trait::Announces(cmd) => has(&p.announcements, cmd),
             Trait::NeverAnnounces(cmd) => p.then.is_some() && !has(&p.announcements, cmd),
-            Trait::AnnouncesTimes(cmd, n) => p.then.is_some() && p.announcements.iter().filter(|c| *c == cmd).count() == n,
+            Trait::AnnouncesTimes(cmd, n) => {
+                p.then.is_some() && p.announcements.iter().filter(|c| *c == cmd).count() == n
+            }
             Trait::Then(cmd) => p.then.as_deref() == Some(cmd),
             Trait::Protocol(n) => v.protocol_version == n,
             Trait::Relay(r) => v.relay == r,
@@ -746,23 +780,33 @@ pub struct CrawlRow {
 
 impl CrawlRow {
     fn matches_version(&self, p: &Phases, v: &VersionFields) -> bool {
-        self.traits.iter().filter(|t| t.of_version()).all(|t| t.holds(p, v))
+        self.traits
+            .iter()
+            .filter(|t| t.of_version())
+            .all(|t| t.holds(p, v))
     }
 
     /// Every trait but the `version` fields' holds, and the features agree.
     fn admits_session(&self, p: &Phases, v: &VersionFields, f: &CrawlFeatures) -> bool {
-        self.traits.iter().filter(|t| !t.of_version()).all(|t| t.holds(p, v)) && self.admits_features(f)
+        self.traits
+            .iter()
+            .filter(|t| !t.of_version())
+            .all(|t| t.holds(p, v))
+            && self.admits_features(f)
     }
 
     /// The BIP 324 greeting, the probes and the `getaddr` answer agree.
     fn admits_features(&self, f: &CrawlFeatures) -> bool {
         self.transports.admits(f.v2.is_some())
-            && f.v2.is_none_or(|g| (g.decoys > 0) == self.v2_decoys && (g.version_len > 0) == self.v2_version_contents)
+            && f.v2.is_none_or(|g| {
+                (g.decoys > 0) == self.v2_decoys && (g.version_len > 0) == self.v2_version_contents
+            })
             && Probe::ALL
                 .iter()
                 .zip(self.probes)
                 .all(|(p, answer)| f.probes.get(*p).is_none_or(|o| answer.admits(o)))
-            && f.getaddr.is_none_or(|k| self.getaddr.is_none_or(|g| g == k))
+            && f.getaddr
+                .is_none_or(|k| self.getaddr.is_none_or(|g| g == k))
     }
 }
 
@@ -920,7 +964,9 @@ fn matching_crawl_row_in<'t>(
     features: &CrawlFeatures,
 ) -> Option<&'t CrawlRow> {
     let phases = Phases::of(capture)?;
-    table.iter().find(|row| row.admits_session(&phases, version, features) && row.matches_version(&phases, version))
+    table.iter().find(|row| {
+        row.admits_session(&phases, version, features) && row.matches_version(&phases, version)
+    })
 }
 
 /// Judge a crawl session, once it has ended, against [`CRAWL_TABLE`]. A
@@ -958,17 +1004,26 @@ fn classify_crawl_in(
     };
     let claimed = Family::claimed_by(&version.user_agent);
     let Some(row) = matching_crawl_row_in(table, capture, version, features) else {
-        return claimed.map_or(Fingerprint::Unknown, |f| Fingerprint::Known(f, Confidence::Claimed));
+        return claimed.map_or(Fingerprint::Unknown, |f| {
+            Fingerprint::Known(f, Confidence::Claimed)
+        });
     };
     let observed = row.family;
     match claimed {
         Some(claimed) if claimed != observed => Fingerprint::Mismatch { claimed, observed },
         _ => {
             let phases = Phases::of(capture).expect("a row matched");
-            let only_version_tells = table
-                .iter()
-                .any(|other| other.family != observed && other.admits_session(&phases, version, features));
-            Fingerprint::Known(observed, if only_version_tells { Confidence::Low } else { Confidence::High })
+            let only_version_tells = table.iter().any(|other| {
+                other.family != observed && other.admits_session(&phases, version, features)
+            });
+            Fingerprint::Known(
+                observed,
+                if only_version_tells {
+                    Confidence::Low
+                } else {
+                    Confidence::High
+                },
+            )
         }
     }
 }
@@ -991,13 +1046,19 @@ mod tests {
         assert!(names.len() >= 150, "the captures: {}", names.len());
         for row in TABLE {
             for capture in row.captures {
-                assert!(names.iter().any(|n| n == capture), "row names {capture}, which is not a capture");
+                assert!(
+                    names.iter().any(|n| n == capture),
+                    "row names {capture}, which is not a capture"
+                );
             }
         }
         for name in &names {
             let r = replay_fixture(name);
             let got = classify(r.inbound, &r.capture, r.version.as_ref(), true);
-            let own: Vec<&Row> = TABLE.iter().filter(|row| row.captures.contains(&name.as_str())).collect();
+            let own: Vec<&Row> = TABLE
+                .iter()
+                .filter(|row| row.captures.contains(&name.as_str()))
+                .collect();
             let Some(v) = r.version.as_ref() else {
                 assert!(own.is_empty(), "{name} has no version, so no row");
                 assert_eq!(got, Fingerprint::Unknown, "{name}");
@@ -1006,7 +1067,9 @@ mod tests {
             let Some(row) = own.first() else {
                 assert_eq!(
                     got,
-                    Family::claimed_by(&v.user_agent).map_or(Fingerprint::Unknown, |f| Fingerprint::Known(f, Confidence::Claimed)),
+                    Family::claimed_by(&v.user_agent).map_or(Fingerprint::Unknown, |f| {
+                        Fingerprint::Known(f, Confidence::Claimed)
+                    }),
                     "{name} has no row"
                 );
                 continue;
@@ -1019,10 +1082,15 @@ mod tests {
             let phases = Phases::of(&r.capture).unwrap();
             let hits: Vec<Family> = TABLE
                 .iter()
-                .filter(|other| other.admits_session(r.inbound, &phases, v) && other.matches_version(&phases, v))
+                .filter(|other| {
+                    other.admits_session(r.inbound, &phases, v) && other.matches_version(&phases, v)
+                })
                 .map(|other| other.family)
                 .collect();
-            assert!(hits.iter().all(|f| *f == row.family), "{name} matches these rows: {hits:?}");
+            assert!(
+                hits.iter().all(|f| *f == row.family),
+                "{name} matches these rows: {hits:?}"
+            );
         }
     }
 
@@ -1032,7 +1100,9 @@ mod tests {
         let base = capture.strip_suffix("-s2").unwrap_or(capture);
         let base = base.strip_suffix("-v2").unwrap_or(base);
         let base = base.strip_suffix("-survey").unwrap_or(base);
-        base.strip_suffix("-inbound").or_else(|| base.strip_suffix("-outbound")).unwrap()
+        base.strip_suffix("-inbound")
+            .or_else(|| base.strip_suffix("-outbound"))
+            .unwrap()
     }
 
     /// Each family's rows were checked against captures of more than one
@@ -1042,7 +1112,10 @@ mod tests {
     fn every_family_was_checked_against_more_than_one_release() {
         let single: &[(Family, &str)] = &[
             (Family::Floresta, "one release captured; it dials only"),
-            (Family::Libbitcoin, "one release captured on node connections"),
+            (
+                Family::Libbitcoin,
+                "one release captured on node connections",
+            ),
             (Family::BitcoinSeeder, "a crawler, one commit captured"),
             (Family::Bitnodes, "a crawler, one commit captured"),
         ];
@@ -1073,7 +1146,10 @@ mod tests {
             ("bitnodes-036dc5c-inbound", Family::Bitnodes),
         ] {
             let r = replay_fixture(name);
-            assert_eq!(classify(true, &r.capture, r.version.as_ref(), true), Fingerprint::Known(family, Confidence::Low));
+            assert_eq!(
+                classify(true, &r.capture, r.version.as_ref(), true),
+                Fingerprint::Known(family, Confidence::Low)
+            );
         }
         let r = replay_fixture("core-31.2-inbound");
         assert_eq!(
@@ -1090,11 +1166,17 @@ mod tests {
         v.user_agent = "/Satoshi:31.2.0/".into();
         assert_eq!(
             classify(true, &r.capture, Some(&v), true),
-            Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }
+            Fingerprint::Mismatch {
+                claimed: Family::Core,
+                observed: Family::Btcd
+            }
         );
         // A user agent naming no family is not a claim.
         v.user_agent = "/whatever:1.0/".into();
-        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Known(Family::Btcd, Confidence::Low));
+        assert_eq!(
+            classify(true, &r.capture, Some(&v), true),
+            Fingerprint::Known(Family::Btcd, Confidence::Low)
+        );
 
         let r = replay_fixture("knots-29.4.3.knots20260508-outbound");
         assert_eq!(
@@ -1110,12 +1192,21 @@ mod tests {
     #[test]
     fn a_shape_from_the_other_direction_is_only_claimed() {
         let r = replay_fixture("core-31.2-outbound");
-        assert_eq!(classify(true, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        assert_eq!(
+            classify(true, &r.capture, r.version.as_ref(), true),
+            Fingerprint::Known(Family::Core, Confidence::Claimed)
+        );
         let r = replay_fixture("core-31.2-inbound");
-        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        assert_eq!(
+            classify(false, &r.capture, r.version.as_ref(), true),
+            Fingerprint::Known(Family::Core, Confidence::Claimed)
+        );
         // Floresta only dials: a node we dialed with its shape is not it.
         let r = replay_fixture("floresta-0.9.1-inbound");
-        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Floresta, Confidence::Claimed));
+        assert_eq!(
+            classify(false, &r.capture, r.version.as_ref(), true),
+            Fingerprint::Known(Family::Floresta, Confidence::Claimed)
+        );
     }
 
     /// An open transcript is judged only once settled.
@@ -1123,7 +1214,10 @@ mod tests {
     fn an_open_transcript_waits_until_settled() {
         let r = replay_fixture("btcd-0.27.0-outbound");
         assert!(r.capture.is_open(), "btcd sends nothing past verack");
-        assert_eq!(classify(false, &r.capture, r.version.as_ref(), false), Fingerprint::Unknown);
+        assert_eq!(
+            classify(false, &r.capture, r.version.as_ref(), false),
+            Fingerprint::Unknown
+        );
         assert_eq!(
             classify(false, &r.capture, r.version.as_ref(), true),
             Fingerprint::Known(Family::Btcd, Confidence::High)
@@ -1131,7 +1225,10 @@ mod tests {
         // A closed one needs no wait.
         let r = replay_fixture("core-31.2-inbound");
         assert!(!r.capture.is_open());
-        assert_eq!(classify(true, &r.capture, r.version.as_ref(), false).observed(), Some(Family::Core));
+        assert_eq!(
+            classify(true, &r.capture, r.version.as_ref(), false).observed(),
+            Some(Family::Core)
+        );
     }
 
     /// A shape with no feature negotiation pins its protocol version: the
@@ -1142,7 +1239,10 @@ mod tests {
     fn a_shape_without_negotiation_pins_its_protocol_version() {
         let r = replay_fixture("bitcoin-seeder-92d2b46-inbound");
         let mut v = r.version.clone().unwrap();
-        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Known(Family::BitcoinSeeder, Confidence::Low));
+        assert_eq!(
+            classify(true, &r.capture, Some(&v), true),
+            Fingerprint::Known(Family::BitcoinSeeder, Confidence::Low)
+        );
         let core = replay_fixture("core-0.20.2-inbound");
         assert_eq!(
             classify(true, &core.capture, core.version.as_ref(), true),
@@ -1153,12 +1253,21 @@ mod tests {
         v.services = 1;
         assert_eq!(
             classify(true, &r.capture, Some(&v), true),
-            Fingerprint::Mismatch { claimed: Family::BitcoinSeeder, observed: Family::Core }
+            Fingerprint::Mismatch {
+                claimed: Family::BitcoinSeeder,
+                observed: Family::Core
+            }
         );
         v.protocol_version = 70014;
-        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Known(Family::BitcoinSeeder, Confidence::Claimed));
+        assert_eq!(
+            classify(true, &r.capture, Some(&v), true),
+            Fingerprint::Known(Family::BitcoinSeeder, Confidence::Claimed)
+        );
         v.user_agent = "/Satoshi:0.19.1/".into();
-        assert_eq!(classify(true, &r.capture, Some(&v), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        assert_eq!(
+            classify(true, &r.capture, Some(&v), true),
+            Fingerprint::Known(Family::Core, Confidence::Claimed)
+        );
     }
 
     /// A node-connection shape no capture shows, but with its family's
@@ -1170,18 +1279,26 @@ mod tests {
     fn a_perturbed_node_transcript_still_matches_by_its_traits() {
         type Edit = fn(&mut Vec<String>, &mut VersionFields);
         let cases: &[(&str, &str, Edit)] = &[
-            ("core-32.1-outbound-survey", "erlay, the other order, 70018", |c, v| {
-                c.swap(1, 2);
-                c.insert(3, "sendtxrcncl".into());
-                v.protocol_version = 70018;
-                v.user_agent = "/Satoshi:33.0.0/".into();
-            }),
-            ("core-25.2-outbound", "a getheaders first, relay off (-blocksonly)", |c, v| {
-                let ping = c.iter().position(|x| x == "ping").unwrap();
-                c[ping] = "getheaders".into();
-                v.relay = false;
-                v.user_agent = "/Satoshi:26.0.0/".into();
-            }),
+            (
+                "core-32.1-outbound-survey",
+                "erlay, the other order, 70018",
+                |c, v| {
+                    c.swap(1, 2);
+                    c.insert(3, "sendtxrcncl".into());
+                    v.protocol_version = 70018;
+                    v.user_agent = "/Satoshi:33.0.0/".into();
+                },
+            ),
+            (
+                "core-25.2-outbound",
+                "a getheaders first, relay off (-blocksonly)",
+                |c, v| {
+                    let ping = c.iter().position(|x| x == "ping").unwrap();
+                    c[ping] = "getheaders".into();
+                    v.relay = false;
+                    v.user_agent = "/Satoshi:26.0.0/".into();
+                },
+            ),
             ("core-22.1-outbound", "a later first message", |c, v| {
                 let ping = c.iter().position(|x| x == "ping").unwrap();
                 c[ping] = "inv".into();
@@ -1192,40 +1309,71 @@ mod tests {
                 v.protocol_version = 70017;
                 v.user_agent = "/Satoshi:30.0.0/Knots:20251010/".into();
             }),
-            ("satd-0.8.0-pre-inbound", "feefilter before getheaders, 70017", |c, v| {
-                c.insert(5, "feefilter".into());
-                v.protocol_version = 70017;
-                v.user_agent = "/satd:0.9.0/".into();
-            }),
-            ("rbitcoin-0.9.99-outbound-v2", "sendcmpct before sendheaders, a feefilter", |c, v| {
-                c.splice(4..6, ["sendcmpct".to_string(), "feefilter".into(), "sendheaders".into()]);
-                v.user_agent = "/rbitcoin:0.10.0/".into();
-            }),
-            ("btcd-0.25.0-outbound", "a getblocks after verack, 70017", |c, v| {
-                c.push("getblocks".into());
-                v.protocol_version = 70017;
-                v.user_agent = "/btcwire:0.5.0/btcd:0.28.0/".into();
-            }),
+            (
+                "satd-0.8.0-pre-inbound",
+                "feefilter before getheaders, 70017",
+                |c, v| {
+                    c.insert(5, "feefilter".into());
+                    v.protocol_version = 70017;
+                    v.user_agent = "/satd:0.9.0/".into();
+                },
+            ),
+            (
+                "rbitcoin-0.9.99-outbound-v2",
+                "sendcmpct before sendheaders, a feefilter",
+                |c, v| {
+                    c.splice(
+                        4..6,
+                        [
+                            "sendcmpct".to_string(),
+                            "feefilter".into(),
+                            "sendheaders".into(),
+                        ],
+                    );
+                    v.user_agent = "/rbitcoin:0.10.0/".into();
+                },
+            ),
+            (
+                "btcd-0.25.0-outbound",
+                "a getblocks after verack, 70017",
+                |c, v| {
+                    c.push("getblocks".into());
+                    v.protocol_version = 70017;
+                    v.user_agent = "/btcwire:0.5.0/btcd:0.28.0/".into();
+                },
+            ),
             ("bcoin-2.1.2-inbound", "other services", |_, v| {
                 v.services = 1;
                 v.user_agent = "/bcoin:2.3.0/".into();
             }),
-            ("libbitcoin-3.8.0-outbound", "other services and height", |_, v| {
-                v.services = 1;
-                v.start_height = 900_000;
-                v.user_agent = "/libbitcoin:4.0.0/".into();
-            }),
-            ("floresta-0.9.1-inbound-v2", "a getheaders for its first message", |c, v| {
-                *c.last_mut().unwrap() = "getheaders".into();
-                v.user_agent = "/Floresta:0.10.0/".into();
-            }),
+            (
+                "libbitcoin-3.8.0-outbound",
+                "other services and height",
+                |_, v| {
+                    v.services = 1;
+                    v.start_height = 900_000;
+                    v.user_agent = "/libbitcoin:4.0.0/".into();
+                },
+            ),
+            (
+                "floresta-0.9.1-inbound-v2",
+                "a getheaders for its first message",
+                |c, v| {
+                    *c.last_mut().unwrap() = "getheaders".into();
+                    v.user_agent = "/Floresta:0.10.0/".into();
+                },
+            ),
         ];
         for (name, what, edit) in cases {
             let r = replay_fixture(name);
             let mut commands: Vec<String> = r.capture.commands().collect();
             let mut v = r.version.clone().unwrap();
             edit(&mut commands, &mut v);
-            let own = TABLE.iter().find(|row| row.captures.contains(name)).expect("a named capture").family;
+            let own = TABLE
+                .iter()
+                .find(|row| row.captures.contains(name))
+                .expect("a named capture")
+                .family;
             let got = classify(r.inbound, &transcript(&commands), Some(&v), true);
             assert!(
                 matches!(got, Fingerprint::Known(fam, Confidence::High | Confidence::Low) if fam == own),
@@ -1244,35 +1392,98 @@ mod tests {
         let v = |name: &str| replay_fixture(name).version.unwrap();
         // Core 23 with one `sendcmpct` is rbitcoin's shape: under Core's
         // user agent, a mismatch.
-        let rb = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "ping"]);
+        let rb = transcript(&[
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendheaders",
+            "sendcmpct",
+            "ping",
+        ]);
         assert_eq!(
             classify(false, &rb, Some(&v("core-23.2-outbound")), true),
-            Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Rbitcoin }
+            Fingerprint::Mismatch {
+                claimed: Family::Core,
+                observed: Family::Rbitcoin
+            }
         );
         // rbitcoin with two is older Core's.
-        let two = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "sendcmpct", "ping"]);
+        let two = transcript(&[
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendheaders",
+            "sendcmpct",
+            "sendcmpct",
+            "ping",
+        ]);
         assert_eq!(
             classify(false, &two, Some(&v("rbitcoin-0.9.99-outbound-v2")), true),
-            Fingerprint::Mismatch { claimed: Family::Rbitcoin, observed: Family::Core }
+            Fingerprint::Mismatch {
+                claimed: Family::Rbitcoin,
+                observed: Family::Core
+            }
         );
         // Three is no one's.
-        let three =
-            transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendheaders", "sendcmpct", "sendcmpct", "sendcmpct", "ping"]);
-        assert_eq!(classify(false, &three, Some(&v("core-23.2-outbound")), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        let three = transcript(&[
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendheaders",
+            "sendcmpct",
+            "sendcmpct",
+            "sendcmpct",
+            "ping",
+        ]);
+        assert_eq!(
+            classify(false, &three, Some(&v("core-23.2-outbound")), true),
+            Fingerprint::Known(Family::Core, Confidence::Claimed)
+        );
         // satd sending `sendcmpct` before its `getheaders` has Core's
         // traits, which leave Core's first message open: under satd's user
         // agent, a mismatch.
-        let s = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "getheaders"]);
+        let s = transcript(&[
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendcmpct",
+            "getheaders",
+        ]);
         assert_eq!(
             classify(false, &s, Some(&v("satd-0.7.2-outbound")), true),
-            Fingerprint::Mismatch { claimed: Family::Satd, observed: Family::Core }
+            Fingerprint::Mismatch {
+                claimed: Family::Satd,
+                observed: Family::Core
+            }
         );
         // Core since 24 announcing `feefilter` before its next message is
         // no capture's either.
-        let f = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "feefilter", "ping"]);
-        assert_eq!(classify(false, &f, Some(&v("core-25.2-outbound")), true), Fingerprint::Known(Family::Core, Confidence::Claimed));
+        let f = transcript(&[
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendcmpct",
+            "feefilter",
+            "ping",
+        ]);
+        assert_eq!(
+            classify(false, &f, Some(&v("core-25.2-outbound")), true),
+            Fingerprint::Known(Family::Core, Confidence::Claimed)
+        );
         // `AnnouncesTimes` waits for the announcements to end.
-        let open = Phases::of(&transcript(&["version", "verack", "sendheaders", "sendcmpct", "sendcmpct"])).unwrap();
+        let open = Phases::of(&transcript(&[
+            "version",
+            "verack",
+            "sendheaders",
+            "sendcmpct",
+            "sendcmpct",
+        ]))
+        .unwrap();
         assert!(!Trait::AnnouncesTimes("sendcmpct", 2).holds(&open, &v("core-23.2-outbound")));
     }
 
@@ -1287,14 +1498,29 @@ mod tests {
         let early = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack"]);
         let v = replay_fixture("core-31.2-outbound").version.unwrap();
         for (ua, want) in [
-            ("/Satoshi:25.1.0/", Fingerprint::Known(Family::Core, Confidence::Claimed)),
-            ("/Satoshi:99.0.0/", Fingerprint::Known(Family::Core, Confidence::Claimed)),
-            ("/btcwire:0.5.0/btcd:0.99.0/", Fingerprint::Known(Family::Btcd, Confidence::Claimed)),
-            ("/satd:0.9.0/", Fingerprint::Known(Family::Satd, Confidence::Claimed)),
+            (
+                "/Satoshi:25.1.0/",
+                Fingerprint::Known(Family::Core, Confidence::Claimed),
+            ),
+            (
+                "/Satoshi:99.0.0/",
+                Fingerprint::Known(Family::Core, Confidence::Claimed),
+            ),
+            (
+                "/btcwire:0.5.0/btcd:0.99.0/",
+                Fingerprint::Known(Family::Btcd, Confidence::Claimed),
+            ),
+            (
+                "/satd:0.9.0/",
+                Fingerprint::Known(Family::Satd, Confidence::Claimed),
+            ),
             ("/bitcoin-lisp:0.1.0/", Fingerprint::Unknown),
             ("", Fingerprint::Unknown),
         ] {
-            let v = VersionFields { user_agent: ua.into(), ..v.clone() };
+            let v = VersionFields {
+                user_agent: ua.into(),
+                ..v.clone()
+            };
             for inbound in [false, true] {
                 let got = classify(inbound, &early, Some(&v), true);
                 assert_eq!(got, want, "{ua}");
@@ -1305,10 +1531,11 @@ mod tests {
         assert_eq!(classify(false, &early, None, true), Fingerprint::Unknown);
         // Not settled yet: no claim either.
         let open = transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct"]);
-        assert_eq!(classify(false, &open, Some(&v), false), Fingerprint::Unknown);
+        assert_eq!(
+            classify(false, &open, Some(&v), false),
+            Fingerprint::Unknown
+        );
     }
-
-
 
     // ---- Crawl rows ----
 
@@ -1330,7 +1557,10 @@ mod tests {
 
     /// The family a crawl capture's own row names.
     fn own_family(name: &str) -> Family {
-        let own: Vec<&CrawlRow> = CRAWL_TABLE.iter().filter(|row| row.captures.contains(&name)).collect();
+        let own: Vec<&CrawlRow> = CRAWL_TABLE
+            .iter()
+            .filter(|row| row.captures.contains(&name))
+            .collect();
         assert_eq!(own.len(), 1, "{name} is named by {} crawl rows", own.len());
         own[0].family
     }
@@ -1346,13 +1576,19 @@ mod tests {
         assert!(names.len() >= 38, "the crawl captures: {names:?}");
         for row in CRAWL_TABLE {
             for capture in row.captures {
-                assert!(names.iter().any(|n| n == capture), "crawl row names {capture}, which is not a crawl capture");
+                assert!(
+                    names.iter().any(|n| n == capture),
+                    "crawl row names {capture}, which is not a crawl capture"
+                );
             }
         }
         for name in &names {
             let (r, f) = replay_crawl_fixture(name);
             let got = classify_crawl(&r.capture, r.version.as_ref(), &f);
-            let own: Vec<&CrawlRow> = CRAWL_TABLE.iter().filter(|row| row.captures.contains(&name.as_str())).collect();
+            let own: Vec<&CrawlRow> = CRAWL_TABLE
+                .iter()
+                .filter(|row| row.captures.contains(&name.as_str()))
+                .collect();
             let Some(v) = r.version.as_ref() else {
                 assert!(own.is_empty(), "{name} has no version, so no row");
                 assert_eq!(got, Fingerprint::Unknown, "{name}");
@@ -1379,13 +1615,19 @@ mod tests {
     /// sent; the newer has only the development tree's captures.)
     #[test]
     fn every_crawl_family_was_checked_against_more_than_one_release() {
-        let families: std::collections::BTreeSet<Family> = CRAWL_TABLE.iter().map(|r| r.family).collect();
+        let families: std::collections::BTreeSet<Family> =
+            CRAWL_TABLE.iter().map(|r| r.family).collect();
         for family in families {
             let releases: std::collections::BTreeSet<&str> = CRAWL_TABLE
                 .iter()
                 .filter(|r| r.family == family)
                 .flat_map(|r| r.captures.iter())
-                .map(|c| c.strip_suffix("-v2").unwrap_or(c).strip_suffix("-outbound-crawl").unwrap())
+                .map(|c| {
+                    c.strip_suffix("-v2")
+                        .unwrap_or(c)
+                        .strip_suffix("-outbound-crawl")
+                        .unwrap()
+                })
                 .collect();
             assert!(releases.len() >= 2, "{family}: {releases:?}");
         }
@@ -1400,45 +1642,84 @@ mod tests {
     fn a_perturbed_transcript_still_matches_by_its_traits() {
         type Edit = fn(&mut Vec<String>, &mut VersionFields);
         let cases: &[(&str, &str, Edit)] = &[
-            ("core-32.1-outbound-crawl", "erlay, the other order, 70018", |c, v| {
-                c.swap(1, 2);
-                c.insert(3, "sendtxrcncl".into());
-                v.protocol_version = 70018;
-                v.user_agent = "/Satoshi:33.0.0/".into();
-            }),
-            ("knots-29.5.1.knots20260508-outbound-crawl-v2", "a later first message", |c, v| {
-                let ping = c.iter().position(|x| x == "ping").unwrap();
-                c[ping] = "getheaders".into();
-                v.user_agent = "/Satoshi:30.2.0/Knots:20261201/".into();
-            }),
-            ("satd-0.8.0-pre-outbound-crawl", "feefilter before sendcmpct, 70017", |c, v| {
-                c.swap(4, 5);
-                v.protocol_version = 70017;
-                v.user_agent = "/satd:0.9.0/".into();
-            }),
-            ("satd-0.7.2-outbound-crawl-v2", "the other negotiation order", |c, v| {
-                c.swap(1, 2);
-                v.user_agent = "/satd:0.7.3/".into();
-            }),
-            ("rbitcoin-0.9.2-outbound-crawl-v2", "sendheaders last, a feefilter", |c, v| {
-                c.splice(4..6, ["sendcmpct".to_string(), "feefilter".into(), "sendheaders".into()]);
-                v.user_agent = "/rbitcoin:0.10.0/".into();
-            }),
-            ("btcd-0.27.0-outbound-crawl", "a getblocks after verack, 70017", |c, v| {
-                c.push("getblocks".into());
-                v.protocol_version = 70017;
-                v.user_agent = "/btcwire:0.5.0/btcd:0.28.0/".into();
-            }),
-            ("bcoin-2.2.0-outbound-crawl", "relay off, other services", |_, v| {
-                v.relay = false;
-                v.services = 1;
-                v.user_agent = "/bcoin:2.3.0/".into();
-            }),
-            ("libbitcoin-3.8.0-outbound-crawl", "other services and height", |_, v| {
-                v.services = 1;
-                v.start_height = 900_000;
-                v.user_agent = "/libbitcoin:4.0.0/".into();
-            }),
+            (
+                "core-32.1-outbound-crawl",
+                "erlay, the other order, 70018",
+                |c, v| {
+                    c.swap(1, 2);
+                    c.insert(3, "sendtxrcncl".into());
+                    v.protocol_version = 70018;
+                    v.user_agent = "/Satoshi:33.0.0/".into();
+                },
+            ),
+            (
+                "knots-29.5.1.knots20260508-outbound-crawl-v2",
+                "a later first message",
+                |c, v| {
+                    let ping = c.iter().position(|x| x == "ping").unwrap();
+                    c[ping] = "getheaders".into();
+                    v.user_agent = "/Satoshi:30.2.0/Knots:20261201/".into();
+                },
+            ),
+            (
+                "satd-0.8.0-pre-outbound-crawl",
+                "feefilter before sendcmpct, 70017",
+                |c, v| {
+                    c.swap(4, 5);
+                    v.protocol_version = 70017;
+                    v.user_agent = "/satd:0.9.0/".into();
+                },
+            ),
+            (
+                "satd-0.7.2-outbound-crawl-v2",
+                "the other negotiation order",
+                |c, v| {
+                    c.swap(1, 2);
+                    v.user_agent = "/satd:0.7.3/".into();
+                },
+            ),
+            (
+                "rbitcoin-0.9.2-outbound-crawl-v2",
+                "sendheaders last, a feefilter",
+                |c, v| {
+                    c.splice(
+                        4..6,
+                        [
+                            "sendcmpct".to_string(),
+                            "feefilter".into(),
+                            "sendheaders".into(),
+                        ],
+                    );
+                    v.user_agent = "/rbitcoin:0.10.0/".into();
+                },
+            ),
+            (
+                "btcd-0.27.0-outbound-crawl",
+                "a getblocks after verack, 70017",
+                |c, v| {
+                    c.push("getblocks".into());
+                    v.protocol_version = 70017;
+                    v.user_agent = "/btcwire:0.5.0/btcd:0.28.0/".into();
+                },
+            ),
+            (
+                "bcoin-2.2.0-outbound-crawl",
+                "relay off, other services",
+                |_, v| {
+                    v.relay = false;
+                    v.services = 1;
+                    v.user_agent = "/bcoin:2.3.0/".into();
+                },
+            ),
+            (
+                "libbitcoin-3.8.0-outbound-crawl",
+                "other services and height",
+                |_, v| {
+                    v.services = 1;
+                    v.start_height = 900_000;
+                    v.user_agent = "/libbitcoin:4.0.0/".into();
+                },
+            ),
         ];
         for (name, what, edit) in cases {
             let (r, f) = replay_crawl_fixture(name);
@@ -1469,17 +1750,32 @@ mod tests {
         assert_eq!(got.claimed_only(), Some(Family::Core));
         assert_eq!(got.to_string(), "core/claimed");
         for (ua, want) in [
-            ("/btcwire:0.5.0/btcd:0.27.0/", Fingerprint::Known(Family::Btcd, Confidence::Claimed)),
-            ("/satd:0.9.0/", Fingerprint::Known(Family::Satd, Confidence::Claimed)),
+            (
+                "/btcwire:0.5.0/btcd:0.27.0/",
+                Fingerprint::Known(Family::Btcd, Confidence::Claimed),
+            ),
+            (
+                "/satd:0.9.0/",
+                Fingerprint::Known(Family::Satd, Confidence::Claimed),
+            ),
             ("/bitcoin-lisp:0.1.0/", Fingerprint::Unknown),
             ("", Fingerprint::Unknown),
         ] {
-            let v = VersionFields { user_agent: ua.into(), ..v.clone() };
+            let v = VersionFields {
+                user_agent: ua.into(),
+                ..v.clone()
+            };
             assert_eq!(classify_crawl(&early, Some(&v), &f), want, "{ua}");
         }
         // A matched row still settles it: the claim plays no part then.
-        assert_eq!(crawl("core-28.1-outbound-crawl"), Fingerprint::Known(Family::Core, Confidence::High));
-        assert_eq!(Fingerprint::Known(Family::Core, Confidence::High).claimed_only(), None);
+        assert_eq!(
+            crawl("core-28.1-outbound-crawl"),
+            Fingerprint::Known(Family::Core, Confidence::High)
+        );
+        assert_eq!(
+            Fingerprint::Known(Family::Core, Confidence::High).claimed_only(),
+            None
+        );
         // No version, no user agent: unknown.
         assert_eq!(classify_crawl(&early, None, &f), Fingerprint::Unknown);
     }
@@ -1488,15 +1784,36 @@ mod tests {
     /// announcement came: before it, the announcements may be incomplete.
     #[test]
     fn an_absent_announcement_counts_only_once_the_announcements_ended() {
-        let v = replay_crawl_fixture("core-32.1-outbound-crawl").0.version.unwrap();
-        let open = Phases::of(&transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct"])).unwrap();
+        let v = replay_crawl_fixture("core-32.1-outbound-crawl")
+            .0
+            .version
+            .unwrap();
+        let open = Phases::of(&transcript(&[
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendcmpct",
+        ]))
+        .unwrap();
         assert!(open.then.is_none());
         assert!(!Trait::NeverAnnounces("feefilter").holds(&open, &v));
         assert!(Trait::Announces("sendcmpct").holds(&open, &v));
-        let ended = Phases::of(&transcript(&["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"])).unwrap();
+        let ended = Phases::of(&transcript(&[
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendcmpct",
+            "ping",
+        ]))
+        .unwrap();
         assert!(Trait::NeverAnnounces("feefilter").holds(&ended, &v));
         assert!(Trait::Then("ping").holds(&ended, &v));
-        assert!(Phases::of(&transcript(&["version", "wtxidrelay"])).is_none(), "no verack, no phases");
+        assert!(
+            Phases::of(&transcript(&["version", "wtxidrelay"])).is_none(),
+            "no verack, no phases"
+        );
     }
 
     /// The crawl rows are the crawl's: the node table does not know satd
@@ -1507,8 +1824,14 @@ mod tests {
     #[test]
     fn crawl_shapes_and_node_shapes_are_judged_by_their_own_tables() {
         let (r, _) = replay_crawl_fixture("satd-0.8.0-pre-outbound-crawl");
-        assert_eq!(classify(false, &r.capture, r.version.as_ref(), true), Fingerprint::Known(Family::Satd, Confidence::Claimed));
-        assert_eq!(crawl("satd-0.8.0-pre-outbound-crawl"), Fingerprint::Known(Family::Satd, Confidence::High));
+        assert_eq!(
+            classify(false, &r.capture, r.version.as_ref(), true),
+            Fingerprint::Known(Family::Satd, Confidence::Claimed)
+        );
+        assert_eq!(
+            crawl("satd-0.8.0-pre-outbound-crawl"),
+            Fingerprint::Known(Family::Satd, Confidence::High)
+        );
         let r = replay_fixture("satd-0.7.0-outbound");
         assert_eq!(
             classify_crawl(&r.capture, r.version.as_ref(), &CrawlFeatures::default()),
@@ -1516,9 +1839,17 @@ mod tests {
         );
         // The node classifier claims as the crawl's does: no row, the user
         // agent's family at `claimed`.
-        let v = VersionFields { user_agent: "/satd:0.7.0/".into(), ..r.version.clone().unwrap() };
+        let v = VersionFields {
+            user_agent: "/satd:0.7.0/".into(),
+            ..r.version.clone().unwrap()
+        };
         assert_eq!(
-            classify(false, &transcript(&["version", "verack", "inv"]), Some(&v), true),
+            classify(
+                false,
+                &transcript(&["version", "verack", "inv"]),
+                Some(&v),
+                true
+            ),
             Fingerprint::Known(Family::Satd, Confidence::Claimed)
         );
     }
@@ -1533,7 +1864,11 @@ mod tests {
         for name in ["core-32.1-outbound-crawl", "core-24.0.1-outbound-crawl-v2"] {
             let (r, mut f) = replay_crawl_fixture(name);
             f.probes.set(Probe::GetData, ProbeOutcome::Answered(1));
-            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Core, Confidence::High), "{name}");
+            assert_eq!(
+                classify_crawl(&r.capture, r.version.as_ref(), &f),
+                Fingerprint::Known(Family::Core, Confidence::High),
+                "{name}"
+            );
         }
         let claimed = |f: Family| Fingerprint::Known(f, Confidence::Claimed);
         for (name, family) in [
@@ -1543,50 +1878,84 @@ mod tests {
         ] {
             let (r, mut f) = replay_crawl_fixture(name);
             f.probes.set(Probe::GetData, ProbeOutcome::Silent);
-            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), claimed(family), "{name}");
+            assert_eq!(
+                classify_crawl(&r.capture, r.version.as_ref(), &f),
+                claimed(family),
+                "{name}"
+            );
         }
         // The unknown message: every capture leaves it unanswered.
         let (r, mut f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
         f.probes.set(Probe::Unknown, ProbeOutcome::Answered(0));
-        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), claimed(Family::Core));
+        assert_eq!(
+            classify_crawl(&r.capture, r.version.as_ref(), &f),
+            claimed(Family::Core)
+        );
         // A disconnect on any probe matches no row.
         for p in Probe::ALL {
             let (r, mut f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
             f.probes.set(p, ProbeOutcome::Disconnected);
-            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), claimed(Family::Core), "{}", p.name());
+            assert_eq!(
+                classify_crawl(&r.capture, r.version.as_ref(), &f),
+                claimed(Family::Core),
+                "{}",
+                p.name()
+            );
         }
         // `ping` and `getheaders` are not pinned: a slow pong or a node in
         // initial block download keeping quiet is no other implementation.
         let (r, mut f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
         f.probes.set(Probe::Ping, ProbeOutcome::Silent);
         f.probes.set(Probe::GetHeaders, ProbeOutcome::Silent);
-        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Core, Confidence::High));
+        assert_eq!(
+            classify_crawl(&r.capture, r.version.as_ref(), &f),
+            Fingerprint::Known(Family::Core, Confidence::High)
+        );
         // A session that sent no probe is judged on the rest.
         let (r, mut f) = replay_crawl_fixture("satd-0.8.0-pre-outbound-crawl-v2");
         f.probes = ProbeResults::default();
-        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Satd, Confidence::High));
+        assert_eq!(
+            classify_crawl(&r.capture, r.version.as_ref(), &f),
+            Fingerprint::Known(Family::Satd, Confidence::High)
+        );
     }
 
     /// No capture shows a decoy packet or a version packet with contents;
     /// the garbage length is random per connection and is not pinned.
     #[test]
     fn a_v2_greeting_its_captures_never_showed_is_only_claimed() {
-        for name in ["core-32.1-outbound-crawl-v2", "satd-0.8.0-pre-outbound-crawl-v2", "rbitcoin-0.8.99-outbound-crawl-v2"] {
+        for name in [
+            "core-32.1-outbound-crawl-v2",
+            "satd-0.8.0-pre-outbound-crawl-v2",
+            "rbitcoin-0.8.99-outbound-crawl-v2",
+        ] {
             let claimed = Fingerprint::Known(own_family(name), Confidence::Claimed);
             let (r, f) = replay_crawl_fixture(name);
             let mut g = f.v2.expect("a v2 capture");
             g.decoys = 1;
             let decoy = CrawlFeatures { v2: Some(g), ..f };
-            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &decoy), claimed, "{name}");
+            assert_eq!(
+                classify_crawl(&r.capture, r.version.as_ref(), &decoy),
+                claimed,
+                "{name}"
+            );
             let mut g = f.v2.unwrap();
             g.version_len = 4;
             let contents = CrawlFeatures { v2: Some(g), ..f };
-            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &contents), claimed, "{name}");
+            assert_eq!(
+                classify_crawl(&r.capture, r.version.as_ref(), &contents),
+                claimed,
+                "{name}"
+            );
             for garbage_len in [0, 4095] {
                 let mut g = f.v2.unwrap();
                 g.garbage_len = garbage_len;
                 let any = CrawlFeatures { v2: Some(g), ..f };
-                assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &any).observed(), Some(own_family(name)), "{name}");
+                assert_eq!(
+                    classify_crawl(&r.capture, r.version.as_ref(), &any).observed(),
+                    Some(own_family(name)),
+                    "{name}"
+                );
             }
         }
     }
@@ -1597,26 +1966,43 @@ mod tests {
     fn a_v2_only_shape_over_v1_is_only_claimed() {
         let (r, f) = replay_crawl_fixture("rbitcoin-0.8.99-outbound-crawl-v2");
         let v1 = CrawlFeatures { v2: None, ..f };
-        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &v1), Fingerprint::Known(Family::Rbitcoin, Confidence::Claimed));
+        assert_eq!(
+            classify_crawl(&r.capture, r.version.as_ref(), &v1),
+            Fingerprint::Known(Family::Rbitcoin, Confidence::Claimed)
+        );
         let (r, f) = replay_crawl_fixture("core-32.1-outbound-crawl-v2");
         let v1 = CrawlFeatures { v2: None, ..f };
-        assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &v1), Fingerprint::Known(Family::Core, Confidence::High));
+        assert_eq!(
+            classify_crawl(&r.capture, r.version.as_ref(), &v1),
+            Fingerprint::Known(Family::Core, Confidence::High)
+        );
     }
 
     /// Every capture answered `getaddr` in `addrv2`, as it was asked to;
     /// a legacy `addr` answer is no capture's.
     #[test]
     fn a_legacy_addr_answer_is_only_claimed() {
-        for name in ["core-24.0.1-outbound-crawl", "satd-0.8.0-pre-outbound-crawl", "rbitcoin-0.8.99-outbound-crawl-v2"] {
+        for name in [
+            "core-24.0.1-outbound-crawl",
+            "satd-0.8.0-pre-outbound-crawl",
+            "rbitcoin-0.8.99-outbound-crawl-v2",
+        ] {
             let (r, f) = replay_crawl_fixture(name);
-            let addr = CrawlFeatures { getaddr: Some(AddrKind::Addr), ..f };
+            let addr = CrawlFeatures {
+                getaddr: Some(AddrKind::Addr),
+                ..f
+            };
             assert_eq!(
                 classify_crawl(&r.capture, r.version.as_ref(), &addr),
                 Fingerprint::Known(own_family(name), Confidence::Claimed),
                 "{name}"
             );
             let none = CrawlFeatures { getaddr: None, ..f };
-            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &none).observed(), Some(own_family(name)), "{name}");
+            assert_eq!(
+                classify_crawl(&r.capture, r.version.as_ref(), &none).observed(),
+                Some(own_family(name)),
+                "{name}"
+            );
         }
     }
 
@@ -1629,10 +2015,16 @@ mod tests {
         v.user_agent = "/satd:0.8.0/".into();
         assert_eq!(
             classify_crawl(&r.capture, Some(&v), &f),
-            Fingerprint::Mismatch { claimed: Family::Satd, observed: Family::Core }
+            Fingerprint::Mismatch {
+                claimed: Family::Satd,
+                observed: Family::Core
+            }
         );
         v.user_agent = "/Satoshi:29.4.3/Knots:20260508/".into();
-        assert_eq!(classify_crawl(&r.capture, Some(&v), &f), Fingerprint::Known(Family::Core, Confidence::High));
+        assert_eq!(
+            classify_crawl(&r.capture, Some(&v), &f),
+            Fingerprint::Known(Family::Core, Confidence::High)
+        );
     }
 
     /// The v1-only rows admit no BIP 324 session: btcd, bcoin and
@@ -1647,24 +2039,46 @@ mod tests {
             ("libbitcoin-3.8.0-outbound-crawl", Family::Libbitcoin),
         ] {
             let (r, f) = replay_crawl_fixture(name);
-            assert_eq!(classify_crawl(&r.capture, r.version.as_ref(), &f), Fingerprint::Known(family, Confidence::High), "{name}");
-            let inside_v2 = CrawlFeatures { v2: Some(V2Greeting { garbage_len: 0, decoys: 0, version_len: 0 }), ..f };
+            assert_eq!(
+                classify_crawl(&r.capture, r.version.as_ref(), &f),
+                Fingerprint::Known(family, Confidence::High),
+                "{name}"
+            );
+            let inside_v2 = CrawlFeatures {
+                v2: Some(V2Greeting {
+                    garbage_len: 0,
+                    decoys: 0,
+                    version_len: 0,
+                }),
+                ..f
+            };
             assert_eq!(
                 classify_crawl(&r.capture, r.version.as_ref(), &inside_v2),
                 Fingerprint::Known(family, Confidence::Claimed),
                 "{name} over v2"
             );
         }
-        for (name, protocol_version) in [("bcoin-2.2.0-outbound-crawl", 70016), ("libbitcoin-3.8.0-outbound-crawl", 70015)] {
+        for (name, protocol_version) in [
+            ("bcoin-2.2.0-outbound-crawl", 70016),
+            ("libbitcoin-3.8.0-outbound-crawl", 70015),
+        ] {
             let (r, f) = replay_crawl_fixture(name);
             let mut v = r.version.clone().unwrap();
             v.protocol_version = protocol_version;
-            assert_eq!(classify_crawl(&r.capture, Some(&v), &f).observed(), None, "{name} at {protocol_version}");
+            assert_eq!(
+                classify_crawl(&r.capture, Some(&v), &f).observed(),
+                None,
+                "{name} at {protocol_version}"
+            );
         }
         let (r, f) = replay_crawl_fixture("libbitcoin-3.8.0-outbound-crawl");
         let mut v = r.version.clone().unwrap();
         v.relay = true;
-        assert_eq!(classify_crawl(&r.capture, Some(&v), &f).observed(), None, "libbitcoin with relay on");
+        assert_eq!(
+            classify_crawl(&r.capture, Some(&v), &f).observed(),
+            None,
+            "libbitcoin with relay on"
+        );
     }
 
     /// Where two families' rows share the traits, a session whose probe
@@ -1674,21 +2088,49 @@ mod tests {
     /// two captured families share their traits; Knots is Core.)
     #[test]
     fn a_probe_answer_that_tells_families_apart_is_high_confidence() {
-        let base = CRAWL_TABLE.iter().find(|r| r.family == Family::Satd).unwrap();
+        let base = CRAWL_TABLE
+            .iter()
+            .find(|r| r.family == Family::Satd)
+            .unwrap();
         let table = [
-            CrawlRow { captures: &[], family: Family::Satd, ..*base },
-            CrawlRow { captures: &[], family: Family::Btcd, probes: [Answer::Either, Answer::Either, Answer::Silent, Answer::Silent], ..*base },
-            CrawlRow { captures: &[], family: Family::Bcoin, traits: &[Trait::Protocol(1)], ..*base },
+            CrawlRow {
+                captures: &[],
+                family: Family::Satd,
+                ..*base
+            },
+            CrawlRow {
+                captures: &[],
+                family: Family::Btcd,
+                probes: [
+                    Answer::Either,
+                    Answer::Either,
+                    Answer::Silent,
+                    Answer::Silent,
+                ],
+                ..*base
+            },
+            CrawlRow {
+                captures: &[],
+                family: Family::Bcoin,
+                traits: &[Trait::Protocol(1)],
+                ..*base
+            },
         ];
         let (r, f) = replay_crawl_fixture("satd-0.8.0-pre-outbound-crawl");
         // btcd's row is ruled out by the notfound, bcoin's only by the protocol version.
-        assert_eq!(classify_crawl_in(&table, &r.capture, r.version.as_ref(), &f), Fingerprint::Known(Family::Satd, Confidence::Low));
+        assert_eq!(
+            classify_crawl_in(&table, &r.capture, r.version.as_ref(), &f),
+            Fingerprint::Known(Family::Satd, Confidence::Low)
+        );
         assert_eq!(
             classify_crawl_in(&table[..2], &r.capture, r.version.as_ref(), &f),
             Fingerprint::Known(Family::Satd, Confidence::High)
         );
         // Without the probe nothing but the version could tell them apart.
-        let unprobed = CrawlFeatures { probes: ProbeResults::default(), ..f };
+        let unprobed = CrawlFeatures {
+            probes: ProbeResults::default(),
+            ..f
+        };
         assert_eq!(
             classify_crawl_in(&table[..2], &r.capture, r.version.as_ref(), &unprobed),
             Fingerprint::Known(Family::Satd, Confidence::Low)

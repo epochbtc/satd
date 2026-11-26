@@ -62,7 +62,10 @@ pub fn check_outbound_limits(
     max_connections: usize,
 ) -> Result<(), String> {
     if max_full_relay == 0 {
-        return Err("-maxoutboundfullrelay must be at least 1 (-connect=0 opens no automatic connections)".into());
+        return Err(
+            "-maxoutboundfullrelay must be at least 1 (-connect=0 opens no automatic connections)"
+                .into(),
+        );
     }
     if max_full_relay > MAX_OUTBOUND_FULL_RELAY_CEILING {
         return Err(format!(
@@ -80,7 +83,9 @@ pub fn check_outbound_limits(
         ));
     }
     if alt_slots > max_connections {
-        return Err(format!("-maxconnections={max_connections} is too small to hold -altslots={alt_slots}"));
+        return Err(format!(
+            "-maxconnections={max_connections} is too small to hold -altslots={alt_slots}"
+        ));
     }
     Ok(())
 }
@@ -172,7 +177,10 @@ impl fmt::Display for Rule {
 impl Rule {
     /// The rule with alt-slots on and no `-altprefer`.
     pub fn default_rule() -> Rule {
-        Rule { terms: vec![Term::Family(FamilyTerm::NonCore)], cap: None }
+        Rule {
+            terms: vec![Term::Family(FamilyTerm::NonCore)],
+            cap: None,
+        }
     }
 
     /// Parse one `-altprefer` value. An unknown term kind, family or service
@@ -186,7 +194,9 @@ impl Rule {
         // may hold an `@` of its own.
         let (body, cap) = match s.rsplit_once('@') {
             Some((body, k)) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()) => {
-                let k: usize = k.parse().map_err(|_| format!("-altprefer={s}: the cap @{k} is too large"))?;
+                let k: usize = k
+                    .parse()
+                    .map_err(|_| format!("-altprefer={s}: the cap @{k} is too large"))?;
                 if k == 0 {
                     return Err(format!("-altprefer={s}: a cap of @0 fills no slot"));
                 }
@@ -197,26 +207,46 @@ impl Rule {
         let mut terms = Vec::new();
         for term in body.split('+') {
             let Some((kind, value)) = term.split_once(':') else {
-                return Err(format!("-altprefer={s}: \"{term}\" is not family:, ua: or svc:"));
+                return Err(format!(
+                    "-altprefer={s}: \"{term}\" is not family:, ua: or svc:"
+                ));
             };
             if value.is_empty() {
                 return Err(format!("-altprefer={s}: \"{term}\" has no value"));
             }
             terms.push(match kind.to_ascii_lowercase().as_str() {
                 "family" => Term::Family(parse_family(value).ok_or_else(|| {
-                    let names: Vec<&str> = Family::ALL.iter().map(|f| f.name()).chain(["non-core"]).collect();
-                    format!("-altprefer={s}: unknown family \"{value}\" (one of {})", names.join(", "))
+                    let names: Vec<&str> = Family::ALL
+                        .iter()
+                        .map(|f| f.name())
+                        .chain(["non-core"])
+                        .collect();
+                    format!(
+                        "-altprefer={s}: unknown family \"{value}\" (one of {})",
+                        names.join(", ")
+                    )
                 })?),
                 "ua" => Term::Ua(value.to_string()),
                 "svc" => {
                     let lower = value.to_ascii_lowercase();
-                    let (name, bit) = SERVICE_NAMES.iter().find(|(n, _)| *n == lower).copied().ok_or_else(|| {
-                        let names: Vec<&str> = SERVICE_NAMES.iter().map(|(n, _)| *n).collect();
-                        format!("-altprefer={s}: unknown service \"{value}\" (one of {})", names.join(", "))
-                    })?;
+                    let (name, bit) = SERVICE_NAMES
+                        .iter()
+                        .find(|(n, _)| *n == lower)
+                        .copied()
+                        .ok_or_else(|| {
+                            let names: Vec<&str> = SERVICE_NAMES.iter().map(|(n, _)| *n).collect();
+                            format!(
+                                "-altprefer={s}: unknown service \"{value}\" (one of {})",
+                                names.join(", ")
+                            )
+                        })?;
                     Term::Svc(name, bit)
                 }
-                _ => return Err(format!("-altprefer={s}: \"{term}\" is not family:, ua: or svc:")),
+                _ => {
+                    return Err(format!(
+                        "-altprefer={s}: \"{term}\" is not family:, ua: or svc:"
+                    ));
+                }
             });
         }
         Ok(Rule { terms, cap })
@@ -231,7 +261,9 @@ impl Rule {
         let trust = c.trust();
         self.terms.iter().all(|term| match term {
             Term::Family(FamilyTerm::Is(f)) => c.fingerprint.observed() == Some(*f),
-            Term::Family(FamilyTerm::NonCore) => c.fingerprint.observed().is_some_and(|f| f != Family::Core),
+            Term::Family(FamilyTerm::NonCore) => {
+                c.fingerprint.observed().is_some_and(|f| f != Family::Core)
+            }
             Term::Ua(glob) => mode.admits(trust) && glob_match(glob, c.user_agent),
             Term::Svc(_, bit) => c.services & bit == *bit,
         })
@@ -252,7 +284,10 @@ fn parse_family(value: &str) -> Option<FamilyTerm> {
     if lower == "non-core" {
         return Some(FamilyTerm::NonCore);
     }
-    Family::ALL.iter().find(|f| f.name() == lower).map(|f| FamilyTerm::Is(*f))
+    Family::ALL
+        .iter()
+        .find(|f| f.name() == lower)
+        .map(|f| FamilyTerm::Is(*f))
 }
 
 /// `-altuatrust`: how far a `ua:` term trusts the claimed user agent.
@@ -273,7 +308,9 @@ impl UaTrust {
             "strict" => Ok(UaTrust::Strict),
             "consistent" => Ok(UaTrust::Consistent),
             "any" => Ok(UaTrust::Any),
-            other => Err(format!("-altuatrust must be strict, consistent or any, not \"{other}\"")),
+            other => Err(format!(
+                "-altuatrust must be strict, consistent or any, not \"{other}\""
+            )),
         }
     }
 
@@ -331,9 +368,13 @@ impl Candidate<'_> {
     pub fn trust(&self) -> Trust {
         match (self.fingerprint, Family::claimed_by(self.user_agent)) {
             // A claimed family is the user agent's word alone.
-            (Fingerprint::Unknown | Fingerprint::Known(_, Confidence::Claimed), _) => Trust::Unverified,
+            (Fingerprint::Unknown | Fingerprint::Known(_, Confidence::Claimed), _) => {
+                Trust::Unverified
+            }
             (Fingerprint::Mismatch { .. }, _) => Trust::Contradicted,
-            (Fingerprint::Known(observed, _), Some(claimed)) if claimed == observed => Trust::Verified,
+            (Fingerprint::Known(observed, _), Some(claimed)) if claimed == observed => {
+                Trust::Verified
+            }
             (Fingerprint::Known(..), Some(_)) => Trust::Contradicted,
             (Fingerprint::Known(..), None) => Trust::Unverified,
         }
@@ -375,9 +416,23 @@ impl Default for AltConfig {
 
 impl AltConfig {
     /// From the options' values; `rules` empty takes the default rule.
-    pub fn new(slots: usize, rules: Vec<Rule>, ua_trust: UaTrust, fill_wait: Duration) -> AltConfig {
-        let rules = if rules.is_empty() { vec![Rule::default_rule()] } else { rules };
-        AltConfig { slots, rules, ua_trust, fill_wait }
+    pub fn new(
+        slots: usize,
+        rules: Vec<Rule>,
+        ua_trust: UaTrust,
+        fill_wait: Duration,
+    ) -> AltConfig {
+        let rules = if rules.is_empty() {
+            vec![Rule::default_rule()]
+        } else {
+            rules
+        };
+        AltConfig {
+            slots,
+            rules,
+            ua_trust,
+            fill_wait,
+        }
     }
 
     /// The first rule `c` matches that has a slot left under its cap, with
@@ -390,7 +445,10 @@ impl AltConfig {
 
     /// The rules with a slot left under their cap.
     pub fn open_rules(&self, used: impl Fn(&Rule) -> usize) -> Vec<&Rule> {
-        self.rules.iter().filter(|r| r.cap.is_none_or(|k| used(r) < k)).collect()
+        self.rules
+            .iter()
+            .filter(|r| r.cap.is_none_or(|k| used(r) < k))
+            .collect()
     }
 }
 
@@ -438,7 +496,12 @@ mod tests {
     use super::*;
 
     fn cand(fp: Fingerprint, ua: &str) -> Candidate<'_> {
-        Candidate { fingerprint: fp, user_agent: ua, services: 0, flags: FlagSet::default() }
+        Candidate {
+            fingerprint: fp,
+            user_agent: ua,
+            services: 0,
+            flags: FlagSet::default(),
+        }
     }
 
     fn known(f: Family) -> Fingerprint {
@@ -465,7 +528,10 @@ mod tests {
         assert_eq!(r.cap, Some(2));
         assert_eq!(
             r.terms,
-            vec![Term::Family(FamilyTerm::Is(Family::Floresta)), Term::Svc("compact_filters", 1 << 6)]
+            vec![
+                Term::Family(FamilyTerm::Is(Family::Floresta)),
+                Term::Svc("compact_filters", 1 << 6)
+            ]
         );
         assert_eq!(Rule::parse("ua:/Knots:*@1").unwrap().cap, Some(1));
         // An `@` not followed by a count is part of the glob.
@@ -494,7 +560,10 @@ mod tests {
     fn the_default_rule_is_non_core() {
         let c = AltConfig::new(2, Vec::new(), UaTrust::Consistent, Duration::ZERO);
         assert_eq!(c.rules, vec![Rule::parse("family:non-core").unwrap()]);
-        assert!(c.rules[0].matches(&cand(known(Family::Btcd), "/btcwire:0.5.0/btcd:0.24.2/"), c.ua_trust));
+        assert!(c.rules[0].matches(
+            &cand(known(Family::Btcd), "/btcwire:0.5.0/btcd:0.24.2/"),
+            c.ua_trust
+        ));
         assert!(!c.rules[0].matches(&cand(known(Family::Core), "/Satoshi:28.1.0/"), c.ua_trust));
         assert!(!c.rules[0].matches(&cand(Fingerprint::Unknown, "/btcd:0.24.2/"), c.ua_trust));
     }
@@ -507,10 +576,16 @@ mod tests {
         let knots = "/Satoshi:28.1.0/Knots:20250305/";
         assert_eq!(cand(known(Family::Core), knots).trust(), Trust::Verified);
         assert_eq!(cand(Fingerprint::Unknown, knots).trust(), Trust::Unverified);
-        let contradicted = Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd };
+        let contradicted = Fingerprint::Mismatch {
+            claimed: Family::Core,
+            observed: Family::Btcd,
+        };
         assert_eq!(cand(contradicted, knots).trust(), Trust::Contradicted);
         // An agent naming no family the table knows.
-        assert_eq!(cand(known(Family::Core), "/Custom:1.0/").trust(), Trust::Unverified);
+        assert_eq!(
+            cand(known(Family::Core), "/Custom:1.0/").trust(),
+            Trust::Unverified
+        );
         // A claimed family is the agent's word alone: unverified, and no
         // family term matches it.
         let claimed = cand(Fingerprint::Known(Family::Core, Confidence::Claimed), knots);
@@ -518,9 +593,19 @@ mod tests {
         assert_eq!(claimed.fingerprint.observed(), None);
         // As the survey and connected peers now claim too: no family rule
         // takes a claim, and a strict `ua:` rule does not either.
-        let btcd = cand(Fingerprint::Known(Family::Btcd, Confidence::Claimed), "/btcwire:0.5.0/btcd:0.25.0/");
-        for (rule, c) in [("family:core", claimed), ("family:non-core", btcd), ("family:btcd", btcd)] {
-            assert!(!Rule::parse(rule).unwrap().matches(&c, UaTrust::Consistent), "{rule}");
+        let btcd = cand(
+            Fingerprint::Known(Family::Btcd, Confidence::Claimed),
+            "/btcwire:0.5.0/btcd:0.25.0/",
+        );
+        for (rule, c) in [
+            ("family:core", claimed),
+            ("family:non-core", btcd),
+            ("family:btcd", btcd),
+        ] {
+            assert!(
+                !Rule::parse(rule).unwrap().matches(&c, UaTrust::Consistent),
+                "{rule}"
+            );
         }
         let ua = Rule::parse("ua:/Satoshi:*Knots*").unwrap();
         assert!(!ua.matches(&claimed, UaTrust::Strict));
@@ -533,10 +618,14 @@ mod tests {
         let knots = "/Satoshi:28.1.0/Knots:20250305/";
         let verified = cand(known(Family::Core), knots);
         let unverified = cand(Fingerprint::Unknown, knots);
-        let contradicted = cand(Fingerprint::Mismatch { claimed: Family::Core, observed: Family::Btcd }, knots);
-        let got = |mode| {
-            [verified, unverified, contradicted].map(|c| rule.matches(&c, mode))
-        };
+        let contradicted = cand(
+            Fingerprint::Mismatch {
+                claimed: Family::Core,
+                observed: Family::Btcd,
+            },
+            knots,
+        );
+        let got = |mode| [verified, unverified, contradicted].map(|c| rule.matches(&c, mode));
         assert_eq!(got(UaTrust::Strict), [true, false, false]);
         assert_eq!(got(UaTrust::Consistent), [true, true, false]);
         assert_eq!(got(UaTrust::Any), [true, true, true]);
@@ -548,7 +637,10 @@ mod tests {
         for flag in [Flag::Crawler, Flag::Spy, Flag::FingerprintMismatch] {
             let mut flags = FlagSet::default();
             flags.insert(flag);
-            let c = Candidate { flags, ..cand(known(Family::Btcd), "/btcd:0.24.2/") };
+            let c = Candidate {
+                flags,
+                ..cand(known(Family::Btcd), "/btcd:0.24.2/")
+            };
             assert!(!rule.matches(&c, UaTrust::Strict), "{flag:?}");
             assert!(!rule.matches(&c, UaTrust::Consistent), "{flag:?}");
             assert!(rule.matches(&c, UaTrust::Any), "{flag:?}");
@@ -556,14 +648,20 @@ mod tests {
         // Another flag does not.
         let mut flags = FlagSet::default();
         flags.insert(Flag::Stalling);
-        let c = Candidate { flags, ..cand(known(Family::Btcd), "/btcd:0.24.2/") };
+        let c = Candidate {
+            flags,
+            ..cand(known(Family::Btcd), "/btcd:0.24.2/")
+        };
         assert!(rule.matches(&c, UaTrust::Strict));
     }
 
     #[test]
     fn svc_terms_need_every_bit() {
         let rule = Rule::parse("family:floresta+svc:compact_filters").unwrap();
-        let c = Candidate { services: 1 | (1 << 6), ..cand(known(Family::Floresta), "/Floresta:0.7.0/") };
+        let c = Candidate {
+            services: 1 | (1 << 6),
+            ..cand(known(Family::Floresta), "/Floresta:0.7.0/")
+        };
         assert!(rule.matches(&c, UaTrust::Consistent));
         assert!(!rule.matches(&Candidate { services: 1, ..c }, UaTrust::Consistent));
         assert!(rule.services_may_match(1 | (1 << 6)));
@@ -575,7 +673,10 @@ mod tests {
     fn earlier_rules_first_and_caps_hold() {
         let c = AltConfig::new(
             4,
-            vec![Rule::parse("family:btcd@1").unwrap(), Rule::parse("family:non-core").unwrap()],
+            vec![
+                Rule::parse("family:btcd@1").unwrap(),
+                Rule::parse("family:non-core").unwrap(),
+            ],
             UaTrust::Consistent,
             Duration::ZERO,
         );
@@ -583,8 +684,16 @@ mod tests {
         assert_eq!(c.choose(&btcd, |_| 0).unwrap().to_string(), "family:btcd@1");
         // The capped rule is full; the next takes it.
         let first = c.rules[0].clone();
-        assert_eq!(c.choose(&btcd, |r| usize::from(*r == first)).unwrap().to_string(), "family:non-core");
-        assert!(c.choose(&cand(known(Family::Core), "/Satoshi:28.1.0/"), |_| 0).is_none());
+        assert_eq!(
+            c.choose(&btcd, |r| usize::from(*r == first))
+                .unwrap()
+                .to_string(),
+            "family:non-core"
+        );
+        assert!(
+            c.choose(&cand(known(Family::Core), "/Satoshi:28.1.0/"), |_| 0)
+                .is_none()
+        );
     }
 
     #[test]
@@ -612,7 +721,10 @@ mod tests {
         assert!(check_outbound_limits(8, false, 9, 125).is_err());
         assert!(check_outbound_limits(12, false, 9, 125).is_ok());
         assert!(check_outbound_limits(8, false, 6, 5).is_err());
-        assert!(check_outbound_limits(8, false, 0, 0).is_ok(), "-maxconnections=0 with no alt-slots stays Core's");
+        assert!(
+            check_outbound_limits(8, false, 0, 0).is_ok(),
+            "-maxconnections=0 with no alt-slots stays Core's"
+        );
         assert!(outbound_limit_warnings(8, 4).is_empty());
         assert_eq!(outbound_limit_warnings(9, 0).len(), 1);
         assert_eq!(outbound_limit_warnings(8, 5).len(), 1);

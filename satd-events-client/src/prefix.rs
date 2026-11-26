@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 
 use bitcoin::consensus;
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::{Hash, sha256};
 use bitcoin::{Script, ScriptBuf, Transaction, Txid};
 
 use crate::error::StreamError;
@@ -177,7 +177,8 @@ impl PrefixWatcher {
 
     /// Stop watching a scriptPubKey. Returns whether it had been watched.
     pub fn unwatch_script(&mut self, script_pubkey: &Script) -> bool {
-        self.watched.remove(&scripthash_of(script_pubkey.as_bytes()))
+        self.watched
+            .remove(&scripthash_of(script_pubkey.as_bytes()))
     }
 
     /// Whether `scripthash` is in the watched set.
@@ -213,8 +214,11 @@ impl PrefixWatcher {
     /// buckets in the same order.
     pub fn prefixes(&self, bits: u32) -> Vec<(Vec<u8>, u32)> {
         let bits = bits.clamp(1, crate::client::MAX_PREFIX_BITS);
-        let buckets: HashSet<Vec<u8>> =
-            self.watched.iter().map(|sh| mask_prefix(sh, bits)).collect();
+        let buckets: HashSet<Vec<u8>> = self
+            .watched
+            .iter()
+            .map(|sh| mask_prefix(sh, bits))
+            .collect();
         let mut out: Vec<(Vec<u8>, u32)> = buckets.into_iter().map(|p| (p, bits)).collect();
         out.sort();
         out
@@ -288,10 +292,13 @@ impl PrefixWatcher {
 /// Locate the input index that spends `outpoint` in `tx`, comparing the raw
 /// (internal byte order) txid and vout the wire carries.
 fn find_vin(tx: &Transaction, outpoint: &Outpoint) -> Option<u32> {
-    tx.input.iter().position(|i| {
-        i.previous_output.vout == outpoint.vout
-            && i.previous_output.txid.to_byte_array().as_slice() == outpoint.txid.as_slice()
-    }).map(|p| p as u32)
+    tx.input
+        .iter()
+        .position(|i| {
+            i.previous_output.vout == outpoint.vout
+                && i.previous_output.txid.to_byte_array().as_slice() == outpoint.txid.as_slice()
+        })
+        .map(|p| p as u32)
 }
 
 #[cfg(test)]
@@ -309,7 +316,10 @@ mod tests {
         let txid = Txid::from_byte_array([byte; 32]);
         (
             OutPoint { txid, vout },
-            Outpoint { txid: txid.to_byte_array().to_vec(), vout },
+            Outpoint {
+                txid: txid.to_byte_array().to_vec(),
+                vout,
+            },
         )
     }
 
@@ -324,7 +334,10 @@ mod tests {
 
     fn prefix_match(tx: &Transaction, prevouts: Vec<SpentPrevout>) -> PrefixMatch {
         PrefixMatch {
-            prefix: ScriptPrefix { prefix: vec![0u8, 0u8], bits: 16 },
+            prefix: ScriptPrefix {
+                prefix: vec![0u8, 0u8],
+                bits: 16,
+            },
             raw_tx: consensus::serialize(tx),
             raw_tx_stripped: false,
             txid: tx.compute_txid().to_byte_array().to_vec(),
@@ -361,7 +374,11 @@ mod tests {
         assert_eq!(p[1], sh[1] & 0xf0, "the 4 bits past the width are zeroed");
         // Same bucket either way, which is the point: masking is free.
         let key = |b0: u8, b1: u8| u32::from_be_bytes([b0, b1, 0, 0]) & (u32::MAX << 20);
-        assert_eq!(key(p[0], p[1]), key(sh[0], sh[1]), "masking must not move the bucket");
+        assert_eq!(
+            key(p[0], p[1]),
+            key(sh[0], sh[1]),
+            "masking must not move the bucket"
+        );
     }
 
     /// Two scripts in the same bucket must register ONE bucket.
@@ -434,8 +451,14 @@ mod tests {
 
         let tx = tx_with(
             vec![
-                TxOut { value: Amount::from_sat(500), script_pubkey: decoy },
-                TxOut { value: Amount::from_sat(1234), script_pubkey: watched.clone() },
+                TxOut {
+                    value: Amount::from_sat(500),
+                    script_pubkey: decoy,
+                },
+                TxOut {
+                    value: Amount::from_sat(1234),
+                    script_pubkey: watched.clone(),
+                },
             ],
             vec![],
         );
@@ -454,7 +477,10 @@ mod tests {
         let mut w = PrefixWatcher::new();
         w.watch_script(&spk(1));
         let tx = tx_with(
-            vec![TxOut { value: Amount::from_sat(9), script_pubkey: spk(99) }],
+            vec![TxOut {
+                value: Amount::from_sat(9),
+                script_pubkey: spk(99),
+            }],
             vec![],
         );
         let hits = w.filter(&prefix_match(&tx, vec![])).unwrap();
@@ -470,7 +496,10 @@ mod tests {
 
         let (op_btc, op_wire) = dummy_outpoint(0xaa, 3);
         let tx = tx_with(
-            vec![TxOut { value: Amount::from_sat(10), script_pubkey: spk(42) }],
+            vec![TxOut {
+                value: Amount::from_sat(10),
+                script_pubkey: spk(42),
+            }],
             vec![
                 TxIn {
                     previous_output: dummy_outpoint(0xbb, 0).0,
@@ -504,11 +533,18 @@ mod tests {
         w.watch_script(&spk(5));
         let (_op_btc, op_wire) = dummy_outpoint(0xcc, 1);
         let tx = tx_with(
-            vec![TxOut { value: Amount::from_sat(10), script_pubkey: spk(42) }],
+            vec![TxOut {
+                value: Amount::from_sat(10),
+                script_pubkey: spk(42),
+            }],
             vec![],
         );
         // Empty script_pubkey = server did not retain it.
-        let prevout = SpentPrevout { outpoint: op_wire.clone(), script_pubkey: vec![], amount: None };
+        let prevout = SpentPrevout {
+            outpoint: op_wire.clone(),
+            script_pubkey: vec![],
+            amount: None,
+        };
         let hits = w.filter(&prefix_match(&tx, vec![prevout])).unwrap();
         assert!(!hits.is_match()); // no confirmable hit
         assert!(hits.has_unresolved());
@@ -536,7 +572,10 @@ mod tests {
     fn garbage_raw_tx_is_decode_error() {
         let w = PrefixWatcher::new();
         let m = PrefixMatch {
-            prefix: ScriptPrefix { prefix: vec![0, 0], bits: 16 },
+            prefix: ScriptPrefix {
+                prefix: vec![0, 0],
+                bits: 16,
+            },
             raw_tx: vec![0xff, 0x00, 0x01],
             raw_tx_stripped: false,
             txid: vec![],
@@ -557,15 +596,31 @@ mod tests {
         w.watch_script(&spk(7));
         let (op, wire_op) = dummy_outpoint(0x11, 0);
         let tx = tx_with(
-            vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: spk(7) }],
-            vec![TxIn { previous_output: op, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }],
+            vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk(7),
+            }],
+            vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
         );
         let mut m = prefix_match(
             &tx,
-            vec![SpentPrevout { outpoint: wire_op.clone(), script_pubkey: spk(7).to_bytes(), amount: Some(5) }],
+            vec![SpentPrevout {
+                outpoint: wire_op.clone(),
+                script_pubkey: spk(7).to_bytes(),
+                amount: Some(5),
+            }],
         );
         let intact = w.filter(&m).unwrap();
-        assert_eq!(intact.funding.len(), 1, "premise: the intact match funds the script");
+        assert_eq!(
+            intact.funding.len(),
+            1,
+            "premise: the intact match funds the script"
+        );
         assert!(!intact.outputs_unavailable);
         assert!(!intact.has_unresolved());
 
@@ -575,7 +630,10 @@ mod tests {
         assert_eq!(hits.txid, tx.compute_txid());
         assert!(hits.funding.is_empty());
         assert!(hits.outputs_unavailable);
-        assert!(hits.has_unresolved(), "the caller must still fetch the outputs");
+        assert!(
+            hits.has_unresolved(),
+            "the caller must still fetch the outputs"
+        );
         assert_eq!(hits.spending.len(), 1);
         assert_eq!(hits.spending[0].vin, None);
         assert_eq!(hits.spending[0].outpoint, wire_op);

@@ -60,16 +60,25 @@ pub(super) const MIN_ENTRY_LEN: usize = 64;
 
 /// Value tiers, by coin value in satoshis: each is below its bound, the
 /// last unbounded.
-const VALUE_TIERS: [(&str, u64); 4] =
-    [("<0.01", 1_000_000), ("0.01-1", 100_000_000), ("1-100", 10_000_000_000), (">=100", u64::MAX)];
+const VALUE_TIERS: [(&str, u64); 4] = [
+    ("<0.01", 1_000_000),
+    ("0.01-1", 100_000_000),
+    ("1-100", 10_000_000_000),
+    (">=100", u64::MAX),
+];
 /// Anchor-age buckets in blocks (tip height − anchor height): about two
 /// weeks, three months, and the freshness window, which no valid
 /// attestation reaches.
 const ANCHOR_AGES: [(&str, u32); 3] = [("<2016", 2_016), ("<13104", 13_104), ("<26208", 26_208)];
 /// Coin-age buckets in blocks at the tip (tip height − coin height): about
 /// three months, one, two and five years, and older.
-const COIN_AGES: [(&str, u32); 5] =
-    [("<13104", 13_104), ("<52416", 52_416), ("<104832", 104_832), ("<262080", 262_080), (">=262080", u32::MAX)];
+const COIN_AGES: [(&str, u32); 5] = [
+    ("<13104", 13_104),
+    ("<52416", 52_416),
+    ("<104832", 104_832),
+    ("<262080", 262_080),
+    (">=262080", u32::MAX),
+];
 /// Script types, by the coin's scriptPubKey.
 const SCRIPT_TYPES: [&str; 6] = ["p2pkh", "p2sh", "p2wpkh", "p2wsh", "p2tr", "other"];
 /// The largest outpoints whose share of a value's weight a report gives.
@@ -89,7 +98,9 @@ pub struct Snapshot {
 /// `atts` in snapshot order: ascending by id, each once. Owned
 /// attestations or references to them, so a set can be ordered without
 /// copying it.
-pub fn canonical<A: Borrow<Attestation> + Send + Sync>(atts: impl IntoIterator<Item = A>) -> Vec<A> {
+pub fn canonical<A: Borrow<Attestation> + Send + Sync>(
+    atts: impl IntoIterator<Item = A>,
+) -> Vec<A> {
     let atts: Vec<A> = atts.into_iter().collect();
     let ids = par::map(&atts, |a| a.borrow().id());
     let mut keyed: Vec<(sha256::Hash, A)> = ids.into_iter().zip(atts).collect();
@@ -105,7 +116,10 @@ pub(super) const ENTRY_BATCH: usize = 4_096;
 /// Write the entries to `w` in order: each attestation's wire form
 /// prefixed by its length. They are serialized [`ENTRY_BATCH`] at a time,
 /// so the whole set is never in one buffer.
-fn write_entries<'a>(w: &mut dyn Write, atts: impl IntoIterator<Item = &'a Attestation>) -> std::io::Result<()> {
+fn write_entries<'a>(
+    w: &mut dyn Write,
+    atts: impl IntoIterator<Item = &'a Attestation>,
+) -> std::io::Result<()> {
     let mut atts = atts.into_iter();
     let mut batch: Vec<&Attestation> = Vec::with_capacity(ENTRY_BATCH);
     loop {
@@ -150,7 +164,10 @@ impl Write for Hashing<'_> {
 /// hashed an entry at a time.
 pub fn digest<'a>(atts: impl IntoIterator<Item = &'a Attestation>) -> sha256::Hash {
     let mut sink = std::io::sink();
-    let mut hashing = Hashing { inner: &mut sink, engine: sha256::Hash::engine() };
+    let mut hashing = Hashing {
+        inner: &mut sink,
+        engine: sha256::Hash::engine(),
+    };
     write_entries(&mut hashing, atts).expect("a sink does not fail");
     sha256::Hash::from_engine(hashing.engine)
 }
@@ -164,13 +181,19 @@ pub fn write_snapshot(
     hash: BlockHash,
     atts: &[Attestation],
 ) -> std::io::Result<sha256::Hash> {
-    let mut hashing = Hashing { inner: w, engine: sha256::Hash::engine() };
+    let mut hashing = Hashing {
+        inner: w,
+        engine: sha256::Hash::engine(),
+    };
     hashing.write_all(MAGIC)?;
     hashing.write_all(&SNAPSHOT_VERSION.to_le_bytes())?;
     hashing.write_all(&height.to_le_bytes())?;
     hashing.write_all(hash.as_byte_array())?;
     hashing.write_all(&(atts.len() as u32).to_le_bytes())?;
-    let mut entries = Hashing { inner: &mut hashing, engine: sha256::Hash::engine() };
+    let mut entries = Hashing {
+        inner: &mut hashing,
+        engine: sha256::Hash::engine(),
+    };
     write_entries(&mut entries, atts)?;
     let digest = sha256::Hash::from_engine(entries.engine);
     let checksum = sha256::Hash::from_engine(hashing.engine);
@@ -208,13 +231,17 @@ pub fn decode_snapshot(bytes: &[u8], max: usize) -> Result<Snapshot, String> {
     let hash = BlockHash::from_byte_array(body[12..44].try_into().expect("32 bytes"));
     let count = u32_at(44) as usize;
     if max != 0 && count > max {
-        return Err(format!("the snapshot holds {count} attestations, more than the {max} this node takes"));
+        return Err(format!(
+            "the snapshot holds {count} attestations, more than the {max} this node takes"
+        ));
     }
     let mut rest = &body[HEADER_LEN..];
     let mut out: Vec<Attestation> = Vec::with_capacity(room_for(count, rest.len()));
     let mut last: Option<sha256::Hash> = None;
     for i in 0..count {
-        let len = encode::VarInt::consensus_decode(&mut rest).map_err(|e| format!("entry {i}: {e}"))?.0;
+        let len = encode::VarInt::consensus_decode(&mut rest)
+            .map_err(|e| format!("entry {i}: {e}"))?
+            .0;
         if len > MAX_ATTESTATION_SIZE as u64 || rest.len() < len as usize {
             return Err(format!("entry {i}: bad length {len}"));
         }
@@ -231,7 +258,11 @@ pub fn decode_snapshot(bytes: &[u8], max: usize) -> Result<Snapshot, String> {
     if !rest.is_empty() {
         return Err(format!("{} bytes follow the last entry", rest.len()));
     }
-    Ok(Snapshot { height, hash, attestations: out })
+    Ok(Snapshot {
+        height,
+        hash,
+        attestations: out,
+    })
 }
 
 /// The longest snapshot file holding at most `max` attestations (0 is no
@@ -239,7 +270,8 @@ pub fn decode_snapshot(bytes: &[u8], max: usize) -> Result<Snapshot, String> {
 /// whose length prefix is three bytes.
 fn max_snapshot_len(max: usize) -> Option<u64> {
     (max != 0).then(|| {
-        ((max as u64).saturating_mul((3 + MAX_ATTESTATION_SIZE) as u64)).saturating_add((HEADER_LEN + CHECKSUM_LEN) as u64)
+        ((max as u64).saturating_mul((3 + MAX_ATTESTATION_SIZE) as u64))
+            .saturating_add((HEADER_LEN + CHECKSUM_LEN) as u64)
     })
 }
 
@@ -258,7 +290,9 @@ pub fn read_snapshot(path: &Path, max: usize) -> Result<Snapshot, String> {
     let mut bytes = Vec::new();
     match max_snapshot_len(max) {
         Some(limit) => {
-            file.take(limit.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            file.take(limit.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("reading {}: {e}", path.display()))?;
             if bytes.len() as u64 > limit {
                 return Err(format!(
                     "{}: the file is longer than a snapshot of {max} attestations can be",
@@ -268,7 +302,8 @@ pub fn read_snapshot(path: &Path, max: usize) -> Result<Snapshot, String> {
         }
         None => {
             let mut file = file;
-            file.read_to_end(&mut bytes).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("reading {}: {e}", path.display()))?;
         }
     }
     decode_snapshot(&bytes, max).map_err(|e| format!("{}: {e}", path.display()))
@@ -290,7 +325,10 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// [`write_new`], the contents written by `write`, which may run twice (the
 /// second time to `path` directly, on a filesystem without hard links). Its
 /// writes are buffered on their way to the file, so it can stream.
-pub fn write_new_with(path: &Path, write: impl Fn(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<()> {
+pub fn write_new_with(
+    path: &Path,
+    write: impl Fn(&mut dyn Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     write_new_linking(path, write, |from, to| std::fs::hard_link(from, to))
 }
 
@@ -302,18 +340,32 @@ pub(super) fn write_new_linking(
     link: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let name = path.file_name().ok_or_else(|| std::io::Error::other("the path names no file"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("the path names no file"))?;
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{}.{}.{seq}.tmp", name.to_string_lossy(), std::process::id()));
+    let tmp = dir.join(format!(
+        ".{}.{}.{seq}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
     let linked = write_synced(&tmp, &write).and_then(|()| link(&tmp, path));
     let _ = std::fs::remove_file(&tmp);
     match linked {
         // `link(2)` fails with EPERM (PermissionDenied) on a filesystem
         // without hard links, such as FAT and exFAT. A real permission
         // problem fails the direct write the same way.
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
             write_synced(path, &write)?
         }
         other => other?,
@@ -329,12 +381,21 @@ pub(super) fn write_new_linking(
 /// Create `path`, which must not exist, with what `write` writes, buffered
 /// and synced. A failed write removes the file it created; a file it did
 /// not create is never touched.
-fn write_synced(path: &Path, write: &dyn Fn(&mut dyn Write) -> std::io::Result<()>) -> std::io::Result<()> {
-    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+fn write_synced(
+    path: &Path,
+    write: &dyn Fn(&mut dyn Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     let written = (|| {
         let mut buffered = std::io::BufWriter::new(file);
         write(&mut buffered)?;
-        buffered.into_inner().map_err(|e| e.into_error())?.sync_all()
+        buffered
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(path);
@@ -397,7 +458,11 @@ pub fn replay(chain: &impl ChainSource, atts: &[Attestation]) -> Option<Replay> 
         }
         let (tip, counting) = chain.read(&|v| counting_at(&held, v))?;
         if read_at == (tip.height, Some(tip.hash)) {
-            return Some(Replay { tip, counting, invalid });
+            return Some(Replay {
+                tip,
+                counting,
+                invalid,
+            });
         }
     }
     None
@@ -438,13 +503,19 @@ impl Cache {
     ) -> Result<Value, E> {
         let mut cached = self.0.lock();
         let fresh = |c: &&Cached| {
-            c.tip == tip && (c.changes == changes || now.saturating_duration_since(c.at) < REPORT_REUSE)
+            c.tip == tip
+                && (c.changes == changes || now.saturating_duration_since(c.at) < REPORT_REUSE)
         };
         if let Some(c) = cached.as_ref().filter(fresh) {
             return Ok(c.report.clone());
         }
         let (judged_at, report) = compute()?;
-        *cached = Some(Cached { tip: judged_at, changes, at: now, report: report.clone() });
+        *cached = Some(Cached {
+            tip: judged_at,
+            changes,
+            at: now,
+            report: report.clone(),
+        });
         Ok(report)
     }
 }
@@ -471,7 +542,10 @@ pub struct Tip {
 ///
 /// The rules are checked between threads; the attestation that counts is
 /// chosen in `held`'s order, as it would be on one.
-pub fn counting_at(held: &[(Attestation, Timelocks)], v: &(dyn ChainView + Sync)) -> (Tip, Vec<Counted>) {
+pub fn counting_at(
+    held: &[(Attestation, Timelocks)],
+    v: &(dyn ChainView + Sync),
+) -> (Tip, Vec<Counted>) {
     let coins = par::map(held, |(att, locks)| {
         let coin = check_chain(att, v).ok()?;
         check_timelocks(v, &coin, locks).ok().map(|_| coin)
@@ -482,15 +556,23 @@ pub fn counting_at(held: &[(Attestation, Timelocks)], v: &(dyn ChainView + Sync)
         best.entry((att.outpoint(), att.key()))
             .and_modify(|cur| {
                 if supersedes(att, &cur.attestation) {
-                    *cur = Counted { attestation: att.clone(), coin: coin.clone() };
+                    *cur = Counted {
+                        attestation: att.clone(),
+                        coin: coin.clone(),
+                    };
                 }
             })
-            .or_insert_with(|| Counted { attestation: att.clone(), coin: coin.clone() });
+            .or_insert_with(|| Counted {
+                attestation: att.clone(),
+                coin: coin.clone(),
+            });
     }
     let height = v.tip_height();
     let tip = Tip {
         height,
-        hash: v.block_hash(height).expect("the active chain holds its tip"),
+        hash: v
+            .block_hash(height)
+            .expect("the active chain holds its tip"),
         utxo_total: v.utxo_total(),
     };
     (tip, best.into_values().collect())
@@ -556,7 +638,10 @@ fn buckets<'a>(labels: impl IntoIterator<Item = &'a str>, sums: &[Sum], name: &s
 
 /// The first bucket `x` is below.
 fn bucket<T: PartialOrd>(x: T, bounds: impl IntoIterator<Item = T>) -> usize {
-    bounds.into_iter().position(|b| x < b).expect("the last bucket is unbounded")
+    bounds
+        .into_iter()
+        .position(|b| x < b)
+        .expect("the last bucket is unbounded")
 }
 
 /// One value of one key.
@@ -579,11 +664,19 @@ impl ValueTally {
         let anchor_age = tip.saturating_sub(c.attestation.anchor_height());
         // The freshness rule keeps every counted anchor inside the last
         // bucket; the clamp only spares a panic.
-        let at = ANCHOR_AGES.iter().position(|(_, b)| anchor_age < *b).unwrap_or(ANCHOR_AGES.len() - 1);
+        let at = ANCHOR_AGES
+            .iter()
+            .position(|(_, b)| anchor_age < *b)
+            .unwrap_or(ANCHOR_AGES.len() - 1);
         self.anchor_ages[at].add(sat);
-        self.coin_ages[bucket(tip.saturating_sub(c.coin.height), COIN_AGES.map(|(_, b)| b))].add(sat);
+        self.coin_ages[bucket(tip.saturating_sub(c.coin.height), COIN_AGES.map(|(_, b)| b))]
+            .add(sat);
         let script = script_type(&c.coin.script_pubkey);
-        self.scripts[SCRIPT_TYPES.iter().position(|t| *t == script).expect("listed")].add(sat);
+        self.scripts[SCRIPT_TYPES
+            .iter()
+            .position(|t| *t == script)
+            .expect("listed")]
+        .add(sat);
         self.weights.push(sat);
     }
 }
@@ -592,7 +685,13 @@ impl ValueTally {
 /// set of `held` attestations with `digest`. `invalid` is how many in the
 /// set failed their signature check (always 0 for the aggregator's own,
 /// which holds only verified ones).
-pub fn report(tip: Tip, digest: sha256::Hash, held: usize, invalid: usize, counting: &[Counted]) -> Value {
+pub fn report(
+    tip: Tip,
+    digest: sha256::Hash,
+    held: usize,
+    invalid: usize,
+    counting: &[Counted],
+) -> Value {
     let mut keys: BTreeMap<&str, (Sum, BTreeMap<&str, ValueTally>)> = BTreeMap::new();
     for c in counting {
         let att = &c.attestation;

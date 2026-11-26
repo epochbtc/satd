@@ -104,7 +104,10 @@ fn bip375_vectors() {
 fn k_follows_output_index_not_spend_key() {
     let v = common::bip375_valid()
         .into_iter()
-        .find(|v| v.description.starts_with("can finalize: two sp outputs - output 0 uses label=3"))
+        .find(|v| {
+            v.description
+                .starts_with("can finalize: two sp outputs - output 0 uses label=3")
+        })
         .expect("the vector is in the file");
     let raw = RawPsbt::parse(&v.psbt).expect("parses");
     let view = V2View::new(&raw).unwrap();
@@ -138,14 +141,21 @@ fn k_follows_output_index_not_spend_key() {
 fn k_counts_per_scan_key() {
     let v = common::bip375_valid()
         .into_iter()
-        .find(|v| v.description.starts_with("can finalize: three sp outputs (different scan keys)"))
+        .find(|v| {
+            v.description
+                .starts_with("can finalize: three sp outputs (different scan keys)")
+        })
         .expect("the vector is in the file");
     let raw = RawPsbt::parse(&v.psbt).expect("parses");
     let view = V2View::new(&raw).unwrap();
     let report = sp::verify_with_binding(&view, None, sp::KeyBinding::Declared).expect("verifies");
     assert_eq!(report.outputs.len(), 3);
     for output in &report.outputs {
-        assert_eq!(output.k, 0, "output {} is alone under its scan key", output.index);
+        assert_eq!(
+            output.k, 0,
+            "output {} is alone under its scan key",
+            output.index
+        );
         assert_eq!(output.status, OutputStatus::Ready);
     }
 }

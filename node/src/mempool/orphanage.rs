@@ -274,7 +274,11 @@ impl TxOrphanage {
             inner.by_parent.entry(*parent).or_default().insert(wtxid);
         }
         for input in &entry.tx.input {
-            inner.by_outpoint.entry(input.previous_output).or_default().insert(wtxid);
+            inner
+                .by_outpoint
+                .entry(input.previous_output)
+                .or_default()
+                .insert(wtxid);
         }
         inner.by_wtxid.insert(wtxid, entry);
         Self::announce_locked(&mut inner, &wtxid, from_peer);
@@ -299,7 +303,9 @@ impl TxOrphanage {
     /// held or the announcement exists.
     fn announce_locked(inner: &mut OrphanageInner, wtxid: &Wtxid, peer: PeerId) -> bool {
         let seq = inner.next_seq;
-        let Some(entry) = inner.by_wtxid.get_mut(wtxid) else { return false };
+        let Some(entry) = inner.by_wtxid.get_mut(wtxid) else {
+            return false;
+        };
         if entry.announcers.contains_key(&peer) {
             return false;
         }
@@ -317,8 +323,12 @@ impl TxOrphanage {
     /// Remove the announcement (`wtxid`, `peer`), and the orphan with it if
     /// it was the last. True when the orphan went.
     fn drop_announcement_locked(inner: &mut OrphanageInner, wtxid: &Wtxid, peer: PeerId) -> bool {
-        let Some(entry) = inner.by_wtxid.get_mut(wtxid) else { return false };
-        let Some(seq) = entry.announcers.remove(&peer) else { return false };
+        let Some(entry) = inner.by_wtxid.get_mut(wtxid) else {
+            return false;
+        };
+        let Some(seq) = entry.announcers.remove(&peer) else {
+            return false;
+        };
         let last = entry.announcers.is_empty();
         let (weight, latency_score) = (entry.weight, entry.latency_score());
         inner.announcements -= 1;
@@ -340,7 +350,9 @@ impl TxOrphanage {
 
     /// Take out an orphan whose last announcement has gone.
     fn remove_unannounced_locked(inner: &mut OrphanageInner, wtxid: &Wtxid) {
-        let Some(entry) = inner.by_wtxid.remove(wtxid) else { return };
+        let Some(entry) = inner.by_wtxid.remove(wtxid) else {
+            return;
+        };
         debug_assert!(entry.announcers.is_empty());
         inner.unique_weight -= entry.weight;
         inner.unique_bytes -= entry.bytes;
@@ -354,7 +366,11 @@ impl TxOrphanage {
         }
     }
 
-    fn unindex<K: std::hash::Hash + Eq>(index: &mut HashMap<K, HashSet<Wtxid>>, key: &K, wtxid: &Wtxid) {
+    fn unindex<K: std::hash::Hash + Eq>(
+        index: &mut HashMap<K, HashSet<Wtxid>>,
+        key: &K,
+        wtxid: &Wtxid,
+    ) {
         if let Some(set) = index.get_mut(key) {
             set.remove(wtxid);
             if set.is_empty() {
@@ -366,7 +382,9 @@ impl TxOrphanage {
     /// Remove every announcement of `wtxid`, and so the orphan. True when
     /// it was held.
     fn erase_locked(inner: &mut OrphanageInner, wtxid: &Wtxid) -> bool {
-        let Some(peers) = inner.by_wtxid.get(wtxid).map(OrphanEntry::announcers) else { return false };
+        let Some(peers) = inner.by_wtxid.get(wtxid).map(OrphanEntry::announcers) else {
+            return false;
+        };
         for peer in peers {
             Self::drop_announcement_locked(inner, wtxid, peer);
         }
@@ -387,10 +405,15 @@ impl TxOrphanage {
     /// and an orphan no other peer announced goes. Returns those removed.
     pub fn erase_for_peer(&self, peer: PeerId) -> Vec<Wtxid> {
         let mut inner = self.inner.lock();
-        let wtxids: Vec<Wtxid> =
-            inner.peers.get(&peer).map(|u| u.announcements.values().copied().collect()).unwrap_or_default();
-        let removed =
-            wtxids.into_iter().filter(|wtxid| Self::drop_announcement_locked(&mut inner, wtxid, peer)).collect();
+        let wtxids: Vec<Wtxid> = inner
+            .peers
+            .get(&peer)
+            .map(|u| u.announcements.values().copied().collect())
+            .unwrap_or_default();
+        let removed = wtxids
+            .into_iter()
+            .filter(|wtxid| Self::drop_announcement_locked(&mut inner, wtxid, peer))
+            .collect();
         self.limit_orphans(&mut inner);
         removed
     }
@@ -411,7 +434,10 @@ impl TxOrphanage {
                 }
             }
         }
-        let removed: Vec<Wtxid> = doomed.into_iter().filter(|w| Self::erase_locked(&mut inner, w)).collect();
+        let removed: Vec<Wtxid> = doomed
+            .into_iter()
+            .filter(|w| Self::erase_locked(&mut inner, w))
+            .collect();
         self.limit_orphans(&mut inner);
         removed
     }
@@ -427,7 +453,9 @@ impl TxOrphanage {
             self.limit_orphans(&mut inner);
             return false;
         }
-        let Some(entry) = inner.by_wtxid.get_mut(wtxid) else { return false };
+        let Some(entry) = inner.by_wtxid.get_mut(wtxid) else {
+            return false;
+        };
         let old = std::mem::replace(&mut entry.missing_parents, missing_parents.clone());
         for parent in old.difference(&missing_parents) {
             Self::unindex(&mut inner.by_parent, parent, wtxid);
@@ -461,7 +489,11 @@ impl TxOrphanage {
 
     /// Core's `HaveTxFromPeer`: `peer` is an announcer of the orphan `wtxid`.
     pub fn has_announcer(&self, wtxid: &Wtxid, peer: PeerId) -> bool {
-        self.inner.lock().by_wtxid.get(wtxid).is_some_and(|e| e.announcers.contains_key(&peer))
+        self.inner
+            .lock()
+            .by_wtxid
+            .get(wtxid)
+            .is_some_and(|e| e.announcers.contains_key(&peer))
     }
 
     /// Every orphan with its announcers, in wtxid order: Core's
@@ -470,15 +502,21 @@ impl TxOrphanage {
         let inner = self.inner.lock();
         let mut entries: Vec<&OrphanEntry> = inner.by_wtxid.values().collect();
         entries.sort_by_key(|e| e.wtxid);
-        entries.into_iter().map(|e| (e.tx.clone(), e.announcers())).collect()
+        entries
+            .into_iter()
+            .map(|e| (e.tx.clone(), e.announcers()))
+            .collect()
     }
 
     /// The orphans waiting for `parent_txid`, in wtxid order. Caller
     /// typically retries `accept_transaction` on each.
     pub fn children_of(&self, parent_txid: &Txid) -> Vec<Wtxid> {
         let inner = self.inner.lock();
-        let mut kids: Vec<Wtxid> =
-            inner.by_parent.get(parent_txid).map(|set| set.iter().copied().collect()).unwrap_or_default();
+        let mut kids: Vec<Wtxid> = inner
+            .by_parent
+            .get(parent_txid)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
         kids.sort_unstable();
         kids
     }
@@ -544,12 +582,20 @@ impl TxOrphanage {
 
     /// Core's `AnnouncementsFromPeer`.
     pub fn announcements_from_peer(&self, peer: PeerId) -> u32 {
-        self.inner.lock().peers.get(&peer).map_or(0, |u| u.announcements.len() as u32)
+        self.inner
+            .lock()
+            .peers
+            .get(&peer)
+            .map_or(0, |u| u.announcements.len() as u32)
     }
 
     /// Core's `LatencyScoreFromPeer`.
     pub fn latency_score_from_peer(&self, peer: PeerId) -> u32 {
-        self.inner.lock().peers.get(&peer).map_or(0, |u| u.latency_score)
+        self.inner
+            .lock()
+            .peers
+            .get(&peer)
+            .map_or(0, |u| u.latency_score)
     }
 
     /// Core's `UsageByPeer`.
@@ -585,8 +631,14 @@ impl TxOrphanage {
     /// Core's `PeerDoSInfo::GetDosScore`: the larger of the peer's share of
     /// its latency limit and of its weight reservation.
     fn dos_score(usage: &PeerUsage, max_latency: u32, max_weight: u64) -> DosScore {
-        let latency = DosScore { num: u64::from(usage.latency_score), den: u64::from(max_latency) };
-        let weight = DosScore { num: usage.weight, den: max_weight.max(1) };
+        let latency = DosScore {
+            num: u64::from(usage.latency_score),
+            den: u64::from(max_latency),
+        };
+        let weight = DosScore {
+            num: usage.weight,
+            den: max_weight.max(1),
+        };
         latency.max(weight)
     }
 
@@ -613,8 +665,11 @@ impl TxOrphanage {
         while let Some((_, worst)) = heap.pop() {
             let threshold = heap.peek().map_or(DosScore::ONE, |(score, _)| *score);
             while self.needs_trim(inner) {
-                let Some((_, wtxid)) =
-                    inner.peers.get(&worst).and_then(|u| u.announcements.first_key_value()).map(|(s, w)| (*s, *w))
+                let Some((_, wtxid)) = inner
+                    .peers
+                    .get(&worst)
+                    .and_then(|u| u.announcements.first_key_value())
+                    .map(|(s, w)| (*s, *w))
                 else {
                     break;
                 };
@@ -667,10 +722,17 @@ impl TxOrphanage {
         assert_eq!(inner.unique_bytes, bytes);
         assert_eq!(inner.unique_input_score, input_score);
         assert_eq!(inner.announcements, announcements);
-        assert_eq!(inner.peers.len(), peers.len(), "a peer is tracked with no announcement");
+        assert_eq!(
+            inner.peers.len(),
+            peers.len(),
+            "a peer is tracked with no announcement"
+        );
         for (peer, (w, l, n)) in peers {
             let usage = &inner.peers[&peer];
-            assert_eq!((usage.weight, usage.latency_score, usage.announcements.len()), (w, l, n));
+            assert_eq!(
+                (usage.weight, usage.latency_score, usage.announcements.len()),
+                (w, l, n)
+            );
         }
         let indexed: usize = inner.by_txid.values().map(HashSet::len).sum();
         assert_eq!(indexed, inner.by_wtxid.len());

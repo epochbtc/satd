@@ -103,15 +103,21 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, DecodeError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("2 bytes")))
+        Ok(u16::from_le_bytes(
+            self.take(2)?.try_into().expect("2 bytes"),
+        ))
     }
 
     fn u32(&mut self) -> Result<u32, DecodeError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
 
     fn f32(&mut self) -> Result<f32, DecodeError> {
-        Ok(f32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(f32::from_le_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
 
     fn u256(&mut self) -> Result<[u8; 32], DecodeError> {
@@ -263,7 +269,10 @@ pub fn open_standard_mining_channel_success(
     extranonce_prefix: &[u8],
     group_channel_id: u32,
 ) -> Vec<u8> {
-    assert!(extranonce_prefix.len() <= 32, "extranonce_prefix must fit in B032");
+    assert!(
+        extranonce_prefix.len() <= 32,
+        "extranonce_prefix must fit in B032"
+    );
     let mut out = Vec::with_capacity(45 + extranonce_prefix.len());
     out.extend_from_slice(&request_id.to_le_bytes());
     out.extend_from_slice(&channel_id.to_le_bytes());
@@ -285,7 +294,10 @@ pub fn open_extended_mining_channel_success(
     extranonce_prefix: &[u8],
     group_channel_id: u32,
 ) -> Vec<u8> {
-    assert!(extranonce_prefix.len() <= 32, "extranonce_prefix must fit in B032");
+    assert!(
+        extranonce_prefix.len() <= 32,
+        "extranonce_prefix must fit in B032"
+    );
     let mut out = Vec::with_capacity(47 + extranonce_prefix.len());
     out.extend_from_slice(&request_id.to_le_bytes());
     out.extend_from_slice(&channel_id.to_le_bytes());
@@ -343,8 +355,14 @@ pub fn new_extended_mining_job(
     coinbase_tx_suffix: &[u8],
 ) -> Vec<u8> {
     assert!(merkle_path.len() <= 255, "merkle_path must fit in Seq0_255");
-    assert!(coinbase_tx_prefix.len() <= u16::MAX as usize, "prefix must fit in B064K");
-    assert!(coinbase_tx_suffix.len() <= u16::MAX as usize, "suffix must fit in B064K");
+    assert!(
+        coinbase_tx_prefix.len() <= u16::MAX as usize,
+        "prefix must fit in B064K"
+    );
+    assert!(
+        coinbase_tx_suffix.len() <= u16::MAX as usize,
+        "suffix must fit in B064K"
+    );
     let mut out = Vec::with_capacity(
         23 + merkle_path.len() * 32 + coinbase_tx_prefix.len() + coinbase_tx_suffix.len(),
     );
@@ -482,7 +500,10 @@ fn push_b0255(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn push_b064k(out: &mut Vec<u8>, bytes: &[u8]) {
-    assert!(bytes.len() <= u16::MAX as usize, "B064K holds at most 65535 bytes");
+    assert!(
+        bytes.len() <= u16::MAX as usize,
+        "B064K holds at most 65535 bytes"
+    );
     out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
     out.extend_from_slice(bytes);
 }
@@ -555,14 +576,23 @@ pub struct AllocateMiningJobToken {
     pub request_id: u32,
 }
 
-pub fn decode_allocate_mining_job_token(payload: &[u8]) -> Result<AllocateMiningJobToken, DecodeError> {
+pub fn decode_allocate_mining_job_token(
+    payload: &[u8],
+) -> Result<AllocateMiningJobToken, DecodeError> {
     let mut r = Reader::new(payload);
-    Ok(AllocateMiningJobToken { user_identifier: r.str0255()?, request_id: r.u32()? })
+    Ok(AllocateMiningJobToken {
+        user_identifier: r.str0255()?,
+        request_id: r.u32()?,
+    })
 }
 
 /// `AllocateMiningJobTokenSuccess` (0x51): `request_id`, `mining_job_token:
 /// B0255`, `coinbase_outputs: B064K`.
-pub fn allocate_mining_job_token_success(request_id: u32, token: &[u8], coinbase_outputs: &[u8]) -> Vec<u8> {
+pub fn allocate_mining_job_token_success(
+    request_id: u32,
+    token: &[u8],
+    coinbase_outputs: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(7 + token.len() + coinbase_outputs.len());
     out.extend_from_slice(&request_id.to_le_bytes());
     push_b0255(&mut out, token);
@@ -661,22 +691,80 @@ mod tests {
         use stratum_core::common_messages_sv2 as c;
         use stratum_core::mining_sv2 as m;
         assert_eq!(SETUP_CONNECTION, c::MESSAGE_TYPE_SETUP_CONNECTION);
-        assert_eq!(SETUP_CONNECTION_SUCCESS, c::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS);
-        assert_eq!(SETUP_CONNECTION_ERROR, c::MESSAGE_TYPE_SETUP_CONNECTION_ERROR);
+        assert_eq!(
+            SETUP_CONNECTION_SUCCESS,
+            c::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS
+        );
+        assert_eq!(
+            SETUP_CONNECTION_ERROR,
+            c::MESSAGE_TYPE_SETUP_CONNECTION_ERROR
+        );
         let table = [
-            (OPEN_STANDARD_MINING_CHANNEL, m::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL, m::CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL),
-            (OPEN_STANDARD_MINING_CHANNEL_SUCCESS, m::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, m::CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL_SUCCESS),
-            (OPEN_MINING_CHANNEL_ERROR, m::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, m::CHANNEL_BIT_OPEN_MINING_CHANNEL_ERROR),
-            (OPEN_EXTENDED_MINING_CHANNEL, m::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, m::CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL),
-            (OPEN_EXTENDED_MINING_CHANNEL_SUCCESS, m::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS, m::CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS),
-            (NEW_MINING_JOB, m::MESSAGE_TYPE_NEW_MINING_JOB, m::CHANNEL_BIT_NEW_MINING_JOB),
-            (SUBMIT_SHARES_STANDARD, m::MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, m::CHANNEL_BIT_SUBMIT_SHARES_STANDARD),
-            (SUBMIT_SHARES_EXTENDED, m::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, m::CHANNEL_BIT_SUBMIT_SHARES_EXTENDED),
-            (SUBMIT_SHARES_SUCCESS, m::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS, m::CHANNEL_BIT_SUBMIT_SHARES_SUCCESS),
-            (SUBMIT_SHARES_ERROR, m::MESSAGE_TYPE_SUBMIT_SHARES_ERROR, m::CHANNEL_BIT_SUBMIT_SHARES_ERROR),
-            (NEW_EXTENDED_MINING_JOB, m::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, m::CHANNEL_BIT_NEW_EXTENDED_MINING_JOB),
-            (SET_NEW_PREV_HASH, m::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, m::CHANNEL_BIT_MINING_SET_NEW_PREV_HASH),
-            (SET_TARGET, m::MESSAGE_TYPE_SET_TARGET, m::CHANNEL_BIT_SET_TARGET),
+            (
+                OPEN_STANDARD_MINING_CHANNEL,
+                m::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+                m::CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL,
+            ),
+            (
+                OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+                m::MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+                m::CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+            ),
+            (
+                OPEN_MINING_CHANNEL_ERROR,
+                m::MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                m::CHANNEL_BIT_OPEN_MINING_CHANNEL_ERROR,
+            ),
+            (
+                OPEN_EXTENDED_MINING_CHANNEL,
+                m::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+                m::CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL,
+            ),
+            (
+                OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+                m::MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+                m::CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            ),
+            (
+                NEW_MINING_JOB,
+                m::MESSAGE_TYPE_NEW_MINING_JOB,
+                m::CHANNEL_BIT_NEW_MINING_JOB,
+            ),
+            (
+                SUBMIT_SHARES_STANDARD,
+                m::MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
+                m::CHANNEL_BIT_SUBMIT_SHARES_STANDARD,
+            ),
+            (
+                SUBMIT_SHARES_EXTENDED,
+                m::MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+                m::CHANNEL_BIT_SUBMIT_SHARES_EXTENDED,
+            ),
+            (
+                SUBMIT_SHARES_SUCCESS,
+                m::MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+                m::CHANNEL_BIT_SUBMIT_SHARES_SUCCESS,
+            ),
+            (
+                SUBMIT_SHARES_ERROR,
+                m::MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+                m::CHANNEL_BIT_SUBMIT_SHARES_ERROR,
+            ),
+            (
+                NEW_EXTENDED_MINING_JOB,
+                m::MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+                m::CHANNEL_BIT_NEW_EXTENDED_MINING_JOB,
+            ),
+            (
+                SET_NEW_PREV_HASH,
+                m::MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+                m::CHANNEL_BIT_MINING_SET_NEW_PREV_HASH,
+            ),
+            (
+                SET_TARGET,
+                m::MESSAGE_TYPE_SET_TARGET,
+                m::CHANNEL_BIT_SET_TARGET,
+            ),
         ];
         for (ours, reference, bit) in table {
             assert_eq!(ours, reference);
@@ -715,10 +803,14 @@ mod tests {
         let decoded: SetupConnectionSuccess = binary_sv2::from_bytes(&mut bytes).unwrap();
         assert_eq!((decoded.used_version, decoded.flags), (2, 0));
 
-        let mut bytes = setup_connection_error(REQUIRES_WORK_SELECTION, "unsupported-feature-flags");
+        let mut bytes =
+            setup_connection_error(REQUIRES_WORK_SELECTION, "unsupported-feature-flags");
         let decoded: SetupConnectionError = binary_sv2::from_bytes(&mut bytes).unwrap();
         assert_eq!(decoded.flags, REQUIRES_WORK_SELECTION);
-        assert_eq!(decoded.error_code.inner_as_ref(), b"unsupported-feature-flags");
+        assert_eq!(
+            decoded.error_code.inner_as_ref(),
+            b"unsupported-feature-flags"
+        );
     }
 
     #[test]
@@ -781,7 +873,10 @@ mod tests {
         let mut bytes = new_mining_job(1, 99, None, 0x2000_0000, &merkle);
         let decoded: NewMiningJob = binary_sv2::from_bytes(&mut bytes).unwrap();
         assert!(decoded.is_future());
-        assert_eq!((decoded.channel_id, decoded.job_id, decoded.version), (1, 99, 0x2000_0000));
+        assert_eq!(
+            (decoded.channel_id, decoded.job_id, decoded.version),
+            (1, 99, 0x2000_0000)
+        );
         assert_eq!(decoded.merkle_root.inner_as_ref(), &merkle[..]);
         let mut bytes = new_mining_job(1, 100, Some(1_700_000_000), 0x2000_0000, &merkle);
         let decoded: NewMiningJob = binary_sv2::from_bytes(&mut bytes).unwrap();
@@ -801,7 +896,10 @@ mod tests {
         let mut bytes = set_new_prev_hash(7, 99, &prev, 1_700_000_000, 0x1d00ffff);
         let decoded: SetNewPrevHash = binary_sv2::from_bytes(&mut bytes).unwrap();
         assert_eq!(decoded.prev_hash.inner_as_ref(), &prev[..]);
-        assert_eq!((decoded.min_ntime, decoded.nbits), (1_700_000_000, 0x1d00ffff));
+        assert_eq!(
+            (decoded.min_ntime, decoded.nbits),
+            (1_700_000_000, 0x1d00ffff)
+        );
 
         let mut bytes = set_target(11, &[0x77; 32]);
         let decoded: SetTarget = binary_sv2::from_bytes(&mut bytes).unwrap();
@@ -811,7 +909,7 @@ mod tests {
 
     #[test]
     fn job_declaration_messages_match_the_reference_types() {
-        use stratum_core::binary_sv2::{B0255, B064K, Seq0255, Seq064K};
+        use stratum_core::binary_sv2::{B064K, B0255, Seq064K, Seq0255};
         use stratum_core::job_declaration_sv2::{
             AllocateMiningJobToken as RefAllocate, AllocateMiningJobTokenSuccess,
             DeclareMiningJob as RefDeclare, DeclareMiningJobError, DeclareMiningJobSuccess,
@@ -823,19 +921,43 @@ mod tests {
         {
             use stratum_core::job_declaration_sv2 as j;
             use stratum_core::mining_sv2 as m;
-            assert_eq!(ALLOCATE_MINING_JOB_TOKEN, j::MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN);
-            assert_eq!(ALLOCATE_MINING_JOB_TOKEN_SUCCESS, j::MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS);
+            assert_eq!(
+                ALLOCATE_MINING_JOB_TOKEN,
+                j::MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN
+            );
+            assert_eq!(
+                ALLOCATE_MINING_JOB_TOKEN_SUCCESS,
+                j::MESSAGE_TYPE_ALLOCATE_MINING_JOB_TOKEN_SUCCESS
+            );
             assert_eq!(DECLARE_MINING_JOB, j::MESSAGE_TYPE_DECLARE_MINING_JOB);
-            assert_eq!(DECLARE_MINING_JOB_SUCCESS, j::MESSAGE_TYPE_DECLARE_MINING_JOB_SUCCESS);
-            assert_eq!(DECLARE_MINING_JOB_ERROR, j::MESSAGE_TYPE_DECLARE_MINING_JOB_ERROR);
+            assert_eq!(
+                DECLARE_MINING_JOB_SUCCESS,
+                j::MESSAGE_TYPE_DECLARE_MINING_JOB_SUCCESS
+            );
+            assert_eq!(
+                DECLARE_MINING_JOB_ERROR,
+                j::MESSAGE_TYPE_DECLARE_MINING_JOB_ERROR
+            );
             assert_eq!(PUSH_SOLUTION, j::MESSAGE_TYPE_PUSH_SOLUTION);
             assert_eq!(SET_CUSTOM_MINING_JOB, m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB);
-            assert_eq!(SET_CUSTOM_MINING_JOB_SUCCESS, m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS);
-            assert_eq!(SET_CUSTOM_MINING_JOB_ERROR, m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR);
+            assert_eq!(
+                SET_CUSTOM_MINING_JOB_SUCCESS,
+                m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS
+            );
+            assert_eq!(
+                SET_CUSTOM_MINING_JOB_ERROR,
+                m::MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR
+            );
             for (t, bit) in [
                 (SET_CUSTOM_MINING_JOB, m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB),
-                (SET_CUSTOM_MINING_JOB_SUCCESS, m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB_SUCCESS),
-                (SET_CUSTOM_MINING_JOB_ERROR, m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB_ERROR),
+                (
+                    SET_CUSTOM_MINING_JOB_SUCCESS,
+                    m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB_SUCCESS,
+                ),
+                (
+                    SET_CUSTOM_MINING_JOB_ERROR,
+                    m::CHANNEL_BIT_SET_CUSTOM_MINING_JOB_ERROR,
+                ),
             ] {
                 assert_eq!(is_channel_message(t), bit, "{t:#04x}");
             }
@@ -848,7 +970,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             decode_allocate_mining_job_token(&bytes).unwrap(),
-            AllocateMiningJobToken { user_identifier: "bcrt1q.rig".into(), request_id: 4 }
+            AllocateMiningJobToken {
+                user_identifier: "bcrt1q.rig".into(),
+                request_id: 4
+            }
         );
         let mut bytes = allocate_mining_job_token_success(4, &[9; 16], b"outputs");
         let decoded: AllocateMiningJobTokenSuccess = binary_sv2::from_bytes(&mut bytes).unwrap();
@@ -870,7 +995,13 @@ mod tests {
         let got = decode_declare_mining_job(&bytes).unwrap();
         assert_eq!((got.request_id, got.version), (5, 0x2000_0000));
         assert_eq!(got.mining_job_token, vec![7u8; 16]);
-        assert_eq!((got.coinbase_tx_prefix.as_slice(), got.coinbase_tx_suffix.as_slice()), (&b"pre"[..], &b"suf"[..]));
+        assert_eq!(
+            (
+                got.coinbase_tx_prefix.as_slice(),
+                got.coinbase_tx_suffix.as_slice()
+            ),
+            (&b"pre"[..], &b"suf"[..])
+        );
         assert_eq!(got.wtxid_list, wtxids);
 
         let mut bytes = declare_mining_job_success(5, &[8; 16]);
@@ -878,7 +1009,10 @@ mod tests {
         assert_eq!(decoded.new_mining_job_token.inner_as_ref(), &[8; 16]);
         let mut bytes = declare_mining_job_error(5, "invalid-mining-job-token", "unknown token");
         let decoded: DeclareMiningJobError = binary_sv2::from_bytes(&mut bytes).unwrap();
-        assert_eq!(decoded.error_code.inner_as_ref(), b"invalid-mining-job-token");
+        assert_eq!(
+            decoded.error_code.inner_as_ref(),
+            b"invalid-mining-job-token"
+        );
         assert_eq!(decoded.error_details.inner_as_ref(), b"unknown token");
 
         let bytes = binary_sv2::to_bytes(RefPush {
@@ -892,7 +1026,10 @@ mod tests {
         .unwrap();
         let got = decode_push_solution(&bytes).unwrap();
         assert_eq!(got.extranonce, vec![3u8; 10]);
-        assert_eq!((got.ntime, got.nonce, got.nbits, got.version), (11, 12, 13, 14));
+        assert_eq!(
+            (got.ntime, got.nonce, got.nbits, got.version),
+            (11, 12, 13, 14)
+        );
 
         let bytes = binary_sv2::to_bytes(RefCustom {
             channel_id: 2,
@@ -919,10 +1056,16 @@ mod tests {
 
         let mut bytes = set_custom_mining_job_success(2, 3, 99);
         let decoded: SetCustomMiningJobSuccess = binary_sv2::from_bytes(&mut bytes).unwrap();
-        assert_eq!((decoded.channel_id, decoded.request_id, decoded.job_id), (2, 3, 99));
+        assert_eq!(
+            (decoded.channel_id, decoded.request_id, decoded.job_id),
+            (2, 3, 99)
+        );
         let mut bytes = set_custom_mining_job_error(2, 3, "invalid-mining-job-token");
         let decoded: SetCustomMiningJobError = binary_sv2::from_bytes(&mut bytes).unwrap();
-        assert_eq!(decoded.error_code.inner_as_ref(), b"invalid-mining-job-token");
+        assert_eq!(
+            decoded.error_code.inner_as_ref(),
+            b"invalid-mining-job-token"
+        );
     }
 
     #[test]
@@ -965,7 +1108,10 @@ mod tests {
 
         let mut bytes = submit_shares_success(7, 42, 1, 1_000);
         let decoded: SubmitSharesSuccess = binary_sv2::from_bytes(&mut bytes).unwrap();
-        assert_eq!((decoded.last_sequence_number, decoded.new_shares_sum), (42, 1_000));
+        assert_eq!(
+            (decoded.last_sequence_number, decoded.new_shares_sum),
+            (42, 1_000)
+        );
         let mut bytes = submit_shares_error(7, 42, "stale-share");
         let decoded: SubmitSharesError = binary_sv2::from_bytes(&mut bytes).unwrap();
         assert_eq!(decoded.error_code.inner_as_ref(), b"stale-share");

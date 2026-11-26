@@ -29,7 +29,11 @@ pub fn save_found_block(dir: &Path, height: u32, block: &Block) -> io::Result<Pa
     let path = found_block_path(dir, height, block);
     let tmp = path.with_extension("hex.tmp");
     {
-        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         f.write_all(hex::encode(bitcoin::consensus::serialize(block)).as_bytes())?;
         f.write_all(b"\n")?;
         f.sync_all()?;
@@ -87,8 +91,8 @@ mod tests {
     use bitcoin::block::{Header, Version};
     use bitcoin::hashes::Hash;
     use bitcoin::{
-        Amount, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
-        Witness,
+        Amount, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        TxMerkleNode, TxOut, Witness,
     };
 
     fn block(nonce: u32) -> Block {
@@ -101,7 +105,10 @@ mod tests {
                 sequence: Sequence::MAX,
                 witness: Witness::from_slice(&[[0u8; 32]]),
             }],
-            output: vec![TxOut { value: Amount::from_sat(50), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new(),
+            }],
         };
         Block {
             header: Header {
@@ -118,7 +125,10 @@ mod tests {
 
     fn read_back(path: &Path) -> Block {
         let text = fs::read_to_string(path).unwrap();
-        assert!(text.ends_with('\n'), "one line, as submitblock -stdin reads it");
+        assert!(
+            text.ends_with('\n'),
+            "one line, as submitblock -stdin reads it"
+        );
         bitcoin::consensus::deserialize(&hex::decode(text.trim_end()).unwrap()).unwrap()
     }
 
@@ -138,7 +148,10 @@ mod tests {
         let path = saved.expect("saved");
         assert_eq!(path, found.join(format!("968181-{}.hex", b.block_hash())));
         assert_eq!(read_back(&path), b);
-        assert!(!path.with_extension("hex.tmp").exists(), "no temporary file left behind");
+        assert!(
+            !path.with_extension("hex.tmp").exists(),
+            "no temporary file left behind"
+        );
     }
 
     /// A panic in block acceptance loses nothing either.
@@ -147,7 +160,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = block(8);
         let result = std::panic::catch_unwind(|| {
-            save_then_submit(Some(dir.path()), 5, &b, |_| -> bool { panic!("accept_block panicked") })
+            save_then_submit(Some(dir.path()), 5, &b, |_| -> bool {
+                panic!("accept_block panicked")
+            })
         });
         assert!(result.is_err());
         assert_eq!(read_back(&found_block_path(dir.path(), 5, &b)), b);
@@ -157,7 +172,8 @@ mod tests {
     fn an_accepted_block_is_kept() {
         let dir = tempfile::tempdir().unwrap();
         let b = block(9);
-        let (saved, outcome) = save_then_submit(Some(dir.path()), 6, &b, |_| Ok::<bool, String>(true));
+        let (saved, outcome) =
+            save_then_submit(Some(dir.path()), 6, &b, |_| Ok::<bool, String>(true));
         assert_eq!(outcome, Ok(true));
         assert_eq!(read_back(&saved.unwrap()), b);
     }
@@ -170,9 +186,13 @@ mod tests {
         fs::write(&blocker, b"").unwrap();
         let b = block(10);
         let mut submitted = false;
-        let (saved, ()) = save_then_submit(Some(&blocker.join("found")), 7, &b, |_| submitted = true);
+        let (saved, ()) =
+            save_then_submit(Some(&blocker.join("found")), 7, &b, |_| submitted = true);
         assert!(saved.is_none());
-        assert!(submitted, "the block was submitted although it could not be saved");
+        assert!(
+            submitted,
+            "the block was submitted although it could not be saved"
+        );
     }
 
     #[test]

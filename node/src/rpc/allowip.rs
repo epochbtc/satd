@@ -80,7 +80,9 @@ impl IpAllowEntry {
 }
 
 fn strip_brackets(host: &str) -> &str {
-    host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// Does `ip` satisfy the allowlist? Loopback is always allowed (matches
@@ -138,8 +140,14 @@ mod tests {
         assert!(is_allowed(mapped(Ipv4Addr::new(10, 1, 2, 3)), &allow));
         assert!(!is_allowed(mapped(Ipv4Addr::new(192, 0, 2, 1)), &allow));
         assert!(!tls_listener_denies(mapped(Ipv4Addr::LOCALHOST), &allow));
-        assert!(!tls_listener_denies(mapped(Ipv4Addr::new(10, 1, 2, 3)), &allow));
-        assert!(tls_listener_denies(mapped(Ipv4Addr::new(192, 0, 2, 1)), &allow));
+        assert!(!tls_listener_denies(
+            mapped(Ipv4Addr::new(10, 1, 2, 3)),
+            &allow
+        ));
+        assert!(tls_listener_denies(
+            mapped(Ipv4Addr::new(192, 0, 2, 1)),
+            &allow
+        ));
     }
 
     #[test]

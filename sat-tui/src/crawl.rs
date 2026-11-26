@@ -28,7 +28,7 @@
 
 use serde_json::Value;
 
-use crate::rpc::{RpcError, JSONRPC_METHOD_NOT_FOUND};
+use crate::rpc::{JSONRPC_METHOD_NOT_FOUND, RpcError};
 use crate::survey::{CAPABILITY_DENIED_CODE, FamilyBar, READONLY_REJECT_CODE};
 
 /// The networks the crawl dials, in the order the panel lists them (satd
@@ -45,7 +45,9 @@ const NAME_MAX: usize = 24;
 pub fn word(name: &str) -> String {
     let ok = !name.is_empty()
         && name.len() <= NAME_MAX
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if ok { name.to_string() } else { "?".into() }
 }
 
@@ -162,7 +164,9 @@ pub fn classify(res: Result<Value, RpcError>) -> Poll {
             None => Poll::Failed("unexpected reply".into()),
         },
         Err(RpcError::Rpc { code, .. })
-            if code == JSONRPC_METHOD_NOT_FOUND || code == READONLY_REJECT_CODE || code == CAPABILITY_DENIED_CODE =>
+            if code == JSONRPC_METHOD_NOT_FOUND
+                || code == READONLY_REJECT_CODE
+                || code == CAPABILITY_DENIED_CODE =>
         {
             Poll::Hidden
         }
@@ -171,7 +175,9 @@ pub fn classify(res: Result<Value, RpcError>) -> Poll {
 }
 
 fn count(v: Option<&Value>, key: &str) -> u64 {
-    v.and_then(|v| v.get(key)).and_then(Value::as_u64).unwrap_or(0)
+    v.and_then(|v| v.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 /// Parse the answer of a node running the crawl. `None` without a
@@ -190,7 +196,10 @@ pub fn parse(v: &Value) -> Option<Crawl> {
         ),
         _ => return None,
     };
-    let by_network = NETWORKS.iter().map(|n| (*n, count(Some(reachable_obj), n))).collect();
+    let by_network = NETWORKS
+        .iter()
+        .map(|n| (*n, count(Some(reachable_obj), n)))
+        .collect();
     let t = v.get("transport");
     let class = |name: &str| count(t.and_then(|t| t.get(name)), "count");
     let transport = Transport {
@@ -205,7 +214,12 @@ pub fn parse(v: &Value) -> Option<Crawl> {
         let mut out: Vec<(String, u64)> = v
             .get(key)
             .and_then(Value::as_object)
-            .map(|o| o.iter().map(|(name, f)| (word(name), count(Some(f), "count"))).filter(|(_, n)| *n > 0).collect())
+            .map(|o| {
+                o.iter()
+                    .map(|(name, f)| (word(name), count(Some(f), "count")))
+                    .filter(|(_, n)| *n > 0)
+                    .collect()
+            })
             .unwrap_or_default();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out
@@ -223,7 +237,10 @@ pub fn parse(v: &Value) -> Option<Crawl> {
     let book = v.get("book");
     Some(Crawl {
         state,
-        peersurvey_superseded: v.get("peersurvey_superseded").and_then(Value::as_bool).unwrap_or(false),
+        peersurvey_superseded: v
+            .get("peersurvey_superseded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         reachable,
         by_network,
         transport,
@@ -256,7 +273,11 @@ pub fn hold_text(reason: &str) -> String {
 impl Crawl {
     /// `n` as a percentage of the reachable addresses; 0 with none.
     pub fn pct(&self, n: u64) -> f64 {
-        if self.reachable == 0 { 0.0 } else { n as f64 * 100.0 / self.reachable as f64 }
+        if self.reachable == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / self.reachable as f64
+        }
     }
 
     /// The bars: each family's observed and claimed addresses together,
@@ -284,7 +305,12 @@ impl Crawl {
     /// claimed, fake and closed-early addresses, which a row never
     /// observed.
     pub fn non_core_pct(&self) -> f64 {
-        let non_core = self.families.iter().filter(|(f, _)| f != "core" && f != "unknown").map(|(_, n)| n).sum();
+        let non_core = self
+            .families
+            .iter()
+            .filter(|(f, _)| f != "core" && f != "unknown")
+            .map(|(_, n)| n)
+            .sum();
         self.pct(non_core)
     }
 
@@ -295,7 +321,14 @@ impl Crawl {
             CrawlState::Stopped => "stopped (a crawl task panicked)".into(),
             CrawlState::Held(reasons) if reasons.is_empty() => "held".into(),
             CrawlState::Held(reasons) => {
-                format!("held: {}", reasons.iter().map(|r| hold_text(r)).collect::<Vec<_>>().join(", "))
+                format!(
+                    "held: {}",
+                    reasons
+                        .iter()
+                        .map(|r| hold_text(r))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
         }
     }
@@ -378,7 +411,10 @@ pub(crate) mod tests {
         assert_eq!(c.state, CrawlState::Running);
         assert!(c.peersurvey_superseded);
         assert_eq!(c.reachable, 21000);
-        assert_eq!(c.by_network, [("ipv4", 12500), ("ipv6", 2600), ("onion", 5900)]);
+        assert_eq!(
+            c.by_network,
+            [("ipv4", 12500), ("ipv6", 2600), ("onion", 5900)]
+        );
         assert_eq!(
             c.transport,
             Transport {
@@ -393,14 +429,29 @@ pub(crate) mod tests {
         assert_eq!(c.families.len(), 9, "bitnodes has no reachable address");
         assert_eq!(c.families[0], ("core".to_string(), 20000));
         assert_eq!(c.families[1], ("btcd".to_string(), 150));
-        assert!(c.families.contains(&("unknown".to_string(), 100)), "unknown as the node counts it");
-        assert_eq!(c.claimed, [("core".to_string(), 350), ("btcd".to_string(), 10)], "apart from families, zeros left out");
+        assert!(
+            c.families.contains(&("unknown".to_string(), 100)),
+            "unknown as the node counts it"
+        );
+        assert_eq!(
+            c.claimed,
+            [("core".to_string(), 350), ("btcd".to_string(), 10)],
+            "apart from families, zeros left out"
+        );
         assert_eq!(c.claimed_total(), 360);
         assert_eq!(c.fake, [("core".to_string(), 140)]);
         assert_eq!(c.fake_total(), 140);
         assert_eq!(c.closed_early, Some(100));
         assert_eq!((c.mismatches, c.reached, c.unreached), (12, 50213, 140022));
-        assert_eq!((c.in_flight_clearnet, c.in_flight_tor, c.concurrency, c.tor_concurrency), (31, 8, 32, 8));
+        assert_eq!(
+            (
+                c.in_flight_clearnet,
+                c.in_flight_tor,
+                c.concurrency,
+                c.tor_concurrency
+            ),
+            (31, 8, 32, 8)
+        );
         assert_eq!((c.book, c.book_max), (61234, 250000));
     }
 
@@ -410,13 +461,22 @@ pub(crate) mod tests {
         v["state"] = json!("held");
         v["held_by"] = json!(["initial_block_download", "connect"]);
         let c = parse(&v).unwrap();
-        assert_eq!(c.state, CrawlState::Held(vec!["initial_block_download".into(), "connect".into()]));
+        assert_eq!(
+            c.state,
+            CrawlState::Held(vec!["initial_block_download".into(), "connect".into()])
+        );
         assert_eq!(c.state_text(), "held: initial block download, -connect");
         v["held_by"] = json!(["network_inactive", "a_new_reason"]);
-        assert_eq!(parse(&v).unwrap().state_text(), "held: networking off, a_new_reason");
+        assert_eq!(
+            parse(&v).unwrap().state_text(),
+            "held: networking off, a_new_reason"
+        );
         v["state"] = json!("stopped");
         v["stopped_by"] = json!("panic");
-        assert_eq!(parse(&v).unwrap().state_text(), "stopped (a crawl task panicked)");
+        assert_eq!(
+            parse(&v).unwrap().state_text(),
+            "stopped (a crawl task panicked)"
+        );
         v["state"] = json!("dancing");
         assert!(parse(&v).is_none(), "an unknown state is not guessed at");
     }
@@ -427,13 +487,29 @@ pub(crate) mod tests {
     #[test]
     fn hidden_off_unserved_or_refused() {
         assert!(matches!(classify(Ok(off_reply())), Poll::Hidden));
-        for code in [JSONRPC_METHOD_NOT_FOUND, READONLY_REJECT_CODE, CAPABILITY_DENIED_CODE] {
-            let e = RpcError::Rpc { code, message: "no".into() };
+        for code in [
+            JSONRPC_METHOD_NOT_FOUND,
+            READONLY_REJECT_CODE,
+            CAPABILITY_DENIED_CODE,
+        ] {
+            let e = RpcError::Rpc {
+                code,
+                message: "no".into(),
+            };
             assert!(matches!(classify(Err(e)), Poll::Hidden), "{code}");
         }
         assert!(matches!(classify(Err(RpcError::Timeout)), Poll::Failed(_)));
-        assert!(matches!(classify(Err(RpcError::Rpc { code: -1, message: "x".into() })), Poll::Failed(_)));
-        assert!(matches!(classify(Ok(json!({"enabled": true}))), Poll::Failed(_)), "no counts");
+        assert!(matches!(
+            classify(Err(RpcError::Rpc {
+                code: -1,
+                message: "x".into()
+            })),
+            Poll::Failed(_)
+        ));
+        assert!(
+            matches!(classify(Ok(json!({"enabled": true}))), Poll::Failed(_)),
+            "no counts"
+        );
         assert!(matches!(classify(Ok(json!([]))), Poll::Failed(_)));
         assert!(matches!(classify(Ok(reply())), Poll::On(c) if c.reachable == 21000));
     }
@@ -451,10 +527,20 @@ pub(crate) mod tests {
         let c = parse(&v).unwrap();
         assert_eq!(c.closed_early, None);
         assert!(c.fake.is_empty());
-        assert!(c.families.contains(&("unknown".to_string(), 340)), "700 less the 360 claimed: {:?}", c.families);
+        assert!(
+            c.families.contains(&("unknown".to_string(), 340)),
+            "700 less the 360 claimed: {:?}",
+            c.families
+        );
         // Every unknown one claimed: no unknown bar.
         v["families"]["unknown"]["count"] = json!(360);
-        assert!(!parse(&v).unwrap().families.iter().any(|(f, _)| f == "unknown"));
+        assert!(
+            !parse(&v)
+                .unwrap()
+                .families
+                .iter()
+                .any(|(f, _)| f == "unknown")
+        );
     }
 
     /// Each bar is the family's observed and claimed addresses together,
@@ -465,14 +551,36 @@ pub(crate) mod tests {
         let c = parse(&reply()).unwrap();
         let bars = c.family_bars();
         assert_eq!(bars.len(), crate::survey::TOP_FAMILIES + 1);
-        assert_eq!(bars[0], FamilyBar { name: "core".into(), observed: 20000, claimed: 350 });
-        assert_eq!(bars[1], FamilyBar { name: "btcd".into(), observed: 150, claimed: 10 });
+        assert_eq!(
+            bars[0],
+            FamilyBar {
+                name: "core".into(),
+                observed: 20000,
+                claimed: 350
+            }
+        );
+        assert_eq!(
+            bars[1],
+            FamilyBar {
+                name: "btcd".into(),
+                observed: 150,
+                claimed: 10
+            }
+        );
         assert_eq!(
             bars[crate::survey::TOP_FAMILIES],
-            FamilyBar { name: "other".into(), observed: 5, claimed: 0 },
+            FamilyBar {
+                name: "other".into(),
+                observed: 5,
+                claimed: 0
+            },
             "bitcoin-seeder's 5 folded"
         );
-        assert_eq!(bars.iter().map(FamilyBar::total).sum::<u64>(), 21000 - 140 - 100, "all but the fake and closed-early");
+        assert_eq!(
+            bars.iter().map(FamilyBar::total).sum::<u64>(),
+            21000 - 140 - 100,
+            "all but the fake and closed-early"
+        );
     }
 
     #[test]
@@ -480,8 +588,15 @@ pub(crate) mod tests {
         let c = parse(&reply()).unwrap();
         // 150 + 60 + 40 + 20 + 15 + 10 + 5 = 300 of 21,000.
         assert!((c.non_core_pct() - 300.0 * 100.0 / 21000.0).abs() < 1e-9);
-        assert_eq!(c.summary(), "crawl: running, 21,000 reachable, non-Core 1.4 %, v2-only 40");
-        assert_eq!(Crawl::default().non_core_pct(), 0.0, "no address, no division by zero");
+        assert_eq!(
+            c.summary(),
+            "crawl: running, 21,000 reachable, non-Core 1.4 %, v2-only 40"
+        );
+        assert_eq!(
+            Crawl::default().non_core_pct(),
+            0.0,
+            "no address, no division by zero"
+        );
     }
 
     /// A name from the node is drawn only as a plain word: an address or
@@ -491,8 +606,16 @@ pub(crate) mod tests {
     fn names_are_words_or_not_drawn() {
         assert_eq!(word("bitcoin-seeder"), "bitcoin-seeder");
         assert_eq!(word("initial_block_download"), "initial_block_download");
-        for bad in ["203.0.113.7", "203.0.113.7:8333", "[2001:db8::1]:8333", "2001:db8::1",
-                    "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion", "co\x1b[2Jre", "", "a b"] {
+        for bad in [
+            "203.0.113.7",
+            "203.0.113.7:8333",
+            "[2001:db8::1]:8333",
+            "2001:db8::1",
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion",
+            "co\x1b[2Jre",
+            "",
+            "a b",
+        ] {
             assert_eq!(word(bad), "?", "{bad:?}");
         }
         // A bare onion's 56 base32 characters are too long to be a name.

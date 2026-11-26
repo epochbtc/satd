@@ -14,9 +14,7 @@ use bitcoin::hashes::{Hash as _, sha256};
 use electrum_client::ElectrumApi;
 
 use super::{E2eNode, electrum_e2e_args, electrum_url_for};
-use crate::common::{
-    DeterministicWallet, build_signed_p2wpkh_spend_of_coinbase, e2e_test_timeout,
-};
+use crate::common::{DeterministicWallet, build_signed_p2wpkh_spend_of_coinbase, e2e_test_timeout};
 
 /// The status a client derives from a `get_history` response: sha256 over
 /// `"tx_hash:height:"` for each row, in the order received. This is what
@@ -67,7 +65,8 @@ pub(super) fn sign_p2wpkh_spend(
             EcdsaSighashType::All,
         )
         .expect("sighash");
-    let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
+    let sig =
+        Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &wallet.sk);
     let mut sig_bytes = sig.serialize_der().to_vec();
     sig_bytes.push(EcdsaSighashType::All as u8);
     let mut witness = Witness::new();
@@ -138,17 +137,22 @@ fn test_e2e_electrum_status_matches_get_history_with_mempool_rows() {
     // tx_a's output while tx_a is still unconfirmed (height -1). All three
     // pay the same address back, so every one of them is in its history.
     let fee = 1_000u64;
-    let (raw_a, _) = build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 1, script.clone(), fee);
+    let (raw_a, _) =
+        build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 1, script.clone(), fee);
     let txid_a = send(&e2e, &raw_a);
     let raw_b = sign_p2wpkh_spend(
         &wallet,
-        bitcoin::OutPoint { txid: txid_a, vout: 0 },
+        bitcoin::OutPoint {
+            txid: txid_a,
+            vout: 0,
+        },
         50 * 100_000_000 - fee,
         script.clone(),
         fee,
     );
     let txid_b = send(&e2e, &raw_b);
-    let (raw_c, _) = build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 2, script.clone(), fee);
+    let (raw_c, _) =
+        build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &wallet, 2, script.clone(), fee);
     let txid_c = send(&e2e, &raw_c);
 
     // Wait until the history carries all three mempool rows and the latest
@@ -187,23 +191,40 @@ fn test_e2e_electrum_status_matches_get_history_with_mempool_rows() {
         status.map(|s| *s),
         client_status(&history),
         "subscribe status must equal sha256 over get_history; mempool rows {:?}",
-        history[101..].iter().map(|r| (r.height, r.tx_hash.to_string())).collect::<Vec<_>>(),
+        history[101..]
+            .iter()
+            .map(|r| (r.height, r.tx_hash.to_string()))
+            .collect::<Vec<_>>(),
     );
 
     // Protocol order: confirmed by ascending height, then height 0 before -1,
     // then display-hex txid order within one height.
     let heights: Vec<i32> = history.iter().map(|r| r.height).collect();
     let expected_confirmed: Vec<i32> = (1..=101).collect();
-    assert_eq!(&heights[..101], &expected_confirmed[..], "confirmed rows first, by height");
-    assert_eq!(&heights[101..], &[0, 0, -1], "mempool rows: height 0 before -1");
+    assert_eq!(
+        &heights[..101],
+        &expected_confirmed[..],
+        "confirmed rows first, by height"
+    );
+    assert_eq!(
+        &heights[101..],
+        &[0, 0, -1],
+        "mempool rows: height 0 before -1"
+    );
     let mut zero_rows = [txid_a.to_string(), txid_c.to_string()];
     zero_rows.sort();
     assert_eq!(
-        [history[101].tx_hash.to_string(), history[102].tx_hash.to_string()],
+        [
+            history[101].tx_hash.to_string(),
+            history[102].tx_hash.to_string()
+        ],
         zero_rows,
         "height-0 rows ordered by display-hex txid"
     );
-    assert_eq!(history[103].tx_hash, txid_b, "the tx spending an unconfirmed parent is last");
+    assert_eq!(
+        history[103].tx_hash, txid_b,
+        "the tx spending an unconfirmed parent is last"
+    );
     for row in &history[101..] {
         assert_eq!(row.fee, Some(fee), "mempool rows carry their fee");
     }
@@ -233,8 +254,16 @@ fn test_e2e_electrum_subscribe_does_not_repush_an_unchanged_status() {
     };
     mine(101, &wallet.address);
     let deadline = std::time::Instant::now() + e2e_test_timeout(20);
-    while client.script_get_history(&script).expect("get_history").len() < 101 {
-        assert!(std::time::Instant::now() < deadline, "history never reached 101 rows");
+    while client
+        .script_get_history(&script)
+        .expect("get_history")
+        .len()
+        < 101
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "history never reached 101 rows"
+        );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
@@ -285,7 +314,11 @@ fn test_e2e_electrum_subscribe_does_not_repush_an_unchanged_status() {
         hex::encode(answered),
         pushed.iter().map(hex::encode).collect::<Vec<_>>()
     );
-    assert_eq!(pushed.len(), 1, "exactly one push for one change: {pushed:?}");
+    assert_eq!(
+        pushed.len(),
+        1,
+        "exactly one push for one change: {pushed:?}"
+    );
 
     e2e.node.stop();
 }

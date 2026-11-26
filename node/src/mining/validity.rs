@@ -99,7 +99,11 @@ fn check_script() -> ScriptBuf {
 
 /// Check the block `template` describes, and on failure find the transaction
 /// responsible.
-pub fn check_template(chain_state: &ChainState, template: &BlockTemplate, check: Check) -> CheckOutcome {
+pub fn check_template(
+    chain_state: &ChainState,
+    template: &BlockTemplate,
+    check: Check,
+) -> CheckOutcome {
     let txs: Vec<Transaction> = template.transactions.iter().map(|t| t.tx.clone()).collect();
     let block = crate::mining::miner::unsolved_block(
         chain_state,
@@ -113,13 +117,22 @@ pub fn check_template(chain_state: &ChainState, template: &BlockTemplate, check:
 
 /// Check an assembled (unsolved) block at `height` on the current tip, and on
 /// failure find the transaction responsible.
-pub fn check_block(chain_state: &ChainState, block: &Block, height: u32, check: Check) -> CheckOutcome {
+pub fn check_block(
+    chain_state: &ChainState,
+    block: &Block,
+    height: u32,
+    check: Check,
+) -> CheckOutcome {
     let verdict = chain_state.check_template_block(block, check == Check::Full);
     let offending_txid = match verdict {
         TemplateVerdict::Invalid(_) => offending_transaction(chain_state, block, height, check),
         _ => None,
     };
-    CheckOutcome { verdict, height, offending_txid }
+    CheckOutcome {
+        verdict,
+        height,
+        offending_txid,
+    }
 }
 
 /// The first transaction whose inclusion makes the block invalid, by bisection
@@ -136,7 +149,12 @@ pub fn check_block(chain_state: &ChainState, block: &Block, height: u32, check: 
 /// total, not a transaction), when the empty prefix is already invalid (the
 /// fault is in the header, and no transaction is to blame), or when the chain
 /// moved while looking.
-fn offending_transaction(chain_state: &ChainState, block: &Block, height: u32, check: Check) -> Option<Txid> {
+fn offending_transaction(
+    chain_state: &ChainState,
+    block: &Block,
+    height: u32,
+    check: Check,
+) -> Option<Txid> {
     let txs = &block.txdata[1..];
     let subsidy = crate::chain::connect::block_subsidy(chain_state.network, height);
     let shell = BlockTemplate {
@@ -218,7 +236,9 @@ impl TemplateValidity {
     /// a pool polling every few seconds must not buy a full script check
     /// each time.
     pub fn queue_full_check_for_gbt(&self, template: &BlockTemplate) {
-        let Some(checker) = self.checker.get() else { return };
+        let Some(checker) = self.checker.get() else {
+            return;
+        };
         let mut last = self.gbt_full_tip.lock();
         if *last == Some(template.prev_hash) {
             return;
@@ -294,7 +314,11 @@ impl TemplateValidity {
                 if !self.raised.swap(true, Relaxed) {
                     let mut event = crate::events::StatusEvent::raised(
                         crate::events::StatusKind::TemplateInvalid,
-                        format!("block template at height {} failed its {} check: {reason}", outcome.height, check.as_str()),
+                        format!(
+                            "block template at height {} failed its {} check: {reason}",
+                            outcome.height,
+                            check.as_str()
+                        ),
                     )
                     .with_detail("check", check.as_str())
                     .with_detail("origin", origin.as_str())
@@ -315,7 +339,11 @@ impl TemplateValidity {
                 if !still_failing && self.raised.swap(false, Relaxed) {
                     self.emit(crate::events::StatusEvent::cleared(
                         crate::events::StatusKind::TemplateInvalid,
-                        format!("block template at height {} passed its {} check", outcome.height, check.as_str()),
+                        format!(
+                            "block template at height {} passed its {} check",
+                            outcome.height,
+                            check.as_str()
+                        ),
                     ));
                 }
             }
@@ -360,7 +388,10 @@ pub struct FullVerdict {
 impl FullChecker {
     /// Spawn the checker on the calling runtime. The check itself runs on the
     /// blocking pool.
-    pub fn spawn(chain_state: Arc<ChainState>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Arc<Self> {
+    pub fn spawn(
+        chain_state: Arc<ChainState>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Arc<Self> {
         let (pending, mut rx) = tokio::sync::watch::channel(None::<FullRequest>);
         let (verdicts, _) = tokio::sync::watch::channel(None);
         let checker = Arc::new(Self { pending, verdicts });
@@ -371,12 +402,16 @@ impl FullChecker {
                     _ = shutdown.changed() => return,
                     changed = rx.changed() => if changed.is_err() { return },
                 }
-                let Some(request) = rx.borrow_and_update().clone() else { continue };
+                let Some(request) = rx.borrow_and_update().clone() else {
+                    continue;
+                };
                 let chain = chain_state.clone();
                 let template = request.template.clone();
                 let done = tokio::task::spawn_blocking(move || {
                     let outcome = check_template(&chain, &template, Check::Full);
-                    chain.template_validity().record(Check::Full, &outcome, request.origin);
+                    chain
+                        .template_validity()
+                        .record(Check::Full, &outcome, request.origin);
                     outcome
                 })
                 .await;
@@ -388,7 +423,9 @@ impl FullChecker {
                             verdict: outcome.verdict,
                         }));
                     }
-                    Err(e) => tracing::error!(target: "mining::template", error = %e, "full template check panicked"),
+                    Err(e) => {
+                        tracing::error!(target: "mining::template", error = %e, "full template check panicked")
+                    }
                 }
             }
         });
@@ -397,7 +434,11 @@ impl FullChecker {
 
     /// Queue `template` for a full check, replacing any not yet started.
     pub fn submit(&self, id: u64, template: Arc<BlockTemplate>, origin: CheckOrigin) {
-        self.pending.send_replace(Some(FullRequest { id, template, origin }));
+        self.pending.send_replace(Some(FullRequest {
+            id,
+            template,
+            origin,
+        }));
     }
 
     /// Every verdict, the latest first.
@@ -410,8 +451,12 @@ impl FullChecker {
 pub(crate) mod tests {
     use super::*;
     use crate::mempool::pool::{Mempool, QuarantineScope};
-    use crate::mining::template::tests::{confirmed_prev, make_funded_template_env_with, tx_spending};
-    use crate::validation::script::{ConsensusVerifier, RustVerifier, ScriptVerifier, ShadowVerifier};
+    use crate::mining::template::tests::{
+        confirmed_prev, make_funded_template_env_with, tx_spending,
+    };
+    use crate::validation::script::{
+        ConsensusVerifier, RustVerifier, ScriptVerifier, ShadowVerifier,
+    };
     use bitcoin::Network;
 
     /// A confirmed 100,000-sat coin locked by `script`.
@@ -428,7 +473,9 @@ pub(crate) mod tests {
     /// Coins the fixtures spend: `0xA1`/`0xA2` are anyone-can-spend
     /// (`OP_TRUE`), `0xB1` is locked by `OP_FALSE`, so no spend of it can
     /// pass its script.
-    pub(crate) fn funded(verifier: Box<dyn ScriptVerifier>) -> (ChainState, Mempool, std::path::PathBuf) {
+    pub(crate) fn funded(
+        verifier: Box<dyn ScriptVerifier>,
+    ) -> (ChainState, Mempool, std::path::PathBuf) {
         make_funded_template_env_with(
             &[
                 (confirmed_prev(0xA1), coin(&[0x51])),
@@ -467,7 +514,8 @@ pub(crate) mod tests {
             let outcome = check_template(&cs, &t, check);
             assert_eq!(outcome.verdict, TemplateVerdict::Valid, "{check:?}");
             assert_eq!(outcome.offending_txid, None);
-            cs.template_validity().record(check, &outcome, CheckOrigin::Stratum);
+            cs.template_validity()
+                .record(check, &outcome, CheckOrigin::Stratum);
         }
         assert!(!cs.template_validity().is_failing());
         assert_eq!(cs.template_validity().count(Check::Full, "valid"), 1);
@@ -484,7 +532,10 @@ pub(crate) mod tests {
         let t = template(&cs, &mp);
         assert_eq!(t.transactions.len(), 2);
         let outcome = check_template(&cs, &t, Check::Structural);
-        assert_eq!(outcome.verdict, TemplateVerdict::Invalid("bad-txns-in-belowout".into()));
+        assert_eq!(
+            outcome.verdict,
+            TemplateVerdict::Invalid("bad-txns-in-belowout".into())
+        );
         assert_eq!(outcome.offending_txid, Some(bad));
         assert_eq!(outcome.height, 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -508,10 +559,15 @@ pub(crate) mod tests {
                 t.coinbase_value,
                 t.transactions.iter().map(|e| e.tx.clone()).collect(),
             );
-            block.header.bits = bitcoin::CompactTarget::from_consensus(block.header.bits.to_consensus() - 1);
+            block.header.bits =
+                bitcoin::CompactTarget::from_consensus(block.header.bits.to_consensus() - 1);
             for check in Check::ALL {
                 let outcome = check_block(&cs, &block, t.height, check);
-                assert!(matches!(outcome.verdict, TemplateVerdict::Invalid(_)), "{with_tx} {check:?}: {:?}", outcome.verdict);
+                assert!(
+                    matches!(outcome.verdict, TemplateVerdict::Invalid(_)),
+                    "{with_tx} {check:?}: {:?}",
+                    outcome.verdict
+                );
                 assert_eq!(outcome.offending_txid, None, "{with_tx} {check:?}");
             }
         }
@@ -526,10 +582,18 @@ pub(crate) mod tests {
         admit(&mp, spend(0xA1, 50_000, 1), 50_000);
         let bad = admit(&mp, spend(0xB1, 90_000, 2), 10_000);
         let t = template(&cs, &mp);
-        assert_eq!(check_template(&cs, &t, Check::Structural).verdict, TemplateVerdict::Valid);
+        assert_eq!(
+            check_template(&cs, &t, Check::Structural).verdict,
+            TemplateVerdict::Valid
+        );
         let full = check_template(&cs, &t, Check::Full);
-        let TemplateVerdict::Invalid(reason) = &full.verdict else { panic!("{full:?}") };
-        assert!(reason.starts_with("block-script-verify-flag-failed"), "{reason}");
+        let TemplateVerdict::Invalid(reason) = &full.verdict else {
+            panic!("{full:?}")
+        };
+        assert!(
+            reason.starts_with("block-script-verify-flag-failed"),
+            "{reason}"
+        );
         assert_eq!(full.offending_txid, Some(bad));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -539,13 +603,26 @@ pub(crate) mod tests {
     #[test]
     fn the_full_check_uses_a_cpp_shadow_verifier() {
         let shadow = || -> Box<dyn ScriptVerifier> {
-            Box::new(ShadowVerifier::new(rust(), Box::new(ConsensusVerifier::new(Network::Regtest)), "rust", "cpp", 64, 1))
+            Box::new(ShadowVerifier::new(
+                rust(),
+                Box::new(ConsensusVerifier::new(Network::Regtest)),
+                "rust",
+                "cpp",
+                64,
+                1,
+            ))
         };
         let (cs, mp, dir) = funded(shadow());
         admit(&mp, spend(0xA1, 90_000, 1), 10_000);
-        assert_eq!(check_template(&cs, &template(&cs, &mp), Check::Full).verdict, TemplateVerdict::Valid);
+        assert_eq!(
+            check_template(&cs, &template(&cs, &mp), Check::Full).verdict,
+            TemplateVerdict::Valid
+        );
         admit(&mp, spend(0xB1, 90_000, 2), 10_000);
-        assert!(matches!(check_template(&cs, &template(&cs, &mp), Check::Full).verdict, TemplateVerdict::Invalid(_)));
+        assert!(matches!(
+            check_template(&cs, &template(&cs, &mp), Check::Full).verdict,
+            TemplateVerdict::Invalid(_)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -566,7 +643,11 @@ pub(crate) mod tests {
             publisher: publisher.clone(),
             health: Some(health.clone()),
         });
-        let outcome = |verdict| CheckOutcome { verdict, height: 7, offending_txid: None };
+        let outcome = |verdict| CheckOutcome {
+            verdict,
+            height: 7,
+            offending_txid: None,
+        };
         let invalid = outcome(TemplateVerdict::Invalid("bad-txns-in-belowout".into()));
         let kind = crate::events::StatusKind::TemplateInvalid;
 
@@ -574,25 +655,50 @@ pub(crate) mod tests {
         validity.record(Check::Full, &invalid, CheckOrigin::Stratum);
         assert!(validity.is_failing());
         assert!(health.is_active(kind), "satd_alert_active follows it");
-        assert!(warnings.list().iter().any(|w| w.id == kind.warning_id()), "a standing warning");
+        assert!(
+            warnings.list().iter().any(|w| w.id == kind.warning_id()),
+            "a standing warning"
+        );
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(events.len(), 1, "raised once, not per failure: {events:?}");
 
-        validity.record(Check::Structural, &outcome(TemplateVerdict::Valid), CheckOrigin::Stratum);
-        assert!(validity.is_failing(), "the scripts that failed have not been run again");
-        validity.record(Check::Full, &outcome(TemplateVerdict::Superseded), CheckOrigin::Stratum);
+        validity.record(
+            Check::Structural,
+            &outcome(TemplateVerdict::Valid),
+            CheckOrigin::Stratum,
+        );
+        assert!(
+            validity.is_failing(),
+            "the scripts that failed have not been run again"
+        );
+        validity.record(
+            Check::Full,
+            &outcome(TemplateVerdict::Superseded),
+            CheckOrigin::Stratum,
+        );
         assert!(validity.is_failing(), "a superseded check proves nothing");
-        validity.record(Check::Full, &outcome(TemplateVerdict::Valid), CheckOrigin::Stratum);
+        validity.record(
+            Check::Full,
+            &outcome(TemplateVerdict::Valid),
+            CheckOrigin::Stratum,
+        );
         assert!(!validity.is_failing());
         assert!(!health.is_active(kind));
         assert!(warnings.list().iter().all(|w| w.id != kind.warning_id()));
-        assert_eq!(std::iter::from_fn(|| rx.try_recv().ok()).count(), 1, "one clear");
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).count(),
+            1,
+            "one clear"
+        );
         assert_eq!(validity.count(Check::Full, "invalid"), 2);
         assert_eq!(validity.count(Check::Full, "superseded"), 1);
 
         let mut metrics = String::new();
         validity.render_metrics(&mut metrics);
-        assert!(metrics.contains("satd_template_checks_total{check=\"full\",result=\"invalid\"} 2"), "{metrics}");
+        assert!(
+            metrics.contains("satd_template_checks_total{check=\"full\",result=\"invalid\"} 2"),
+            "{metrics}"
+        );
     }
 
     /// `getblocktemplate` refuses a template that fails, with Core's message.
@@ -601,7 +707,13 @@ pub(crate) mod tests {
         let (cs, mp, dir) = funded(rust());
         admit(&mp, spend(0xA2, 200_000, 2), 1_000);
         let err = crate::rpc::mining::get_block_template(&cs, &mp).unwrap_err();
-        assert_eq!(err, (-1, "TestBlockValidity failed: bad-txns-in-belowout".to_string()));
+        assert_eq!(
+            err,
+            (
+                -1,
+                "TestBlockValidity failed: bad-txns-in-belowout".to_string()
+            )
+        );
         assert!(cs.template_validity().is_failing());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -612,9 +724,18 @@ pub(crate) mod tests {
         let (cs, mp, dir) = funded(rust());
         admit(&mp, spend(0xA2, 200_000, 2), 1_000);
         let mut budget = 1_000_000;
-        let err = crate::mining::miner::build_block_to_script_within(&cs, &mp, check_script(), None, &mut budget)
-            .unwrap_err();
-        assert_eq!(err.to_string(), "TestBlockValidity failed: bad-txns-in-belowout");
+        let err = crate::mining::miner::build_block_to_script_within(
+            &cs,
+            &mp,
+            check_script(),
+            None,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "TestBlockValidity failed: bad-txns-in-belowout"
+        );
         assert_eq!(budget, 1_000_000, "refused before solving");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -633,12 +754,26 @@ pub(crate) mod tests {
         for _ in 0..3 {
             crate::rpc::mining::get_block_template(&cs, &mp).unwrap();
         }
-        tokio::time::timeout(std::time::Duration::from_secs(20), verdicts.changed()).await.unwrap().unwrap();
-        assert_eq!(verdicts.borrow().as_ref().map(|v| v.verdict.clone()), Some(TemplateVerdict::Valid));
+        tokio::time::timeout(std::time::Duration::from_secs(20), verdicts.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verdicts.borrow().as_ref().map(|v| v.verdict.clone()),
+            Some(TemplateVerdict::Valid)
+        );
         // Give a second queued check time to have run, were there one.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert_eq!(cs.template_validity().count(Check::Full, "valid"), 1, "three polls, one tip, one full check");
-        assert_eq!(cs.template_validity().count(Check::Structural, "valid"), 3, "every poll is checked structurally");
+        assert_eq!(
+            cs.template_validity().count(Check::Full, "valid"),
+            1,
+            "three polls, one tip, one full check"
+        );
+        assert_eq!(
+            cs.template_validity().count(Check::Structural, "valid"),
+            3,
+            "every poll is checked structurally"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -653,7 +788,10 @@ pub(crate) mod tests {
         let mut verdicts = checker.verdicts();
         let t = Arc::new(template(&cs, &mp));
         checker.submit(9, t.clone(), CheckOrigin::Stratum);
-        tokio::time::timeout(std::time::Duration::from_secs(20), verdicts.changed()).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(20), verdicts.changed())
+            .await
+            .unwrap()
+            .unwrap();
         let verdict = verdicts.borrow().clone().unwrap();
         assert_eq!(verdict.id, 9);
         assert_eq!(verdict.prev_hash, t.prev_hash);

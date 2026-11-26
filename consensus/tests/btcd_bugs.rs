@@ -14,12 +14,10 @@ mod helpers;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{Keypair, Scalar, Secp256k1, SecretKey, XOnlyPublicKey, Parity};
+use bitcoin::hashes::{Hash, HashEngine, sha256};
+use bitcoin::secp256k1::{Keypair, Parity, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::transaction::Version;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use consensus::checker::NoopChecker;
 use consensus::error::ScriptError;
 use consensus::flags;
@@ -48,9 +46,7 @@ fn credit_tx(script_pubkey: &[u8], value: u64) -> Transaction {
 fn spend_tx(credit: &Transaction, script_sig: &[u8], witness: &[Vec<u8>]) -> Transaction {
     let mut buf = Vec::new();
     credit.consensus_encode(&mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
     let mut w = Witness::new();
     for item in witness {
         w.push(item);
@@ -80,9 +76,7 @@ fn spend_tx_versioned(
 ) -> Transaction {
     let mut buf = Vec::new();
     credit.consensus_encode(&mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
     let mut w = Witness::new();
     for item in witness {
         w.push(item);
@@ -149,7 +143,10 @@ fn test_cve_2024_38365_find_and_delete_exact_match() {
     expected.push(0x04);
     expected.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
     expected.push(0x51);
-    assert_eq!(result, expected, "FindAndDelete should preserve superset push");
+    assert_eq!(
+        result, expected,
+        "FindAndDelete should preserve superset push"
+    );
 }
 
 /// Test that FindAndDelete matches at instruction boundaries only, not at
@@ -291,7 +288,11 @@ fn test_csv_version_2_passes() {
         flags::VERIFY_P2SH | flags::VERIFY_CHECKSEQUENCEVERIFY,
         &checker,
     );
-    assert!(result.is_ok(), "Version 2 with seq=1 should pass CSV: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Version 2 with seq=1 should pass CSV: {:?}",
+        result.err()
+    );
 }
 
 /// Version 2 with unsatisfied sequence should fail CSV.
@@ -574,7 +575,11 @@ fn test_segwit_v0_witness_item_at_limit() {
         flags::VERIFY_P2SH | flags::VERIFY_WITNESS,
         &checker,
     );
-    assert!(result.is_ok(), "520-byte witness item should be accepted: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "520-byte witness item should be accepted: {:?}",
+        result.err()
+    );
 }
 
 // =========================================================================

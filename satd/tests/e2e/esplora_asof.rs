@@ -60,7 +60,10 @@ fn test_e2e_esplora_chain_tip_headers() {
     let tip = block_hash_at(&e2e, 5);
 
     let (status, h, height, body) = get(&esplora, "/blocks/tip/hash");
-    assert_eq!((status, h.as_deref(), height.as_deref()), (200, Some(tip.as_str()), Some("5")));
+    assert_eq!(
+        (status, h.as_deref(), height.as_deref()),
+        (200, Some(tip.as_str()), Some("5"))
+    );
     assert_eq!(body, tip);
     let (_, h, _, body) = get(&esplora, &format!("/address/{}/utxo", w.address));
     assert_eq!(h.as_deref(), Some(tip.as_str()));
@@ -94,10 +97,16 @@ fn test_e2e_esplora_asof_answers_as_of_an_ancestor() {
 
     // The spend: confirmed at 103 live, not yet as of 102.
     let (status, h, height, body) = get(&esplora, &format!("/tx/{spend}/status"));
-    assert_eq!((status, h.as_deref(), height.as_deref()), (200, Some(h103.as_str()), Some("103")));
+    assert_eq!(
+        (status, h.as_deref(), height.as_deref()),
+        (200, Some(h103.as_str()), Some("103"))
+    );
     assert_eq!(json(&body)["block_height"], 103);
     let (status, h, height, body) = get(&esplora, &format!("/tx/{spend}/status?{asof}"));
-    assert_eq!((status, h.as_deref(), height.as_deref()), (200, Some(h102.as_str()), Some("102")));
+    assert_eq!(
+        (status, h.as_deref(), height.as_deref()),
+        (200, Some(h102.as_str()), Some("102"))
+    );
     assert_eq!(json(&body), serde_json::json!({ "confirmed": false }));
 
     // The coinbase's output: spent live, unspent as of 102.
@@ -111,7 +120,10 @@ fn test_e2e_esplora_asof_answers_as_of_an_ancestor() {
     let (_, _, _, body) = get(&esplora, &format!("/tx/{coinbase1}/outspends?{asof}"));
     let outs = json(&body);
     assert!(
-        outs.as_array().unwrap().iter().all(|o| *o == serde_json::json!({ "spent": false })),
+        outs.as_array()
+            .unwrap()
+            .iter()
+            .all(|o| *o == serde_json::json!({ "spent": false })),
         "{outs}"
     );
     let (_, _, _, body) = get(&esplora, &format!("/tx/{coinbase1}/outspends"));
@@ -131,7 +143,11 @@ fn test_e2e_esplora_asof_answers_as_of_an_ancestor() {
     assert_eq!(h.as_deref(), Some(h102.as_str()));
     assert!(!utxo_txids(&live).contains(&coinbase1));
     assert!(utxo_txids(&then).contains(&coinbase1));
-    assert_eq!(utxo_txids(&then).len(), 102, "one coinbase per block 1..=102");
+    assert_eq!(
+        utxo_txids(&then).len(),
+        102,
+        "one coinbase per block 1..=102"
+    );
 
     // `dest`: one transaction live, none as of 102.
     let (_, _, _, body) = get(&esplora, &format!("/address/{dest}"));
@@ -141,7 +157,11 @@ fn test_e2e_esplora_asof_answers_as_of_an_ancestor() {
     assert_eq!(json(&body)["mempool_stats"]["tx_count"], 0);
     for route in ["/txs", "/txs/chain", "/utxo"] {
         let (status, _, _, body) = get(&esplora, &format!("/address/{dest}{route}?{asof}"));
-        assert_eq!((status, json(&body)), (200, serde_json::json!([])), "{route}");
+        assert_eq!(
+            (status, json(&body)),
+            (200, serde_json::json!([])),
+            "{route}"
+        );
     }
     let (_, _, _, body) = get(&esplora, &format!("/address/{dest}/txs/chain?asof={h103}"));
     assert_eq!(json(&body).as_array().unwrap().len(), 1);
@@ -151,10 +171,17 @@ fn test_e2e_esplora_asof_answers_as_of_an_ancestor() {
         build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &w, 2, dest.script_pubkey(), 1_000);
     assert_eq!(esplora.post_tx(&raw).status(), 200);
     assert_eq!(get(&esplora, &format!("/tx/{pending}/status")).0, 200);
-    assert_eq!(get(&esplora, &format!("/tx/{pending}/status?{asof}")).0, 404);
+    assert_eq!(
+        get(&esplora, &format!("/tx/{pending}/status?{asof}")).0,
+        404
+    );
     // As of a block, the mempool is not part of the answer.
     let (_, _, _, body) = get(&esplora, &format!("/address/{dest}/txs?asof={h103}"));
-    assert_eq!(json(&body).as_array().unwrap().len(), 1, "no mempool rows: {body}");
+    assert_eq!(
+        json(&body).as_array().unwrap().len(),
+        1,
+        "no mempool rows: {body}"
+    );
 
     // Unknown, malformed or empty asof, and asof on a route that does not
     // take it, are 404 with no tip.
@@ -174,7 +201,8 @@ fn test_e2e_esplora_asof_answers_as_of_an_ancestor() {
 
     // Once block 102 leaves the best chain, asof it is 404; there is no
     // retry onto whatever replaces it.
-    e2e.node.rpc_ok("invalidateblock", vec![serde_json::json!(h102)]);
+    e2e.node
+        .rpc_ok("invalidateblock", vec![serde_json::json!(h102)]);
     let (status, h, _, _) = get(&esplora, &format!("/tx/{spend}/status?{asof}"));
     assert_eq!((status, h), (404, None));
     let (status, h, height, _) = get(&esplora, "/blocks/tip/height");

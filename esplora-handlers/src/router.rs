@@ -117,8 +117,14 @@ pub fn build_router(state: EsploraState) -> Result<Router, RouterBuildError> {
         .route("/block/{hash}/txs", get(block::block_txs))
         // A static segment, so it wins over `/txs/{start_index}`.
         .route("/block/{hash}/txs/summary", get(block::block_txs_summary))
-        .route("/block/{hash}/txs/{start_index}", get(block::block_txs_page))
-        .route("/block/{hash}/txid/{index}", get(block::block_txid_at_index))
+        .route(
+            "/block/{hash}/txs/{start_index}",
+            get(block::block_txs_page),
+        )
+        .route(
+            "/block/{hash}/txid/{index}",
+            get(block::block_txid_at_index),
+        )
         .route("/block/{hash}/txids", get(block::block_txids))
         .route("/tx/{txid}", get(tx::tx_detail))
         .route("/tx/{txid}/hex", get(tx::tx_hex))
@@ -235,12 +241,12 @@ fn build_cors_layer(cfg: &EsploraConfig) -> Result<CorsLayer, RouterBuildError> 
     // empty allowlist (review L2).
     let mut origins: Vec<axum::http::HeaderValue> = Vec::with_capacity(cfg.cors_origins.len());
     for raw in &cfg.cors_origins {
-        let parsed = raw
-            .parse::<axum::http::HeaderValue>()
-            .map_err(|e| RouterBuildError::InvalidCors {
-                origin: raw.clone(),
-                detail: e.to_string(),
-            })?;
+        let parsed =
+            raw.parse::<axum::http::HeaderValue>()
+                .map_err(|e| RouterBuildError::InvalidCors {
+                    origin: raw.clone(),
+                    detail: e.to_string(),
+                })?;
         origins.push(parsed);
     }
     Ok(layer.allow_origin(origins))

@@ -38,10 +38,8 @@ impl tonic::service::Interceptor for AuthInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         if let Some(t) = &self.token {
             let value = format!("Bearer {t}");
-            req.metadata_mut().insert(
-                "authorization",
-                value.parse().expect("ascii bearer header"),
-            );
+            req.metadata_mut()
+                .insert("authorization", value.parse().expect("ascii bearer header"));
         }
         Ok(req)
     }
@@ -74,7 +72,10 @@ impl GrpcStreamClient {
         token: Option<&str>,
     ) -> Result<Self, tonic::transport::Error> {
         let endpoint = format!("http://127.0.0.1:{port}");
-        let channel = Channel::from_shared(endpoint).expect("uri").connect().await?;
+        let channel = Channel::from_shared(endpoint)
+            .expect("uri")
+            .connect()
+            .await?;
         let interceptor = AuthInterceptor {
             token: token.map(|t| t.to_string()),
         };
@@ -160,10 +161,7 @@ impl GrpcStreamClient {
     /// Like [`Self::subscribe`] but returns the auth/transport error instead
     /// of panicking — used by the auth-rejection tests, where the server
     /// rejects the stream with `Unauthenticated`/`PermissionDenied`.
-    pub async fn try_subscribe(
-        &mut self,
-        categories: u32,
-    ) -> Result<Streaming<NodeEvent>, Status> {
+    pub async fn try_subscribe(&mut self, categories: u32) -> Result<Streaming<NodeEvent>, Status> {
         let resp = self
             .inner
             .subscribe(SubscribeRequest {
@@ -338,7 +336,10 @@ pub fn add_transactions(
 ) -> SubscribeControl {
     SubscribeControl {
         msg: Some(Control::AddTransactions(pb::AddTransactions {
-            txids: display_txids.iter().map(|t| txid_internal_bytes(t)).collect(),
+            txids: display_txids
+                .iter()
+                .map(|t| txid_internal_bytes(t))
+                .collect(),
             min_depths,
             auto_close_depth,
         })),

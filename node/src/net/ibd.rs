@@ -228,7 +228,10 @@ impl IbdScheduler {
     /// the next assign pass gives it to another peer.
     fn bar_from_height(&mut self, peer: PeerId, height: u32) {
         let until = Instant::now() + PEER_HEIGHT_COOLDOWN;
-        self.height_peer_cooldown.entry(height).or_default().insert(peer, until);
+        self.height_peer_cooldown
+            .entry(height)
+            .or_default()
+            .insert(peer, until);
     }
 
     /// True if `peer` is currently barred from being assigned `height`.
@@ -282,7 +285,10 @@ impl IbdScheduler {
         if self.in_flight.contains_key(&height) && self.height_to_hash.get(&height) == Some(hash) {
             return true;
         }
-        height <= self.connect_cursor.saturating_add(self.max_ahead.max(PRIORITY_ZONE))
+        height
+            <= self
+                .connect_cursor
+                .saturating_add(self.max_ahead.max(PRIORITY_ZONE))
     }
 
     /// Assign blocks to a peer for download. Returns hashes to request via GetData.
@@ -295,19 +301,16 @@ impl IbdScheduler {
     /// [`Self::assign_blocks`], never past `max_height`: the highest block
     /// the peer can serve. Heights above it stay in the pool for others.
     pub fn assign_blocks_up_to(&mut self, peer_id: PeerId, max_height: u32) -> Vec<BlockHash> {
-        let slots = self
-            .peer_slots
-            .entry(peer_id)
-            .or_insert_with(|| PeerSlots {
-                assigned: Vec::new(),
-                blocks_received: 0,
-                last_activity: Instant::now(),
-                consecutive_failures: 0,
-                last_failure_at: None,
-                last_delivery: None,
-                quiet_since: Instant::now(),
-                timed_out_since_delivery: false,
-            });
+        let slots = self.peer_slots.entry(peer_id).or_insert_with(|| PeerSlots {
+            assigned: Vec::new(),
+            blocks_received: 0,
+            last_activity: Instant::now(),
+            consecutive_failures: 0,
+            last_failure_at: None,
+            last_delivery: None,
+            quiet_since: Instant::now(),
+            timed_out_since_delivery: false,
+        });
 
         let current_assigned = slots.assigned.len() as u32;
         if current_assigned >= self.per_peer_limit {
@@ -338,7 +341,9 @@ impl IbdScheduler {
         // block, so the blocks just above it are always inside
         // (`nWindowEnd`, `net_processing.cpp:1436-1441`). The overshoot is
         // bounded by the zone's 256 heights.
-        let priority_end = (self.connect_cursor + PRIORITY_ZONE).min(self.target_height).min(max_height);
+        let priority_end = (self.connect_cursor + PRIORITY_ZONE)
+            .min(self.target_height)
+            .min(max_height);
         for h in (self.connect_cursor + 1)..=priority_end {
             if hashes.len() >= budget {
                 break;
@@ -561,7 +566,11 @@ impl IbdScheduler {
     /// Clear the arrival of `hash` at `height`, every copy of it, if that is
     /// the block that arrived there: it is stored. Returns whether it was.
     fn take_arrival(&mut self, height: u32, hash: &BlockHash) -> bool {
-        if self.arrived.get(&height).is_some_and(|(recorded, _)| recorded == hash) {
+        if self
+            .arrived
+            .get(&height)
+            .is_some_and(|(recorded, _)| recorded == hash)
+        {
             self.arrived.remove(&height);
             true
         } else {
@@ -666,7 +675,10 @@ impl IbdScheduler {
     /// of `now`.
     fn another_peer_delivered_within(&self, peer: PeerId, now: Instant, window: Duration) -> bool {
         self.peer_slots.iter().any(|(&id, slots)| {
-            id != peer && slots.last_delivery.is_some_and(|at| now.duration_since(at) <= window)
+            id != peer
+                && slots
+                    .last_delivery
+                    .is_some_and(|at| now.duration_since(at) <= window)
         })
     }
 
@@ -682,15 +694,29 @@ impl IbdScheduler {
     /// when `activity`, and the requests of the heights it holds when
     /// `requests`. Lets a test reach a stall without waiting for one.
     #[cfg(test)]
-    pub(crate) fn backdate_for_test(&mut self, peer: PeerId, by: Duration, activity: bool, requests: bool) {
+    pub(crate) fn backdate_for_test(
+        &mut self,
+        peer: PeerId,
+        by: Duration,
+        activity: bool,
+        requests: bool,
+    ) {
         if activity && let Some(slots) = self.peer_slots.get_mut(&peer) {
             slots.last_activity -= by;
             slots.quiet_since -= by;
         }
         if requests {
-            let held: Vec<u32> = self.in_flight.iter().filter(|(_, p)| **p == peer).map(|(h, _)| *h).collect();
+            let held: Vec<u32> = self
+                .in_flight
+                .iter()
+                .filter(|(_, p)| **p == peer)
+                .map(|(h, _)| *h)
+                .collect();
             for h in held {
-                for at in [self.requested_at.get_mut(&h), self.in_flight_at.get_mut(&h)].into_iter().flatten() {
+                for at in [self.requested_at.get_mut(&h), self.in_flight_at.get_mut(&h)]
+                    .into_iter()
+                    .flatten()
+                {
                     *at -= by;
                 }
             }
@@ -723,7 +749,8 @@ impl IbdScheduler {
         timeout: Duration,
         near_cursor_timeout: Duration,
     ) -> usize {
-        self.release_stale_inflight_charging(timeout, near_cursor_timeout).0
+        self.release_stale_inflight_charging(timeout, near_cursor_timeout)
+            .0
     }
 
     /// [`Self::release_stale_inflight`], also naming the holder charged with
@@ -754,7 +781,9 @@ impl IbdScheduler {
                 } else {
                     timeout
                 };
-                let over = |at: Option<&Instant>, limit| at.is_some_and(|at| now.duration_since(*at) > limit);
+                let over = |at: Option<&Instant>, limit| {
+                    at.is_some_and(|at| now.duration_since(*at) > limit)
+                };
                 let holder_timed_out = over(self.requested_at.get(&h), holder_timeout);
                 // The holder's timeout running out is its failure only while
                 // another peer is delivering: when none is, the silence is
@@ -763,8 +792,12 @@ impl IbdScheduler {
                 // The height goes back to the pool either way.
                 let holder_failed =
                     holder_timed_out && self.another_peer_delivered_within(p, now, holder_timeout);
-                (holder_timed_out || over(self.in_flight_at.get(&h), timeout))
-                    .then_some((h, p, holder_timed_out, holder_failed))
+                (holder_timed_out || over(self.in_flight_at.get(&h), timeout)).then_some((
+                    h,
+                    p,
+                    holder_timed_out,
+                    holder_failed,
+                ))
             })
             .collect();
 
@@ -1017,8 +1050,8 @@ impl IbdScheduler {
                         continue;
                     }
                     self.height_to_hash.insert(height, hash);
-                    let was_taken = self.downloaded.remove(&height)
-                        | self.release_from_flight(height);
+                    let was_taken =
+                        self.downloaded.remove(&height) | self.release_from_flight(height);
                     self.height_peer_cooldown.remove(&height);
                     if was_taken && height <= self.target_height {
                         self.pending.push_front(height);
@@ -1160,9 +1193,9 @@ mod ibdwindow_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::state::AssumeValid;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
-    use crate::chain::state::AssumeValid;
     use crate::validation::script::NoopVerifier;
     use bitcoin::Network;
 
@@ -1184,21 +1217,19 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
 
         // Build a chain of headers using test blocks
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let mut parent_hash = genesis.block_hash();
         for i in 1..=num_headers {
-            let block = crate::chain::state::tests::build_test_block(
-                parent_hash,
-                i,
-                1_300_000_000 + i,
-            );
+            let block =
+                crate::chain::state::tests::build_test_block(parent_hash, i, 1_300_000_000 + i);
             // Accept the full block so we get both header and height_hash entries
             parent_hash = cs.accept_block(&block).unwrap().hash();
         }
@@ -1247,7 +1278,10 @@ mod tests {
 
         let full = sched.assign_blocks(2);
         assert!(!full.is_empty());
-        assert!(full.iter().all(|hash| cs.get_block_index(hash).unwrap().height > 5));
+        assert!(
+            full.iter()
+                .all(|hash| cs.get_block_index(hash).unwrap().height > 5)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1263,13 +1297,19 @@ mod tests {
         assert!(!sched.expects(401, &hash_at(401)));
         assert!(!sched.expects(1999, &hash_at(1999)));
         let small = IbdScheduler::new(2000, 0, &cs, 20);
-        assert!(small.expects(256, &hash_at(256)), "the priority zone reaches further than a small window");
+        assert!(
+            small.expects(256, &hash_at(256)),
+            "the priority zone reaches further than a small window"
+        );
         assert!(!small.expects(257, &hash_at(257)));
         for h in 1..=1000 {
             sched.mark_downloaded(h);
         }
         sched.connect_cursor_advanced(1000);
-        assert!(sched.expects(1400, &hash_at(1400)), "the window moves with the cursor");
+        assert!(
+            sched.expects(1400, &hash_at(1400)),
+            "the window moves with the cursor"
+        );
         assert!(!sched.expects(1401, &hash_at(1401)));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1319,7 +1359,10 @@ mod tests {
                 }
             }
         }
-        assert!(assigned >= 3 * max_ahead as usize / 2, "the window was not filled: {assigned} handed out");
+        assert!(
+            assigned >= 3 * max_ahead as usize / 2,
+            "the window was not filled: {assigned} handed out"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1341,22 +1384,39 @@ mod tests {
 
         let new1 = BlockHash::from_byte_array([0x11; 32]);
         let new2 = BlockHash::from_byte_array([0x22; 32]);
-        let changes = [(1, Some(new1)), (2, Some(new2)), (20, None), (0, Some(old1))];
+        let changes = [
+            (1, Some(new1)),
+            (2, Some(new2)),
+            (20, None),
+            (0, Some(old1)),
+        ];
         assert_eq!(sched.header_rows_changed(&changes, 19), (2, 1));
 
-        assert!(!sched.in_flight_contains(1), "no longer owed under the old hash");
-        assert!(!sched.is_downloaded(2), "the delivered fork block is not the block");
+        assert!(
+            !sched.in_flight_contains(1),
+            "no longer owed under the old hash"
+        );
+        assert!(
+            !sched.is_downloaded(2),
+            "the delivered fork block is not the block"
+        );
         assert!(sched.pending_contains(1) && sched.pending_contains(2));
         assert!(!sched.peer_inflight_heights(1).contains(&1));
         assert!(!sched.height_to_hash_contains(20));
         assert_eq!(sched.target_height(), 19, "pulled down to the best header");
 
         let next = sched.assign_blocks(2);
-        assert!(next.contains(&new1) && next.contains(&new2), "asks for the chain's blocks");
+        assert!(
+            next.contains(&new1) && next.contains(&new2),
+            "asks for the chain's blocks"
+        );
         assert!(!next.contains(&old1));
 
         // Re-keying an unchanged row is a no-op.
-        assert_eq!(sched.header_rows_changed(&[(3, cs.get_block_hash_by_height(3))], 19), (0, 0));
+        assert_eq!(
+            sched.header_rows_changed(&[(3, cs.get_block_hash_by_height(3))], 19),
+            (0, 0)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1393,7 +1453,11 @@ mod tests {
 
         // Delivering a block removes just that height.
         let delivered = one[0];
-        sched.block_received(1, delivered, cs.get_block_hash_by_height(delivered).unwrap());
+        sched.block_received(
+            1,
+            delivered,
+            cs.get_block_hash_by_height(delivered).unwrap(),
+        );
         let after = sched.peer_inflight_heights(1);
         assert!(
             !after.contains(&delivered),
@@ -1473,10 +1537,8 @@ mod tests {
 
         // Even though the current assignment is fresh, the underlying
         // in_flight_at is still 2 minutes old → release must fire.
-        let released = sched.release_stale_inflight(
-            Duration::from_secs(60),
-            Duration::from_secs(15),
-        );
+        let released =
+            sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
         assert!(
             released >= heights_in_flight.len(),
             "release_stale_inflight should fire for stale heights despite \
@@ -1608,7 +1670,8 @@ mod tests {
             .map(|s| s.consecutive_failures)
             .unwrap_or(0);
         assert_eq!(
-            failures, 1,
+            failures,
+            1,
             "a burst of {} releases inside the dedupe window must count as one event",
             heights.len()
         );
@@ -1814,7 +1877,11 @@ mod tests {
         assert_eq!(sched.stall_timeout(), Duration::from_secs(30));
         assert_eq!(sched.take_stalled_peer(), Some(2));
         assert_eq!(sched.stall_timeout(), Duration::from_secs(60));
-        assert_eq!(sched.take_stalled_peer(), None, "peer 1 is inside the doubled timeout");
+        assert_eq!(
+            sched.take_stalled_peer(),
+            None,
+            "peer 1 is inside the doubled timeout"
+        );
         assert!(sched.peer_slots.contains_key(&1));
 
         // Capped at Core's 64s.
@@ -1857,7 +1924,10 @@ mod tests {
         let owed = sched.peer_slots[&2].assigned.len();
         sched.peer_slots.get_mut(&2).unwrap().last_activity = long_ago;
         sched.assign_blocks(2);
-        assert!(sched.peer_slots[&2].assigned.len() > owed, "peer 2 was given more");
+        assert!(
+            sched.peer_slots[&2].assigned.len() > owed,
+            "peer 2 was given more"
+        );
         assert_eq!(sched.peer_slots[&2].last_activity, long_ago);
         assert_eq!(sched.take_stalled_peer(), Some(2));
 
@@ -1888,8 +1958,12 @@ mod tests {
         sched.assign_blocks(2);
         assert_eq!(sched.peer_inflight_heights(2).len(), heights.len());
 
-        let released = sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
-        assert_eq!(released, 0, "peer 2 was asked just now; nothing of its is stale");
+        let released =
+            sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
+        assert_eq!(
+            released, 0,
+            "peer 2 was asked just now; nothing of its is stale"
+        );
         assert_eq!(sched.peer_slots[&2].consecutive_failures, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1909,12 +1983,18 @@ mod tests {
             sched.in_flight_at.insert(*h, first);
         }
 
-        let released = sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
+        let released =
+            sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
         assert_eq!(released, heights.len());
-        assert_eq!(sched.peer_slots[&1].consecutive_failures, 0, "peer 1 was asked a moment ago");
+        assert_eq!(
+            sched.peer_slots[&1].consecutive_failures, 0,
+            "peer 1 was asked a moment ago"
+        );
         let now = Instant::now();
         assert!(
-            heights.iter().all(|&h| !sched.is_peer_on_cooldown(h, 1, now)),
+            heights
+                .iter()
+                .all(|&h| !sched.is_peer_on_cooldown(h, 1, now)),
             "peer 1 must not be barred from heights it was not given time to deliver"
         );
 
@@ -1940,12 +2020,19 @@ mod tests {
             Some(Instant::now() - Duration::from_secs(70));
 
         assert_eq!(sched.take_stalled_peer(), None);
-        assert_eq!(sched.stall_timeout(), STALL_TIMEOUT_BASE, "nothing dropped, nothing doubled");
+        assert_eq!(
+            sched.stall_timeout(),
+            STALL_TIMEOUT_BASE,
+            "nothing dropped, nothing doubled"
+        );
         assert!((1..=3).all(|p| sched.peer_slots.contains_key(&p)));
 
         // Once one peer delivers, the others are judged again.
         sched.note_delivering_peer(4);
-        assert_eq!(sched.take_stalled_peer().map(|p| (1..=3).contains(&p)), Some(true));
+        assert_eq!(
+            sched.take_stalled_peer().map(|p| (1..=3).contains(&p)),
+            Some(true)
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1962,7 +2049,11 @@ mod tests {
         let slots = sched.peer_slots.get_mut(&1).unwrap();
         slots.last_activity = Instant::now() - Duration::from_secs(120);
         slots.quiet_since = slots.last_activity;
-        assert_eq!(sched.take_stalled_peer(), None, "alone and quiet for two minutes");
+        assert_eq!(
+            sched.take_stalled_peer(),
+            None,
+            "alone and quiet for two minutes"
+        );
 
         let slots = sched.peer_slots.get_mut(&1).unwrap();
         slots.quiet_since = Instant::now() - QUIET_DOWNLOAD_TIMEOUT - Duration::from_secs(1);
@@ -2028,11 +2119,17 @@ mod tests {
             sched.requested_at.insert(*h, asked);
         }
         sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
-        assert_eq!(sched.peer_slots[&1].consecutive_failures, 0, "no peer is delivering");
+        assert_eq!(
+            sched.peer_slots[&1].consecutive_failures, 0,
+            "no peer is delivering"
+        );
 
         // Peer 1 is asked first, as an unchanged iteration order would.
         sched.assign_blocks(1);
-        assert!(sched.peer_inflight_heights(1).is_empty(), "peer 1 took its heights back");
+        assert!(
+            sched.peer_inflight_heights(1).is_empty(),
+            "peer 1 took its heights back"
+        );
         sched.assign_blocks(2);
         let mut taken = sched.peer_inflight_heights(2);
         taken.sort_unstable();
@@ -2063,7 +2160,8 @@ mod tests {
         };
         backdate(&mut sched, &heights);
 
-        let released = sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
+        let released =
+            sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15));
         assert_eq!(released, heights.len(), "the heights go back to the pool");
         assert_eq!(sched.peer_slots[&1].consecutive_failures, 0);
 
@@ -2138,7 +2236,10 @@ mod tests {
         let mut sched = IbdScheduler::new(20, 0, &cs, 50_000);
         assert_eq!(sched.assign_blocks(1).len(), 16);
         let stale = cs.get_block_hash_by_height(3).unwrap();
-        assert!(sched.in_flight_contains(3), "height 3 went out under the old hash");
+        assert!(
+            sched.in_flight_contains(3),
+            "height 3 went out under the old hash"
+        );
 
         // The best-header chain moves: height 3 now names a different block.
         let fresh = BlockHash::from_byte_array([0x33; 32]);
@@ -2148,11 +2249,17 @@ mod tests {
         // Peer 1's in-flight response for the OLD hash arrives late.
         sched.block_received(1, 3, stale);
 
-        assert!(!sched.is_downloaded(3), "the old block does not satisfy the height");
+        assert!(
+            !sched.is_downloaded(3),
+            "the old block does not satisfy the height"
+        );
         assert!(sched.pending_contains(3), "height 3 is still owed");
         // And it is handed out again, under the new hash.
         let hashes = sched.assign_blocks(2);
-        assert!(hashes.contains(&fresh), "re-requested as {fresh}: {hashes:?}");
+        assert!(
+            hashes.contains(&fresh),
+            "re-requested as {fresh}: {hashes:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2180,7 +2287,10 @@ mod tests {
         // Peer 1's original request lands — the right block, wrong peer.
         sched.block_received(1, 3, real3);
 
-        assert!(sched.is_downloaded(3), "the right block satisfies the height");
+        assert!(
+            sched.is_downloaded(3),
+            "the right block satisfies the height"
+        );
         assert!(
             !sched.peer_inflight_heights(2).contains(&3),
             "peer 2's slot is freed, not leaked: {:?}",
@@ -2211,7 +2321,11 @@ mod tests {
 
     /// The heights `peer` holds, with the hash wanted at each.
     fn held_by(sched: &IbdScheduler, peer: PeerId) -> Vec<(u32, BlockHash)> {
-        sched.peer_slots[&peer].assigned.iter().map(|&h| (h, sched.height_to_hash[&h])).collect()
+        sched.peer_slots[&peer]
+            .assigned
+            .iter()
+            .map(|&h| (h, sched.height_to_hash[&h]))
+            .collect()
     }
 
     /// Wind back every clock a stall or timeout judgement reads, by `secs`.
@@ -2221,7 +2335,11 @@ mod tests {
             slots.last_activity = then;
             slots.quiet_since = then;
         }
-        for at in sched.in_flight_at.values_mut().chain(sched.requested_at.values_mut()) {
+        for at in sched
+            .in_flight_at
+            .values_mut()
+            .chain(sched.requested_at.values_mut())
+        {
             *at = then;
         }
     }
@@ -2241,7 +2359,10 @@ mod tests {
         let mut sched = IbdScheduler::new(50, 0, &cs, 50_000);
         sched.assign_blocks(1);
         let held = held_by(&sched, 1);
-        assert!(held.len() >= 3, "precondition: peer 1 holds several heights");
+        assert!(
+            held.len() >= 3,
+            "precondition: peer 1 holds several heights"
+        );
         for &(h, hash) in &held {
             sched.block_arrived(1, h, hash);
         }
@@ -2250,7 +2371,10 @@ mod tests {
         sched.note_delivering_peer(2);
 
         assert_eq!(sched.take_stalled_peer(), None, "peer 1 owes nothing");
-        assert_eq!(sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15)), 0);
+        assert_eq!(
+            sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15)),
+            0
+        );
         for &(h, _) in &held {
             assert!(sched.is_arrived(h));
         }
@@ -2258,7 +2382,10 @@ mod tests {
         // A store fails: that height is owed again, long overdue.
         let (failed, failed_hash) = held[0];
         sched.block_store_failed(failed, failed_hash);
-        assert_eq!(sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15)), 1);
+        assert_eq!(
+            sched.release_stale_inflight(Duration::from_secs(60), Duration::from_secs(15)),
+            1
+        );
         assert!(!sched.in_flight.contains_key(&failed));
 
         // The peer goes; the blocks it delivered stay in flight, and their
@@ -2266,8 +2393,15 @@ mod tests {
         sched.peer_disconnected(1);
         let asked_of_3 = sched.assign_blocks(3);
         for &(h, hash) in &held[1..] {
-            assert_eq!(sched.in_flight.get(&h), Some(&1), "height {h} stays in flight");
-            assert!(!asked_of_3.contains(&hash), "height {h} is not asked for again");
+            assert_eq!(
+                sched.in_flight.get(&h),
+                Some(&1),
+                "height {h} stays in flight"
+            );
+            assert!(
+                !asked_of_3.contains(&hash),
+                "height {h} is not asked for again"
+            );
             sched.block_received(1, h, hash);
             assert!(!sched.in_flight.contains_key(&h));
             assert!(!sched.is_arrived(h));
@@ -2298,7 +2432,10 @@ mod tests {
         // Not the holder, and not the wanted block: no credit.
         let (h, hash) = held[0];
         assert!(!sched.block_arrived(3, h, hash), "not the holder");
-        assert!(!sched.block_arrived(1, h, held[1].1), "not the wanted block");
+        assert!(
+            !sched.block_arrived(1, h, held[1].1),
+            "not the wanted block"
+        );
         assert!(!sched.is_arrived(h));
 
         assert!(sched.block_arrived(1, h, hash));
@@ -2310,7 +2447,10 @@ mod tests {
         sched.block_store_failed(h, hash);
         assert!(sched.is_arrived(h), "a second copy is still waiting");
         sched.block_store_failed(h, hash);
-        assert!(!sched.is_arrived(h), "owed again once every copy has failed");
+        assert!(
+            !sched.is_arrived(h),
+            "owed again once every copy has failed"
+        );
         assert_eq!(sched.take_stalled_peer(), None, "peer 1 has just delivered");
 
         let _ = std::fs::remove_dir_all(&dir);

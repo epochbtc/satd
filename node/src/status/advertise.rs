@@ -20,7 +20,12 @@ pub enum Surface {
 }
 
 impl Surface {
-    pub const ALL: [Surface; 4] = [Surface::Electrum, Surface::Esplora, Surface::Rpc, Surface::Mcp];
+    pub const ALL: [Surface; 4] = [
+        Surface::Electrum,
+        Surface::Esplora,
+        Surface::Rpc,
+        Surface::Mcp,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -88,10 +93,13 @@ impl Advertised {
         let (scheme, rest) = url
             .split_once("://")
             .ok_or_else(|| "the URL has no scheme; write it as scheme://host:port".to_string())?;
-        let scheme_ok = scheme.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'));
+        let scheme_ok = scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+            && scheme.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.')
+            });
         if !scheme_ok {
             return Err(format!("`{scheme}` is not a URL scheme"));
         }

@@ -78,14 +78,19 @@ pub(crate) struct Shared {
 
 impl Shared {
     fn subscribers(&self) -> MutexGuard<'_, Vec<(u64, Arc<Subscriber>)>> {
-        self.subscribers.lock().unwrap_or_else(PoisonError::into_inner)
+        self.subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Add a subscriber; it is removed when the returned guard drops.
     pub(crate) fn register(self: &Arc<Self>, sub: Arc<Subscriber>) -> Registration {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.subscribers().push((id, sub));
-        Registration { shared: self.clone(), id }
+        Registration {
+            shared: self.clone(),
+            id,
+        }
     }
 }
 
@@ -163,7 +168,10 @@ impl ZmtpPub {
 
     /// Whether any connected subscriber would receive a message on `topic`.
     pub fn has_subscriber(&self, topic: &[u8]) -> bool {
-        self.shared.subscribers().iter().any(|(_, s)| s.matches(topic))
+        self.shared
+            .subscribers()
+            .iter()
+            .any(|(_, s)| s.matches(topic))
     }
 
     /// Connected subscribers that have completed the handshake.
@@ -190,7 +198,11 @@ impl ZmtpPub {
     /// Subscribers that would receive a message on `topic`.
     #[cfg(test)]
     pub(crate) fn subscribers_matching(&self, topic: &[u8]) -> usize {
-        self.shared.subscribers().iter().filter(|(_, s)| s.matches(topic)).count()
+        self.shared
+            .subscribers()
+            .iter()
+            .filter(|(_, s)| s.matches(topic))
+            .count()
     }
 
     #[cfg(test)]

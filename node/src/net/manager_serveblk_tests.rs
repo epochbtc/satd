@@ -35,7 +35,13 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     (pm, dir)
 }
 
@@ -102,18 +108,31 @@ fn served_blocks(rx: &mut mpsc::Receiver<NetworkMessage>) -> Vec<bitcoin::BlockH
 fn a_pruned_node_advertises_network_limited_and_not_network() {
     let (pm, _dir) = mk_pm();
     let full = pm.local_services();
-    assert!(full.has(ServiceFlags::NETWORK) && full.has(ServiceFlags::NETWORK_LIMITED), "{full}");
+    assert!(
+        full.has(ServiceFlags::NETWORK) && full.has(ServiceFlags::NETWORK_LIMITED),
+        "{full}"
+    );
     assert!(full.has(ServiceFlags::WITNESS));
 
     pm.set_prune_manual(true);
     let pruned = pm.local_services();
-    assert!(!pruned.has(ServiceFlags::NETWORK), "a pruned node cannot promise every block: {pruned}");
-    assert!(pruned.has(ServiceFlags::NETWORK_LIMITED) && pruned.has(ServiceFlags::WITNESS), "{pruned}");
+    assert!(
+        !pruned.has(ServiceFlags::NETWORK),
+        "a pruned node cannot promise every block: {pruned}"
+    );
+    assert!(
+        pruned.has(ServiceFlags::NETWORK_LIMITED) && pruned.has(ServiceFlags::WITNESS),
+        "{pruned}"
+    );
 
     // Our own address goes out with the same flags.
-    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
+    pm.external_addrs
+        .write()
+        .push(SocketAddr::from(([44, 33, 22, 11], 8333)));
     let _r = add_peer(&pm, 9, false);
-    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(9) else { panic!("a legacy addr") };
+    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(9) else {
+        panic!("a legacy addr")
+    };
     assert_eq!(a[0].1.services, pruned);
 }
 
@@ -132,17 +151,30 @@ fn a_stale_block_is_served_only_if_it_was_validated() {
     let mut rx = add_peer(&pm, 1, false);
 
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(a[2])]);
-    assert!(drain(&mut rx).is_empty(), "an invalidated block is not served, and no notfound is sent");
-    assert!(pm.peers.read().contains_key(&1), "the peer is not disconnected for it");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "an invalidated block is not served, and no notfound is sent"
+    );
+    assert!(
+        pm.peers.read().contains_key(&1),
+        "the peer is not disconnected for it"
+    );
     pm.handle_getdata(1, vec![Inventory::CompactBlock(a[2])]);
     assert!(drain(&mut rx).is_empty(), "nor as a compact block");
 
     // Reconsidered, they are side-branch blocks never connected: Core does
     // not serve those either (no `BLOCK_VALID_SCRIPTS`).
     pm.chain_state.reconsider_block(a[1]).unwrap();
-    assert_eq!(pm.chain_state.tip_hash(), b[2], "the other branch has more work");
+    assert_eq!(
+        pm.chain_state.tip_hash(),
+        b[2],
+        "the other branch has more work"
+    );
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(a[1])]);
-    assert!(drain(&mut rx).is_empty(), "a block never validated is not served");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "a block never validated is not served"
+    );
 
     // Connected once and then reorged away, they were validated: Core serves
     // those for a month.
@@ -151,7 +183,11 @@ fn a_stale_block_is_served_only_if_it_was_validated() {
     pm.chain_state.reconsider_block(b[0]).unwrap();
     assert_eq!(pm.chain_state.tip_hash(), b[2]);
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(a[1])]);
-    assert_eq!(served_blocks(&mut rx), vec![a[1]], "a validated stale block is served");
+    assert_eq!(
+        served_blocks(&mut rx),
+        vec![a[1]],
+        "a validated stale block is served"
+    );
 
     // The active chain is served as before.
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(b[0])]);
@@ -172,15 +208,26 @@ fn a_pruned_node_serves_nothing_below_the_limited_depth() {
     let mut rx = add_peer(&pm, 1, false);
     let edge = tip - (NODE_NETWORK_LIMITED_MIN_BLOCKS + 2);
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(at(edge))]);
-    assert_eq!(served_blocks(&mut rx), vec![at(edge)], "290 deep is still served");
+    assert_eq!(
+        served_blocks(&mut rx),
+        vec![at(edge)],
+        "290 deep is still served"
+    );
 
     let mut whitelisted = add_peer(&pm, 2, true);
     pm.handle_getdata(2, vec![Inventory::WitnessBlock(at(edge - 1))]);
-    assert_eq!(served_blocks(&mut whitelisted), vec![at(edge - 1)], "noban is exempt");
+    assert_eq!(
+        served_blocks(&mut whitelisted),
+        vec![at(edge - 1)],
+        "noban is exempt"
+    );
 
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(at(edge - 1))]);
     assert!(drain(&mut rx).is_empty(), "nothing deeper");
-    assert!(!pm.peers.read().contains_key(&1), "and the peer is disconnected");
+    assert!(
+        !pm.peers.read().contains_key(&1),
+        "and the peer is disconnected"
+    );
 
     // An unpruned node serves the whole chain.
     pm.set_prune_manual(false);
@@ -214,16 +261,28 @@ fn a_pruned_nodes_getblocks_stops_at_blocks_it_may_not_keep() {
     let none = bitcoin::BlockHash::from_byte_array([0; 32]);
 
     pm.handle_getblocks(1, GetBlocksMessage::new(locator(10), none));
-    assert_eq!(invd(&mut rx).len(), 290, "an unpruned node invs from the fork point on");
+    assert_eq!(
+        invd(&mut rx).len(),
+        290,
+        "an unpruned node invs from the fork point on"
+    );
 
     pm.set_prune_manual(true);
     pm.handle_getblocks(1, GetBlocksMessage::new(locator(10), none));
-    assert!(invd(&mut rx).is_empty(), "a pruned node invs nothing it may soon delete");
+    assert!(
+        invd(&mut rx).is_empty(),
+        "a pruned node invs nothing it may soon delete"
+    );
 
     let from = tip - PRUNED_BLOCKS_LIKELY_TO_HAVE;
     pm.handle_getblocks(1, GetBlocksMessage::new(locator(from), none));
     let got = invd(&mut rx);
-    assert_eq!(got.len(), PRUNED_BLOCKS_LIKELY_TO_HAVE as usize, "{} blocks", got.len());
+    assert_eq!(
+        got.len(),
+        PRUNED_BLOCKS_LIKELY_TO_HAVE as usize,
+        "{} blocks",
+        got.len()
+    );
     assert_eq!(got[0], chain[from as usize], "starting just above the cut");
 
     // Whether a block is still held comes from the block index, not from
@@ -232,12 +291,24 @@ fn a_pruned_nodes_getblocks_stops_at_blocks_it_may_not_keep() {
     for f in std::fs::read_dir(dir.path().join("blocks")).unwrap() {
         let f = f.unwrap().path();
         if f.file_name().unwrap().to_string_lossy().starts_with("blk") {
-            std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(0).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&f)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
         }
     }
-    assert!(pm.chain_state.get_block(&chain[from as usize]).is_none(), "premise: the block bodies are gone");
+    assert!(
+        pm.chain_state.get_block(&chain[from as usize]).is_none(),
+        "premise: the block bodies are gone"
+    );
     pm.handle_getblocks(1, GetBlocksMessage::new(locator(from), none));
-    assert_eq!(invd(&mut rx).len(), PRUNED_BLOCKS_LIKELY_TO_HAVE as usize, "no block is read to answer");
+    assert_eq!(
+        invd(&mut rx).len(),
+        PRUNED_BLOCKS_LIKELY_TO_HAVE as usize,
+        "no block is read to answer"
+    );
 }
 
 /// Core also refuses a validated stale block with 30 days' worth of proof of
@@ -260,10 +331,17 @@ fn a_stale_block_buried_under_a_month_of_work_is_not_served() {
     // b[1] already has one block's more work than a[1].
     mine(&pm, 4318, 2);
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(a[1])]);
-    assert_eq!(served_blocks(&mut rx), vec![a[1]], "4319 blocks on top: still served");
+    assert_eq!(
+        served_blocks(&mut rx),
+        vec![a[1]],
+        "4319 blocks on top: still served"
+    );
     mine(&pm, 1, 2);
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(a[1])]);
-    assert!(drain(&mut rx).is_empty(), "4320 blocks on top: a month of work, not served");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "4320 blocks on top: a month of work, not served"
+    );
 
     // Whether a requested block is on the active chain comes from the height
     // index alone, never a walk from the tip, which a `getdata` naming an old
@@ -272,10 +350,15 @@ fn a_stale_block_buried_under_a_month_of_work_is_not_served() {
     // under a month of work and is not served; a walk would find it and
     // serve it.
     let mut batch = crate::storage::StoreBatch::default();
-    batch.height_hash_puts.push((pm.chain_state.get_block_index(&b[0]).unwrap().height, a[1]));
+    batch
+        .height_hash_puts
+        .push((pm.chain_state.get_block_index(&b[0]).unwrap().height, a[1]));
     pm.chain_state.store_for_test().write_batch(batch).unwrap();
     pm.handle_getdata(1, vec![Inventory::WitnessBlock(b[0])]);
-    assert!(drain(&mut rx).is_empty(), "membership is read from the height index, without a walk");
+    assert!(
+        drain(&mut rx).is_empty(),
+        "membership is read from the height index, without a walk"
+    );
 }
 
 /// A `getheaders` with an empty locator asks for the one header `hashStop`
@@ -300,7 +383,11 @@ fn a_null_locator_getheaders_is_answered_only_for_a_block_it_may_serve() {
 
     // An active-chain block: its header alone.
     pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[1]));
-    assert_eq!(headers(&mut rx), Some(vec![a[1]]), "one header, the one named");
+    assert_eq!(
+        headers(&mut rx),
+        Some(vec![a[1]]),
+        "one header, the one named"
+    );
 
     // A block known only as a header: no reply at all.
     let child = crate::mining::miner::build_block_to_script(
@@ -310,12 +397,21 @@ fn a_null_locator_getheaders_is_answered_only_for_a_block_it_may_serve() {
         None,
     )
     .expect("build block");
-    pm.chain_state.accept_header(&child.header).expect("accept header");
+    pm.chain_state
+        .accept_header(&child.header)
+        .expect("accept header");
     pm.handle_getheaders(1, GetHeadersMessage::new(vec![], child.block_hash()));
-    assert_eq!(headers(&mut rx), None, "a header-only block is not answered");
+    assert_eq!(
+        headers(&mut rx),
+        None,
+        "a header-only block is not answered"
+    );
 
     // An unknown block: no reply either.
-    pm.handle_getheaders(1, GetHeadersMessage::new(vec![], bitcoin::BlockHash::from_byte_array([7; 32])));
+    pm.handle_getheaders(
+        1,
+        GetHeadersMessage::new(vec![], bitcoin::BlockHash::from_byte_array([7; 32])),
+    );
     assert_eq!(headers(&mut rx), None, "an unknown block is not answered");
 
     // A stale block never validated is withheld; one validated is served.
@@ -324,14 +420,26 @@ fn a_null_locator_getheaders_is_answered_only_for_a_block_it_may_serve() {
     pm.chain_state.reconsider_block(a[1]).unwrap();
     assert_eq!(pm.chain_state.tip_hash(), b[2]);
     pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[2]));
-    assert_eq!(headers(&mut rx), None, "a stale block never validated is not answered");
+    assert_eq!(
+        headers(&mut rx),
+        None,
+        "a stale block never validated is not answered"
+    );
     pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[0]));
-    assert_eq!(headers(&mut rx), Some(vec![a[0]]), "a[0] is still on the active chain");
+    assert_eq!(
+        headers(&mut rx),
+        Some(vec![a[0]]),
+        "a[0] is still on the active chain"
+    );
     pm.chain_state.invalidate_block(b[0]).unwrap();
     pm.chain_state.reconsider_block(b[0]).unwrap();
     assert_eq!(pm.chain_state.tip_hash(), b[2]);
     pm.handle_getheaders(1, GetHeadersMessage::new(vec![], a[2]));
-    assert_eq!(headers(&mut rx), Some(vec![a[2]]), "a validated stale block is answered");
+    assert_eq!(
+        headers(&mut rx),
+        Some(vec![a[2]]),
+        "a validated stale block is answered"
+    );
     assert!(pm.peers.read().contains_key(&1), "no refusal disconnects");
 }
 
@@ -380,19 +488,43 @@ fn a_block_is_not_announced_to_a_peer_whose_chain_has_it() {
     pm.note_block_availability(1, &a[0]);
 
     pm.announce_block(a[1]);
-    assert_eq!(announced(&mut at_tip), vec![], "a[1] is an ancestor of the peer's a[2]");
+    assert_eq!(
+        announced(&mut at_tip),
+        vec![],
+        "a[1] is an ancestor of the peer's a[2]"
+    );
     assert_eq!(announced(&mut behind), vec![a[1]]);
     assert_eq!(announced(&mut silent), vec![a[1]]);
-    assert_eq!(announced(&mut on_side), vec![a[1]], "a[1] is not on the side branch");
+    assert_eq!(
+        announced(&mut on_side),
+        vec![a[1]],
+        "a[1] is not on the side branch"
+    );
 
     pm.announce_block(a[0]);
     assert_eq!(announced(&mut at_tip), vec![]);
-    assert_eq!(announced(&mut behind), vec![], "the peer announced a[0] itself");
-    assert_eq!(announced(&mut on_side), vec![], "a[0] is the side branch's parent");
-    assert_eq!(announced(&mut silent), vec![], "announced to it a moment ago");
+    assert_eq!(
+        announced(&mut behind),
+        vec![],
+        "the peer announced a[0] itself"
+    );
+    assert_eq!(
+        announced(&mut on_side),
+        vec![],
+        "a[0] is the side branch's parent"
+    );
+    assert_eq!(
+        announced(&mut silent),
+        vec![],
+        "announced to it a moment ago"
+    );
 
     pm.announce_block(a[2]);
-    assert_eq!(announced(&mut at_tip), vec![], "the peer announced a[2] itself");
+    assert_eq!(
+        announced(&mut at_tip),
+        vec![],
+        "the peer announced a[2] itself"
+    );
     assert_eq!(announced(&mut behind), vec![a[2]]);
 
     // A block announced by `inv` before its header is known (Core's
@@ -409,6 +541,10 @@ fn a_block_is_not_announced_to_a_peer_whose_chain_has_it() {
     drain(&mut early);
     pm.chain_state.accept_block(&c).expect("accept block");
     pm.announce_block(c.block_hash());
-    assert_eq!(announced(&mut early), vec![], "the peer announced c before we had it");
+    assert_eq!(
+        announced(&mut early),
+        vec![],
+        "the peer announced c before we had it"
+    );
     assert_eq!(announced(&mut behind), vec![c.block_hash()]);
 }

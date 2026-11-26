@@ -295,7 +295,11 @@ const _: () = {
 /// TAPROOT flags it is checked under instead of all three.
 const SCRIPT_FLAG_EXCEPTIONS: &[(Network, &str, u32)] = &[
     // Mainnet height 170,060: BIP 16 exception.
-    (Network::Bitcoin, "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22", 0),
+    (
+        Network::Bitcoin,
+        "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+        0,
+    ),
     // Mainnet height 692,261: taproot exception.
     (
         Network::Bitcoin,
@@ -303,7 +307,11 @@ const SCRIPT_FLAG_EXCEPTIONS: &[(Network, &str, u32)] = &[
         consensus::VERIFY_P2SH | consensus::VERIFY_WITNESS,
     ),
     // Testnet3 height 394: BIP 16 exception.
-    (Network::Testnet, "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105", 0),
+    (
+        Network::Testnet,
+        "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+        0,
+    ),
 ];
 
 /// Script-verification flags for the block `hash` at `height` on `network`:
@@ -333,7 +341,8 @@ pub fn script_verify_flags(network: Network, height: u32) -> u32 {
 }
 
 /// The flags Core gives every block but its exceptions.
-const ALWAYS_ON_FLAGS: u32 = consensus::VERIFY_P2SH | consensus::VERIFY_WITNESS | consensus::VERIFY_TAPROOT;
+const ALWAYS_ON_FLAGS: u32 =
+    consensus::VERIFY_P2SH | consensus::VERIFY_WITNESS | consensus::VERIFY_TAPROOT;
 
 /// The flags of the buried deployments active at `height`.
 fn buried_flags(network: Network, height: u32) -> u32 {
@@ -367,13 +376,19 @@ pub struct ScriptContext {
 impl ScriptContext {
     /// A transaction in the block `hash` at `height`.
     pub fn block(height: u32, hash: BlockHash) -> Self {
-        ScriptContext { height, block: Some(hash) }
+        ScriptContext {
+            height,
+            block: Some(hash),
+        }
     }
 
     /// A transaction for a block not mined yet, at `height`: the mempool's,
     /// a template's.
     pub fn unmined(height: u32) -> Self {
-        ScriptContext { height, block: None }
+        ScriptContext {
+            height,
+            block: None,
+        }
     }
 
     /// The script flags on `network`.
@@ -422,8 +437,12 @@ pub const STANDARD_SCRIPT_VERIFY_FLAGS: u32 = {
 /// verifier then checks the same inputs under the block's flags, as Core's
 /// `ConsensusScriptChecks` does, and stays the authority on validity.
 pub fn verify_policy_scripts(tx: &Transaction, prev_outputs: &[TxOut]) -> Result<(), ScriptError> {
-    consensus::verify_transaction(tx, prev_outputs, STANDARD_SCRIPT_VERIFY_FLAGS)
-        .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })
+    consensus::verify_transaction(tx, prev_outputs, STANDARD_SCRIPT_VERIFY_FLAGS).map_err(
+        |(idx, e)| ScriptError::VerifyFailed {
+            input: idx,
+            reason: e.to_string(),
+        },
+    )
 }
 
 /// Script inputs the connect path has verified since startup.
@@ -527,7 +546,14 @@ fn name_script_failure(
 ) -> Option<String> {
     let prev = prev_outputs.get(input)?;
     let precomputed = consensus::PrecomputedTransactionData::new(tx, prev_outputs).ok()?;
-    match consensus::verify(&prev.script_pubkey, prev.value, tx, input, flags, &precomputed) {
+    match consensus::verify(
+        &prev.script_pubkey,
+        prev.value,
+        tx,
+        input,
+        flags,
+        &precomputed,
+    ) {
         Err(consensus::Error::ErrScript(e)) => Some(e.as_str().to_string()),
         Err(_) => None,
         Ok(()) => {
@@ -604,7 +630,10 @@ pub(crate) fn kernel_verify_transaction(
     use bitcoinkernel::prelude::TxOutExt;
     use bitcoinkernel::{PrecomputedTransactionData, ScriptPubkey};
 
-    let setup = |reason: &str| ScriptError::VerifyFailed { input: 0, reason: reason.to_string() };
+    let setup = |reason: &str| ScriptError::VerifyFailed {
+        input: 0,
+        reason: reason.to_string(),
+    };
     let ktx = bitcoinkernel::Transaction::new(&bitcoin::consensus::serialize(tx))
         .map_err(|_| setup("ERR_TX_DESERIALIZE"))?;
     let mut spent = Vec::with_capacity(prev_outputs.len());
@@ -621,7 +650,10 @@ pub(crate) fn kernel_verify_transaction(
     for (input, out) in spent.iter().enumerate() {
         let spk = out.script_pubkey();
         bitcoinkernel::verify(&spk, Some(out.value()), &ktx, input, Some(flags), &txdata).map_err(
-            |e| ScriptError::VerifyFailed { input, reason: kernel_error_name(&e).to_string() },
+            |e| ScriptError::VerifyFailed {
+                input,
+                reason: kernel_error_name(&e).to_string(),
+            },
         )?;
     }
     Ok(())
@@ -695,8 +727,12 @@ impl ScriptVerifier for RustVerifier {
         // Batch API: passes &Transaction so we don't re-deserialize per
         // input, and shares a single SighashCache across inputs (BIP143
         // hashPrevouts / hashSequence / hashOutputs are tx-wide).
-        consensus::verify_transaction(tx, prev_outputs, flags)
-            .map_err(|(idx, e)| ScriptError::VerifyFailed { input: idx, reason: e.to_string() })?;
+        consensus::verify_transaction(tx, prev_outputs, flags).map_err(|(idx, e)| {
+            ScriptError::VerifyFailed {
+                input: idx,
+                reason: e.to_string(),
+            }
+        })?;
         count_inputs_verified(tx.input.len());
         Ok(())
     }
@@ -771,7 +807,10 @@ impl ShadowWork {
         std::mem::size_of::<ShadowWork>()
             + tx.total_size()
             + std::mem::size_of_val(prev_outputs)
-            + prev_outputs.iter().map(|o| o.script_pubkey.len()).sum::<usize>()
+            + prev_outputs
+                .iter()
+                .map(|o| o.script_pubkey.len())
+                .sum::<usize>()
     }
 }
 
@@ -794,11 +833,7 @@ impl ShadowVerifier {
         let primary_label = primary_name.to_string();
         let shadow_label = shadow_name.to_string();
 
-        tracing::info!(
-            queue_size,
-            num_workers,
-            "Shadow verification pool started"
-        );
+        tracing::info!(queue_size, num_workers, "Shadow verification pool started");
         let mut workers = Vec::with_capacity(num_workers);
         for n in 0..num_workers {
             let w_rx = rx.clone();
@@ -899,7 +934,8 @@ impl ShadowVerifier {
 
     /// Every transaction dropped since start because the queue was full.
     pub fn dropped_total(&self) -> u64 {
-        self.dropped_total.load(std::sync::atomic::Ordering::Relaxed)
+        self.dropped_total
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Queue `work` for the shadow pool, counting it as dropped when the
@@ -916,7 +952,8 @@ impl ShadowVerifier {
         };
         let charge = ShadowWork::cost(tx, prev_outputs);
         let before = self.queued_bytes.fetch_add(charge, Ordering::Relaxed);
-        if self.queue_bytes != 0 && before != 0 && before.saturating_add(charge) > self.queue_bytes {
+        if self.queue_bytes != 0 && before != 0 && before.saturating_add(charge) > self.queue_bytes
+        {
             self.queued_bytes.fetch_sub(charge, Ordering::Relaxed);
             self.report_drop(at.height);
             return;
@@ -1009,7 +1046,9 @@ impl ScriptVerifier for ShadowVerifier {
         prev_outputs: &[TxOut],
         at: ScriptContext,
     ) -> Result<(), ScriptError> {
-        let result = self.primary.verify_transaction_unnamed(tx, prev_outputs, at);
+        let result = self
+            .primary
+            .verify_transaction_unnamed(tx, prev_outputs, at);
         if result.is_ok() {
             self.dispatch_shadow(tx, prev_outputs, at);
         }
@@ -1077,9 +1116,14 @@ mod tests {
     #[test]
     fn core_debug_string_names_the_failed_input_as_core_does() {
         use bitcoin::hashes::Hash as _;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction};
+        use bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction,
+        };
         let input = |byte, vout| TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([byte; 32]), vout },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([byte; 32]),
+                vout,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[[0x51]]),
@@ -1088,19 +1132,35 @@ mod tests {
             version: transaction::Version(2),
             lock_time: LockTime::ZERO,
             input: vec![input(0x11, 3), input(0x22, 7)],
-            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
         };
         let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
-        assert_ne!(txid.to_string(), wtxid.to_string(), "premise: the witness makes the two differ");
+        assert_ne!(
+            txid.to_string(),
+            wtxid.to_string(),
+            "premise: the witness makes the two differ"
+        );
 
-        let failed = |input| ScriptError::VerifyFailed { input, reason: "Script failed an OP_EQUALVERIFY operation".into() };
+        let failed = |input| ScriptError::VerifyFailed {
+            input,
+            reason: "Script failed an OP_EQUALVERIFY operation".into(),
+        };
         assert_eq!(
             failed(1).core_debug_string(&tx),
-            Some(format!("input 1 of {txid} (wtxid {wtxid}), spending {}:7", "22".repeat(32))),
+            Some(format!(
+                "input 1 of {txid} (wtxid {wtxid}), spending {}:7",
+                "22".repeat(32)
+            )),
         );
         assert_eq!(
             failed(0).core_debug_string(&tx),
-            Some(format!("input 0 of {txid} (wtxid {wtxid}), spending {}:3", "11".repeat(32))),
+            Some(format!(
+                "input 0 of {txid} (wtxid {wtxid}), spending {}:3",
+                "11".repeat(32)
+            )),
         );
         assert_eq!(failed(2).core_debug_string(&tx), None);
     }
@@ -1112,9 +1172,19 @@ mod tests {
     fn block_and_policy_flags_never_set_the_bip322_extension() {
         let ext = consensus::flags::VERIFY_MINIMALIF_BASE;
         assert_eq!(STANDARD_SCRIPT_VERIFY_FLAGS & ext, 0);
-        for network in [Network::Bitcoin, Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ] {
             for height in [0, 1, 227_931, 481_824, 709_632, u32::MAX] {
-                assert_eq!(script_verify_flags(network, height) & ext, 0, "{network} {height}");
+                assert_eq!(
+                    script_verify_flags(network, height) & ext,
+                    0,
+                    "{network} {height}"
+                );
             }
         }
     }
@@ -1126,10 +1196,15 @@ mod tests {
     #[test]
     fn the_cpp_engine_needs_one_spent_output_per_input() {
         use bitcoin::hashes::Hash as _;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction};
+        use bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction,
+        };
         let op_true = ScriptBuf::from_bytes(vec![0x51]);
         let input = |vout| TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([7; 32]), vout },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([7; 32]),
+                vout,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -1138,17 +1213,48 @@ mod tests {
             version: transaction::Version(2),
             lock_time: LockTime::ZERO,
             input: vec![input(0), input(1)],
-            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: op_true.clone() }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: op_true.clone(),
+            }],
         };
-        let spent = TxOut { value: Amount::from_sat(5000), script_pubkey: op_true };
+        let spent = TxOut {
+            value: Amount::from_sat(5000),
+            script_pubkey: op_true,
+        };
         let cpp = ConsensusVerifier::new(Network::Regtest);
         assert!(
-            cpp.verify_transaction(&tx, &[spent.clone(), spent.clone()], ScriptContext::unmined(200)).is_ok(),
+            cpp.verify_transaction(
+                &tx,
+                &[spent.clone(), spent.clone()],
+                ScriptContext::unmined(200)
+            )
+            .is_ok(),
             "one spent output per input: anyone-can-spend inputs verify"
         );
-        assert!(cpp.verify_transaction(&tx, std::slice::from_ref(&spent), ScriptContext::unmined(200)).is_err(), "one short");
-        assert!(cpp.verify_transaction(&tx, &[], ScriptContext::unmined(200)).is_err(), "none at all");
-        assert!(cpp.verify_transaction(&tx, &[spent.clone(), spent.clone(), spent], ScriptContext::unmined(200)).is_err(), "one extra");
+        assert!(
+            cpp.verify_transaction(
+                &tx,
+                std::slice::from_ref(&spent),
+                ScriptContext::unmined(200)
+            )
+            .is_err(),
+            "one short"
+        );
+        assert!(
+            cpp.verify_transaction(&tx, &[], ScriptContext::unmined(200))
+                .is_err(),
+            "none at all"
+        );
+        assert!(
+            cpp.verify_transaction(
+                &tx,
+                &[spent.clone(), spent.clone(), spent],
+                ScriptContext::unmined(200)
+            )
+            .is_err(),
+            "one extra"
+        );
     }
 
     /// Both engines count every input they verify inside
@@ -1161,10 +1267,15 @@ mod tests {
     #[test]
     fn both_engines_count_the_inputs_they_verify() {
         use bitcoin::hashes::Hash as _;
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction};
+        use bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, TxIn, Witness, absolute::LockTime, transaction,
+        };
         let op_true = ScriptBuf::from_bytes(vec![0x51]);
         let input = |vout| TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([9; 32]), vout },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([9; 32]),
+                vout,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -1173,21 +1284,45 @@ mod tests {
             version: transaction::Version(2),
             lock_time: LockTime::ZERO,
             input: vec![input(0), input(1), input(2)],
-            output: vec![TxOut { value: Amount::from_sat(1000), script_pubkey: op_true.clone() }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: op_true.clone(),
+            }],
         };
-        let spent = vec![TxOut { value: Amount::from_sat(5000), script_pubkey: op_true }; 3];
+        let spent = vec![
+            TxOut {
+                value: Amount::from_sat(5000),
+                script_pubkey: op_true
+            };
+            3
+        ];
         let engines: [(&str, Box<dyn ScriptVerifier>); 2] = [
             ("cpp", Box::new(ConsensusVerifier::new(Network::Regtest))),
             ("rust", Box::new(RustVerifier::new(Network::Regtest))),
         ];
         for (name, engine) in engines {
             let counter: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-            counting_into(counter, || engine.verify_transaction(&tx, &spent, ScriptContext::unmined(200)))
-                .expect("anyone-can-spend inputs verify");
-            assert_eq!(counter.load(Ordering::Relaxed), 3, "{name}: three inputs verified");
-            engine.verify_transaction(&tx, &spent, ScriptContext::unmined(200)).expect("verifies again");
-            assert_eq!(counter.load(Ordering::Relaxed), 3, "{name}: outside the scope, nothing counts");
-            assert!(PROGRESS_COUNTER.with(|c| c.get()).is_none(), "{name}: the scope is restored");
+            counting_into(counter, || {
+                engine.verify_transaction(&tx, &spent, ScriptContext::unmined(200))
+            })
+            .expect("anyone-can-spend inputs verify");
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                3,
+                "{name}: three inputs verified"
+            );
+            engine
+                .verify_transaction(&tx, &spent, ScriptContext::unmined(200))
+                .expect("verifies again");
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                3,
+                "{name}: outside the scope, nothing counts"
+            );
+            assert!(
+                PROGRESS_COUNTER.with(|c| c.get()).is_none(),
+                "{name}: the scope is restored"
+            );
         }
     }
 
@@ -1287,7 +1422,8 @@ mod tests {
                 });
                 let mut bad = prevs.clone();
                 bad[k].value += bitcoin::Amount::from_sat(1);
-                let got = cpp.verify_transaction_unnamed(&tx, &bad, ScriptContext::unmined(974_146));
+                let got =
+                    cpp.verify_transaction_unnamed(&tx, &bad, ScriptContext::unmined(974_146));
                 let txid = tx.compute_txid();
                 if let Some(want) = first_broken {
                     match got {
@@ -1312,7 +1448,10 @@ mod tests {
     fn test_activation_overrides_merge() {
         let base = activation_heights(Network::Regtest);
         // No overrides: identity.
-        assert_eq!(base.with_overrides(&TestActivationOverrides::default()), base);
+        assert_eq!(
+            base.with_overrides(&TestActivationOverrides::default()),
+            base
+        );
 
         // Each name moves exactly its own height.
         let o = TestActivationOverrides {
@@ -1332,7 +1471,10 @@ mod tests {
 
         // Moving segwit moves segwit alone: taproot stays always active,
         // as Core's regtest has it, and gates no flag (#1244).
-        let o = TestActivationOverrides { segwit: Some(300), ..Default::default() };
+        let o = TestActivationOverrides {
+            segwit: Some(300),
+            ..Default::default()
+        };
         let h = base.with_overrides(&o);
         assert_eq!(h.segwit, 300);
         assert_eq!(h.taproot, base.taproot);
@@ -1359,7 +1501,14 @@ mod tests {
         for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
             assert_eq!(
                 activation_heights(net),
-                ActivationHeights { bip34: 1, dersig: 0, cltv: 0, csv: 0, segwit: 0, taproot: 0 },
+                ActivationHeights {
+                    bip34: 1,
+                    dersig: 0,
+                    cltv: 0,
+                    csv: 0,
+                    segwit: 0,
+                    taproot: 0
+                },
                 "{net}: every softfork must be active from genesis"
             );
         }
@@ -1383,7 +1532,10 @@ mod tests {
             always | consensus::VERIFY_DERSIG
         );
         // NULLDUMMY comes on with segwit's block rules.
-        assert_eq!(script_verify_flags(Network::Bitcoin, 481_823) & consensus::VERIFY_NULLDUMMY, 0);
+        assert_eq!(
+            script_verify_flags(Network::Bitcoin, 481_823) & consensus::VERIFY_NULLDUMMY,
+            0
+        );
         assert_eq!(script_verify_flags(Network::Bitcoin, 481_824), all);
         assert_eq!(script_verify_flags(Network::Testnet, 0), always);
         assert_eq!(script_verify_flags(Network::Testnet, 834_624), all);
@@ -1407,7 +1559,10 @@ mod tests {
         let other = hash("00000000000000000000000000000000000000000000000000000000000000aa");
 
         assert_eq!(block_script_flags(Network::Bitcoin, 170_060, &bip16), 0);
-        assert_eq!(block_script_flags(Network::Bitcoin, 170_060, &other), always);
+        assert_eq!(
+            block_script_flags(Network::Bitcoin, 170_060, &other),
+            always
+        );
         assert_eq!(
             block_script_flags(Network::Bitcoin, 692_261, &taproot),
             script_verify_flags(Network::Bitcoin, 692_261) & !consensus::VERIFY_TAPROOT
@@ -1420,8 +1575,14 @@ mod tests {
         assert_eq!(block_script_flags(Network::Testnet, 394, &bip16), always);
         assert_eq!(block_script_flags(Network::Bitcoin, 394, &t3_bip16), always);
 
-        assert_eq!(ScriptContext::block(170_060, bip16).flags(Network::Bitcoin), 0);
-        assert_eq!(ScriptContext::unmined(170_060).flags(Network::Bitcoin), always);
+        assert_eq!(
+            ScriptContext::block(170_060, bip16).flags(Network::Bitcoin),
+            0
+        );
+        assert_eq!(
+            ScriptContext::unmined(170_060).flags(Network::Bitcoin),
+            always
+        );
     }
 
     /// Build a tx spending a P2WPKH prevout with an empty scriptSig and an
@@ -1472,11 +1633,15 @@ mod tests {
         for net in [Network::Signet, Network::Testnet4, Network::Regtest] {
             for height in [1, 308_124, 481_824] {
                 assert!(
-                    ConsensusVerifier::new(net).verify_transaction(&tx, &prevs, ScriptContext::unmined(height)).is_err(),
+                    ConsensusVerifier::new(net)
+                        .verify_transaction(&tx, &prevs, ScriptContext::unmined(height))
+                        .is_err(),
                     "cpp engine accepted unsigned P2WPKH spend on {net} at {height}"
                 );
                 assert!(
-                    RustVerifier::new(net).verify_transaction(&tx, &prevs, ScriptContext::unmined(height)).is_err(),
+                    RustVerifier::new(net)
+                        .verify_transaction(&tx, &prevs, ScriptContext::unmined(height))
+                        .is_err(),
                     "rust engine accepted unsigned P2WPKH spend on {net} at {height}"
                 );
             }
@@ -1486,21 +1651,31 @@ mod tests {
         // without its witness (#1244). Only an exception block is spared.
         for net in [Network::Bitcoin, Network::Testnet] {
             for height in [1, 308_124, 481_824] {
-                for engine in [&ConsensusVerifier::new(net) as &dyn ScriptVerifier, &RustVerifier::new(net)] {
+                for engine in [
+                    &ConsensusVerifier::new(net) as &dyn ScriptVerifier,
+                    &RustVerifier::new(net),
+                ] {
                     assert!(
-                        engine.verify_transaction(&tx, &prevs, ScriptContext::unmined(height)).is_err(),
+                        engine
+                            .verify_transaction(&tx, &prevs, ScriptContext::unmined(height))
+                            .is_err(),
                         "{net} at {height} accepted an unsigned P2WPKH spend"
                     );
                 }
             }
         }
-        let bip16: BlockHash =
-            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22".parse().unwrap();
+        let bip16: BlockHash = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+            .parse()
+            .unwrap();
         for engine in [
             &ConsensusVerifier::new(Network::Bitcoin) as &dyn ScriptVerifier,
             &RustVerifier::new(Network::Bitcoin),
         ] {
-            assert!(engine.verify_transaction(&tx, &prevs, ScriptContext::block(170_060, bip16)).is_ok());
+            assert!(
+                engine
+                    .verify_transaction(&tx, &prevs, ScriptContext::block(170_060, bip16))
+                    .is_ok()
+            );
         }
     }
 
@@ -1518,7 +1693,8 @@ mod tests {
             _prev_outputs: &[TxOut],
             _at: ScriptContext,
         ) -> Result<(), ScriptError> {
-            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(200));
             Ok(())
         }
@@ -1526,7 +1702,8 @@ mod tests {
 
     impl Drop for SlowShadow {
         fn drop(&mut self) {
-            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1547,7 +1724,10 @@ mod tests {
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let verifier = ShadowVerifier::new(
             Box::new(NoopVerifier),
-            Box::new(SlowShadow { started: started.clone(), dropped: dropped.clone() }),
+            Box::new(SlowShadow {
+                started: started.clone(),
+                dropped: dropped.clone(),
+            }),
             "noop",
             "slow",
             16,
@@ -1560,20 +1740,30 @@ mod tests {
             output: vec![TxOut::NULL],
         };
         for _ in 0..5 {
-            verifier.verify_transaction(&tx, &[], ScriptContext::unmined(1)).expect("the primary accepts");
+            verifier
+                .verify_transaction(&tx, &[], ScriptContext::unmined(1))
+                .expect("the primary accepts");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while started.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(started.load(SeqCst), 1, "fixture: the worker must be busy with the first");
+        assert_eq!(
+            started.load(SeqCst),
+            1,
+            "fixture: the worker must be busy with the first"
+        );
 
         drop(verifier);
         assert!(
             dropped.load(SeqCst),
             "drop must return only after every worker has exited"
         );
-        assert_eq!(started.load(SeqCst), 1, "the four still queued must be discarded");
+        assert_eq!(
+            started.load(SeqCst),
+            1,
+            "the four still queued must be discarded"
+        );
     }
 
     /// A shadow engine that blocks every verification until the test
@@ -1590,7 +1780,8 @@ mod tests {
             _prev_outputs: &[TxOut],
             _at: ScriptContext,
         ) -> Result<(), ScriptError> {
-            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             drop(self.gate.lock());
             Ok(())
         }
@@ -1599,7 +1790,10 @@ mod tests {
     fn wait_for(what: &str, cond: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !cond() {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
@@ -1631,10 +1825,16 @@ mod tests {
         // The budget below is a multiple of `cost`, so it scales with
         // whatever `cost` returns; pin that `cost` counts the bytes an item
         // actually holds, or a budget in megabytes bounds nothing.
-        assert!(cost >= tx.total_size() + 200, "an item holds its tx and the 200-byte prevout script: {cost}");
+        assert!(
+            cost >= tx.total_size() + 200,
+            "an item holds its tx and the 200-byte prevout script: {cost}"
+        );
         let verifier = ShadowVerifier::new(
             Box::new(NoopVerifier),
-            Box::new(GatedShadow { gate: gate.clone(), started: started.clone() }),
+            Box::new(GatedShadow {
+                gate: gate.clone(),
+                started: started.clone(),
+            }),
             "noop",
             "gated",
             1_000,
@@ -1643,20 +1843,40 @@ mod tests {
         .with_queue_bytes(3 * cost);
 
         let held = gate.lock();
-        verifier.verify_transaction(&tx, &prevs, ScriptContext::unmined(1)).expect("the primary accepts");
-        wait_for("the worker to take the first item", || started.load(SeqCst) == 1);
-        assert_eq!(verifier.queued_bytes(), 0, "a dequeued item no longer counts");
+        verifier
+            .verify_transaction(&tx, &prevs, ScriptContext::unmined(1))
+            .expect("the primary accepts");
+        wait_for("the worker to take the first item", || {
+            started.load(SeqCst) == 1
+        });
+        assert_eq!(
+            verifier.queued_bytes(),
+            0,
+            "a dequeued item no longer counts"
+        );
 
         for _ in 0..5 {
-            verifier.verify_transaction(&tx, &prevs, ScriptContext::unmined(1)).expect("the primary accepts");
+            verifier
+                .verify_transaction(&tx, &prevs, ScriptContext::unmined(1))
+                .expect("the primary accepts");
         }
-        assert_eq!(verifier.dropped_total(), 2, "two items past the byte budget are dropped");
+        assert_eq!(
+            verifier.dropped_total(),
+            2,
+            "two items past the byte budget are dropped"
+        );
         assert_eq!(verifier.queued_bytes(), 3 * cost);
 
         drop(held);
-        wait_for("the queue to drain", || started.load(SeqCst) == 4 && verifier.queued_bytes() == 0);
-        verifier.verify_transaction(&tx, &prevs, ScriptContext::unmined(1)).expect("the primary accepts");
-        wait_for("the drained queue to take work again", || started.load(SeqCst) == 5);
+        wait_for("the queue to drain", || {
+            started.load(SeqCst) == 4 && verifier.queued_bytes() == 0
+        });
+        verifier
+            .verify_transaction(&tx, &prevs, ScriptContext::unmined(1))
+            .expect("the primary accepts");
+        wait_for("the drained queue to take work again", || {
+            started.load(SeqCst) == 5
+        });
         assert_eq!(verifier.dropped_total(), 2);
     }
 
@@ -1673,7 +1893,10 @@ mod tests {
         };
         let verifier = ShadowVerifier::new(
             Box::new(NoopVerifier),
-            Box::new(GatedShadow { gate: gate.clone(), started: started.clone() }),
+            Box::new(GatedShadow {
+                gate: gate.clone(),
+                started: started.clone(),
+            }),
             "noop",
             "gated",
             4,
@@ -1681,14 +1904,22 @@ mod tests {
         )
         .with_queue_bytes(0);
         let held = gate.lock();
-        verifier.verify_transaction(&tx, &[], ScriptContext::unmined(1)).expect("the primary accepts");
+        verifier
+            .verify_transaction(&tx, &[], ScriptContext::unmined(1))
+            .expect("the primary accepts");
         wait_for("the worker to take the first item", || {
             started.load(std::sync::atomic::Ordering::SeqCst) == 1
         });
         for _ in 0..6 {
-            verifier.verify_transaction(&tx, &[], ScriptContext::unmined(1)).expect("the primary accepts");
+            verifier
+                .verify_transaction(&tx, &[], ScriptContext::unmined(1))
+                .expect("the primary accepts");
         }
-        assert_eq!(verifier.dropped_total(), 2, "only the entry cap of 4 applies");
+        assert_eq!(
+            verifier.dropped_total(),
+            2,
+            "only the entry cap of 4 applies"
+        );
         drop(held);
     }
 }

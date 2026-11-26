@@ -19,14 +19,25 @@ fn floor_env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
 }
 
 fn submit(mp: &Mempool, cs: &ChainState, txs: &[&Transaction]) -> PackageResult {
-    mp.accept_package_with(txs.iter().map(|t| (*t).clone()).collect(), cs, &NoopVerifier, None)
+    mp.accept_package_with(
+        txs.iter().map(|t| (*t).clone()).collect(),
+        cs,
+        &NoopVerifier,
+        None,
+    )
 }
 
 /// A parent spending `coin` and its child, paying `fees`. `tag` keeps the
 /// transactions of one package apart from another's on the same coin.
 fn package(coin: OutPoint, fees: (u64, u64), tag: u8) -> (Transaction, Transaction) {
     let parent = spend(&[coin], COIN_VALUE, fees.0, 1, tag);
-    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), fees.1, 1, tag + 1);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        parent.output[0].value.to_sat(),
+        fees.1,
+        1,
+        tag + 1,
+    );
     (parent, child)
 }
 
@@ -57,7 +68,10 @@ fn a_child_pays_to_replace_its_parents_conflicts() {
 
     let r = submit(&mp, &cs, &[&p2, &c2]);
     assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
-    assert_eq!(r.replaced.iter().copied().collect::<HashSet<_>>(), ids(&[&p1, &c1]));
+    assert_eq!(
+        r.replaced.iter().copied().collect::<HashSet<_>>(),
+        ids(&[&p1, &c1])
+    );
     assert_eq!(pool(&mp), ids(&[&p2, &c2]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -68,7 +82,8 @@ fn a_child_pays_to_replace_its_parents_conflicts() {
 fn a_child_pays_to_replace_a_single_conflict() {
     let (cs, mp, dir) = floor_env(&[1]);
     let single = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    mp.accept_transaction(single.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("single");
+    mp.accept_transaction(single.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("single");
     let (p, c) = package(prev(1), (1_000, 2_000), 3);
 
     let r = submit(&mp, &cs, &[&p, &c]);
@@ -102,7 +117,8 @@ fn the_package_pays_for_what_it_evicts_and_for_its_relay() {
 
     // The incremental relay fee for the package's size, five sats short.
     let (probe, probe_child) = package(prev(1), (1_000, 4_000), 5);
-    let vsize = policy::weight_to_vsize(probe.weight().to_wu()) + policy::weight_to_vsize(probe_child.weight().to_wu());
+    let vsize = policy::weight_to_vsize(probe.weight().to_wu())
+        + policy::weight_to_vsize(probe_child.weight().to_wu());
     let required = (100 * vsize).div_ceil(1000);
     let (p3, c3) = package(prev(1), (1_000, 4_000 + required - 5), 5);
     let r = submit(&mp, &cs, &[&p3, &c3]);
@@ -170,7 +186,10 @@ fn package_rbf_takes_one_parent_and_one_child() {
         7,
     );
     let r = submit(&mp, &cs, &[&pa, &pb, &child]);
-    assert_eq!(r.package_msg, "package RBF failed: package must be 1-parent-1-child");
+    assert_eq!(
+        r.package_msg,
+        "package RBF failed: package must be 1-parent-1-child"
+    );
     assert_eq!(pool(&mp), ids(&[&a1, &a2, &b1, &b2]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -187,14 +206,20 @@ fn package_rbf_takes_no_mempool_ancestors() {
     let replacing = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 3);
     let alone = spend(&[prev(2)], COIN_VALUE, 1_000, 1, 4);
     let child = spend(
-        &[out(replacing.compute_txid(), 0), out(alone.compute_txid(), 0)],
+        &[
+            out(replacing.compute_txid(), 0),
+            out(alone.compute_txid(), 0),
+        ],
         replacing.output[0].value.to_sat() + alone.output[0].value.to_sat(),
         20_000,
         1,
         5,
     );
     let r = submit(&mp, &cs, &[&replacing, &alone, &child]);
-    assert_eq!(r.package_msg, "package RBF failed: new transaction cannot have mempool ancestors");
+    assert_eq!(
+        r.package_msg,
+        "package RBF failed: new transaction cannot have mempool ancestors"
+    );
     assert_eq!(pool(&mp), ids(&[&p1, &c1, &alone]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -207,7 +232,15 @@ fn package_rbf_takes_no_mempool_ancestors() {
 fn a_child_conflicting_with_its_grandparent_is_refused() {
     let (cs, mp, dir) = floor_env(&[1, 2]);
     let grandparent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let g = mp.accept_transaction(grandparent.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("grandparent");
+    let g = mp
+        .accept_transaction(
+            grandparent.clone(),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
+        .expect("grandparent");
     let parent = spend(&[out(g, 0)], grandparent.output[0].value.to_sat(), 0, 1, 2);
     let child = spend(
         &[out(parent.compute_txid(), 0), prev(1)],
@@ -217,7 +250,10 @@ fn a_child_conflicting_with_its_grandparent_is_refused() {
         3,
     );
     let r = submit(&mp, &cs, &[&parent, &child]);
-    assert_eq!(r.package_msg, "package RBF failed: new transaction cannot have mempool ancestors");
+    assert_eq!(
+        r.package_msg,
+        "package RBF failed: new transaction cannot have mempool ancestors"
+    );
     assert_eq!(pool(&mp), HashSet::from([g]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -233,7 +269,10 @@ fn a_package_that_worsens_the_diagram_is_refused() {
 
     let (p2, c2) = package(prev(1), (3_999, 4_000), 3);
     let r = submit(&mp, &cs, &[&p2, &c2]);
-    assert_eq!(r.package_msg, "package RBF failed: insufficient feerate: does not improve feerate diagram");
+    assert_eq!(
+        r.package_msg,
+        "package RBF failed: insufficient feerate: does not improve feerate diagram"
+    );
     assert_eq!(pool(&mp), ids(&[&p1, &c1]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -245,14 +284,29 @@ fn a_package_that_worsens_the_diagram_is_refused() {
 fn a_zero_fee_truc_parent_replaces_on_its_childs_fee() {
     let (cs, mp, dir) = floor_env(&[1]);
     let p1 = v3(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1));
-    let c1 = v3(spend(&[out(p1.compute_txid(), 0)], p1.output[0].value.to_sat(), 1_000, 1, 2));
+    let c1 = v3(spend(
+        &[out(p1.compute_txid(), 0)],
+        p1.output[0].value.to_sat(),
+        1_000,
+        1,
+        2,
+    ));
     assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
 
     let p2 = v3(spend(&[prev(1)], COIN_VALUE, 0, 1, 3));
-    let c2 = v3(spend(&[out(p2.compute_txid(), 0)], COIN_VALUE, 20_000, 1, 4));
+    let c2 = v3(spend(
+        &[out(p2.compute_txid(), 0)],
+        COIN_VALUE,
+        20_000,
+        1,
+        4,
+    ));
     let r = submit(&mp, &cs, &[&p2, &c2]);
     assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
-    assert_eq!(r.replaced.iter().copied().collect::<HashSet<_>>(), ids(&[&p1, &c1]));
+    assert_eq!(
+        r.replaced.iter().copied().collect::<HashSet<_>>(),
+        ids(&[&p1, &c1])
+    );
     assert_eq!(pool(&mp), ids(&[&p2, &c2]));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -262,9 +316,17 @@ fn a_zero_fee_truc_parent_replaces_on_its_childs_fee() {
 struct RefusesOne(Txid);
 
 impl ScriptVerifier for RefusesOne {
-    fn verify_transaction(&self, tx: &Transaction, _: &[TxOut], _: crate::validation::script::ScriptContext) -> Result<(), ScriptError> {
+    fn verify_transaction(
+        &self,
+        tx: &Transaction,
+        _: &[TxOut],
+        _: crate::validation::script::ScriptContext,
+    ) -> Result<(), ScriptError> {
         if tx.compute_txid() == self.0 {
-            return Err(ScriptError::VerifyFailed { input: 0, reason: "Invalid Schnorr signature".into() });
+            return Err(ScriptError::VerifyFailed {
+                input: 0,
+                reason: "Invalid Schnorr signature".into(),
+            });
         }
         Ok(())
     }
@@ -283,10 +345,18 @@ fn a_child_with_bad_scripts_evicts_nothing() {
     assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
     let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
 
-    let r = mp.accept_package_with(vec![p2.clone(), c2.clone()], &cs, &RefusesOne(c2.compute_txid()), None);
+    let r = mp.accept_package_with(
+        vec![p2.clone(), c2.clone()],
+        &cs,
+        &RefusesOne(c2.compute_txid()),
+        None,
+    );
     assert_eq!(r.package_msg, "transaction failed");
     assert!(
-        r.tx_results[&c2.compute_wtxid().to_string()]["error"].as_str().unwrap().contains("script"),
+        r.tx_results[&c2.compute_wtxid().to_string()]["error"]
+            .as_str()
+            .unwrap()
+            .contains("script"),
         "{:?}",
         r.tx_results
     );
@@ -302,8 +372,14 @@ fn the_conflicts_of_both_members_count_toward_rule_five() {
     let tags: Vec<u8> = (1..=101).collect();
     let (cs, mp, dir) = floor_env(&tags);
     for &t in &tags {
-        mp.accept_transaction(spend(&[prev(t)], COIN_VALUE, 1_000, 1, t), &cs, &NoopVerifier, TxSource::Rpc, false)
-            .expect("one cluster per coin");
+        mp.accept_transaction(
+            spend(&[prev(t)], COIN_VALUE, 1_000, 1, t),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
+        .expect("one cluster per coin");
     }
     // The parent conflicts with 50 clusters, the child with the other 51.
     let parent_coins: Vec<OutPoint> = (1..=50).map(prev).collect();
@@ -311,7 +387,13 @@ fn the_conflicts_of_both_members_count_toward_rule_five() {
     let parent = spend(&parent_coins, 50 * COIN_VALUE, 50_000, 1, 200);
     let mut child_inputs = vec![out(parent.compute_txid(), 0)];
     child_inputs.extend(child_coins);
-    let child = spend(&child_inputs, parent.output[0].value.to_sat() + 51 * COIN_VALUE, 1_000_000, 1, 201);
+    let child = spend(
+        &child_inputs,
+        parent.output[0].value.to_sat() + 51 * COIN_VALUE,
+        1_000_000,
+        1,
+        201,
+    );
     let before = pool(&mp);
 
     let r = submit(&mp, &cs, &[&parent, &child]);
@@ -355,7 +437,10 @@ fn a_replacing_dust_parent_needs_its_dust_swept() {
     assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
     let mut parent = v3(spend(&[prev(1)], COIN_VALUE, 0, 1, 3));
     parent.output[0].value = bitcoin::Amount::from_sat(COIN_VALUE - 100);
-    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    parent.output.push(TxOut {
+        value: bitcoin::Amount::from_sat(100),
+        script_pubkey: parent.output[0].script_pubkey.clone(),
+    });
     let p = parent.compute_txid();
     let around = v3(spend(&[out(p, 0)], COIN_VALUE - 100, 20_000, 1, 4));
 
@@ -393,12 +478,21 @@ fn without_full_rbf_a_package_replaces_only_what_signals() {
     let (cs, mp, dir) = floor_env(&[1]);
     mp.config.write().full_rbf = false;
     let resident = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let r = mp.accept_transaction(resident.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect("resident");
+    let r = mp
+        .accept_transaction(resident.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("resident");
     let (parent, child) = package(prev(1), (0, 20_000), 3);
 
     let res = submit(&mp, &cs, &[&parent, &child]);
-    assert_eq!(res.package_msg, "transaction failed", "{:?}", res.tx_results);
-    assert_eq!(res.tx_results[&parent.compute_wtxid().to_string()]["error"], "txn-mempool-conflict");
+    assert_eq!(
+        res.package_msg, "transaction failed",
+        "{:?}",
+        res.tx_results
+    );
+    assert_eq!(
+        res.tx_results[&parent.compute_wtxid().to_string()]["error"],
+        "txn-mempool-conflict"
+    );
     assert_eq!(pool(&mp), HashSet::from([r]));
 
     // A resident that signals is replaced.
@@ -416,17 +510,34 @@ fn a_held_child_conflicting_with_an_acting_transaction_evicts_nothing() {
     let (cs, mp, dir) = floor_env(&[1, 2]);
     let a = version(spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1), 1);
     let b = version(spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2), 1);
-    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
-    let b_id = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
-    let rs = satd_policy::parse_ruleset("version 1\nquarantine catch on template when tx.version == 2").expect("ruleset");
+    let a_id = mp
+        .accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("a");
+    let b_id = mp
+        .accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("b");
+    let rs =
+        satd_policy::parse_ruleset("version 1\nquarantine catch on template when tx.version == 2")
+            .expect("ruleset");
     mp.set_policy(std::sync::Arc::new(rs));
 
     // The parent replaces A; the child, which the rule holds, also spends B's coin.
     let parent = version(spend(&[prev(1)], COIN_VALUE, 0, 1, 3), 1);
-    let child = spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4);
+    let child = spend(
+        &[out(parent.compute_txid(), 0), prev(2)],
+        2 * COIN_VALUE,
+        20_000,
+        1,
+        4,
+    );
 
     let res = submit(&mp, &cs, &[&parent, &child]);
-    assert_eq!(res.tx_results[&child.compute_wtxid().to_string()]["error"], "txn-mempool-conflict", "{:?}", res.tx_results);
+    assert_eq!(
+        res.tx_results[&child.compute_wtxid().to_string()]["error"],
+        "txn-mempool-conflict",
+        "{:?}",
+        res.tx_results
+    );
     assert!(res.replaced.is_empty());
     assert_eq!(pool(&mp), HashSet::from([a_id, b_id]));
 
@@ -440,18 +551,38 @@ fn a_held_child_conflicting_with_an_acting_transaction_evicts_nothing() {
 fn a_child_held_through_its_parent_is_judged_held() {
     let (cs, mp, dir) = floor_env(&[1, 2]);
     let b = version(spend(&[prev(2)], COIN_VALUE, 1_000, 1, 2), 1);
-    let b_id = mp.accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false).expect("b");
-    let rs = satd_policy::parse_ruleset("version 1\nquarantine catch on template when tx.version == 2").expect("ruleset");
+    let b_id = mp
+        .accept_transaction(b, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("b");
+    let rs =
+        satd_policy::parse_ruleset("version 1\nquarantine catch on template when tx.version == 2")
+            .expect("ruleset");
     mp.set_policy(std::sync::Arc::new(rs));
     let x = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let x_id = mp.accept_transaction(x, &cs, &NoopVerifier, TxSource::Rpc, false).expect("x, held");
+    let x_id = mp
+        .accept_transaction(x, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("x, held");
 
     // Both held by the rule's version or by descent; the child is version 1.
     let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 3);
-    let child = version(spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4), 1);
+    let child = version(
+        spend(
+            &[out(parent.compute_txid(), 0), prev(2)],
+            2 * COIN_VALUE,
+            20_000,
+            1,
+            4,
+        ),
+        1,
+    );
 
     let res = submit(&mp, &cs, &[&parent, &child]);
-    assert_eq!(res.tx_results[&child.compute_wtxid().to_string()]["error"], "txn-mempool-conflict", "{:?}", res.tx_results);
+    assert_eq!(
+        res.tx_results[&child.compute_wtxid().to_string()]["error"],
+        "txn-mempool-conflict",
+        "{:?}",
+        res.tx_results
+    );
     assert!(res.replaced.is_empty());
     assert_eq!(pool(&mp), HashSet::from([x_id, b_id]));
 
@@ -466,15 +597,29 @@ fn unswept_dust_is_refused_before_eviction_even_with_acceptnonstdtxn() {
     let (cs, mp, dir) = floor_env(&[1]);
     mp.config.write().accept_non_std_txn = true;
     let a = spend(&[prev(1)], COIN_VALUE, 2_000, 1, 1);
-    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let a_id = mp
+        .accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("a");
     let mut parent = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 3);
     parent.output[0].value = bitcoin::Amount::from_sat(COIN_VALUE - 1_100);
-    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
-    let child = spend(&[out(parent.compute_txid(), 0)], COIN_VALUE - 1_100, 20_000, 1, 4);
+    parent.output.push(TxOut {
+        value: bitcoin::Amount::from_sat(100),
+        script_pubkey: parent.output[0].script_pubkey.clone(),
+    });
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        COIN_VALUE - 1_100,
+        20_000,
+        1,
+        4,
+    );
 
     let res = submit(&mp, &cs, &[&parent, &child]);
     assert!(
-        res.tx_results[&child.compute_wtxid().to_string()]["error"].as_str().unwrap_or_default().starts_with("missing-ephemeral-spends"),
+        res.tx_results[&child.compute_wtxid().to_string()]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("missing-ephemeral-spends"),
         "{:?}",
         res.tx_results
     );
@@ -491,19 +636,34 @@ fn the_childs_policy_sees_the_mempool_after_its_parent() {
     let (cs, mp, dir) = floor_env(&[1]);
     let a = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
     let a_size = bitcoin::consensus::serialize(&a).len();
-    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let a_id = mp
+        .accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("a");
     // A larger parent than A, so the mempool grows when it replaces A.
     let parent = version(spend(&[prev(1)], COIN_VALUE, 0, 3, 3), 1);
     let parent_size = bitcoin::consensus::serialize(&parent).len();
     assert!(parent_size > a_size);
-    let child = spend(&[out(parent.compute_txid(), 0)], parent.output[0].value.to_sat(), 20_000, 1, 4);
+    let child = spend(
+        &[out(parent.compute_txid(), 0)],
+        parent.output[0].value.to_sat(),
+        20_000,
+        1,
+        4,
+    );
     // Holds a version 2 transaction from relay once the mempool is past A's size.
-    let rule = format!("version 1\nquarantine catch when tx.version == 2 and node.mempool_bytes > {a_size}");
-    mp.set_policy(std::sync::Arc::new(satd_policy::parse_ruleset(&rule).expect("ruleset")));
+    let rule = format!(
+        "version 1\nquarantine catch when tx.version == 2 and node.mempool_bytes > {a_size}"
+    );
+    mp.set_policy(std::sync::Arc::new(
+        satd_policy::parse_ruleset(&rule).expect("ruleset"),
+    ));
 
     let res = submit(&mp, &cs, &[&parent, &child]);
     assert!(
-        res.tx_results[&child.compute_wtxid().to_string()]["error"].as_str().unwrap_or_default().starts_with("txn-policy-quarantined"),
+        res.tx_results[&child.compute_wtxid().to_string()]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("txn-policy-quarantined"),
         "{:?}",
         res.tx_results
     );
@@ -534,7 +694,9 @@ fn stream(rx: &mut tokio::sync::broadcast::Receiver<MempoolEvent>) -> Vec<String
         match event {
             MempoolEvent::Enter { txid, .. } => out.push(format!("enter {txid}")),
             MempoolEvent::LeaveReplaced { txid, .. } => out.push(format!("replaced {txid}")),
-            MempoolEvent::LeaveEvicted { txid, reason, .. } => out.push(format!("evicted {txid} {reason:?}")),
+            MempoolEvent::LeaveEvicted { txid, reason, .. } => {
+                out.push(format!("evicted {txid} {reason:?}"))
+            }
             _ => {}
         }
     }
@@ -548,21 +710,39 @@ fn stream(rx: &mut tokio::sync::broadcast::Receiver<MempoolEvent>) -> Vec<String
 fn a_child_failing_after_its_parent_restores_what_the_parent_replaced() {
     let (cs, mp, dir) = floor_env(&[1, 2]);
     let a = spend(&[prev(1)], COIN_VALUE, 1_000, 1, 1);
-    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let a_id = mp
+        .accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("a");
     mp.mark_unbroadcast(a_id);
     let (tx, mut rx) = tokio::sync::broadcast::channel(64);
     mp.set_event_sender(tx);
     let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 3);
-    let child = spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4);
+    let child = spend(
+        &[out(parent.compute_txid(), 0), prev(2)],
+        2 * COIN_VALUE,
+        20_000,
+        1,
+        4,
+    );
     spend_between(&mp, &cs, vec![prev(2)]);
 
     let res = submit(&mp, &cs, &[&parent, &child]);
     assert_eq!(res.package_msg, "transaction failed");
     assert!(res.replaced.is_empty(), "{:?}", res.replaced);
     assert_eq!(pool(&mp), HashSet::from([a_id]));
-    assert!(stream(&mut rx).is_empty(), "the replacement that did not happen was announced");
-    assert_eq!(mp.spending_tx(&prev(1)).map(|(t, _)| t), Some(a_id), "a spends its coin again");
-    assert!(mp.is_unbroadcast(&a_id), "a is still rebroadcast until it has propagated");
+    assert!(
+        stream(&mut rx).is_empty(),
+        "the replacement that did not happen was announced"
+    );
+    assert_eq!(
+        mp.spending_tx(&prev(1)).map(|(t, _)| t),
+        Some(a_id),
+        "a spends its coin again"
+    );
+    assert!(
+        mp.is_unbroadcast(&a_id),
+        "a is still rebroadcast until it has propagated"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -574,17 +754,28 @@ fn a_child_failing_after_its_parent_restores_what_the_parent_replaced() {
 fn a_replaced_transaction_the_block_invalidated_is_not_restored() {
     let (cs, mp, dir) = floor_env(&[1, 2, 3]);
     let a = spend(&[prev(1), prev(3)], 2 * COIN_VALUE, 1_000, 1, 1);
-    let a_id = mp.accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false).expect("a");
+    let a_id = mp
+        .accept_transaction(a, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("a");
     let (tx, mut rx) = tokio::sync::broadcast::channel(64);
     mp.set_event_sender(tx);
     let parent = spend(&[prev(1)], COIN_VALUE, 0, 1, 3);
-    let child = spend(&[out(parent.compute_txid(), 0), prev(2)], 2 * COIN_VALUE, 20_000, 1, 4);
+    let child = spend(
+        &[out(parent.compute_txid(), 0), prev(2)],
+        2 * COIN_VALUE,
+        20_000,
+        1,
+        4,
+    );
     spend_between(&mp, &cs, vec![prev(2), prev(3)]);
 
     let res = submit(&mp, &cs, &[&parent, &child]);
     assert_eq!(res.package_msg, "transaction failed");
     assert!(pool(&mp).is_empty());
-    assert_eq!(stream(&mut rx), vec![format!("evicted {a_id} BlockConflict")]);
+    assert_eq!(
+        stream(&mut rx),
+        vec![format!("evicted {a_id} BlockConflict")]
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -605,13 +796,28 @@ fn no_reader_sees_a_replacing_package_half_admitted() {
     }));
 
     assert_eq!(submit(&mp, &cs, &[&p2, &c2]).package_msg, "success");
-    assert_eq!(*seen.lock(), Some(false), "the mempool was readable between the parent and the child");
+    assert_eq!(
+        *seen.lock(),
+        Some(false),
+        "the mempool was readable between the parent and the child"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn submit_from(mp: &Mempool, cs: &ChainState, txs: &[&Transaction], source: TxSource) -> PackageResult {
-    mp.accept_package_from(txs.iter().map(|t| (*t).clone()).collect(), cs, &NoopVerifier, None, source)
+fn submit_from(
+    mp: &Mempool,
+    cs: &ChainState,
+    txs: &[&Transaction],
+    source: TxSource,
+) -> PackageResult {
+    mp.accept_package_from(
+        txs.iter().map(|t| (*t).clone()).collect(),
+        cs,
+        &NoopVerifier,
+        None,
+        source,
+    )
 }
 
 /// A zero-fee parent with one dust output and the child that sweeps it, the
@@ -619,7 +825,10 @@ fn submit_from(mp: &Mempool, cs: &ChainState, txs: &[&Transaction], source: TxSo
 fn dust_package(coin: OutPoint) -> (Transaction, Transaction) {
     let mut parent = spend(&[coin], COIN_VALUE, 0, 1, 3);
     parent.output[0].value = bitcoin::Amount::from_sat(COIN_VALUE - 100);
-    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    parent.output.push(TxOut {
+        value: bitcoin::Amount::from_sat(100),
+        script_pubkey: parent.output[0].script_pubkey.clone(),
+    });
     let p = parent.compute_txid();
     let child = version(spend(&[out(p, 0), out(p, 1)], COIN_VALUE, 20_000, 1, 4), 1);
     (parent, child)
@@ -633,14 +842,18 @@ fn dust_package(coin: OutPoint) -> (Transaction, Transaction) {
 fn a_peers_dust_parent_is_held_by_the_policy() {
     let (cs, mp, dir) = floor_env(&[1]);
     mp.set_policy(std::sync::Arc::new(
-        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 2").expect("ruleset"),
+        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 2")
+            .expect("ruleset"),
     ));
     let (parent, child) = dust_package(prev(1));
     let r = submit_from(&mp, &cs, &[&parent, &child], TxSource::P2p);
     assert_eq!(r.package_msg, "success", "{:?}", r.tx_results);
     for tx in [&parent, &child] {
         let entry = mp.get(&tx.compute_txid()).expect("in the pool");
-        assert!(entry.scope.relay && entry.scope.template, "held, the child through its parent");
+        assert!(
+            entry.scope.relay && entry.scope.template,
+            "held, the child through its parent"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -652,13 +865,21 @@ fn a_peers_dust_parent_is_held_by_the_policy() {
 fn a_local_dust_parent_the_policy_would_hold_is_refused() {
     let (cs, mp, dir) = floor_env(&[1]);
     mp.set_policy(std::sync::Arc::new(
-        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 2").expect("ruleset"),
+        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 2")
+            .expect("ruleset"),
     ));
     let (parent, child) = dust_package(prev(1));
     let r = submit_from(&mp, &cs, &[&parent, &child], TxSource::Rpc);
     assert_ne!(r.package_msg, "success");
-    let err = r.tx_results[&parent.compute_wtxid().to_string()]["error"].as_str().unwrap_or_default().to_string();
-    assert!(err.starts_with("txn-policy-quarantined"), "{:?}", r.tx_results);
+    let err = r.tx_results[&parent.compute_wtxid().to_string()]["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        err.starts_with("txn-policy-quarantined"),
+        "{:?}",
+        r.tx_results
+    );
     assert!(pool(&mp).is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -673,12 +894,16 @@ fn package_rbf_judges_a_peers_package_by_its_source() {
     let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
     assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
     mp.set_policy(std::sync::Arc::new(
-        satd_policy::parse_ruleset("version 1\nquarantine local when tx.source == rpc").expect("ruleset"),
+        satd_policy::parse_ruleset("version 1\nquarantine local when tx.source == rpc")
+            .expect("ruleset"),
     ));
     let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
 
     let local = submit_from(&mp, &cs, &[&p2, &c2], TxSource::Rpc);
-    assert_ne!(local.package_msg, "success", "a local package the rule holds is refused");
+    assert_ne!(
+        local.package_msg, "success",
+        "a local package the rule holds is refused"
+    );
     assert_eq!(pool(&mp), ids(&[&p1, &c1]));
 
     let r = submit_from(&mp, &cs, &[&p2, &c2], TxSource::P2p);
@@ -699,7 +924,8 @@ fn a_peers_replacing_package_keeps_its_held_child() {
     let (p1, c1) = package(prev(1), (1_000, 1_000), 1);
     assert_eq!(submit(&mp, &cs, &[&p1, &c1]).package_msg, "success");
     mp.set_policy(std::sync::Arc::new(
-        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 1").expect("ruleset"),
+        satd_policy::parse_ruleset("version 1\nquarantine catch when tx.version == 1")
+            .expect("ruleset"),
     ));
     let (p2, c2) = package(prev(1), (1_000, 4_000), 3);
     let c2 = version(c2, 1);
@@ -724,11 +950,21 @@ fn a_dust_parent_spending_its_package_is_refused_with_a_fee_delta() {
     let g = grand.compute_txid();
     let mut parent = spend(&[out(g, 0)], grand.output[0].value.to_sat(), 0, 1, 2);
     parent.output[0].value = bitcoin::Amount::from_sat(parent.output[0].value.to_sat() - 100);
-    parent.output.push(TxOut { value: bitcoin::Amount::from_sat(100), script_pubkey: parent.output[0].script_pubkey.clone() });
+    parent.output.push(TxOut {
+        value: bitcoin::Amount::from_sat(100),
+        script_pubkey: parent.output[0].script_pubkey.clone(),
+    });
     let p = parent.compute_txid();
-    let child = spend(&[out(g, 1), out(p, 0), out(p, 1)], half + grand.output[0].value.to_sat(), 20_000, 1, 3);
+    let child = spend(
+        &[out(g, 1), out(p, 0), out(p, 1)],
+        half + grand.output[0].value.to_sat(),
+        20_000,
+        1,
+        3,
+    );
 
-    mp.prioritise_transaction(&p, 1_000).expect("a delta set ahead of the transaction");
+    mp.prioritise_transaction(&p, 1_000)
+        .expect("a delta set ahead of the transaction");
     let r = submit(&mp, &cs, &[&grand, &parent, &child]);
     assert_eq!(
         r.tx_results[&parent.compute_wtxid().to_string()]["error"],

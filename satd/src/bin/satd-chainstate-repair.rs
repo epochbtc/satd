@@ -87,7 +87,9 @@ struct Args {
 }
 
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 fn parse_network(s: &str) -> Result<bitcoin::Network, String> {
@@ -97,19 +99,24 @@ fn parse_network(s: &str) -> Result<bitcoin::Network, String> {
         "testnet" | "testnet3" => Ok(bitcoin::Network::Testnet),
         "signet" => Ok(bitcoin::Network::Signet),
         "regtest" => Ok(bitcoin::Network::Regtest),
-        other => Err(format!("unknown network {other:?} (expected main|testnet4|signet|regtest)")),
+        other => Err(format!(
+            "unknown network {other:?} (expected main|testnet4|signet|regtest)"
+        )),
     }
 }
 
 fn run(args: &Args) -> Result<RepairReport, String> {
     let network = parse_network(&args.network)?;
-    let blockhash: bitcoin::BlockHash =
-        args.blockhash.parse().map_err(|e| format!("bad --blockhash: {e}"))?;
+    let blockhash: bitcoin::BlockHash = args
+        .blockhash
+        .parse()
+        .map_err(|e| format!("bad --blockhash: {e}"))?;
     if args.apply && args.checkpoint.is_none() && !args.no_checkpoint {
         return Err("--apply requires --checkpoint <dir> (or an explicit --no-checkpoint)".into());
     }
     if !args.datadir.join("chainstate").is_dir() {
-        return Err(format!("{} has no chainstate/ subdirectory — pass the node's network \
+        return Err(format!(
+            "{} has no chainstate/ subdirectory — pass the node's network \
              datadir (for non-mainnet chains that is the network subdirectory itself)",
             args.datadir.display()
         ));
@@ -128,10 +135,16 @@ fn run(args: &Args) -> Result<RepairReport, String> {
         blockhash, entry.height, entry.status, entry.num_tx, entry.file_number, entry.data_pos
     );
 
-    let blocksdir = args.blocksdir.clone().unwrap_or_else(|| args.datadir.join("blocks"));
+    let blocksdir = args
+        .blocksdir
+        .clone()
+        .unwrap_or_else(|| args.datadir.join("blocks"));
     let mut flat_files =
         FlatFileManager::new(&blocksdir).map_err(|e| format!("cannot open block files: {e}"))?;
-    let pos = FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos };
+    let pos = FlatFilePos {
+        file_number: entry.file_number,
+        data_pos: entry.data_pos,
+    };
     let raw = flat_files
         .read_block(&pos)
         .map_err(|e| format!("cannot read block data from flat files: {e}"))?;
@@ -158,8 +171,10 @@ fn run(args: &Args) -> Result<RepairReport, String> {
     }
 
     let verifier = RustVerifier::new(network);
-    let address_index =
-        AddressIndexConfig { enabled: args.addressindex, ..Default::default() };
+    let address_index = AddressIndexConfig {
+        enabled: args.addressindex,
+        ..Default::default()
+    };
     repair_lost_connect_delta(
         &store,
         &block,
@@ -176,7 +191,11 @@ fn main() -> ExitCode {
     let args = Args::parse();
     match run(&args) {
         Ok(report) => {
-            let mode = if report.applied { "APPLIED" } else { "DRY RUN (nothing written)" };
+            let mode = if report.applied {
+                "APPLIED"
+            } else {
+                "DRY RUN (nothing written)"
+            };
             println!("{mode}");
             println!(
                 "  block {} at height {} (tip {} at height {})",
@@ -199,8 +218,10 @@ fn main() -> ExitCode {
             if !report.applied {
                 println!("re-run with --apply --checkpoint <dir> to write the repair");
             } else {
-                println!("repair written and flushed durably; restart the node to verify \
-                     it connects new blocks");
+                println!(
+                    "repair written and flushed durably; restart the node to verify \
+                     it connects new blocks"
+                );
             }
             ExitCode::SUCCESS
         }

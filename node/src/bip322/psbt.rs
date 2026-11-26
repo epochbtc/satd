@@ -145,18 +145,30 @@ pub fn add_descriptor(psbt: &mut Psbt, descriptor: &str) -> Result<(), Descripto
     }) {
         return Err(DescriptorError::HardenedDerivation);
     }
-    let singles = descriptor.into_single_descriptors().map_err(|e| DescriptorError::Parse(e.to_string()))?;
+    let singles = descriptor
+        .into_single_descriptors()
+        .map_err(|e| DescriptorError::Parse(e.to_string()))?;
     let input = psbt.inputs.first().ok_or(DescriptorError::NoUtxo)?;
     let challenge = match (&input.witness_utxo, &input.non_witness_utxo) {
         (Some(utxo), _) => utxo.script_pubkey.clone(),
-        (None, Some(tx)) => tx.output.first().ok_or(DescriptorError::NoUtxo)?.script_pubkey.clone(),
+        (None, Some(tx)) => tx
+            .output
+            .first()
+            .ok_or(DescriptorError::NoUtxo)?
+            .script_pubkey
+            .clone(),
         (None, None) => return Err(DescriptorError::NoUtxo),
     };
     for single in singles {
-        let range = if single.has_wildcard() { DESCRIPTOR_SEARCH_RANGE } else { 1 };
+        let range = if single.has_wildcard() {
+            DESCRIPTOR_SEARCH_RANGE
+        } else {
+            1
+        };
         for index in 0..range {
-            let definite =
-                single.at_derivation_index(index).map_err(|e| DescriptorError::Parse(e.to_string()))?;
+            let definite = single
+                .at_derivation_index(index)
+                .map_err(|e| DescriptorError::Parse(e.to_string()))?;
             if definite.script_pubkey() == challenge {
                 return psbt
                     .update_input_with_descriptor(0, &definite)
@@ -168,7 +180,10 @@ pub fn add_descriptor(psbt: &mut Psbt, descriptor: &str) -> Result<(), Descripto
 }
 
 fn message_key() -> raw::Key {
-    raw::Key { type_value: PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE, key: Vec::new() }
+    raw::Key {
+        type_value: PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE,
+        key: Vec::new(),
+    }
 }
 
 /// Whether `bytes` are a serialized PSBT rather than a signature: no
@@ -194,7 +209,11 @@ pub struct Signed {
 pub fn finalize(bytes: &[u8]) -> Result<Finalized, PsbtError> {
     let signed = parse(bytes)?;
     let (message, challenge) = (signed.message.clone(), signed.challenge.clone());
-    Ok(Finalized { message, challenge, proof: signed.finalize()? })
+    Ok(Finalized {
+        message,
+        challenge,
+        proof: signed.finalize()?,
+    })
 }
 
 /// Decode a BIP 322 PSBT and check its structure.
@@ -206,7 +225,11 @@ pub fn finalize(bytes: &[u8]) -> Result<Finalized, PsbtError> {
 /// proof of funds, which is refused.
 pub fn parse(bytes: &[u8]) -> Result<Signed, PsbtError> {
     let psbt = Psbt::deserialize(bytes).map_err(|e| PsbtError::Decode(e.to_string()))?;
-    let message = psbt.unknown.get(&message_key()).cloned().ok_or(PsbtError::NoMessage)?;
+    let message = psbt
+        .unknown
+        .get(&message_key())
+        .cloned()
+        .ok_or(PsbtError::NoMessage)?;
     if psbt.inputs.len() != 1 {
         return Err(PsbtError::ExtraInputs(psbt.inputs.len()));
     }
@@ -225,17 +248,31 @@ pub fn parse(bytes: &[u8]) -> Result<Signed, PsbtError> {
     if prevout.txid != spend_txid || prevout.vout != 0 {
         return Err(PsbtError::NotToSpend("its prevout is not to_spend:0"));
     }
-    if input.witness_utxo.as_ref().is_some_and(|u| *u != spend.output[0]) {
-        return Err(PsbtError::NotToSpend("witness_utxo is not to_spend's output"));
+    if input
+        .witness_utxo
+        .as_ref()
+        .is_some_and(|u| *u != spend.output[0])
+    {
+        return Err(PsbtError::NotToSpend(
+            "witness_utxo is not to_spend's output",
+        ));
     }
-    if input.non_witness_utxo.as_ref().is_some_and(|tx| *tx != spend) {
+    if input
+        .non_witness_utxo
+        .as_ref()
+        .is_some_and(|tx| *tx != spend)
+    {
         return Err(PsbtError::NotToSpend("non_witness_utxo is not to_spend"));
     }
     let outputs = &psbt.unsigned_tx.output;
     if outputs.len() != 1 || *outputs != to_sign(spend_txid, Witness::new()).output {
         return Err(PsbtError::NotOpReturn);
     }
-    Ok(Signed { message, challenge, psbt })
+    Ok(Signed {
+        message,
+        challenge,
+        psbt,
+    })
 }
 
 impl Signed {
@@ -244,7 +281,11 @@ impl Signed {
     /// `to_sign` is the default one and the challenge is native segwit,
     /// full otherwise. The proof is not verified here.
     pub fn finalize(self) -> Result<Proof, PsbtError> {
-        let Signed { challenge, mut psbt, .. } = self;
+        let Signed {
+            challenge,
+            mut psbt,
+            ..
+        } = self;
         let spend_txid = psbt.unsigned_tx.input[0].previous_output.txid;
         crate::rpc::psbt::try_finalize_input(&mut psbt.inputs[0]);
         if !is_final(&psbt.inputs[0]) {
@@ -257,11 +298,13 @@ impl Signed {
         tx.input[0].witness = input.final_script_witness.clone().unwrap_or_default();
 
         let native_segwit = challenge.is_p2wpkh() || challenge.is_p2wsh() || challenge.is_p2tr();
-        Ok(if native_segwit && tx == to_sign(spend_txid, tx.input[0].witness.clone()) {
-            Proof::Simple(tx.input[0].witness.clone())
-        } else {
-            Proof::Full(tx)
-        })
+        Ok(
+            if native_segwit && tx == to_sign(spend_txid, tx.input[0].witness.clone()) {
+                Proof::Simple(tx.input[0].witness.clone())
+            } else {
+                Proof::Full(tx)
+            },
+        )
     }
 }
 

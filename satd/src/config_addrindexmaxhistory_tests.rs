@@ -23,15 +23,28 @@ fn load(body: &str, extra: &[&str]) -> Config {
 #[test]
 fn the_default_cap_is_the_index_default() {
     let c = load("", &[]);
-    assert_eq!(c.addrindexmaxhistory, node_index::DEFAULT_MAX_HISTORY_ENTRIES);
-    assert_eq!(c.address_history_cap(), node_index::DEFAULT_MAX_HISTORY_ENTRIES);
+    assert_eq!(
+        c.addrindexmaxhistory,
+        node_index::DEFAULT_MAX_HISTORY_ENTRIES
+    );
+    assert_eq!(
+        c.address_history_cap(),
+        node_index::DEFAULT_MAX_HISTORY_ENTRIES
+    );
 }
 
 #[test]
 fn the_cap_is_read_from_the_config_file_and_the_command_line() {
-    assert_eq!(load("addrindexmaxhistory=500000\n", &[]).address_history_cap(), 500_000);
     assert_eq!(
-        load("addrindexmaxhistory=500000\n", &["--addrindexmaxhistory=1000"]).address_history_cap(),
+        load("addrindexmaxhistory=500000\n", &[]).address_history_cap(),
+        500_000
+    );
+    assert_eq!(
+        load(
+            "addrindexmaxhistory=500000\n",
+            &["--addrindexmaxhistory=1000"]
+        )
+        .address_history_cap(),
         1_000,
         "the command line wins over the config file"
     );

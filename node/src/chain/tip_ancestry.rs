@@ -242,10 +242,7 @@ pub fn audit_tip_ancestry(
                         .iter()
                         .filter(|a| {
                             a.height <= h
-                                && !matches!(
-                                    a.status,
-                                    BlockStatus::Valid | BlockStatus::Pruned
-                                )
+                                && !matches!(a.status, BlockStatus::Valid | BlockStatus::Pruned)
                         })
                         .cloned(),
                 );
@@ -267,9 +264,7 @@ pub fn audit_tip_ancestry(
 
     // The walk runs tip-first; report ascending, which is how heights read.
     audit.holes.sort_unstable_by_key(|a| a.height);
-    audit
-        .unvalidated_floor
-        .sort_unstable_by_key(|a| a.height);
+    audit.unvalidated_floor.sort_unstable_by_key(|a| a.height);
 
     audit.elapsed_ms = started.elapsed().as_millis() as u64;
     audit
@@ -373,7 +368,10 @@ mod tests {
         }
         let audit = audit_tip_ancestry(&store, hashes[49], 49, 2016, None);
 
-        assert!(audit.is_intact(), "unvalidated history must not fail the audit");
+        assert!(
+            audit.is_intact(),
+            "unvalidated history must not fail the audit"
+        );
         assert!(audit.holes.is_empty());
         assert_eq!(audit.unvalidated_floor.len(), 40);
     }

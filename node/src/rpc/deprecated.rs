@@ -46,8 +46,15 @@ mod tests {
     fn warnings_are_always_an_array_unless_deprecated() {
         let two = || vec!["first".to_string(), "second".to_string()];
         assert_eq!(warnings_value_with(Vec::new(), false), json!([]));
-        assert_eq!(warnings_value_with(two(), false), json!(["first", "second"]));
+        assert_eq!(
+            warnings_value_with(two(), false),
+            json!(["first", "second"])
+        );
         assert_eq!(warnings_value_with(Vec::new(), true), json!(""));
-        assert_eq!(warnings_value_with(two(), true), json!("second"), "Core keeps the latest message");
+        assert_eq!(
+            warnings_value_with(two(), true),
+            json!("second"),
+            "Core keeps the latest message"
+        );
     }
 }

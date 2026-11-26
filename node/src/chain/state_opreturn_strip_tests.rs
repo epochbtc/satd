@@ -10,9 +10,14 @@ use std::os::unix::fs::FileExt;
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::consensus::serialize;
-use bitcoin::{Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction};
+use bitcoin::{
+    Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    transaction,
+};
 
-use super::tests::{build_test_block, grind_test_pow, make_chain_state, make_chain_state_with_store};
+use super::tests::{
+    build_test_block, grind_test_pow, make_chain_state, make_chain_state_with_store,
+};
 use super::*;
 use crate::storage::StoreBatch;
 use crate::storage::db::InMemoryStore;
@@ -111,7 +116,8 @@ fn put_record(store: &dyn crate::storage::Store, hash: BlockHash, record: &Strip
 fn payload_location(cs: &ChainState, hash: &BlockHash) -> (std::path::PathBuf, u64) {
     let entry = cs.store.get_block_index(hash).expect("indexed");
     (
-        cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number)),
+        cs.blocks_dir()
+            .join(format!("blk{:05}.dat", entry.file_number)),
         u64::from(entry.data_pos) + 8,
     )
 }
@@ -134,18 +140,42 @@ fn strip(cs: &ChainState, block: &Block) -> Vec<u8> {
 
 fn corrupt_warning(cs: &ChainState, hash: &BlockHash) -> Option<String> {
     let id = format!("blockdata.corrupt.{hash}");
-    cs.warnings().list().into_iter().find(|w| w.id == id).map(|w| w.message)
+    cs.warnings()
+        .list()
+        .into_iter()
+        .find(|w| w.id == id)
+        .map(|w| w.message)
 }
 
 fn assert_filled(cs: &ChainState, original: &Block, filled: &[u8]) {
     let hash = original.block_hash();
-    let stored = cs.get_stored_block(&hash).expect("a stripped block reads in its filled form");
+    let stored = cs
+        .get_stored_block(&hash)
+        .expect("a stripped block reads in its filled form");
     assert!(stored.is_stripped());
     assert_eq!(serialize(&stored.block), filled);
-    assert_eq!(stored.txids(), original.txdata.iter().map(|t| t.compute_txid()).collect::<Vec<_>>());
-    assert_eq!(stored.wtxids(), original.txdata.iter().map(|t| t.compute_wtxid()).collect::<Vec<_>>());
+    assert_eq!(
+        stored.txids(),
+        original
+            .txdata
+            .iter()
+            .map(|t| t.compute_txid())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stored.wtxids(),
+        original
+            .txdata
+            .iter()
+            .map(|t| t.compute_wtxid())
+            .collect::<Vec<_>>()
+    );
     let script = stored.block.txdata[1].output[1].script_pubkey.as_bytes();
-    assert_eq!(script.len(), PAYLOAD, "the filled form keeps the original size");
+    assert_eq!(
+        script.len(),
+        PAYLOAD,
+        "the filled form keeps the original size"
+    );
     assert_eq!(script[0], 0x6a);
     assert!(script[1..].iter().all(|b| *b == 0));
 }
@@ -160,21 +190,35 @@ fn a_stripped_block_is_unavailable_to_get_block_and_filled_from_get_stored_block
     let b = &blocks[101];
     let hash = b.block_hash();
 
-    assert_eq!(cs.get_block(&hash).as_ref(), Some(b), "intact before the strip");
+    assert_eq!(
+        cs.get_block(&hash).as_ref(),
+        Some(b),
+        "intact before the strip"
+    );
     assert!(!cs.get_stored_block(&hash).unwrap().is_stripped());
 
     let filled = strip(&cs, b);
     let (path, offset) = payload_location(&cs, &hash);
     let mut on_disk = vec![0u8; filled.len()];
-    std::fs::File::open(&path).unwrap().read_exact_at(&mut on_disk, offset).unwrap();
+    std::fs::File::open(&path)
+        .unwrap()
+        .read_exact_at(&mut on_disk, offset)
+        .unwrap();
     assert_eq!(on_disk, filled, "premise: the payload on disk is zeroed");
 
     assert_eq!(cs.get_block(&hash), None);
     assert!(!cs.block_data_readable(&hash));
-    assert_eq!(corrupt_warning(&cs, &hash), None, "a stripped block is not corrupt");
+    assert_eq!(
+        corrupt_warning(&cs, &hash),
+        None,
+        "a stripped block is not corrupt"
+    );
     assert_filled(&cs, b, &filled);
     // Its neighbours are untouched.
-    assert_eq!(cs.get_block(&blocks[100].block_hash()).as_ref(), Some(&blocks[100]));
+    assert_eq!(
+        cs.get_block(&blocks[100].block_hash()).as_ref(),
+        Some(&blocks[100])
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -216,7 +260,10 @@ fn a_record_that_does_not_decode_is_reported_as_corruption() {
         .unwrap();
     assert!(cs.get_stored_block(&hash).is_none());
     let warning = corrupt_warning(&cs, &hash).expect("an undecodable record is reported");
-    assert!(warning.contains("strip record does not decode"), "{warning}");
+    assert!(
+        warning.contains("strip record does not decode"),
+        "{warning}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -237,7 +284,10 @@ fn an_unreadable_record_is_corruption_not_an_intact_block() {
     assert!(cs.get_stored_block(&hash).is_none());
     assert!(cs.get_block(&hash).is_none());
     let warning = corrupt_warning(&cs, &hash).expect("an unreadable record is reported");
-    assert!(warning.contains("strip record could not be read"), "{warning}");
+    assert!(
+        warning.contains("strip record could not be read"),
+        "{warning}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -299,7 +349,10 @@ fn prune_drops_the_strip_records_of_the_blocks_it_deletes() {
         parent = next.block_hash();
     }
 
-    assert!(cs.store.get_opreturn_strip(&hash).unwrap().is_some(), "premise: stripped");
+    assert!(
+        cs.store.get_opreturn_strip(&hash).unwrap().is_some(),
+        "premise: stripped"
+    );
     assert_eq!(cs.prune_up_to(102), 1, "file 0 goes");
     assert!(cs.is_pruned(&hash));
     assert_eq!(cs.store.get_opreturn_strip(&hash).unwrap(), None);
@@ -317,7 +370,10 @@ fn repairing_a_stripped_block_with_a_full_copy_drops_the_record() {
     strip(&cs, b);
     assert_eq!(cs.get_block(&hash), None, "premise: stripped");
 
-    assert!(matches!(cs.repair_block_data(b), Ok(BlockDataRepair::Repaired { .. })));
+    assert!(matches!(
+        cs.repair_block_data(b),
+        Ok(BlockDataRepair::Repaired { .. })
+    ));
     assert_eq!(cs.store.get_opreturn_strip(&hash).unwrap(), None);
     assert_eq!(cs.get_block(&hash).as_ref(), Some(b));
     let _ = std::fs::remove_dir_all(dir);
@@ -393,7 +449,10 @@ fn a_lost_strip_record_is_caught_by_the_merkle_check() {
         })
         .unwrap();
 
-    assert!(cs.get_stored_block(&hash).is_none(), "punched bytes must not read as the block");
+    assert!(
+        cs.get_stored_block(&hash).is_none(),
+        "punched bytes must not read as the block"
+    );
     let warning = corrupt_warning(&cs, &hash).expect("a lost record is reported");
     assert!(warning.contains("lost strip record"), "{warning}");
     let _ = std::fs::remove_dir_all(dir);
@@ -411,7 +470,10 @@ fn a_genuine_zero_payload_reads_as_the_block() {
     b.txdata[1].output[1].script_pubkey = ScriptBuf::from_bytes(zeros);
     b.header.merkle_root = b.compute_merkle_root().unwrap();
     grind_test_pow(&mut b);
-    assert!(crate::storage::opreturn_strip::has_punched_op_return(&b, &[0; 8]), "premise");
+    assert!(
+        crate::storage::opreturn_strip::has_punched_op_return(&b, &[0; 8]),
+        "premise"
+    );
     assert!(cs.accept_block(&b).expect("accept").connected());
 
     let hash = b.block_hash();
@@ -452,8 +514,16 @@ fn a_repoint_between_the_index_read_and_the_record_lookup_is_not_corruption() {
     });
     cs.store_ref().drop_read_overlays();
 
-    assert_eq!(cs.get_block(&hash).as_ref(), Some(&b), "the reader follows the repoint");
-    assert_eq!(corrupt_warning(&cs, &hash), None, "a repoint is not corruption");
+    assert_eq!(
+        cs.get_block(&hash).as_ref(),
+        Some(&b),
+        "the reader follows the repoint"
+    );
+    assert_eq!(
+        corrupt_warning(&cs, &hash),
+        None,
+        "a repoint is not corruption"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -478,17 +548,30 @@ fn an_in_place_restore_between_the_byte_read_and_the_record_lookup_is_not_corrup
     let mut body = serialize(&b);
     let key = cs.flat_files.lock().xor_key();
     crate::storage::flatfile::xor_in_place(&mut body, &key, offset);
-    let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    let path = cs
+        .blocks_dir()
+        .join(format!("blk{:05}.dat", entry.file_number));
     controls.before_next_strip_lookup(move |inner: &InMemoryStore| {
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         std::os::unix::fs::FileExt::write_all_at(&file, &body, offset).unwrap();
         inner
-            .write_batch(StoreBatch { opreturn_strip_removes: vec![hash], ..Default::default() })
+            .write_batch(StoreBatch {
+                opreturn_strip_removes: vec![hash],
+                ..Default::default()
+            })
             .unwrap();
     });
     cs.store_ref().drop_read_overlays();
 
-    assert_eq!(cs.get_block(&hash).as_ref(), Some(&b), "the reader reads again");
-    assert_eq!(corrupt_warning(&cs, &hash), None, "a restore is not corruption");
+    assert_eq!(
+        cs.get_block(&hash).as_ref(),
+        Some(&b),
+        "the reader reads again"
+    );
+    assert_eq!(
+        corrupt_warning(&cs, &hash),
+        None,
+        "a restore is not corruption"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

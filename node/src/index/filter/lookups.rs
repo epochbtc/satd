@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bitcoin::hashes::Hash;
 
-use node_filter_index::{FilterIndex, IndexError, FILTER_TYPE_BASIC};
+use node_filter_index::{FILTER_TYPE_BASIC, FilterIndex, IndexError};
 
 use crate::storage::Store;
 
@@ -193,10 +193,10 @@ mod indexgate_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::db::InMemoryStore;
     use crate::storage::StoreBatch;
+    use crate::storage::db::InMemoryStore;
     use node_filter_index::{
-        FilterHeaderRow, FilterIndexConfig, FilterKey, FilterRow, FILTER_TYPE_BASIC,
+        FILTER_TYPE_BASIC, FilterHeaderRow, FilterIndexConfig, FilterKey, FilterRow,
     };
 
     fn enabled() -> FilterIndexConfig {

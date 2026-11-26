@@ -118,7 +118,11 @@ pub fn resolve_payout(
             address: Some(addr.to_string()),
             worker,
         }),
-        (None, Some(script)) => Ok(Payout { script: script.clone(), address: None, worker }),
+        (None, Some(script)) => Ok(Payout {
+            script: script.clone(),
+            address: None,
+            worker,
+        }),
         (None, None) => Err(PayoutError),
     }
 }
@@ -143,10 +147,23 @@ mod tests {
         let p = resolve_payout(&regtest_addr, Network::Regtest, None).unwrap();
         assert_eq!(p.worker, None);
         // The miner's own string, bounded and reduced to printable ASCII.
-        let p = resolve_payout(&format!("{regtest_addr}.rig\n1\u{1b}"), Network::Regtest, None).unwrap();
+        let p = resolve_payout(
+            &format!("{regtest_addr}.rig\n1\u{1b}"),
+            Network::Regtest,
+            None,
+        )
+        .unwrap();
         assert_eq!(p.worker.as_deref(), Some("rig1"));
-        let p = resolve_payout(&format!("{regtest_addr}.{}", "w".repeat(1000)), Network::Regtest, None).unwrap();
-        assert_eq!(p.worker.map(|w| w.len()), Some(super::super::miner::MAX_LABEL_CHARS));
+        let p = resolve_payout(
+            &format!("{regtest_addr}.{}", "w".repeat(1000)),
+            Network::Regtest,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.worker.map(|w| w.len()),
+            Some(super::super::miner::MAX_LABEL_CHARS)
+        );
         let p = resolve_payout(&format!("{regtest_addr}.\n"), Network::Regtest, None).unwrap();
         assert_eq!(p.worker, None);
     }
@@ -154,12 +171,21 @@ mod tests {
     #[test]
     fn wrong_network_address_rejected() {
         let mainnet_addr = addr(Network::Bitcoin);
-        assert_eq!(resolve_payout(&mainnet_addr, Network::Regtest, None), Err(PayoutError));
-        assert_eq!(resolve_payout("not-an-address", Network::Regtest, None), Err(PayoutError));
+        assert_eq!(
+            resolve_payout(&mainnet_addr, Network::Regtest, None),
+            Err(PayoutError)
+        );
+        assert_eq!(
+            resolve_payout("not-an-address", Network::Regtest, None),
+            Err(PayoutError)
+        );
 
         let fallback = ScriptBuf::new_op_return([1]);
         let p = resolve_payout(&mainnet_addr, Network::Regtest, Some(&fallback)).unwrap();
-        assert_eq!(p.script, fallback, "the fallback pays, not the foreign address");
+        assert_eq!(
+            p.script, fallback,
+            "the fallback pays, not the foreign address"
+        );
         assert_eq!(p.address, None);
     }
 

@@ -82,7 +82,13 @@ struct Refusal {
 
 impl Refusal {
     fn new(error: StratumError, reason: &'static str) -> Self {
-        Self { error, reason, job_id: None, difficulty: None, hash_difficulty: None }
+        Self {
+            error,
+            reason,
+            job_id: None,
+            difficulty: None,
+            hash_difficulty: None,
+        }
     }
 
     fn on(mut self, job: &Job) -> Self {
@@ -115,7 +121,11 @@ pub(crate) async fn run<S>(
         writer,
         version_mask: 0,
         payout: None,
-        vardiff: Vardiff::new(config.vardiff.clone(), config.initial_difficulty, std::time::Instant::now()),
+        vardiff: Vardiff::new(
+            config.vardiff.clone(),
+            config.initial_difficulty,
+            std::time::Instant::now(),
+        ),
         jobs: JobManager::new(),
         job_prev_hash: None,
         seen: HashSet::new(),
@@ -219,7 +229,8 @@ async fn read_line_bounded<R: AsyncRead + Unpin>(
     // Stratum V1 is JSON text. Bytes that are not text are almost always a
     // Stratum V2 miner (its first message is a Noise handshake) pointed at
     // the V1 port.
-    String::from_utf8(buf.clone()).map_err(|_| "binary data on the Stratum V1 port (a Stratum V2 client?)")
+    String::from_utf8(buf.clone())
+        .map_err(|_| "binary data on the Stratum V1 port (a Stratum V2 client?)")
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
@@ -247,11 +258,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             return Ok(());
         }
         let Some(req) = parse_request(line) else {
-            return self.write(error_response(&Value::Null, StratumError::Other, Some("Malformed request"))).await;
+            return self
+                .write(error_response(
+                    &Value::Null,
+                    StratumError::Other,
+                    Some("Malformed request"),
+                ))
+                .await;
         };
         match req.method.as_str() {
             "mining.subscribe" => {
-                self.user_agent = req.params.first().and_then(Value::as_str).map(miner::label).filter(|ua| !ua.is_empty());
+                self.user_agent = req
+                    .params
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(miner::label)
+                    .filter(|ua| !ua.is_empty());
                 tracing::debug!(
                     target: "node::stratum",
                     peer = %self.peer,
@@ -273,7 +295,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             "mining.submit" => self.submit(&req).await,
             "mining.extranonce.subscribe" => self.write(response(&req.id, json!(true))).await,
             "mining.ping" => self.write(response(&req.id, json!("pong"))).await,
-            _ => self.write(error_response(&req.id, StratumError::UnknownMethod, None)).await,
+            _ => {
+                self.write(error_response(&req.id, StratumError::UnknownMethod, None))
+                    .await
+            }
         }
     }
 
@@ -306,7 +331,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
                 "Stratum version rolling negotiated"
             );
             result.insert("version-rolling".into(), json!(self.version_mask != 0));
-            result.insert("version-rolling.mask".into(), json!(format!("{:08x}", self.version_mask)));
+            result.insert(
+                "version-rolling.mask".into(),
+                json!(format!("{:08x}", self.version_mask)),
+            );
         }
         result.insert("minimum-difficulty".into(), json!(false));
         result.insert("subscribe-extranonce".into(), json!(false));
@@ -320,21 +348,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     ) -> Result<(), Close> {
         let username = req.params.first().and_then(Value::as_str).unwrap_or("");
         let config = &self.shared.config;
-        let payout = match resolve_payout(username, config.network, config.fallback_address.as_ref()) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
-                    target: "node::stratum",
-                    peer = %self.peer,
-                    username,
-                    "Stratum authorize refused: {e}"
-                );
-                let detail = format!("{}: {e}", StratumError::Unauthorized.message());
-                return self
-                    .write(error_response(&req.id, StratumError::Unauthorized, Some(&detail)))
-                    .await;
-            }
-        };
+        let payout =
+            match resolve_payout(username, config.network, config.fallback_address.as_ref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "node::stratum",
+                        peer = %self.peer,
+                        username,
+                        "Stratum authorize refused: {e}"
+                    );
+                    let detail = format!("{}: {e}", StratumError::Unauthorized.message());
+                    return self
+                        .write(error_response(
+                            &req.id,
+                            StratumError::Unauthorized,
+                            Some(&detail),
+                        ))
+                        .await;
+                }
+            };
         tracing::info!(
             target: "node::stratum",
             peer = %self.peer,
@@ -347,7 +380,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         );
         let first = self.payout.is_none();
         let miner = self.miner.get_or_insert_with(|| {
-            self.shared.stats.miners.register(MinerRecord::new("v1", self.peer, None, self.vardiff.difficulty()))
+            self.shared.stats.miners.register(MinerRecord::new(
+                "v1",
+                self.peer,
+                None,
+                self.vardiff.difficulty(),
+            ))
         });
         {
             let mut record = miner.lock();
@@ -361,8 +399,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         }
         self.write(response(&req.id, json!(true))).await?;
         if first {
-            self.write(notification("mining.set_difficulty", json!([self.vardiff.difficulty()])))
-                .await?;
+            self.write(notification(
+                "mining.set_difficulty",
+                json!([self.vardiff.difficulty()]),
+            ))
+            .await?;
             // Mark it seen, so the select loop does not issue the same work
             // again as a change.
             let work = work_rx.borrow_and_update().clone();
@@ -382,7 +423,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
                 %params,
                 "Stratum suggest_difficulty refused: not a difficulty"
             );
-            return self.write(error_response(&req.id, StratumError::InvalidParams, None)).await;
+            return self
+                .write(error_response(&req.id, StratumError::InvalidParams, None))
+                .await;
         };
         let adopted = self.vardiff.suggest(d, std::time::Instant::now());
         tracing::debug!(
@@ -404,7 +447,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         if let Some(miner) = &self.miner {
             miner.lock().difficulty = difficulty;
         }
-        self.write(notification("mining.set_difficulty", json!([difficulty]))).await?;
+        self.write(notification("mining.set_difficulty", json!([difficulty])))
+            .await?;
         let work = self.jobs.latest().map(|j| j.template.work.clone());
         match work {
             Some(work) => self.issue_job(work).await,
@@ -413,7 +457,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     }
 
     async fn check_vardiff(&mut self) -> Result<(), Close> {
-        let Some(latest) = self.jobs.latest() else { return Ok(()) };
+        let Some(latest) = self.jobs.latest() else {
+            return Ok(());
+        };
         let ceiling = network_difficulty(&latest.template.work.block_target);
         match self.vardiff.retarget(std::time::Instant::now(), ceiling) {
             Some(d) => {
@@ -426,7 +472,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
 
     /// Build a job on `work` for this miner and send it.
     async fn issue_job(&mut self, work: Arc<Work>) -> Result<(), Close> {
-        let Some(payout) = self.payout.as_ref() else { return Ok(()) };
+        let Some(payout) = self.payout.as_ref() else {
+            return Ok(());
+        };
         let clean = self.job_prev_hash != Some(work.prev_hash);
         if clean {
             self.jobs.mark_all_stale();
@@ -435,7 +483,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         }
         let job_id = self.jobs.next_job_id();
         let extranonce_len = EXTRANONCE1_LEN + EXTRANONCE2_LEN;
-        let template = match ActiveTemplate::build(work, job_id, payout.script.clone(), extranonce_len) {
+        let template = match ActiveTemplate::build(
+            work,
+            job_id,
+            payout.script.clone(),
+            extranonce_len,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 // Unreachable with the fixed SV1 extranonce length; if it ever
@@ -456,7 +509,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             clean,
             "Stratum job issued"
         );
-        self.jobs.push(Job { template: Arc::new(template), difficulty, share_target });
+        self.jobs.push(Job {
+            template: Arc::new(template),
+            difficulty,
+            share_target,
+        });
         self.write(notification("mining.notify", params)).await
     }
 
@@ -514,7 +571,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
 
     async fn judge_submit(&mut self, req: &Request) -> Result<(), Refusal> {
         let Some(payout) = self.payout.clone() else {
-            return Err(Refusal::new(StratumError::Unauthorized, "submit before authorize"));
+            return Err(Refusal::new(
+                StratumError::Unauthorized,
+                "submit before authorize",
+            ));
         };
         let malformed = |reason| Refusal::new(StratumError::InvalidParams, reason);
         let p = &req.params;
@@ -529,8 +589,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
             .and_then(|s| hex::decode(s).ok())
             .and_then(|b| b.try_into().ok())
             .ok_or_else(|| malformed("malformed extranonce2"))?;
-        let ntime = p.get(3).and_then(parse_hex_u32).ok_or_else(|| malformed("malformed ntime"))?;
-        let nonce = p.get(4).and_then(parse_hex_u32).ok_or_else(|| malformed("malformed nonce"))?;
+        let ntime = p
+            .get(3)
+            .and_then(parse_hex_u32)
+            .ok_or_else(|| malformed("malformed ntime"))?;
+        let nonce = p
+            .get(4)
+            .and_then(parse_hex_u32)
+            .ok_or_else(|| malformed("malformed nonce"))?;
         let Some(job) = self.jobs.get(job_id).cloned() else {
             let mut refusal = Refusal::new(StratumError::JobNotFound, "stale or unknown job");
             refusal.job_id = Some(job_id);
@@ -555,12 +621,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         extranonce[..EXTRANONCE1_LEN].copy_from_slice(&self.extranonce1);
         extranonce[EXTRANONCE1_LEN..].copy_from_slice(&extranonce2);
         let now = crate::time::now_secs();
-        let result = validate_share(&job.template, &extranonce, ntime, nonce, version, &job.share_target, now)
-            .map_err(|_| Refusal::new(StratumError::InvalidParams, "malformed extranonce").on(&job))?;
+        let result = validate_share(
+            &job.template,
+            &extranonce,
+            ntime,
+            nonce,
+            version,
+            &job.share_target,
+            now,
+        )
+        .map_err(|_| Refusal::new(StratumError::InvalidParams, "malformed extranonce").on(&job))?;
         match result {
             ShareResult::Block(block) => {
                 self.accepted(key, job.difficulty, hash_difficulty(&block.block_hash()));
-                submit_found_block(&self.shared, *block, job.template.work.height, &payout, self.peer).await;
+                submit_found_block(
+                    &self.shared,
+                    *block,
+                    job.template.work.height,
+                    &payout,
+                    self.peer,
+                )
+                .await;
                 Ok(())
             }
             ShareResult::Share { hash_difficulty } => {
@@ -577,13 +658,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
                 Ok(())
             }
             ShareResult::LowDifficulty { hash_difficulty } => {
-                let mut refusal = Refusal::new(StratumError::LowDifficulty, "low difficulty").on(&job);
+                let mut refusal =
+                    Refusal::new(StratumError::LowDifficulty, "low difficulty").on(&job);
                 refusal.hash_difficulty = Some(hash_difficulty);
                 Err(refusal)
             }
-            ShareResult::Stale => Err(Refusal::new(StratumError::JobNotFound, "stale ntime").on(&job)),
-            ShareResult::Duplicate => Err(Refusal::new(StratumError::Duplicate, "duplicate").on(&job)),
-            ShareResult::BadTime => Err(Refusal::new(StratumError::InvalidTime, "ntime out of range").on(&job)),
+            ShareResult::Stale => {
+                Err(Refusal::new(StratumError::JobNotFound, "stale ntime").on(&job))
+            }
+            ShareResult::Duplicate => {
+                Err(Refusal::new(StratumError::Duplicate, "duplicate").on(&job))
+            }
+            ShareResult::BadTime => {
+                Err(Refusal::new(StratumError::InvalidTime, "ntime out of range").on(&job))
+            }
         }
     }
 
@@ -594,7 +682,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         self.seen.insert(key);
         self.vardiff.record_share(difficulty);
         if let Some(miner) = &self.miner {
-            miner.lock().tally.accept(std::time::Instant::now(), difficulty, hash_difficulty);
+            miner
+                .lock()
+                .tally
+                .accept(std::time::Instant::now(), difficulty, hash_difficulty);
         }
     }
 
@@ -609,14 +700,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
     }
 
     fn worker(&self) -> &str {
-        self.payout.as_ref().and_then(|p| p.worker.as_deref()).unwrap_or("")
+        self.payout
+            .as_ref()
+            .and_then(|p| p.worker.as_deref())
+            .unwrap_or("")
     }
 
     /// The periodic `-debug=stratum` reading: is this miner still hashing,
     /// and at what rate.
     fn log_status(&mut self) {
         let Some(miner) = &self.miner else { return };
-        let Some(report) = miner.lock().tally.status_due(std::time::Instant::now()) else { return };
+        let Some(report) = miner.lock().tally.status_due(std::time::Instant::now()) else {
+            return;
+        };
         tracing::debug!(
             target: "node::stratum",
             peer = %self.peer,
@@ -643,7 +739,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Session<S> {
         let (hashrate, total, connected_secs, best_share) = {
             let mut record = miner.lock();
             let tally = &mut record.tally;
-            (format_hashrate(tally.hashrate(now)), tally.total(), tally.connected_secs(now), tally.best_share())
+            (
+                format_hashrate(tally.hashrate(now)),
+                tally.total(),
+                tally.connected_secs(now),
+                tally.best_share(),
+            )
         };
         tracing::info!(
             target: "node::stratum",
@@ -703,7 +804,10 @@ pub(crate) mod tests {
     }
 
     async fn send(client: &mut DuplexStream, line: &str) {
-        client.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        client
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
     }
 
     /// Whether the server closes the connection within `wait`, discarding
@@ -722,17 +826,38 @@ pub(crate) mod tests {
     }
 
     async fn authorize(client: &mut DuplexStream) {
-        send(client, r#"{"id":1,"method":"mining.subscribe","params":["test"]}"#).await;
-        send(client, &format!(r#"{{"id":2,"method":"mining.authorize","params":["{ADDRESS}.w","x"]}}"#)).await;
+        send(
+            client,
+            r#"{"id":1,"method":"mining.subscribe","params":["test"]}"#,
+        )
+        .await;
+        send(
+            client,
+            &format!(r#"{{"id":2,"method":"mining.authorize","params":["{ADDRESS}.w","x"]}}"#),
+        )
+        .await;
     }
 
     /// A socket that never authorizes is still reaped at the short limit.
     #[tokio::test(start_paused = true)]
     async fn an_unauthorized_connection_is_dropped_after_two_minutes_of_silence() {
         let (_shared, mut client, _shutdown) = start();
-        send(&mut client, r#"{"id":1,"method":"mining.subscribe","params":["test"]}"#).await;
-        assert!(!closes_within(&mut client, UNAUTHORIZED_IDLE_TIMEOUT - Duration::from_secs(5)).await);
-        assert!(closes_within(&mut client, Duration::from_secs(10)).await, "reaped at the limit");
+        send(
+            &mut client,
+            r#"{"id":1,"method":"mining.subscribe","params":["test"]}"#,
+        )
+        .await;
+        assert!(
+            !closes_within(
+                &mut client,
+                UNAUTHORIZED_IDLE_TIMEOUT - Duration::from_secs(5)
+            )
+            .await
+        );
+        assert!(
+            closes_within(&mut client, Duration::from_secs(10)).await,
+            "reaped at the limit"
+        );
     }
 
     /// An authorized miner whose rate is not known yet is allowed the fixed
@@ -742,10 +867,17 @@ pub(crate) mod tests {
         let (_shared, mut client, _shutdown) = start();
         authorize(&mut client).await;
         assert!(
-            !closes_within(&mut client, UNESTIMATED_MINER_IDLE_TIMEOUT - Duration::from_secs(10)).await,
+            !closes_within(
+                &mut client,
+                UNESTIMATED_MINER_IDLE_TIMEOUT - Duration::from_secs(10)
+            )
+            .await,
             "an authorized miner was dropped before its share rate was known"
         );
-        assert!(closes_within(&mut client, Duration::from_secs(20)).await, "and is dropped after it");
+        assert!(
+            closes_within(&mut client, Duration::from_secs(20)).await,
+            "and is dropped after it"
+        );
     }
 
     /// A miner whose shares are due every 150 s is allowed twenty of those
@@ -766,7 +898,11 @@ pub(crate) mod tests {
             let mut record = records[0].lock();
             record.tally = MinerTally::new(start);
             for i in 1..=20 {
-                record.tally.accept(start + Duration::from_secs(150 * i), DIFFICULTY, DIFFICULTY as f64);
+                record.tally.accept(
+                    start + Duration::from_secs(150 * i),
+                    DIFFICULTY,
+                    DIFFICULTY as f64,
+                );
             }
         }
         let allowed = Duration::from_secs(20 * 150);
@@ -774,7 +910,10 @@ pub(crate) mod tests {
             !closes_within(&mut client, allowed - Duration::from_secs(60)).await,
             "a miner with rare shares was dropped before twenty intervals"
         );
-        assert!(closes_within(&mut client, Duration::from_secs(120)).await, "and is dropped after them");
+        assert!(
+            closes_within(&mut client, Duration::from_secs(120)).await,
+            "and is dropped after them"
+        );
     }
 
     /// A Stratum V2 miner pointed at the V1 port is named in the reason.

@@ -220,14 +220,17 @@ mod tests {
     #[test]
     fn prevout_script_scan_is_per_element_not_one_tx_pass() {
         // leaf_script (witness, tx-resident): one tx-pass, no per-element scan.
-        let leaf =
-            compile("all inputs (in.leaf_script.contains_ops(script(OP_RETURN)))").unwrap();
+        let leaf = compile("all inputs (in.leaf_script.contains_ops(script(OP_RETURN)))").unwrap();
         assert_eq!(leaf.cost().scan_elem, 0);
         assert!(leaf.cost().within_budget());
 
         // prevout_script (UTXO set): per-element scan ≈ MAX_INPUTS × MAX_PREVOUT_SCRIPT.
         let prevout = compile("all inputs (in.prevout_script.well_formed)").unwrap();
-        assert!(prevout.cost().scan_elem >= 200_000_000, "{:?}", prevout.cost());
+        assert!(
+            prevout.cost().scan_elem >= 200_000_000,
+            "{:?}",
+            prevout.cost()
+        );
         assert!(prevout.cost().within_budget());
     }
 
@@ -254,9 +257,8 @@ mod tests {
     // gate and silently fuel-quarantining every matching transaction at runtime.
     #[test]
     fn pathological_prevout_glob_rejected_at_load() {
-        let err =
-            compile("all inputs (in.prevout_script.contains_ops(script(OP_RETURN OP_DUP)))")
-                .unwrap_err();
+        let err = compile("all inputs (in.prevout_script.contains_ops(script(OP_RETURN OP_DUP)))")
+            .unwrap_err();
         assert!(err.message.contains("cost budget"), "{}", err.message);
     }
 }

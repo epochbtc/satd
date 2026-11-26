@@ -120,8 +120,16 @@ struct State {
 
 impl State {
     fn remove_where(&mut self, key: &Key, drop: impl Fn(usize, &Held) -> bool) -> usize {
-        let State { entries, ids, dirty, changes, .. } = self;
-        let Some(gens) = entries.get_mut(key) else { return 0 };
+        let State {
+            entries,
+            ids,
+            dirty,
+            changes,
+            ..
+        } = self;
+        let Some(gens) = entries.get_mut(key) else {
+            return 0;
+        };
         let before = gens.len();
         let mut i = 0;
         gens.retain(|h| {
@@ -166,9 +174,17 @@ impl Aggregate {
     /// [`Inserted::Full`]); 0 is no limit, as for the publisher. A file
     /// holding more, from a higher limit, keeps what fits and is rewritten
     /// without the rest.
-    pub fn open_with_max(path: PathBuf, chain: &impl ChainSource, max_attestations: usize) -> Result<Self, String> {
+    pub fn open_with_max(
+        path: PathBuf,
+        chain: &impl ChainSource,
+        max_attestations: usize,
+    ) -> Result<Self, String> {
         let loaded = load(&path)?;
-        let agg = Aggregate { path, state: Mutex::new(State::default()), max_attestations };
+        let agg = Aggregate {
+            path,
+            state: Mutex::new(State::default()),
+            max_attestations,
+        };
         agg.state.lock().pending = loaded;
         // What loaded is what the file holds, unless some was dropped.
         let dropped = agg.judge_pending(chain);
@@ -215,9 +231,13 @@ impl Aggregate {
                     Ok(locks) => match chain.read(&|v| (judge(&att, &locks, v), v.tip_height())) {
                         // One the tip pass would drop at once takes no place
                         // in the set, which a cap may have to share.
-                        Some((status, tip)) if doomed(&status, att.anchor_height(), tip) => Pending::Spent,
+                        Some((status, tip)) if doomed(&status, att.anchor_height(), tip) => {
+                            Pending::Spent
+                        }
                         Some((status, _)) => Pending::Verified(locks, status),
-                        None => Pending::Verified(locks, Err(Rejection::NotYetValid("not judged yet"))),
+                        None => {
+                            Pending::Verified(locks, Err(Rejection::NotYetValid("not judged yet")))
+                        }
                     },
                 },
             };
@@ -260,7 +280,13 @@ impl Aggregate {
 
     /// Add an attestation whose signature verified, with its status at the
     /// tip it was judged at.
-    pub fn insert(&self, att: Attestation, locks: Timelocks, source: String, status: Status) -> Inserted {
+    pub fn insert(
+        &self,
+        att: Attestation,
+        locks: Timelocks,
+        source: String,
+        status: Status,
+    ) -> Inserted {
         let source = truncated(source, MAX_SOURCE_LEN);
         let key = (att.outpoint(), att.key().to_owned());
         let id = att.id();
@@ -268,23 +294,41 @@ impl Aggregate {
         if st.ids.contains_key(&id) {
             return Inserted::Duplicate;
         }
-        if !st.entries.contains_key(&key) && keys_for(&st.entries, att.outpoint()) >= MAX_KEYS_PER_OUTPOINT {
+        if !st.entries.contains_key(&key)
+            && keys_for(&st.entries, att.outpoint()) >= MAX_KEYS_PER_OUTPOINT
+        {
             return Inserted::KeyLimit;
         }
-        if self.max_attestations != 0 && !st.entries.contains_key(&key) && st.ids.len() >= self.max_attestations {
+        if self.max_attestations != 0
+            && !st.entries.contains_key(&key)
+            && st.ids.len() >= self.max_attestations
+        {
             return Inserted::Full;
         }
         let gens = st.entries.entry(key.clone()).or_default();
-        let at = gens.iter().position(|h| supersedes(&att, &h.attestation)).unwrap_or(gens.len());
+        let at = gens
+            .iter()
+            .position(|h| supersedes(&att, &h.attestation))
+            .unwrap_or(gens.len());
         if at >= MAX_GENERATIONS {
             if gens.is_empty() {
                 st.entries.remove(&key);
             }
             return Inserted::TooOld;
         }
-        gens.insert(at, Held { attestation: att, locks, source, status });
-        let dropped: Vec<sha256::Hash> =
-            gens.drain(MAX_GENERATIONS.min(gens.len())..).map(|h| h.attestation.id()).collect();
+        gens.insert(
+            at,
+            Held {
+                attestation: att,
+                locks,
+                source,
+                status,
+            },
+        );
+        let dropped: Vec<sha256::Hash> = gens
+            .drain(MAX_GENERATIONS.min(gens.len())..)
+            .map(|h| h.attestation.id())
+            .collect();
         for d in dropped {
             st.ids.remove(&d);
         }
@@ -303,14 +347,24 @@ impl Aggregate {
             st.entries
                 .iter()
                 .flat_map(|(k, gens)| {
-                    gens.iter().map(move |h| (k.clone(), h.attestation.id(), h.attestation.clone(), h.locks))
+                    gens.iter().map(move |h| {
+                        (
+                            k.clone(),
+                            h.attestation.id(),
+                            h.attestation.clone(),
+                            h.locks,
+                        )
+                    })
                 })
                 .collect()
         };
-        let mut judged: HashMap<sha256::Hash, (Judged, u32)> = HashMap::with_capacity(snapshot.len());
+        let mut judged: HashMap<sha256::Hash, (Judged, u32)> =
+            HashMap::with_capacity(snapshot.len());
         let mut keys: Vec<Key> = Vec::new();
         for (key, id, att, locks) in snapshot {
-            let Some(j) = chain.read(&|v| (assess(&att, &locks, v), v.tip_height())) else { continue };
+            let Some(j) = chain.read(&|v| (assess(&att, &locks, v), v.tip_height())) else {
+                continue;
+            };
             judged.insert(id, j);
             if keys.last() != Some(&key) {
                 keys.push(key);
@@ -325,14 +379,17 @@ impl Aggregate {
             if let Some(gens) = st.entries.get_mut(&key) {
                 let mut newer_settled = false;
                 for (i, h) in gens.iter_mut().enumerate() {
-                    let Some((j, tip)) = judged.get(&h.attestation.id()) else { continue };
+                    let Some((j, tip)) = judged.get(&h.attestation.id()) else {
+                        continue;
+                    };
                     let anchor_depth = tip.saturating_sub(h.attestation.anchor_height());
                     let deep = *tip >= h.attestation.anchor_height() && anchor_depth >= REORG_DEPTH;
                     match j {
                         Judged::Spent => drops[i] = true,
                         Judged::Status(status) => {
                             h.status = status.clone();
-                            drops[i] = newer_settled || doomed(status, h.attestation.anchor_height(), *tip);
+                            drops[i] = newer_settled
+                                || doomed(status, h.attestation.anchor_height(), *tip);
                             // A valid attestation this deep will not be
                             // reorganised out: those it superseded are done.
                             if status.is_ok() && deep {
@@ -361,7 +418,13 @@ impl Aggregate {
     /// Every attestation held, ordered by outpoint and key, newest first
     /// within each.
     pub fn all(&self) -> Vec<Held> {
-        self.state.lock().entries.values().flatten().cloned().collect()
+        self.state
+            .lock()
+            .entries
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// A count that moves whenever an attestation is added or dropped.
@@ -391,9 +454,16 @@ impl Aggregate {
                 return Ok(false);
             }
             st.dirty = false;
-            let held = st.entries.values().flatten().map(|h| (&h.attestation, h.source.as_str()));
+            let held = st
+                .entries
+                .values()
+                .flatten()
+                .map(|h| (&h.attestation, h.source.as_str()));
             // A pending entry collected again meanwhile is saved once.
-            let pending = st.pending.iter().filter(|(a, _)| !st.ids.contains_key(&a.id()));
+            let pending = st
+                .pending
+                .iter()
+                .filter(|(a, _)| !st.ids.contains_key(&a.id()));
             encode(held.chain(pending.map(|(a, s)| (a, s.as_str()))))
         };
         if let Err(e) = store::save(&self.path, &bytes) {
@@ -418,7 +488,10 @@ fn doomed(status: &Status, anchor_height: u32, tip: u32) -> bool {
 
 /// How many keys `outpoint` has in `entries`.
 fn keys_for(entries: &BTreeMap<Key, Vec<Held>>, outpoint: OutPoint) -> usize {
-    entries.range((outpoint, String::new())..).take_while(|((op, _), _)| *op == outpoint).count()
+    entries
+        .range((outpoint, String::new())..)
+        .take_while(|((op, _), _)| *op == outpoint)
+        .count()
 }
 
 /// `s` cut to at most `max` bytes, on a character boundary.
@@ -463,7 +536,9 @@ enum Judged {
 fn assess(att: &Attestation, locks: &Timelocks, v: &dyn ChainView) -> Judged {
     // As the publisher's `assess`: a missing coin is a spent one only on a
     // chain that holds the anchor.
-    if v.block_hash(att.anchor_height()) == Some(att.anchor_hash()) && v.coin(&att.outpoint()).is_none() {
+    if v.block_hash(att.anchor_height()) == Some(att.anchor_hash())
+        && v.coin(&att.outpoint()).is_none()
+    {
         return Judged::Spent;
     }
     Judged::Status(judge(att, locks, v))
@@ -486,7 +561,11 @@ fn encode<'a>(entries: impl Iterator<Item = (&'a Attestation, &'a str)>) -> Vec<
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (att, source) in entries {
         buf.extend_from_slice(&att.to_bytes());
-        source.as_bytes().to_vec().consensus_encode(&mut buf).expect("a Vec does not fail");
+        source
+            .as_bytes()
+            .to_vec()
+            .consensus_encode(&mut buf)
+            .expect("a Vec does not fail");
     }
     let checksum = sha256::Hash::hash(&buf);
     buf.extend_from_slice(checksum.as_byte_array());
@@ -514,13 +593,16 @@ fn decode(bytes: &[u8]) -> Result<Vec<(Attestation, String)>, String> {
     let mut out = Vec::with_capacity((count as usize).min(rest.len()));
     for i in 0..count {
         let att = Attestation::decode_from(&mut rest).map_err(|e| format!("entry {i}: {e}"))?;
-        let len = encode::VarInt::consensus_decode(&mut rest).map_err(|e| format!("entry {i}: {e}"))?.0;
+        let len = encode::VarInt::consensus_decode(&mut rest)
+            .map_err(|e| format!("entry {i}: {e}"))?
+            .0;
         if len > MAX_SOURCE_LEN as u64 || rest.len() < len as usize {
             return Err(format!("entry {i}: bad source length {len}"));
         }
         let (source, tail) = rest.split_at(len as usize);
         rest = tail;
-        let source = String::from_utf8(source.to_vec()).map_err(|_| format!("entry {i}: source is not UTF-8"))?;
+        let source = String::from_utf8(source.to_vec())
+            .map_err(|_| format!("entry {i}: source is not UTF-8"))?;
         out.push((att, source));
     }
     if !rest.is_empty() {

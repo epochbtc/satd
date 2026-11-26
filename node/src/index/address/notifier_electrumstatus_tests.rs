@@ -82,7 +82,10 @@ fn spend_of(parent: Txid) -> Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: parent, vout: 0 },
+            previous_output: OutPoint {
+                txid: parent,
+                vout: 0,
+            },
             ..Default::default()
         }],
         output: Vec::new(),
@@ -132,9 +135,7 @@ fn test_notifier_status_covers_history_in_electrum_order() {
     recompute_for(&index, &registry, &mempool, &[sh]);
     let pushed = rx.try_recv().expect("the recompute pushed a status");
 
-    let text = format!(
-        "{c0}:5:{p0}:10:{p1}:10:{p2}:10:{free_b}:0:{free_a}:0:{chained}:-1:"
-    );
+    let text = format!("{c0}:5:{p0}:10:{p1}:10:{p2}:10:{free_b}:0:{free_a}:0:{chained}:-1:");
     let expected = sha256::Hash::hash(text.as_bytes()).to_byte_array();
     assert_eq!(
         hex::encode(pushed.status_hash),
@@ -144,8 +145,10 @@ fn test_notifier_status_covers_history_in_electrum_order() {
 
     // The rows `get_history` serves come from the same helper, in the same
     // order, with a fee on each mempool row.
-    let rows = node_index::history_rows(&index, &sh, usize::MAX, |t| super::mempool_facts(&mempool, t))
-        .unwrap();
+    let rows = node_index::history_rows(&index, &sh, usize::MAX, |t| {
+        super::mempool_facts(&mempool, t)
+    })
+    .unwrap();
     let got: Vec<(i64, Txid, Option<u64>)> =
         rows.iter().map(|r| (r.height, r.txid, r.fee_sat)).collect();
     assert_eq!(

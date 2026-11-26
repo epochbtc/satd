@@ -75,7 +75,9 @@ fn service() -> impl tower::Service<
 > {
     let auth = Arc::new(RpcAuth::from_user_pass("alice".into(), "secret".into()));
     AuthLayer::new(auth, None).layer(tower::service_fn(|_req: hyper::Request<String>| async {
-        Ok::<_, Infallible>(hyper::Response::new(jsonrpsee::server::HttpBody::from("ok")))
+        Ok::<_, Infallible>(hyper::Response::new(jsonrpsee::server::HttpBody::from(
+            "ok",
+        )))
     }))
 }
 
@@ -86,7 +88,8 @@ fn request(userpass: Option<&str>) -> hyper::Request<String> {
         b = b.header("authorization", format!("Basic {}", B64.encode(up)));
     }
     let mut req = b.body(String::new()).unwrap();
-    req.extensions_mut().insert(RpcPeerAddr(PEER.parse::<SocketAddr>().unwrap()));
+    req.extensions_mut()
+        .insert(RpcPeerAddr(PEER.parse::<SocketAddr>().unwrap()));
     req
 }
 
@@ -109,7 +112,11 @@ async fn a_wrong_password_is_logged_and_answered_after_250_ms() {
     }
     let text = logs.text();
     assert_eq!(text.matches(CORE_LINE).count(), 3, "{text}");
-    assert!(text.lines().all(|l| !l.contains(CORE_LINE) || l.contains("WARN")), "{text}");
+    assert!(
+        text.lines()
+            .all(|l| !l.contains(CORE_LINE) || l.contains("WARN")),
+        "{text}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -123,5 +130,9 @@ async fn no_credential_is_refused_at_once_and_a_right_one_passes() {
     let resp = svc.call(request(Some("alice:secret"))).await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(start.elapsed(), Duration::ZERO, "neither request waits");
-    assert!(!logs.text().contains("incorrect password"), "{}", logs.text());
+    assert!(
+        !logs.text().contains("incorrect password"),
+        "{}",
+        logs.text()
+    );
 }

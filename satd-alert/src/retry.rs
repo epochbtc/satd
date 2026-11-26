@@ -35,7 +35,9 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
 pub fn retry_delay(attempt: u32) -> Duration {
     // `attempt` is 1-based, so the first retry waits 1s. Saturating shift keeps
     // a long-dead endpoint from overflowing into a zero delay.
-    let secs = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+    let secs = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX);
     Duration::from_secs(secs).min(MAX_BACKOFF)
 }
 

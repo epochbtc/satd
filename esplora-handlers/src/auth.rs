@@ -61,9 +61,10 @@ impl AuthExpectation {
     pub fn build(cfg: &EsploraAuth, bearer: Option<Arc<TokenStore>>) -> Result<Self, String> {
         let operator = match cfg {
             EsploraAuth::None => None,
-            EsploraAuth::UserPass { username, password } => {
-                Some(OperatorCreds::from_user_pass(username.clone(), password.clone()))
-            }
+            EsploraAuth::UserPass { username, password } => Some(OperatorCreds::from_user_pass(
+                username.clone(),
+                password.clone(),
+            )),
             EsploraAuth::Cookie { path } => {
                 let content = std::fs::read_to_string(path).map_err(|e| {
                     format!("esplora auth: cannot read cookie {}: {}", path.display(), e)
@@ -71,7 +72,10 @@ impl AuthExpectation {
                 let (user, pass) = content.trim().split_once(':').ok_or_else(|| {
                     format!("esplora auth: malformed cookie at {}", path.display())
                 })?;
-                Some(OperatorCreds::from_user_pass(user.to_string(), pass.to_string()))
+                Some(OperatorCreds::from_user_pass(
+                    user.to_string(),
+                    pass.to_string(),
+                ))
             }
         };
         if !esplora_auth_enabled(cfg, &bearer) {
@@ -171,7 +175,10 @@ pub async fn require_auth(
         // Per-principal rate limit: shed with 429 + Retry-After, never block.
         AuthOutcome::RateLimited { retry_after_secs } => Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
-            .header(axum::http::header::RETRY_AFTER, retry_after_secs.to_string())
+            .header(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string(),
+            )
             .body(Body::from("Too Many Requests"))
             .unwrap(),
     }
@@ -239,7 +246,10 @@ mod tests {
         use sha2::{Digest, Sha256};
         use std::io::Write;
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let h = format!("sha256:{}", hex::encode(Sha256::digest(plaintext.as_bytes())));
+        let h = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(plaintext.as_bytes()))
+        );
         let caps_list = caps
             .split(',')
             .filter(|s| !s.is_empty())
@@ -283,7 +293,10 @@ mod tests {
     #[test]
     fn operator_and_bearer_coexist() {
         let exp = AuthExpectation::Required {
-            operator: Some(OperatorCreds::from_user_pass("alice".into(), "secret".into())),
+            operator: Some(OperatorCreds::from_user_pass(
+                "alice".into(),
+                "secret".into(),
+            )),
             bearer: Some(token_store_with("ro", "esplora-token", "esplora:read")),
         };
         // Operator Basic works.

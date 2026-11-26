@@ -36,7 +36,11 @@ fn type_name(v: &Value) -> &'static str {
 
 /// Core's `RPCTypeCheckObj` with `fStrict`: every expected key in order
 /// (missing, then mistyped), then any key it does not expect.
-fn check_obj(o: &Map<String, Value>, expected: &[(&str, &str)], allow_null: bool) -> Result<(), (i32, String)> {
+fn check_obj(
+    o: &Map<String, Value>,
+    expected: &[(&str, &str)],
+    allow_null: bool,
+) -> Result<(), (i32, String)> {
     for (key, ty) in expected {
         let v = o.get(*key).unwrap_or(&Value::Null);
         if !allow_null && v.is_null() {
@@ -44,7 +48,10 @@ fn check_obj(o: &Map<String, Value>, expected: &[(&str, &str)], allow_null: bool
         }
         let actual = type_name(v);
         if actual != *ty && !(allow_null && v.is_null()) {
-            return Err((-3, format!("JSON value of type {actual} for field {key} is not of expected type {ty}")));
+            return Err((
+                -3,
+                format!("JSON value of type {actual} for field {key} is not of expected type {ty}"),
+            ));
         }
     }
     if let Some(k) = o.keys().find(|k| !expected.iter().any(|(e, _)| e == k)) {
@@ -61,16 +68,20 @@ fn confirmed_spender(
     outpoint: &OutPoint,
 ) -> Result<Option<(Txid, bitcoin::BlockHash)>, IndexError> {
     let read = || -> Result<Option<(Txid, bitcoin::BlockHash)>, IndexError> {
-        let Some(spend) = index.spend_of(outpoint)? else { return Ok(None) };
+        let Some(spend) = index.spend_of(outpoint)? else {
+            return Ok(None);
+        };
         let hash = chain
             .store_ref()
             .get_block_hash_by_height(spend.height)
             .ok_or_else(|| IndexError::Storage(format!("no block at height {}", spend.height)))?;
         Ok(Some((spend.spending_txid, hash)))
     };
-    chain
-        .coherent_read(read)
-        .unwrap_or_else(|| Err(IndexError::Storage("the chain kept moving; ask again".into())))
+    chain.coherent_read(read).unwrap_or_else(|| {
+        Err(IndexError::Storage(
+            "the chain kept moving; ask again".into(),
+        ))
+    })
 }
 
 /// `gettxspendingprevout outputs ( options )`.
@@ -85,7 +96,14 @@ pub fn get_tx_spending_prevout(
     outputs: Vec<Value>,
     options: Option<Map<String, Value>>,
 ) -> Result<Value, (i32, String)> {
-    answer(chain, mempool, index, outputs, options, crate::rpc::RPC_MAX_RESPONSE_SIZE)
+    answer(
+        chain,
+        mempool,
+        index,
+        outputs,
+        options,
+        crate::rpc::RPC_MAX_RESPONSE_SIZE,
+    )
 }
 
 /// [`get_tx_spending_prevout`], refusing an answer whose spending
@@ -102,7 +120,11 @@ fn answer(
         return Err((-8, "Invalid parameter, outputs are missing".into()));
     }
     let options = options.unwrap_or_default();
-    check_obj(&options, &[("mempool_only", "bool"), ("return_spending_tx", "bool")], true)?;
+    check_obj(
+        &options,
+        &[("mempool_only", "bool"), ("return_spending_tx", "bool")],
+        true,
+    )?;
     let flag = |k: &str| options.get(k).and_then(Value::as_bool);
     let mempool_only = flag("mempool_only").unwrap_or(index.is_none());
     let return_spending_tx = flag("return_spending_tx").unwrap_or(false);
@@ -110,7 +132,13 @@ fn answer(
     let mut prevouts: Vec<(OutPoint, Map<String, Value>)> = Vec::with_capacity(outputs.len());
     for o in outputs {
         let Value::Object(o) = o else {
-            return Err((-3, format!("JSON value of type {} is not of expected type object", type_name(&o))));
+            return Err((
+                -3,
+                format!(
+                    "JSON value of type {} is not of expected type object",
+                    type_name(&o)
+                ),
+            ));
         };
         check_obj(&o, &[("txid", "string"), ("vout", "number")], false)?;
         let txid: Txid = parse_hash_v(o["txid"].as_str().unwrap_or_default(), "txid")?;
@@ -121,7 +149,13 @@ fn answer(
         if vout < 0 {
             return Err((-8, "Invalid parameter, vout cannot be negative".into()));
         }
-        prevouts.push((OutPoint { txid, vout: vout as u32 }, o));
+        prevouts.push((
+            OutPoint {
+                txid,
+                vout: vout as u32,
+            },
+            o,
+        ));
     }
 
     // The mempool pass first, as one snapshot, then the index. A spender's
@@ -131,7 +165,8 @@ fn answer(
     // spenders in one block share a read without the call holding every
     // block it touches.
     let outpoints: Vec<OutPoint> = prevouts.iter().map(|(op, _)| *op).collect();
-    let (in_mempool, mempool_txs) = mempool.spending_transactions_acting(&outpoints, return_spending_tx);
+    let (in_mempool, mempool_txs) =
+        mempool.spending_transactions_acting(&outpoints, return_spending_tx);
     let mut hex: HashMap<Txid, String> = HashMap::new();
     let mut last_block: Option<(BlockHash, StoredBlock, Vec<Txid>)> = None;
     // The answer repeats a spender's hex for every output it spends, as
@@ -149,23 +184,34 @@ fn answer(
     let mut result = Vec::with_capacity(prevouts.len());
     for ((outpoint, mut o), spender) in prevouts.into_iter().zip(in_mempool) {
         if let Some(spending_txid) = spender {
-            o.insert("spendingtxid".into(), Value::String(spending_txid.to_string()));
+            o.insert(
+                "spendingtxid".into(),
+                Value::String(spending_txid.to_string()),
+            );
             if let Some(tx) = mempool_txs.get(&spending_txid) {
-                let h = hex.entry(spending_txid).or_insert_with(|| serialize_hex(tx));
+                let h = hex
+                    .entry(spending_txid)
+                    .or_insert_with(|| serialize_hex(tx));
                 o.insert("spendingtx".into(), copy_hex(h)?);
             }
         } else if !mempool_only {
             let unavailable = || {
-                (-1, format!(
-                    "No spending tx for the outpoint {}:{} in mempool, and txospenderindex is unavailable.",
-                    outpoint.txid, outpoint.vout
-                ))
+                (
+                    -1,
+                    format!(
+                        "No spending tx for the outpoint {}:{} in mempool, and txospenderindex is unavailable.",
+                        outpoint.txid, outpoint.vout
+                    ),
+                )
             };
             let index = index.ok_or_else(unavailable)?;
             match confirmed_spender(chain, index, &outpoint) {
                 Ok(None) => {}
                 Ok(Some((spending_txid, block_hash))) => {
-                    o.insert("spendingtxid".into(), Value::String(spending_txid.to_string()));
+                    o.insert(
+                        "spendingtxid".into(),
+                        Value::String(spending_txid.to_string()),
+                    );
                     o.insert("blockhash".into(), Value::String(block_hash.to_string()));
                     if return_spending_tx {
                         let h = match hex.entry(spending_txid) {
@@ -179,13 +225,18 @@ fn answer(
                                     last_block = Some((block_hash, block, txids));
                                 }
                                 let (_, block, txids) = last_block.as_ref().expect("read above");
-                                let i = txids
-                                    .iter()
-                                    .position(|t| *t == spending_txid)
-                                    .ok_or((-1, format!("Transaction {spending_txid} not in block {block_hash}")))?;
+                                let i = txids.iter().position(|t| *t == spending_txid).ok_or((
+                                    -1,
+                                    format!(
+                                        "Transaction {spending_txid} not in block {block_hash}"
+                                    ),
+                                ))?;
                                 // Its bytes are gone; the filled form is not it.
                                 if block.tx_is_stripped(i) {
-                                    return Err((-1, crate::rpc::rawtx::TX_DATA_STRIPPED.to_string()));
+                                    return Err((
+                                        -1,
+                                        crate::rpc::rawtx::TX_DATA_STRIPPED.to_string(),
+                                    ));
                                 }
                                 e.insert(serialize_hex(&block.block.txdata[i]))
                             }

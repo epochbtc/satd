@@ -163,7 +163,9 @@ mod tests {
         .unwrap();
         if let Some((block, height)) = block {
             let mut flat = FlatFileManager::new(&dir.path().join("blocks")).unwrap();
-            let pos = flat.write_block(&serialize(block), [0x0a, 0x03, 0xcf, 0x40], height).unwrap();
+            let pos = flat
+                .write_block(&serialize(block), [0x0a, 0x03, 0xcf, 0x40], height)
+                .unwrap();
             flat.sync_all().unwrap();
             let mut batch = StoreBatch::default();
             batch.block_index_puts.push((
@@ -186,7 +188,11 @@ mod tests {
     }
 
     fn look(dir: &tempfile::TempDir, challenge: &[u8]) -> SignetDirContents {
-        inspect(&dir.path().join("chainstate"), &[dir.path().join("blocks")], challenge)
+        inspect(
+            &dir.path().join("chainstate"),
+            &[dir.path().join("blocks")],
+            challenge,
+        )
     }
 
     /// #1271: the tip's solution tells which signet an old `signet/` holds.
@@ -227,12 +233,21 @@ mod tests {
         assert_eq!(look(&default, &op_true), SignetDirContents::DefaultSignet);
 
         let genesis = bitcoin::constants::genesis_block(Network::Signet);
-        assert_eq!(look(&signet_dir(Some((&genesis, 0))), &op_true), SignetDirContents::Genesis);
-        assert_eq!(look(&signet_dir(None), &op_true), SignetDirContents::Genesis);
+        assert_eq!(
+            look(&signet_dir(Some((&genesis, 0))), &op_true),
+            SignetDirContents::Genesis
+        );
+        assert_eq!(
+            look(&signet_dir(None), &op_true),
+            SignetDirContents::Genesis
+        );
 
         // The tip's block file is gone: unreadable, never a guess.
         std::fs::remove_dir_all(dir.path().join("blocks")).unwrap();
-        assert!(matches!(look(&dir, &op_true), SignetDirContents::Unreadable(_)));
+        assert!(matches!(
+            look(&dir, &op_true),
+            SignetDirContents::Unreadable(_)
+        ));
     }
 
     /// The look is read-only: nothing in the directory changes.

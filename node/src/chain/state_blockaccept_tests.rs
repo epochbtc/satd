@@ -32,7 +32,12 @@ fn status(cs: &ChainState, hash: &BlockHash) -> Option<BlockStatus> {
 /// A regtest block on `parent` whose header commits to exactly `txdata`, with
 /// its proof of work solved and its header accepted: the `HeaderOnly` row a
 /// header announcement leaves.
-fn announced_block(cs: &ChainState, parent: BlockHash, time: u32, txdata: Vec<Transaction>) -> Block {
+fn announced_block(
+    cs: &ChainState,
+    parent: BlockHash,
+    time: u32,
+    txdata: Vec<Transaction>,
+) -> Block {
     let mut block = Block {
         header: bitcoin::block::Header {
             version: bitcoin::block::Version::from_consensus(0x2000_0000),
@@ -49,7 +54,10 @@ fn announced_block(cs: &ChainState, parent: BlockHash, time: u32, txdata: Vec<Tr
         .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
     grind_test_pow(&mut block);
     cs.accept_header(&block.header).expect("fixture header");
-    assert_eq!(status(cs, &block.block_hash()), Some(BlockStatus::HeaderOnly));
+    assert_eq!(
+        status(cs, &block.block_hash()),
+        Some(BlockStatus::HeaderOnly)
+    );
     block
 }
 
@@ -68,7 +76,10 @@ fn coinbase(script_sig: Vec<u8>, outputs: Vec<TxOut>) -> Transaction {
 }
 
 fn pay(sats: u64, script: Vec<u8>) -> TxOut {
-    TxOut { value: bitcoin::Amount::from_sat(sats), script_pubkey: ScriptBuf::from(script) }
+    TxOut {
+        value: bitcoin::Amount::from_sat(sats),
+        script_pubkey: ScriptBuf::from(script),
+    }
 }
 
 /// A non-coinbase transaction whose serialization without witness is exactly
@@ -78,7 +89,10 @@ fn sixty_four_byte_tx() -> Transaction {
         version: bitcoin::transaction::Version(2),
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0x11; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: bitcoin::Sequence::MAX,
             witness: bitcoin::Witness::new(),
@@ -109,9 +123,18 @@ fn an_empty_body_for_a_known_header_does_not_bar_the_real_block() {
     let (accepted, err) = cs.accept_headers(&[b4.header, b5.header]);
     assert_eq!(accepted, 2, "fixture: headers accepted ({err:?})");
 
-    let empty = Block { header: b5.header, txdata: Vec::new() };
-    let err = cs.accept_block(&empty).expect_err("an empty body must be refused");
-    assert_eq!(err.to_string(), "bad-txnmrklroot", "Core's CheckMerkleRoot runs first");
+    let empty = Block {
+        header: b5.header,
+        txdata: Vec::new(),
+    };
+    let err = cs
+        .accept_block(&empty)
+        .expect_err("an empty body must be refused");
+    assert_eq!(
+        err.to_string(),
+        "bad-txnmrklroot",
+        "Core's CheckMerkleRoot runs first"
+    );
     assert_eq!(
         status(&cs, &b5.block_hash()),
         Some(BlockStatus::HeaderOnly),
@@ -162,7 +185,10 @@ fn a_check_block_failure_is_not_marked_on_a_known_header() {
         &cs,
         tip,
         1_707_000_102,
-        vec![coinbase(vec![0x54, 0x03], vec![pay(subsidy, vec![0xac; 20_001])])],
+        vec![coinbase(
+            vec![0x54, 0x03],
+            vec![pay(subsidy, vec![0xac; 20_001])],
+        )],
     );
 
     for (block, reason) in [
@@ -203,7 +229,10 @@ fn an_overweight_block_is_still_marked_invalid() {
         version: bitcoin::transaction::Version(2),
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: bitcoin::Txid::from_byte_array([0x22; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: bitcoin::Sequence::MAX,
             witness,
@@ -219,18 +248,29 @@ fn an_overweight_block_is_still_marked_invalid() {
         bitcoin::hashes::sha256d::Hash::hash(&preimage).to_byte_array()
     };
     let nonce = [0u8; 32];
-    let witness_root = sha256d(&[0u8; 32], &heavy.compute_wtxid().to_raw_hash().to_byte_array());
+    let witness_root = sha256d(
+        &[0u8; 32],
+        &heavy.compute_wtxid().to_raw_hash().to_byte_array(),
+    );
     let commitment = sha256d(&witness_root, &nonce);
     let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
     commitment_script.extend_from_slice(&commitment);
     let mut cb = coinbase(
         vec![0x54, 0x04],
-        vec![pay(crate::chain::connect::block_subsidy(Network::Regtest, 4), vec![]), pay(0, commitment_script)],
+        vec![
+            pay(
+                crate::chain::connect::block_subsidy(Network::Regtest, 4),
+                vec![],
+            ),
+            pay(0, commitment_script),
+        ],
     );
     cb.input[0].witness.push(nonce);
 
     let block = announced_block(&cs, tip, 1_707_000_200, vec![cb, heavy]);
-    let err = cs.accept_block(&block).expect_err("an overweight block must be refused");
+    let err = cs
+        .accept_block(&block)
+        .expect_err("an overweight block must be refused");
     assert_eq!(err.to_string(), "bad-blk-weight");
     assert_eq!(
         status(&cs, &block.block_hash()),
@@ -254,18 +294,29 @@ fn a_tip_extending_block_that_fails_to_connect_is_remembered() {
     let chain = connect_chain(&cs, 3);
     let tip = chain[2].block_hash();
 
-    let missing = OutPoint { txid: bitcoin::Txid::from_byte_array([0x9e; 32]), vout: 0 };
+    let missing = OutPoint {
+        txid: bitcoin::Txid::from_byte_array([0x9e; 32]),
+        vout: 0,
+    };
     let bad = build_test_block_spending(tip, 4, 1_707_000_004, missing);
-    assert!(cs.get_block_index(&bad.block_hash()).is_none(), "fixture: no header announced");
+    assert!(
+        cs.get_block_index(&bad.block_hash()).is_none(),
+        "fixture: no header announced"
+    );
 
-    let err = cs.accept_block(&bad).expect_err("a block spending a missing coin");
+    let err = cs
+        .accept_block(&bad)
+        .expect_err("a block spending a missing coin");
     assert_eq!(err.to_string(), "bad-txns-inputs-missingorspent");
     assert_eq!(status(&cs, &bad.block_hash()), Some(BlockStatus::Invalid));
     assert_eq!(cs.tip_hash(), tip, "the tip must not move");
 
     let on_disk = cs.flat_files.lock().size_on_disk();
     let again = cs.accept_block(&bad).expect_err("the same block again");
-    assert!(matches!(again, ChainError::Duplicate), "answered from the index, got: {again}");
+    assert!(
+        matches!(again, ChainError::Duplicate),
+        "answered from the index, got: {again}"
+    );
     assert_eq!(
         cs.flat_files.lock().size_on_disk(),
         on_disk,
@@ -289,7 +340,10 @@ fn an_unannounced_block_that_connects_ends_valid_and_best() {
     let (cs, dir) = make_chain_state();
     let chain = connect_chain(&cs, 3);
     let b4 = build_test_block(chain[2].block_hash(), 4, 1_707_000_004);
-    assert!(cs.get_block_index(&b4.block_hash()).is_none(), "fixture: no header announced");
+    assert!(
+        cs.get_block_index(&b4.block_hash()).is_none(),
+        "fixture: no header announced"
+    );
 
     cs.accept_block(&b4).expect("block 4 connects");
     let entry = cs.get_block_index(&b4.block_hash()).expect("indexed");

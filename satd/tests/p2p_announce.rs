@@ -4,12 +4,12 @@
 
 mod common;
 
+use bitcoin::BlockHash;
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, Magic, ServiceFlags};
-use bitcoin::BlockHash;
 use common::{TestNode, find_available_port, poll_until, test_timeout};
 use serde_json::json;
 use std::io::{self, Read, Write};
@@ -31,12 +31,16 @@ impl Peer {
         let stream = loop {
             match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
                 Err(e) => panic!("connect to the node: {e}"),
             }
         };
         stream.set_nodelay(true).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let mut peer = Peer { stream };
         peer.send(NetworkMessage::Version(version()));
         let (mut got_version, mut got_verack) = (false, false);
@@ -54,7 +58,9 @@ impl Peer {
     }
 
     fn send(&mut self, msg: NetworkMessage) {
-        let _ = self.stream.write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
+        let _ = self
+            .stream
+            .write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
     }
 
     fn recv(&mut self, timeout: Duration) -> io::Result<NetworkMessage> {
@@ -65,8 +71,8 @@ impl Peer {
         let mut buf = header.to_vec();
         buf.resize(24 + len, 0);
         self.stream.read_exact(&mut buf[24..])?;
-        let raw: RawNetworkMessage =
-            deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let raw: RawNetworkMessage = deserialize(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
 }
@@ -91,7 +97,11 @@ fn version() -> VersionMessage {
 }
 
 fn best_hash(node: &TestNode) -> BlockHash {
-    node.rpc_ok("getbestblockhash", vec![]).as_str().unwrap().parse().unwrap()
+    node.rpc_ok("getbestblockhash", vec![])
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 /// Blocks connected by the catch-up emit no chain event, so the announcement
@@ -117,11 +127,23 @@ fn a_catch_up_announces_the_tip_it_reaches() {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match peer.recv(Duration::from_millis(200)) {
                     Ok(NetworkMessage::Ping(n)) => peer.send(NetworkMessage::Pong(n)),
-                    Ok(NetworkMessage::Inv(inv)) if inv.contains(&Inventory::Block(tip)) => return true,
-                    Ok(NetworkMessage::Headers(h)) if h.iter().any(|h| h.block_hash() == tip) => return true,
-                    Ok(NetworkMessage::CmpctBlock(c)) if c.compact_block.header.block_hash() == tip => return true,
+                    Ok(NetworkMessage::Inv(inv)) if inv.contains(&Inventory::Block(tip)) => {
+                        return true;
+                    }
+                    Ok(NetworkMessage::Headers(h)) if h.iter().any(|h| h.block_hash() == tip) => {
+                        return true;
+                    }
+                    Ok(NetworkMessage::CmpctBlock(c))
+                        if c.compact_block.header.block_hash() == tip =>
+                    {
+                        return true;
+                    }
                     Ok(_) => {}
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
                     Err(_) => return false,
                 }
             }
@@ -130,13 +152,23 @@ fn a_catch_up_announces_the_tip_it_reaches() {
     };
 
     // 200 blocks behind: B catches up by the parallel download.
-    node_b.rpc_ok("addnode", vec![json!(format!("127.0.0.1:{port_a}")), json!("onetry")]);
-    poll_until(|| best_hash(&node_b) == tip, test_timeout(180), "B did not catch up to A");
+    node_b.rpc_ok(
+        "addnode",
+        vec![json!(format!("127.0.0.1:{port_a}")), json!("onetry")],
+    );
+    poll_until(
+        || best_hash(&node_b) == tip,
+        test_timeout(180),
+        "B did not catch up to A",
+    );
 
     let deadline = Instant::now() + test_timeout(30);
     while !reader.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    assert!(reader.join().unwrap(), "B never announced the tip its catch-up reached");
+    assert!(
+        reader.join().unwrap(),
+        "B never announced the tip its catch-up reached"
+    );
 }

@@ -52,8 +52,7 @@ impl LiveLogControl {
     /// Core would have refused the call.
     fn is_known(name: &str) -> bool {
         let lower = name.trim().to_ascii_lowercase();
-        ALL_CATEGORIES.contains(&lower.as_str())
-            || config::debug_category_target(&lower).is_some()
+        ALL_CATEGORIES.contains(&lower.as_str()) || config::debug_category_target(&lower).is_some()
     }
 }
 

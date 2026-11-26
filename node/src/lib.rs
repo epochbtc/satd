@@ -11,10 +11,9 @@ pub mod health;
 pub mod http_serve;
 pub mod ibd_eta;
 pub mod index;
-pub mod memstat;
 pub mod mempool;
+pub mod memstat;
 pub mod metrics;
-pub mod status;
 pub mod mining;
 pub mod nap;
 pub mod net;
@@ -25,9 +24,10 @@ pub mod shutdown;
 pub mod sp_serve;
 pub mod stall_watchdog;
 pub mod startup_progress;
-pub mod time;
+pub mod status;
 pub mod storage;
 pub mod stratum;
+pub mod time;
 pub mod validation;
 pub mod warn_budget;
 pub mod warnings;
@@ -170,7 +170,9 @@ mod user_agent_tests {
         let err = format_user_agent(&["a".repeat(256)]).unwrap_err();
         assert!(
             err.starts_with("Total length of network version string (")
-                && err.ends_with("exceeds maximum length (256). Reduce the number or size of uacomments."),
+                && err.ends_with(
+                    "exceeds maximum length (256). Reduce the number or size of uacomments."
+                ),
             "{err}"
         );
     }

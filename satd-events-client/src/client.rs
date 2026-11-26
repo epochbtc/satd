@@ -201,8 +201,9 @@ impl SilentPaymentTarget {
     #[cfg(feature = "bitcoin")]
     pub fn scan_pubkey(&self) -> Result<[u8; 33], StreamError> {
         use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-        let sk = SecretKey::from_slice(&self.scan_secret)
-            .map_err(|_| StreamError::InvalidArgument("scan_secret is not a valid scalar".into()))?;
+        let sk = SecretKey::from_slice(&self.scan_secret).map_err(|_| {
+            StreamError::InvalidArgument("scan_secret is not a valid scalar".into())
+        })?;
         let secp = Secp256k1::signing_only();
         Ok(PublicKey::from_secret_key(&secp, &sk).serialize())
     }
@@ -217,8 +218,9 @@ impl SilentPaymentTarget {
     #[cfg(feature = "bitcoin")]
     pub fn validate(&self) -> Result<[u8; 33], StreamError> {
         let id = self.scan_pubkey()?; // validates the b_scan scalar
-        bitcoin::secp256k1::PublicKey::from_slice(&self.spend_pubkey)
-            .map_err(|_| StreamError::InvalidArgument("spend_pubkey is not a valid point".into()))?;
+        bitcoin::secp256k1::PublicKey::from_slice(&self.spend_pubkey).map_err(|_| {
+            StreamError::InvalidArgument("spend_pubkey is not a valid point".into())
+        })?;
         // Mirror the server's per-target label cap: an over-label target is
         // otherwise silently skipped by the node while the client believes it
         // was installed (and a resilient reconnect replays it forever).
@@ -304,7 +306,12 @@ impl EventStream {
     }
 
     fn new(inner: tonic::Streaming<pb::NodeEvent>, head: Option<Cursor>) -> Self {
-        EventStream { inner, last_cursor: None, head, schema_checked: false }
+        EventStream {
+            inner,
+            last_cursor: None,
+            head,
+            schema_checked: false,
+        }
     }
 }
 
@@ -341,11 +348,15 @@ pub struct WatchHandle {
 impl WatchHandle {
     /// Send a raw [`SubscribeControl`](pb::SubscribeControl) message.
     pub async fn send_control(&self, ctrl: pb::SubscribeControl) -> Result<(), StreamError> {
-        self.tx.send(ctrl).await.map_err(|_| StreamError::ControlClosed)
+        self.tx
+            .send(ctrl)
+            .await
+            .map_err(|_| StreamError::ControlClosed)
     }
 
     async fn send_msg(&self, msg: pb::subscribe_control::Msg) -> Result<(), StreamError> {
-        self.send_control(pb::SubscribeControl { msg: Some(msg) }).await
+        self.send_control(pb::SubscribeControl { msg: Some(msg) })
+            .await
     }
 
     /// Add scripthashes (each `sha256(scriptPubKey)`), with an optional per-script
@@ -385,9 +396,9 @@ impl WatchHandle {
         if scripthashes.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::RemoveScripts(pb::RemoveScripts {
-            scripthashes,
-        }))
+        self.send_msg(pb::subscribe_control::Msg::RemoveScripts(
+            pb::RemoveScripts { scripthashes },
+        ))
         .await
     }
 
@@ -398,13 +409,18 @@ impl WatchHandle {
     ) -> Result<(), StreamError> {
         let outpoints: Vec<pb::Outpoint> = outpoints
             .into_iter()
-            .map(|(txid, vout)| pb::Outpoint { txid: txid.to_vec(), vout })
+            .map(|(txid, vout)| pb::Outpoint {
+                txid: txid.to_vec(),
+                vout,
+            })
             .collect();
         if outpoints.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints { outpoints }))
-            .await
+        self.send_msg(pb::subscribe_control::Msg::AddOutpoints(pb::AddOutpoints {
+            outpoints,
+        }))
+        .await
     }
 
     /// Remove outpoints from the watch-set, releasing their quota.
@@ -414,14 +430,17 @@ impl WatchHandle {
     ) -> Result<(), StreamError> {
         let outpoints: Vec<pb::Outpoint> = outpoints
             .into_iter()
-            .map(|(txid, vout)| pb::Outpoint { txid: txid.to_vec(), vout })
+            .map(|(txid, vout)| pb::Outpoint {
+                txid: txid.to_vec(),
+                vout,
+            })
             .collect();
         if outpoints.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::RemoveOutpoints(pb::RemoveOutpoints {
-            outpoints,
-        }))
+        self.send_msg(pb::subscribe_control::Msg::RemoveOutpoints(
+            pb::RemoveOutpoints { outpoints },
+        ))
         .await
     }
 
@@ -437,11 +456,13 @@ impl WatchHandle {
         if txids.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::AddTransactions(pb::AddTransactions {
-            txids,
-            min_depths: Vec::new(),
-            auto_close_depth: auto_close.depth(),
-        }))
+        self.send_msg(pb::subscribe_control::Msg::AddTransactions(
+            pb::AddTransactions {
+                txids,
+                min_depths: Vec::new(),
+                auto_close_depth: auto_close.depth(),
+            },
+        ))
         .await
     }
 
@@ -454,10 +475,12 @@ impl WatchHandle {
         if txids.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::RemoveTransactions(pb::RemoveTransactions {
-            txids,
-            min_depths: Vec::new(),
-        }))
+        self.send_msg(pb::subscribe_control::Msg::RemoveTransactions(
+            pb::RemoveTransactions {
+                txids,
+                min_depths: Vec::new(),
+            },
+        ))
         .await
     }
 
@@ -479,11 +502,13 @@ impl WatchHandle {
         if txids.is_empty() || min_depths.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::AddTransactions(pb::AddTransactions {
-            txids,
-            min_depths,
-            auto_close_depth: 0,
-        }))
+        self.send_msg(pb::subscribe_control::Msg::AddTransactions(
+            pb::AddTransactions {
+                txids,
+                min_depths,
+                auto_close_depth: 0,
+            },
+        ))
         .await
     }
 
@@ -501,10 +526,9 @@ impl WatchHandle {
         if txids.is_empty() || min_depths.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::RemoveTransactions(pb::RemoveTransactions {
-            txids,
-            min_depths,
-        }))
+        self.send_msg(pb::subscribe_control::Msg::RemoveTransactions(
+            pb::RemoveTransactions { txids, min_depths },
+        ))
         .await
     }
 
@@ -520,11 +544,13 @@ impl WatchHandle {
         gap_limit: u32,
         start: u32,
     ) -> Result<(), StreamError> {
-        self.send_msg(pb::subscribe_control::Msg::AddDescriptor(pb::AddDescriptor {
-            descriptor: descriptor.into(),
-            gap_limit,
-            start,
-        }))
+        self.send_msg(pb::subscribe_control::Msg::AddDescriptor(
+            pb::AddDescriptor {
+                descriptor: descriptor.into(),
+                gap_limit,
+                start,
+            },
+        ))
         .await
     }
 
@@ -537,9 +563,11 @@ impl WatchHandle {
         &self,
         descriptor: impl Into<String>,
     ) -> Result<(), StreamError> {
-        self.send_msg(pb::subscribe_control::Msg::RemoveDescriptor(pb::RemoveDescriptor {
-            descriptor: descriptor.into(),
-        }))
+        self.send_msg(pb::subscribe_control::Msg::RemoveDescriptor(
+            pb::RemoveDescriptor {
+                descriptor: descriptor.into(),
+            },
+        ))
         .await
     }
 
@@ -563,9 +591,9 @@ impl WatchHandle {
         if prefixes.is_empty() {
             return Ok(());
         }
-        self.send_msg(pb::subscribe_control::Msg::AddScriptPrefixes(pb::AddScriptPrefixes {
-            prefixes,
-        }))
+        self.send_msg(pb::subscribe_control::Msg::AddScriptPrefixes(
+            pb::AddScriptPrefixes { prefixes },
+        ))
         .await
     }
 
@@ -641,9 +669,9 @@ impl WatchHandle {
     /// Adjust the live firehose category bitfield (see [`Categories`]). Applies
     /// immediately; does not affect the watch-set.
     pub async fn set_categories(&self, categories: u32) -> Result<(), StreamError> {
-        self.send_msg(pb::subscribe_control::Msg::SetCategories(pb::SetCategories {
-            categories,
-        }))
+        self.send_msg(pb::subscribe_control::Msg::SetCategories(
+            pb::SetCategories { categories },
+        ))
         .await
     }
 
@@ -722,10 +750,7 @@ impl WatchHandle {
 pub(crate) const MAX_PREFIX_BITS: u32 = 32;
 
 /// Validate a prefix/bits pair before it reaches the wire.
-pub(crate) fn validate_prefix(
-    prefix: Vec<u8>,
-    bits: u32,
-) -> Result<pb::ScriptPrefix, StreamError> {
+pub(crate) fn validate_prefix(prefix: Vec<u8>, bits: u32) -> Result<pb::ScriptPrefix, StreamError> {
     if !(1..=MAX_PREFIX_BITS).contains(&bits) {
         return Err(StreamError::InvalidArgument(format!(
             "prefix bits {bits} out of range 1..={MAX_PREFIX_BITS}"
@@ -908,8 +933,10 @@ impl StreamClientBuilder {
     /// (30s interval / 20s timeout) when [`keepalive_default`](Self::keepalive_default)
     /// is used; this overrides with explicit seconds.
     pub fn keepalive(mut self, interval_secs: u64, timeout_secs: u64) -> Self {
-        self.keepalive =
-            Some((Duration::from_secs(interval_secs), Duration::from_secs(timeout_secs)));
+        self.keepalive = Some((
+            Duration::from_secs(interval_secs),
+            Duration::from_secs(timeout_secs),
+        ));
         self
     }
 
@@ -1144,7 +1171,11 @@ impl StreamClient {
     /// `None` until a stream has been opened, and when the node predates the
     /// `satd-version` header (0.5.x and older).
     pub fn node_version(&self) -> Option<String> {
-        self.compat.lock().unwrap_or_else(|e| e.into_inner()).node_version.clone()
+        self.compat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .node_version
+            .clone()
     }
 
     /// Apply the SDK ↔ node compatibility rule to a stream-opening response's
@@ -1215,10 +1246,7 @@ impl StreamClient {
 
     /// Open a server-streaming firehose. Requires the `stream:subscribe`
     /// capability when the server enforces auth.
-    pub async fn subscribe(
-        &mut self,
-        opts: SubscribeOptions,
-    ) -> Result<EventStream, StreamError> {
+    pub async fn subscribe(&mut self, opts: SubscribeOptions) -> Result<EventStream, StreamError> {
         let req = self.authed(opts.into_request());
         let resp = self.inner.subscribe(req).await?;
         self.check_compat(resp.metadata())?;
@@ -1257,7 +1285,10 @@ impl StreamClient {
         let resp = self.inner.watch(req).await?;
         self.check_compat(resp.metadata())?;
         let head = crate::compat::head_cursor_from(resp.metadata());
-        Ok((WatchHandle { tx }, EventStream::new(resp.into_inner(), head)))
+        Ok((
+            WatchHandle { tx },
+            EventStream::new(resp.into_inner(), head),
+        ))
     }
 }
 
@@ -1302,7 +1333,10 @@ mod tests {
     }
 
     fn next(rx: &mut mpsc::Receiver<pb::SubscribeControl>) -> Msg {
-        rx.try_recv().expect("a control message was sent").msg.expect("msg set")
+        rx.try_recv()
+            .expect("a control message was sent")
+            .msg
+            .expect("msg set")
     }
 
     #[test]
@@ -1323,7 +1357,10 @@ mod tests {
     /// exactly the configuration the gate advertises as safe.
     #[test]
     fn encryption_requires_the_tls_feature_and_not_just_the_scheme() {
-        assert_eq!(endpoint_is_encrypted("https://node.example:50051"), cfg!(feature = "tls"));
+        assert_eq!(
+            endpoint_is_encrypted("https://node.example:50051"),
+            cfg!(feature = "tls")
+        );
         assert!(!endpoint_is_encrypted("http://node.example:50051"));
         assert!(!endpoint_is_encrypted("node.example:50051"));
     }
@@ -1340,13 +1377,19 @@ mod tests {
             redact_endpoint_userinfo("http://user:hunter2@node.example:50051/a@b"),
             "http://***@node.example:50051/a@b"
         );
-        assert_eq!(redact_endpoint_userinfo("user:hunter2@node.example:50051"), "***@node.example:50051");
+        assert_eq!(
+            redact_endpoint_userinfo("user:hunter2@node.example:50051"),
+            "***@node.example:50051"
+        );
         // Untouched when there is nothing to redact.
         assert_eq!(
             redact_endpoint_userinfo("https://node.example:50051/path"),
             "https://node.example:50051/path"
         );
-        assert_eq!(redact_endpoint_userinfo("node.example:50051"), "node.example:50051");
+        assert_eq!(
+            redact_endpoint_userinfo("node.example:50051"),
+            "node.example:50051"
+        );
     }
 
     #[tokio::test]
@@ -1356,8 +1399,14 @@ mod tests {
             .connect()
             .await
             .expect_err("a bearer token over plaintext must be refused");
-        assert!(!err.to_string().contains("hunter2"), "leaked the URL password: {err}");
-        assert!(!err.to_string().contains("SECRET"), "leaked the token: {err}");
+        assert!(
+            !err.to_string().contains("hunter2"),
+            "leaked the URL password: {err}"
+        );
+        assert!(
+            !err.to_string().contains("SECRET"),
+            "leaked the token: {err}"
+        );
     }
 
     /// The #521 guard. The token is attached as ordinary metadata, so there is
@@ -1367,7 +1416,11 @@ mod tests {
     /// credential reaching the wire in the clear.
     #[tokio::test]
     async fn a_bearer_token_over_plaintext_is_refused() {
-        for endpoint in ["http://127.0.0.1:1", "http://node.example:50051", "node.example:50051"] {
+        for endpoint in [
+            "http://127.0.0.1:1",
+            "http://node.example:50051",
+            "node.example:50051",
+        ] {
             let err = StreamClient::builder(endpoint)
                 .bearer_token("SECRET")
                 .connect()
@@ -1457,8 +1510,11 @@ mod tests {
     fn subscribe_options_map_tweak_knobs_only_when_set() {
         // A default subscription sends no tweak knobs (byte-identical to one
         // built before they existed); each flag maps to Some(true) when set.
-        let default = SubscribeOptions { categories: Categories::TWEAKS, ..Default::default() }
-            .into_request();
+        let default = SubscribeOptions {
+            categories: Categories::TWEAKS,
+            ..Default::default()
+        }
+        .into_request();
         assert_eq!(default.mempool_tweaks, None);
         assert_eq!(default.tweak_outputs, None);
         assert_eq!(default.tweak_unspent_only, None);
@@ -1481,7 +1537,9 @@ mod tests {
     #[tokio::test]
     async fn add_scripts_mixed_floors_emits_parallel_min_values() {
         let (h, mut rx) = handle();
-        h.add_scripts([([1u8; 32], Some(5_000)), ([2u8; 32], None)]).await.unwrap();
+        h.add_scripts([([1u8; 32], Some(5_000)), ([2u8; 32], None)])
+            .await
+            .unwrap();
         match next(&mut rx) {
             Msg::AddScripts(a) => {
                 assert_eq!(a.scripthashes.len(), 2);
@@ -1495,7 +1553,9 @@ mod tests {
     #[tokio::test]
     async fn add_scripts_no_floors_emits_empty_min_values() {
         let (h, mut rx) = handle();
-        h.add_scripts([([1u8; 32], None), ([2u8; 32], None)]).await.unwrap();
+        h.add_scripts([([1u8; 32], None), ([2u8; 32], None)])
+            .await
+            .unwrap();
         match next(&mut rx) {
             Msg::AddScripts(a) => assert!(a.min_values.is_empty()),
             other => panic!("expected AddScripts, got {other:?}"),
@@ -1518,7 +1578,9 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_vs_depth_alarms_dispatch_on_min_depths() {
         let (h, mut rx) = handle();
-        h.add_tx_lifecycle([[7u8; 32]], AutoClose::AtDepth(6)).await.unwrap();
+        h.add_tx_lifecycle([[7u8; 32]], AutoClose::AtDepth(6))
+            .await
+            .unwrap();
         match next(&mut rx) {
             Msg::AddTransactions(a) => {
                 assert!(a.min_depths.is_empty(), "lifecycle => empty min_depths");
@@ -1527,7 +1589,9 @@ mod tests {
             other => panic!("expected AddTransactions, got {other:?}"),
         }
 
-        h.add_depth_alarms([[7u8; 32], [8u8; 32]], [3, 6]).await.unwrap();
+        h.add_depth_alarms([[7u8; 32], [8u8; 32]], [3, 6])
+            .await
+            .unwrap();
         match next(&mut rx) {
             Msg::AddTransactions(a) => {
                 assert_eq!(a.txids.len(), 2);
@@ -1549,20 +1613,27 @@ mod tests {
         assert!(matches!(err, StreamError::InvalidArgument(_)));
         // bits above the server's 32-bit ceiling: rejected client-side rather
         // than sent and silently dropped by the server (5 bytes = ceil(33/8)).
-        let err = h.add_script_prefixes([(vec![0u8; 5], 33)]).await.unwrap_err();
+        let err = h
+            .add_script_prefixes([(vec![0u8; 5], 33)])
+            .await
+            .unwrap_err();
         assert!(matches!(err, StreamError::InvalidArgument(_)));
         // Nothing reached the wire.
         assert!(rx.try_recv().is_err());
 
         // Valid boundary: exactly 32 bits, 4 bytes.
-        h.add_script_prefixes([(vec![0xde, 0xad, 0xbe, 0xef], 32)]).await.unwrap();
+        h.add_script_prefixes([(vec![0xde, 0xad, 0xbe, 0xef], 32)])
+            .await
+            .unwrap();
         match next(&mut rx) {
             Msg::AddScriptPrefixes(a) => assert_eq!(a.prefixes[0].bits, 32),
             other => panic!("expected AddScriptPrefixes, got {other:?}"),
         }
 
         // Valid: 16 bits, 2 bytes.
-        h.add_script_prefixes([(vec![0xab, 0xcd], 16)]).await.unwrap();
+        h.add_script_prefixes([(vec![0xab, 0xcd], 16)])
+            .await
+            .unwrap();
         match next(&mut rx) {
             Msg::AddScriptPrefixes(a) => {
                 assert_eq!(a.prefixes.len(), 1);
@@ -1576,7 +1647,12 @@ mod tests {
     #[tokio::test]
     async fn set_cursor_wraps_cursor() {
         let (h, mut rx) = handle();
-        let cursor = Cursor { height: 9, tx_index: 0, mempool_seq: 1, instance_id: 2 };
+        let cursor = Cursor {
+            height: 9,
+            tx_index: 0,
+            mempool_seq: 1,
+            instance_id: 2,
+        };
         h.set_cursor(cursor).await.unwrap();
         match next(&mut rx) {
             Msg::SetCursor(s) => assert_eq!(s.cursor, Some(cursor)),
@@ -1595,7 +1671,10 @@ mod tests {
             .tls_client_identity(b"CLIENT_CERT".to_vec(), b"CLIENT_PRIVATE_KEY".to_vec());
         let dbg = format!("{b:?}");
         assert!(dbg.contains("tls: true"), "expected tls: true, got {dbg}");
-        assert!(dbg.contains("<redacted>"), "token should be redacted: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "token should be redacted: {dbg}"
+        );
         assert!(!dbg.contains("SUPER_SECRET_TOKEN"));
         assert!(!dbg.contains("SECRET_CA_BYTES"));
         assert!(!dbg.contains("CLIENT_PRIVATE_KEY"));
@@ -1616,7 +1695,10 @@ mod tests {
             .await
             .expect_err("connect to a dead port must fail");
         assert!(
-            !matches!(err, StreamError::InvalidEndpoint(_) | StreamError::InvalidToken),
+            !matches!(
+                err,
+                StreamError::InvalidEndpoint(_) | StreamError::InvalidToken
+            ),
             "expected a transport/connect error, got {err:?}",
         );
     }
@@ -1654,12 +1736,10 @@ mod version_check_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use satd_events_proto::v1::node_event_stream_server::{
-        NodeEventStream, NodeEventStreamServer,
-    };
+    use satd_events_proto::v1::node_event_stream_server::{NodeEventStream, NodeEventStreamServer};
     use tokio_stream::Stream;
 
-    use crate::compat::{Version, SDK_VERSION};
+    use crate::compat::{SDK_VERSION, Version};
     use crate::{ResilientConfig, ResilientWatchConfig};
 
     type EventResult = Result<pb::NodeEvent, tonic::Status>;
@@ -1701,10 +1781,8 @@ mod version_check_tests {
                 })
                 .into_iter()
                 .collect();
-            let stream = tokio_stream::StreamExt::chain(
-                tokio_stream::iter(events),
-                tokio_stream::pending(),
-            );
+            let stream =
+                tokio_stream::StreamExt::chain(tokio_stream::iter(events), tokio_stream::pending());
             let mut resp = tonic::Response::new(Box::pin(stream) as BoxStream);
             let md = resp.metadata_mut();
             if let Some(v) = self.version.lock().unwrap().as_deref() {
@@ -1751,7 +1829,10 @@ mod version_check_tests {
     }
 
     async fn client_for(fake: &FakeNode) -> StreamClient {
-        StreamClient::builder(serve(fake.clone()).await).connect().await.expect("connect")
+        StreamClient::builder(serve(fake.clone()).await)
+            .connect()
+            .await
+            .expect("connect")
     }
 
     fn sdk() -> Version {
@@ -1798,11 +1879,7 @@ mod version_check_tests {
     struct ProbeLock;
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLock {
-        fn on_event(
-            &self,
-            _: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
             PROBE_COMPAT.with(|p| {
                 if let Some(compat) = p.borrow().as_ref() {
                     let free = compat.try_lock().is_ok();
@@ -1887,7 +1964,10 @@ mod version_check_tests {
         }
 
         fn warnings(&self) -> Vec<String> {
-            self.lines().into_iter().filter(|l| l.contains("WARN")).collect()
+            self.lines()
+                .into_iter()
+                .filter(|l| l.contains("WARN"))
+                .collect()
         }
     }
 
@@ -1896,7 +1976,10 @@ mod version_check_tests {
         let logs = Logs::capture();
         let fake = FakeNode::new(Some(SDK_VERSION));
         let mut client = client_for(&fake).await;
-        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe");
         client.watch().await.expect("watch");
         assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
     }
@@ -1907,7 +1990,10 @@ mod version_check_tests {
         let sdk = sdk();
         let fake = FakeNode::new(Some(&format!("{}.{}.0", sdk.major, sdk.minor + 3)));
         let mut client = client_for(&fake).await;
-        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe");
         assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
     }
 
@@ -1930,7 +2016,11 @@ mod version_check_tests {
     async fn two_minors_behind_is_refused() {
         let fake = FakeNode::new(Some(&too_old()));
         let mut client = client_for(&fake).await;
-        let err = client.subscribe(SubscribeOptions::default()).await.err().expect("refused");
+        let err = client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .err()
+            .expect("refused");
         match &err {
             StreamError::NodeTooOld { node, sdk } => {
                 assert_eq!(node, &too_old());
@@ -1952,7 +2042,10 @@ mod version_check_tests {
             .connect()
             .await
             .unwrap();
-        client.subscribe(SubscribeOptions::default()).await.expect("allowed");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("allowed");
         assert_eq!(logs.warnings().len(), 1, "{:?}", logs.warnings());
     }
 
@@ -1965,11 +2058,21 @@ mod version_check_tests {
             .connect()
             .await
             .unwrap();
-        let err = client.subscribe(SubscribeOptions::default()).await.err().expect("refused");
-        assert!(matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }), "{err:?}");
+        let err = client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }),
+            "{err:?}"
+        );
         assert!(!err.is_retryable());
         let err = client.watch().await.err().expect("watch refused too");
-        assert!(matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }), "{err:?}");
+        assert!(
+            matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }),
+            "{err:?}"
+        );
     }
 
     /// A node that predates the headers still stamps `schema_version` on every
@@ -1979,9 +2082,15 @@ mod version_check_tests {
         let mut fake = FakeNode::new(Some(SDK_VERSION));
         fake.event_schema = Some(2);
         let mut client = client_for(&fake).await;
-        let mut stream = client.subscribe(SubscribeOptions::default()).await.expect("opens");
+        let mut stream = client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("opens");
         let err = stream.message().await.expect_err("refused");
-        assert!(matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }), "{err:?}");
+        assert!(
+            matches!(err, StreamError::SchemaMismatch { node: 2, sdk: 1 }),
+            "{err:?}"
+        );
 
         // The matching schema passes through as an ordinary event.
         let mut fake = FakeNode::new(Some(SDK_VERSION));
@@ -2008,20 +2117,41 @@ mod version_check_tests {
         }
         let mut client = builder.connect().await.unwrap();
 
-        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
-        client.subscribe(SubscribeOptions::default()).await.expect("subscribe again");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe again");
         // A clone (as the resilient layers hold) shares the state.
         client.clone().watch().await.expect("watch");
         let warnings = logs.warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains(&format!("node_version={behind}")), "{warnings:?}");
-        assert!(warnings[0].contains(&format!("sdk_version=\"{SDK_VERSION}\"")), "{warnings:?}");
-        assert!(warnings[0].contains("is older than this SDK"), "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!("node_version={behind}")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(&format!("sdk_version=\"{SDK_VERSION}\"")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("is older than this SDK"),
+            "{warnings:?}"
+        );
 
         // The node changes version (a rolling downgrade, say): warn again.
         *fake.version.lock().unwrap() = Some(format!("{behind}-other"));
-        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
-        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe");
         assert_eq!(logs.warnings().len(), 2, "{:?}", logs.warnings());
     }
 
@@ -2043,10 +2173,16 @@ mod version_check_tests {
         let mut client = builder.connect().await.unwrap();
 
         let probe = Probe::arm(client.compat.clone());
-        client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe");
         let seen = probe.seen();
         assert!(!seen.is_empty(), "the warning was not logged");
-        assert!(seen.iter().all(|f| *f), "an event was logged under the compat lock: {seen:?}");
+        assert!(
+            seen.iter().all(|f| *f),
+            "an event was logged under the compat lock: {seen:?}"
+        );
     }
 
     #[tokio::test]
@@ -2054,7 +2190,11 @@ mod version_check_tests {
         let fake = FakeNode::new(Some(SDK_VERSION));
         let client = client_for(&fake).await;
         assert_eq!(client.node_version(), None);
-        client.clone().subscribe(SubscribeOptions::default()).await.expect("subscribe");
+        client
+            .clone()
+            .subscribe(SubscribeOptions::default())
+            .await
+            .expect("subscribe");
         assert_eq!(client.node_version().as_deref(), Some(SDK_VERSION));
     }
 
@@ -2094,9 +2234,7 @@ mod head_cursor_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use satd_events_proto::v1::node_event_stream_server::{
-        NodeEventStream, NodeEventStreamServer,
-    };
+    use satd_events_proto::v1::node_event_stream_server::{NodeEventStream, NodeEventStreamServer};
     use tokio_stream::Stream;
 
     use crate::resilience::Backoff;
@@ -2122,7 +2260,9 @@ mod head_cursor_tests {
                 Box::pin(tokio_stream::iter(vec![
                     Ok(pb::NodeEvent {
                         schema_version: satd_events_proto::SCHEMA_VERSION,
-                        body: Some(pb::node_event::Body::Heartbeat(pb::Heartbeat { uptime_ns: 1 })),
+                        body: Some(pb::node_event::Body::Heartbeat(pb::Heartbeat {
+                            uptime_ns: 1,
+                        })),
                         ..Default::default()
                     }),
                     Err(tonic::Status::unavailable("dropped")),
@@ -2150,7 +2290,10 @@ mod head_cursor_tests {
             &self,
             req: tonic::Request<pb::SubscribeRequest>,
         ) -> Result<tonic::Response<BoxStream>, tonic::Status> {
-            self.from_cursors.lock().unwrap().push(req.into_inner().from_cursor);
+            self.from_cursors
+                .lock()
+                .unwrap()
+                .push(req.into_inner().from_cursor);
             Ok(self.respond())
         }
 
@@ -2183,7 +2326,10 @@ mod head_cursor_tests {
                 .add_service(NodeEventStreamServer::new(node.clone()))
                 .serve_with_incoming(incoming),
         );
-        StreamClient::builder(format!("http://{addr}")).connect().await.expect("connect")
+        StreamClient::builder(format!("http://{addr}"))
+            .connect()
+            .await
+            .expect("connect")
     }
 
     fn fast() -> Backoff {
@@ -2195,12 +2341,20 @@ mod head_cursor_tests {
         }
     }
 
-    const HEAD: Cursor = Cursor { height: 7, tx_index: 0, mempool_seq: 3, instance_id: 99 };
+    const HEAD: Cursor = Cursor {
+        height: 7,
+        tx_index: 0,
+        mempool_seq: 3,
+        instance_id: 99,
+    };
 
     async fn wait_until(what: &str, cond: impl Fn() -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !cond() {
-            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
@@ -2208,7 +2362,11 @@ mod head_cursor_tests {
     #[test]
     fn the_header_parses_or_is_ignored() {
         let mut md = MetadataMap::new();
-        assert_eq!(compat::head_cursor_from(&md), None, "a node without the header");
+        assert_eq!(
+            compat::head_cursor_from(&md),
+            None,
+            "a node without the header"
+        );
         md.insert(compat::HEAD_CURSOR_HEADER, "7:0:3:99".parse().unwrap());
         assert_eq!(compat::head_cursor_from(&md), Some(HEAD));
         for bad in ["7:0:3", "7:0:3:99:1", "x:0:3:99", "7:0:-3:99", ""] {
@@ -2222,14 +2380,19 @@ mod head_cursor_tests {
     /// this times out.
     #[tokio::test]
     async fn a_watch_dropped_before_any_cursor_re_anchors_to_the_head() {
-        let node = DroppingNode { head: Some("7:0:3:99"), ..Default::default() };
+        let node = DroppingNode {
+            head: Some("7:0:3:99"),
+            ..Default::default()
+        };
         let client = client_for(&node).await;
         let mut watch = client.resilient_watch(ResilientWatchConfig::new().backoff(fast()));
         assert!(matches!(watch.next().await, Ok(Event::Heartbeat { .. })));
         // Drive the reconnect; the parked second stream yields nothing.
         let _ = tokio::time::timeout(Duration::from_millis(200), watch.next()).await;
-        wait_until("the reconnect's set_cursor", || !node.set_cursors.lock().unwrap().is_empty())
-            .await;
+        wait_until("the reconnect's set_cursor", || {
+            !node.set_cursors.lock().unwrap().is_empty()
+        })
+        .await;
         assert_eq!(node.set_cursors.lock().unwrap()[0], HEAD);
     }
 
@@ -2252,13 +2415,21 @@ mod head_cursor_tests {
     /// `from_cursor` and this fails.
     #[tokio::test]
     async fn a_subscription_dropped_before_any_cursor_resumes_from_the_head() {
-        let node = DroppingNode { head: Some("7:0:3:99"), ..Default::default() };
+        let node = DroppingNode {
+            head: Some("7:0:3:99"),
+            ..Default::default()
+        };
         let client = client_for(&node).await;
-        let mut sub = client
-            .resilient_subscribe(SubscribeOptions::default(), ResilientConfig::new().backoff(fast()));
+        let mut sub = client.resilient_subscribe(
+            SubscribeOptions::default(),
+            ResilientConfig::new().backoff(fast()),
+        );
         assert!(matches!(sub.next().await, Ok(Event::Heartbeat { .. })));
         let _ = tokio::time::timeout(Duration::from_millis(200), sub.next()).await;
-        wait_until("the reconnect", || node.from_cursors.lock().unwrap().len() >= 2).await;
+        wait_until("the reconnect", || {
+            node.from_cursors.lock().unwrap().len() >= 2
+        })
+        .await;
         let asked = node.from_cursors.lock().unwrap().clone();
         assert_eq!(asked, vec![None, Some(HEAD)]);
     }

@@ -37,7 +37,13 @@ fn extend(
 ) -> BlockIndexEntry {
     let mut cur = from.clone();
     for h in (from.height + 1)..=to_height {
-        let e = entry(cur.header.block_hash(), h, cur.header.time + spacing, MAINNET_POWLIMIT_BITS, tag);
+        let e = entry(
+            cur.header.block_hash(),
+            h,
+            cur.header.time + spacing,
+            MAINNET_POWLIMIT_BITS,
+            tag,
+        );
         index.insert(e.header.block_hash(), e.clone());
         cur = e;
     }
@@ -52,7 +58,13 @@ fn extend(
 #[test]
 fn retarget_seed_is_the_branchs_own_ancestor() {
     let mut index = HashMap::new();
-    let root = entry(BlockHash::all_zeros(), 0, 1_300_000_000, MAINNET_POWLIMIT_BITS, 0);
+    let root = entry(
+        BlockHash::all_zeros(),
+        0,
+        1_300_000_000,
+        MAINNET_POWLIMIT_BITS,
+        0,
+    );
     index.insert(root.header.block_hash(), root.clone());
     let fork = extend(&mut index, &root, 1000, 600, 0);
     // A height index would follow branch A; the seed must not come from it.
@@ -79,20 +91,25 @@ fn retarget_seed_is_the_branchs_own_ancestor() {
     );
     let a_seeded = retarget(
         b_tip.header.bits,
-        (b_tip.header.time - a_rows[&2016].header.time).clamp(TARGET_TIMESPAN / 4, TARGET_TIMESPAN * 4),
+        (b_tip.header.time - a_rows[&2016].header.time)
+            .clamp(TARGET_TIMESPAN / 4, TARGET_TIMESPAN * 4),
         MAINNET_POWLIMIT_BITS,
     );
-    assert_ne!(expected, a_seeded, "fixture: the two seeds must give different bits");
+    assert_ne!(
+        expected, a_seeded,
+        "fixture: the two seeds must give different bits"
+    );
 
     for network in [Network::Bitcoin, Network::Testnet, Network::Testnet4] {
-        let bits = next_bits(
-            network,
-            &b_tip,
-            b_tip.header.time + 600,
-            |h| index.get(h).cloned(),
-        )
+        let bits = next_bits(network, &b_tip, b_tip.header.time + 600, |h| {
+            index.get(h).cloned()
+        })
         .unwrap();
-        assert_eq!(bits.to_consensus(), expected, "{network:?}: seeded from the other branch");
+        assert_eq!(
+            bits.to_consensus(),
+            expected,
+            "{network:?}: seeded from the other branch"
+        );
     }
 }
 
@@ -100,7 +117,13 @@ fn retarget_seed_is_the_branchs_own_ancestor() {
 #[test]
 fn retarget_seed_missing_ancestor_fails_closed() {
     let mut index = HashMap::new();
-    let root = entry(BlockHash::all_zeros(), 0, 1_300_000_000, MAINNET_POWLIMIT_BITS, 0);
+    let root = entry(
+        BlockHash::all_zeros(),
+        0,
+        1_300_000_000,
+        MAINNET_POWLIMIT_BITS,
+        0,
+    );
     index.insert(root.header.block_hash(), root.clone());
     let tip = extend(&mut index, &root, 2015, 600, 0);
     let mut hole = tip.clone();
@@ -109,7 +132,9 @@ fn retarget_seed_missing_ancestor_fails_closed() {
     }
     index.remove(&hole.header.block_hash());
     assert!(matches!(
-        next_bits(Network::Bitcoin, &tip, tip.header.time + 600, |h| index.get(h).cloned()),
+        next_bits(Network::Bitcoin, &tip, tip.header.time + 600, |h| index
+            .get(h)
+            .cloned()),
         Err(ValidationError::BadDifficulty)
     ));
 }
@@ -122,12 +147,20 @@ fn testnet_min_difficulty_rule_does_not_overflow() {
     let prev = entry(BlockHash::all_zeros(), 5, u32::MAX - 100, 0x1c00_ffff, 0);
     for network in [Network::Testnet, Network::Testnet4] {
         let bits = next_bits(network, &prev, u32::MAX, |_| None).unwrap();
-        assert_eq!(bits.to_consensus(), 0x1c00_ffff, "{network:?}: within 20 minutes keeps the parent's bits");
+        assert_eq!(
+            bits.to_consensus(),
+            0x1c00_ffff,
+            "{network:?}: within 20 minutes keeps the parent's bits"
+        );
     }
     let prev = entry(BlockHash::all_zeros(), 5, u32::MAX - 2000, 0x1c00_ffff, 0);
     for network in [Network::Testnet, Network::Testnet4] {
         let bits = next_bits(network, &prev, u32::MAX, |_| None).unwrap();
-        assert_eq!(bits.to_consensus(), TESTNET_POWLIMIT_BITS, "{network:?}: after 20 minutes, minimum difficulty");
+        assert_eq!(
+            bits.to_consensus(),
+            TESTNET_POWLIMIT_BITS,
+            "{network:?}: after 20 minutes, minimum difficulty"
+        );
     }
 }
 
@@ -138,8 +171,16 @@ fn testnet_min_difficulty_rule_does_not_overflow() {
 #[test]
 fn permitted_difficulty_transition_follows_core() {
     let old = 0x1b04_04cb;
-    assert!(permitted_difficulty_transition(Network::Bitcoin, 2017, old, old));
-    assert!(!permitted_difficulty_transition(Network::Bitcoin, 2017, old, 0x1b04_04cc), "off a boundary");
+    assert!(permitted_difficulty_transition(
+        Network::Bitcoin,
+        2017,
+        old,
+        old
+    ));
+    assert!(
+        !permitted_difficulty_transition(Network::Bitcoin, 2017, old, 0x1b04_04cc),
+        "off a boundary"
+    );
 
     // On a boundary: the target times four, then a quarter, in compact form.
     let old_target = target_from_compact(CompactTarget::from_consensus(old));
@@ -152,18 +193,54 @@ fn permitted_difficulty_transition_follows_core() {
     };
     let easiest = scaled(4, 1);
     let hardest = scaled(1, 4);
-    assert!(permitted_difficulty_transition(Network::Bitcoin, 4032, old, easiest));
-    assert!(permitted_difficulty_transition(Network::Bitcoin, 4032, old, hardest));
-    assert!(!permitted_difficulty_transition(Network::Bitcoin, 4032, old, easiest + 1), "easier than x4");
-    assert!(!permitted_difficulty_transition(Network::Bitcoin, 4032, old, hardest - 1), "harder than /4");
+    assert!(permitted_difficulty_transition(
+        Network::Bitcoin,
+        4032,
+        old,
+        easiest
+    ));
+    assert!(permitted_difficulty_transition(
+        Network::Bitcoin,
+        4032,
+        old,
+        hardest
+    ));
+    assert!(
+        !permitted_difficulty_transition(Network::Bitcoin, 4032, old, easiest + 1),
+        "easier than x4"
+    );
+    assert!(
+        !permitted_difficulty_transition(Network::Bitcoin, 4032, old, hardest - 1),
+        "harder than /4"
+    );
 
     // At the limit the target cannot get easier.
-    assert!(permitted_difficulty_transition(Network::Bitcoin, 4032, 0x1d00_ffff, 0x1d00_ffff));
-    assert!(!permitted_difficulty_transition(Network::Bitcoin, 4032, 0x1d00_ffff, 0x1d01_fffe));
+    assert!(permitted_difficulty_transition(
+        Network::Bitcoin,
+        4032,
+        0x1d00_ffff,
+        0x1d00_ffff
+    ));
+    assert!(!permitted_difficulty_transition(
+        Network::Bitcoin,
+        4032,
+        0x1d00_ffff,
+        0x1d01_fffe
+    ));
 
     // Signet is checked; the min-difficulty networks are not.
-    assert!(!permitted_difficulty_transition(Network::Signet, 1, 0x1e03_77ae, 0x1d00_ffff));
+    assert!(!permitted_difficulty_transition(
+        Network::Signet,
+        1,
+        0x1e03_77ae,
+        0x1d00_ffff
+    ));
     for n in [Network::Testnet, Network::Testnet4, Network::Regtest] {
-        assert!(permitted_difficulty_transition(n, 1, 0x1e03_77ae, 0x1d00_ffff));
+        assert!(permitted_difficulty_transition(
+            n,
+            1,
+            0x1e03_77ae,
+            0x1d00_ffff
+        ));
     }
 }

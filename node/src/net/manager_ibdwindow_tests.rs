@@ -32,11 +32,22 @@ fn mk_pm() -> (Arc<PeerManager>, tempfile::TempDir) {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let pm = PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx);
+    let pm = PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    );
     (pm, dir)
 }
 
-fn add_peer(pm: &PeerManager, id: PeerId, services: ServiceFlags, best_height: i32) -> mpsc::Receiver<NetworkMessage> {
+fn add_peer(
+    pm: &PeerManager,
+    id: PeerId,
+    services: ServiceFlags,
+    best_height: i32,
+) -> mpsc::Receiver<NetworkMessage> {
     let addr = SocketAddr::from(([10, 62, 0, id as u8], 8333));
     let mut info = PeerInfo::new(id, addr, Direction::Outbound);
     info.state = PeerState::Connected;
@@ -106,8 +117,16 @@ fn break_block_files(pm: &PeerManager, dir: &tempfile::TempDir) -> bool {
     }
     std::fs::set_permissions(&blocks, std::fs::Permissions::from_mode(0o555)).unwrap();
     pm.chain_state.resync_block_append_pos().unwrap();
-    let probe = std::fs::read_dir(&blocks).unwrap().next().unwrap().unwrap().path();
-    std::fs::OpenOptions::new().append(true).open(probe).is_err()
+    let probe = std::fs::read_dir(&blocks)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(probe)
+        .is_err()
 }
 
 fn restore_block_files(dir: &tempfile::TempDir) {
@@ -123,11 +142,19 @@ fn restore_block_files(dir: &tempfile::TempDir) {
 fn a_local_write_failure_does_not_charge_the_sender() {
     type Store = fn(&PeerManager, PeerId, bitcoin::Block);
     let paths: [(&str, Store, u32); 2] = [
-        ("forward IBD", |pm, id, b| {
-            pm.handle_block_ibd(id, b, true, InFlight::adopt(None));
-            pm.wait_for_ibd_stores();
-        }, 10),
-        ("background catch-up", |pm, id, b| pm.store_bg_block(id, b), 5),
+        (
+            "forward IBD",
+            |pm, id, b| {
+                pm.handle_block_ibd(id, b, true, InFlight::adopt(None));
+                pm.wait_for_ibd_stores();
+            },
+            10,
+        ),
+        (
+            "background catch-up",
+            |pm, id, b| pm.store_bg_block(id, b),
+            5,
+        ),
     ];
     for (path, store, penalty) in paths {
         // The disk refuses the write.
@@ -142,8 +169,15 @@ fn a_local_write_failure_does_not_charge_the_sender() {
         let hash = block.block_hash();
         store(&pm, 1, block);
         restore_block_files(&dir);
-        assert!(!pm.chain_state.has_block_data(&hash), "{path}: the write did not fail");
-        assert_eq!(ban_score(&pm, 1), 0, "{path}: the sender was charged for our disk");
+        assert!(
+            !pm.chain_state.has_block_data(&hash),
+            "{path}: the write did not fail"
+        );
+        assert_eq!(
+            ban_score(&pm, 1),
+            0,
+            "{path}: the sender was charged for our disk"
+        );
 
         // The block itself is bad.
         let (pm, _dir) = mk_pm();
@@ -151,7 +185,11 @@ fn a_local_write_failure_does_not_charge_the_sender() {
         let mut block = blocks(1).remove(0);
         block.txdata[0].output[0].value = bitcoin::Amount::from_sat(1);
         store(&pm, 1, block);
-        assert_eq!(ban_score(&pm, 1), penalty, "{path}: a bad block went uncharged");
+        assert_eq!(
+            ban_score(&pm, 1),
+            penalty,
+            "{path}: a bad block went uncharged"
+        );
     }
 }
 
@@ -169,8 +207,18 @@ fn ibd_work_goes_only_to_peers_that_can_serve_it() {
     let cases = [
         ("NODE_NETWORK", ServiceFlags::NETWORK, 5, true),
         ("no block service", ServiceFlags::WITNESS, 5, false),
-        ("limited, every height recent", ServiceFlags::NETWORK_LIMITED, 5, true),
-        ("limited, heights too deep", ServiceFlags::NETWORK_LIMITED, 300, false),
+        (
+            "limited, every height recent",
+            ServiceFlags::NETWORK_LIMITED,
+            5,
+            true,
+        ),
+        (
+            "limited, heights too deep",
+            ServiceFlags::NETWORK_LIMITED,
+            300,
+            false,
+        ),
         ("limited and intact, heights too deep", intact(), 300, true),
     ];
     for (what, services, best_height, expect) in cases {
@@ -196,12 +244,15 @@ fn the_sweep_asks_one_peer_per_block() {
     for b in &chain {
         pm.chain_state.accept_header(&b.header).unwrap();
     }
-    let mut rxs: Vec<_> = (1..=3).map(|id| add_peer(&pm, id, ServiceFlags::NETWORK, 5)).collect();
+    let mut rxs: Vec<_> = (1..=3)
+        .map(|id| add_peer(&pm, id, ServiceFlags::NETWORK, 5))
+        .collect();
     let peers = [1, 2, 3];
 
     pm.sweep_missing_blocks(&peers);
     pm.sweep_missing_blocks(&peers);
-    let first: Vec<Vec<bitcoin::BlockHash>> = rxs.iter_mut().map(|rx| blocks_asked(&drain(rx))).collect();
+    let first: Vec<Vec<bitcoin::BlockHash>> =
+        rxs.iter_mut().map(|rx| blocks_asked(&drain(rx))).collect();
     for b in &chain {
         let hash = b.block_hash();
         let times = first.iter().flatten().filter(|h| **h == hash).count();
@@ -215,7 +266,8 @@ fn the_sweep_asks_one_peer_per_block() {
         }
     }
     pm.sweep_missing_blocks(&peers);
-    let second: Vec<Vec<bitcoin::BlockHash>> = rxs.iter_mut().map(|rx| blocks_asked(&drain(rx))).collect();
+    let second: Vec<Vec<bitcoin::BlockHash>> =
+        rxs.iter_mut().map(|rx| blocks_asked(&drain(rx))).collect();
     for b in &chain {
         let hash = b.block_hash();
         let before: Vec<usize> = (0..3).filter(|i| first[*i].contains(&hash)).collect();
@@ -235,14 +287,26 @@ fn notfound_releases_a_background_height() {
     }
     let _rx1 = add_peer(&pm, 1, ServiceFlags::NETWORK, 2);
     let _rx2 = add_peer(&pm, 2, ServiceFlags::NETWORK, 2);
-    pm.bg_downloader.write().mark_in_flight(1, 1, Instant::now());
-    pm.bg_downloader.write().mark_in_flight(2, 1, Instant::now());
+    pm.bg_downloader
+        .write()
+        .mark_in_flight(1, 1, Instant::now());
+    pm.bg_downloader
+        .write()
+        .mark_in_flight(2, 1, Instant::now());
 
-    let notfound = |h: &bitcoin::Block| NetworkMessage::NotFound(vec![Inventory::WitnessBlock(h.block_hash())]);
+    let notfound = |h: &bitcoin::Block| {
+        NetworkMessage::NotFound(vec![Inventory::WitnessBlock(h.block_hash())])
+    };
     pm.handle_message(2, notfound(&chain[0]), InFlight::adopt(None));
-    assert!(pm.bg_downloader.read().is_in_flight(1), "peer 2 was not asked for it");
+    assert!(
+        pm.bg_downloader.read().is_in_flight(1),
+        "peer 2 was not asked for it"
+    );
     pm.handle_message(1, notfound(&chain[0]), InFlight::adopt(None));
-    assert!(!pm.bg_downloader.read().is_in_flight(1), "notfound from the peer asked releases it");
+    assert!(
+        !pm.bg_downloader.read().is_in_flight(1),
+        "notfound from the peer asked releases it"
+    );
     assert!(pm.bg_downloader.read().is_in_flight(2));
 }
 
@@ -260,17 +324,33 @@ fn the_sweep_asks_a_peer_that_has_the_block() {
     let mut limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED, 300);
     let mut full = add_peer(&pm, 3, ServiceFlags::NETWORK, 300);
     pm.sweep_missing_blocks(&[1, 2, 3]);
-    assert!(blocks_asked(&drain(&mut behind)).is_empty(), "a peer without the blocks was asked");
+    assert!(
+        blocks_asked(&drain(&mut behind)).is_empty(),
+        "a peer without the blocks was asked"
+    );
     // The limited peer keeps blocks 15..=300 (within 286 of its tip).
     let deep: Vec<bitcoin::BlockHash> = chain[..14].iter().map(|b| b.block_hash()).collect();
     let from_limited = blocks_asked(&drain(&mut limited));
-    assert!(!from_limited.is_empty(), "the limited peer is asked for the blocks it keeps");
-    assert!(from_limited.iter().all(|h| !deep.contains(h)), "a limited peer was asked for deep blocks");
+    assert!(
+        !from_limited.is_empty(),
+        "the limited peer is asked for the blocks it keeps"
+    );
+    assert!(
+        from_limited.iter().all(|h| !deep.contains(h)),
+        "a limited peer was asked for deep blocks"
+    );
     let asked = blocks_asked(&drain(&mut full));
-    assert!(asked.contains(&chain[0].block_hash()), "the peer that has them was not asked: {asked:?}");
+    assert!(
+        asked.contains(&chain[0].block_hash()),
+        "the peer that has them was not asked: {asked:?}"
+    );
 
     // It answers notfound: the next pass may ask again at once.
-    pm.handle_message(3, NetworkMessage::NotFound(vec![Inventory::WitnessBlock(chain[0].block_hash())]), InFlight::adopt(None));
+    pm.handle_message(
+        3,
+        NetworkMessage::NotFound(vec![Inventory::WitnessBlock(chain[0].block_hash())]),
+        InFlight::adopt(None),
+    );
     pm.sweep_missing_blocks(&[1, 2, 3]);
     assert!(blocks_asked(&drain(&mut full)).contains(&chain[0].block_hash()));
 }
@@ -290,13 +370,26 @@ fn the_sweep_asks_an_intact_peer_for_deep_blocks_and_falls_back_on_notfound() {
     let deep = chain[0].block_hash();
     // Both could serve it; the first in turn is the intact peer.
     pm.sweep_missing_blocks(&[1, 2]);
-    assert!(blocks_asked(&drain(&mut intact_peer)).contains(&deep), "the intact peer was not asked for a deep block");
+    assert!(
+        blocks_asked(&drain(&mut intact_peer)).contains(&deep),
+        "the intact peer was not asked for a deep block"
+    );
     assert!(!blocks_asked(&drain(&mut full)).contains(&deep));
 
-    pm.handle_message(1, NetworkMessage::NotFound(vec![Inventory::WitnessBlock(deep)]), InFlight::adopt(None));
+    pm.handle_message(
+        1,
+        NetworkMessage::NotFound(vec![Inventory::WitnessBlock(deep)]),
+        InFlight::adopt(None),
+    );
     pm.sweep_missing_blocks(&[1, 2]);
-    assert!(blocks_asked(&drain(&mut full)).contains(&deep), "after notfound the block did not go to the full peer");
-    assert!(!blocks_asked(&drain(&mut intact_peer)).contains(&deep), "the peer that said notfound was asked again");
+    assert!(
+        blocks_asked(&drain(&mut full)).contains(&deep),
+        "after notfound the block did not go to the full peer"
+    );
+    assert!(
+        !blocks_asked(&drain(&mut intact_peer)).contains(&deep),
+        "the peer that said notfound was asked again"
+    );
 }
 
 /// The background download asks NODE_NETWORK peers and intact limited ones,
@@ -305,7 +398,12 @@ fn the_sweep_asks_an_intact_peer_for_deep_blocks_and_falls_back_on_notfound() {
 fn the_background_download_asks_intact_peers_but_not_plain_limited_ones() {
     let (pm, _dir) = mk_pm();
     let _full = add_peer(&pm, 1, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
-    let _limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS, 300);
+    let _limited = add_peer(
+        &pm,
+        2,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+        300,
+    );
     let _intact = add_peer(&pm, 3, intact(), 300);
     assert_eq!(pm.bg_catchup_peer_ids(), vec![1, 3]);
 }
@@ -317,8 +415,17 @@ fn the_background_download_asks_intact_peers_but_not_plain_limited_ones() {
 fn block_serving_peers_fall_back_to_intact_ones_only_without_a_full_peer() {
     let (pm, _dir) = mk_pm();
     let _intact = add_peer(&pm, 1, intact(), 300);
-    let _limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS, 300);
-    assert_eq!(pm.block_serving_peer_ids(), vec![1], "no full peer: the intact one");
+    let _limited = add_peer(
+        &pm,
+        2,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+        300,
+    );
+    assert_eq!(
+        pm.block_serving_peer_ids(),
+        vec![1],
+        "no full peer: the intact one"
+    );
     let _full = add_peer(&pm, 3, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
     assert_eq!(pm.block_serving_peer_ids(), vec![3], "a full peer: only it");
 }
@@ -330,7 +437,11 @@ fn block_serving_peers_fall_back_to_intact_ones_only_without_a_full_peer() {
 fn an_intact_peer_does_not_stand_in_for_network_while_catching_up() {
     let (pm, _dir) = mk_pm();
     let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-    assert_eq!(pm.missing_desirable_services(intact()), Some(full), "the regtest genesis tip is years old");
+    assert_eq!(
+        pm.missing_desirable_services(intact()),
+        Some(full),
+        "the regtest genesis tip is years old"
+    );
     assert_eq!(pm.missing_desirable_services(full), None);
 }
 
@@ -340,7 +451,12 @@ fn an_intact_peer_does_not_stand_in_for_network_while_catching_up() {
 fn the_opreturn_restore_asks_only_full_peers() {
     let (pm, _dir) = mk_pm();
     let _intact = add_peer(&pm, 1, intact(), 300);
-    let _limited = add_peer(&pm, 2, ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS, 300);
+    let _limited = add_peer(
+        &pm,
+        2,
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+        300,
+    );
     let _no_witness = add_peer(&pm, 3, ServiceFlags::NETWORK, 300);
     assert_eq!(pm.opreturn_restore_peer_ids(), Vec::<PeerId>::new());
     let _full = add_peer(&pm, 4, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 300);
@@ -363,10 +479,22 @@ fn a_panicking_restore_work_list_read_reports_an_error() {
 fn a_pending_restore_wants_full_outbound_peers() {
     let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
     let limited = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-    assert_eq!(super::missing_desirable_services(limited, 0, false), None, "a recent tip");
-    assert_eq!(super::missing_desirable_services(limited, 0, true), Some(full), "restoring");
+    assert_eq!(
+        super::missing_desirable_services(limited, 0, false),
+        None,
+        "a recent tip"
+    );
+    assert_eq!(
+        super::missing_desirable_services(limited, 0, true),
+        Some(full),
+        "restoring"
+    );
     assert_eq!(super::missing_desirable_services(full, 0, true), None);
-    assert_eq!(super::missing_desirable_services(limited, 10_000, false), Some(full), "an old tip");
+    assert_eq!(
+        super::missing_desirable_services(limited, 10_000, false),
+        Some(full),
+        "an old tip"
+    );
 }
 
 /// A peer's `notfound` record for the sweep goes when the peer disconnects,
@@ -383,14 +511,26 @@ fn the_sweeps_notfound_record_is_dropped_with_the_peer_and_the_block() {
     let asked = blocks_asked(&drain(&mut intact_peer));
     let notfound: Vec<Inventory> = asked.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
     pm.handle_message(1, NetworkMessage::NotFound(notfound), InFlight::adopt(None));
-    assert_eq!(pm.sweep_not_found.read().len(), asked.len(), "each block answered notfound is recorded");
+    assert_eq!(
+        pm.sweep_not_found.read().len(),
+        asked.len(),
+        "each block answered notfound is recorded"
+    );
     pm.handle_peer_disconnected(1);
-    assert!(pm.sweep_not_found.read().is_empty(), "a departed peer's notfound record stayed");
+    assert!(
+        pm.sweep_not_found.read().is_empty(),
+        "a departed peer's notfound record stayed"
+    );
 
     // A record for a block the chain no longer misses goes on the next pass.
-    pm.sweep_not_found.write().insert(bitcoin::BlockHash::all_zeros(), vec![1]);
+    pm.sweep_not_found
+        .write()
+        .insert(bitcoin::BlockHash::all_zeros(), vec![1]);
     pm.sweep_missing_blocks(&[2]);
-    assert!(pm.sweep_not_found.read().is_empty(), "a record for a block not missing stayed");
+    assert!(
+        pm.sweep_not_found.read().is_empty(),
+        "a record for a block not missing stayed"
+    );
 }
 
 /// During IBD a block `inv` is answered with `getheaders` only, as in Core;
@@ -411,7 +551,11 @@ fn a_block_inv_during_ibd_is_not_fetched_directly() {
         let mut rx = add_peer(&pm, 1, ServiceFlags::NETWORK, 6);
         pm.handle_inv(1, vec![Inventory::Block(announced)]);
         let asked = blocks_asked(&drain(&mut rx));
-        assert_eq!(asked.contains(&announced), expect_fetch, "ibd={ibd}: asked for {asked:?}");
+        assert_eq!(
+            asked.contains(&announced),
+            expect_fetch,
+            "ibd={ibd}: asked for {asked:?}"
+        );
     }
 }
 
@@ -476,14 +620,26 @@ fn an_ibd_block_arriving_during_a_connect_does_not_hold_up_the_p2p_task() {
     }
     let returned = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
     assert!(returned, "handle_block_ibd waited for accept_lock");
-    assert!(!pm.chain_state.has_block_data(&hash), "the store waits for the lock");
-    assert!(pm.ibd.read().as_ref().unwrap().is_arrived(1), "the arrival is credited");
+    assert!(
+        !pm.chain_state.has_block_data(&hash),
+        "the store waits for the lock"
+    );
+    assert!(
+        pm.ibd.read().as_ref().unwrap().is_arrived(1),
+        "the arrival is credited"
+    );
     assert_eq!(flow.in_flight(), 1, "the block message is still in flight");
 
     drop(held);
     pm.wait_for_ibd_stores();
-    assert!(pm.chain_state.has_block_data(&hash), "stored once the lock is free");
-    assert!(!pm.ibd.read().as_ref().unwrap().is_arrived(1), "the store settled the height");
+    assert!(
+        pm.chain_state.has_block_data(&hash),
+        "stored once the lock is free"
+    );
+    assert!(
+        !pm.ibd.read().as_ref().unwrap().is_arrived(1),
+        "the store settled the height"
+    );
     assert!(flow.is_idle(), "the block message is done with");
 }
 
@@ -504,7 +660,11 @@ fn a_refetched_block_releases_its_ibd_slot() {
         let scheduler = ibd.as_mut().unwrap();
         scheduler.register_peer(1);
         scheduler.assign_blocks(1);
-        assert_eq!(scheduler.inflight_peer(3), Some(1), "fixture: peer 1 is fetching height 3");
+        assert_eq!(
+            scheduler.inflight_peer(3),
+            Some(1),
+            "fixture: peer 1 is fetching height 3"
+        );
     }
     // Height 3 is stored, and an operator re-fetch from peer 1 is armed.
     let block = chain[2].clone();
@@ -514,6 +674,13 @@ fn a_refetched_block_releases_its_ibd_slot() {
 
     pm.handle_block(1, block, InFlight::new(pm.peer_flow(1)));
 
-    assert!(pm.block_refetch.read().is_empty(), "fixture: the re-fetch path took the block");
-    assert_eq!(pm.ibd.read().as_ref().unwrap().inflight_peer(3), None, "the slot is released");
+    assert!(
+        pm.block_refetch.read().is_empty(),
+        "fixture: the re-fetch path took the block"
+    );
+    assert_eq!(
+        pm.ibd.read().as_ref().unwrap().inflight_peer(3),
+        None,
+        "the slot is released"
+    );
 }

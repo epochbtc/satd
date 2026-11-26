@@ -4,7 +4,9 @@
 mod common;
 
 use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::{
+    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+};
 use common::TestNode;
 use serde_json::json;
 
@@ -27,7 +29,13 @@ fn heavy_spend(node: &TestNode) -> (String, u64) {
     let block = node.rpc_ok("getblock", vec![hashes[0].clone(), json!(2)]);
     let coinbase = &block["tx"][0];
     // Mature it.
-    node.rpc_ok("generatetoaddress", vec![json!(100), json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")]);
+    node.rpc_ok(
+        "generatetoaddress",
+        vec![
+            json!(100),
+            json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"),
+        ],
+    );
 
     let value = Amount::from_btc(coinbase["vout"][0]["value"].as_f64().unwrap()).unwrap();
     let tx = Transaction {
@@ -57,7 +65,11 @@ fn accepted_vsize(node: &TestNode, hex: &str) -> u64 {
 fn the_vsize_is_sigop_adjusted_by_the_configured_bytes_per_sigop() {
     let mut node = TestNode::start(&[]);
     let (hex, by_weight) = heavy_spend(&node);
-    assert_eq!(accepted_vsize(&node, &hex), 19_705, "3941 sigops at 20 bytes each");
+    assert_eq!(
+        accepted_vsize(&node, &hex),
+        19_705,
+        "3941 sigops at 20 bytes each"
+    );
     assert!(by_weight < 1_000);
     node.stop();
 
@@ -76,29 +88,55 @@ fn every_mempool_rpc_reports_vsize_bip141_and_vsize_adjusted() {
     let mut node = TestNode::start(&[]);
     let (hex, by_weight) = heavy_spend(&node);
     assert!(by_weight < 1_000);
-    let sizes = |v: &serde_json::Value| (v["vsize"].clone(), v["vsize_adjusted"].clone(), v["vsize_bip141"].clone());
+    let sizes = |v: &serde_json::Value| {
+        (
+            v["vsize"].clone(),
+            v["vsize_adjusted"].clone(),
+            v["vsize_bip141"].clone(),
+        )
+    };
     let want = (json!(19_705), json!(19_705), json!(by_weight));
 
     let r = node.rpc_ok("testmempoolaccept", vec![json!([hex])]);
     assert_eq!(sizes(&r[0]), want, "testmempoolaccept: {r}");
 
     let r = node.rpc_ok("submitpackage", vec![json!([hex])]);
-    let result = r["tx-results"].as_object().unwrap().values().next().unwrap().clone();
+    let result = r["tx-results"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
     assert_eq!(sizes(&result), want, "submitpackage: {r}");
     let txid = result["txid"].clone();
 
     let entry = node.rpc_ok("getmempoolentry", vec![txid.clone()]);
     assert_eq!(sizes(&entry), want, "getmempoolentry: {entry}");
     let pool = node.rpc_ok("getrawmempool", vec![json!(true)]);
-    assert_eq!(sizes(&pool[txid.as_str().unwrap()]), want, "getrawmempool: {pool}");
+    assert_eq!(
+        sizes(&pool[txid.as_str().unwrap()]),
+        want,
+        "getrawmempool: {pool}"
+    );
 
     // `getrawtransaction` adds only `vsize_adjusted`, and only while the
     // transaction is in the mempool; its `vsize` is the BIP 141 one.
     for verbosity in [1, 2] {
         let tx = node.rpc_ok("getrawtransaction", vec![txid.clone(), json!(verbosity)]);
-        assert_eq!(sizes(&tx), (json!(by_weight), json!(19_705), serde_json::Value::Null), "{tx}");
+        assert_eq!(
+            sizes(&tx),
+            (json!(by_weight), json!(19_705), serde_json::Value::Null),
+            "{tx}"
+        );
     }
-    let hashes = node.rpc_ok("generatetoaddress", vec![json!(1), json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202")]);
+    let hashes = node.rpc_ok(
+        "generatetoaddress",
+        vec![
+            json!(1),
+            json!("bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202"),
+        ],
+    );
     let tx = node.rpc_ok("getrawtransaction", vec![txid, json!(1), hashes[0].clone()]);
     assert!(tx.get("vsize_adjusted").is_none(), "confirmed: {tx}");
     node.stop();

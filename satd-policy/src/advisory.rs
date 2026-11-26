@@ -321,6 +321,9 @@ mod tests {
         )
         .unwrap();
         let adv = advise_ruleset(&rs);
-        assert_eq!(adv.iter().filter(|a| a.flow == L2Flow::DustAnchor).count(), 1);
+        assert_eq!(
+            adv.iter().filter(|a| a.flow == L2Flow::DustAnchor).count(),
+            1
+        );
     }
 }

@@ -122,7 +122,10 @@ where
         } else {
             timings.dns_few_peers
         };
-        tracing::info!("Waiting {} seconds before querying DNS seeds.", to_wait.as_secs());
+        tracing::info!(
+            "Waiting {} seconds before querying DNS seeds.",
+            to_wait.as_secs()
+        );
         while !to_wait.is_zero() {
             let step = to_wait.min(timings.dns_few_peers);
             tokio::select! {
@@ -256,9 +259,20 @@ mod tests {
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
-        let got = dns_seed(&book, false, FAST, || async { vec![seed(1), seed(2)] }, Vec::new(), running()).await;
+        let got = dns_seed(
+            &book,
+            false,
+            FAST,
+            || async { vec![seed(1), seed(2)] },
+            Vec::new(),
+            running(),
+        )
+        .await;
         assert_eq!(got, Some(2));
-        assert!(started.elapsed() >= FAST.dns_few_peers, "queried before the wait");
+        assert!(
+            started.elapsed() >= FAST.dns_few_peers,
+            "queried before the wait"
+        );
         assert_eq!(book.addrs.lock().unwrap().len(), 2);
         assert_eq!(book.dials.load(Ordering::Relaxed), 1);
     }
@@ -267,8 +281,17 @@ mod tests {
     async fn enough_peers_after_the_wait_skips_the_seeds() {
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
-        book.outbound.store(SEED_OUTBOUND_CONNECTION_THRESHOLD, Ordering::Relaxed);
-        let got = dns_seed(&book, false, FAST, || async { panic!("seeds queried with enough peers") }, Vec::new(), running()).await;
+        book.outbound
+            .store(SEED_OUTBOUND_CONNECTION_THRESHOLD, Ordering::Relaxed);
+        let got = dns_seed(
+            &book,
+            false,
+            FAST,
+            || async { panic!("seeds queried with enough peers") },
+            Vec::new(),
+            running(),
+        )
+        .await;
         assert_eq!(got, None);
     }
 
@@ -277,34 +300,77 @@ mod tests {
     #[tokio::test]
     async fn a_large_book_waits_longer_and_checks_on_the_way() {
         let book = std::sync::Arc::new(Book::default());
-        book.stale.store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
+        book.stale
+            .store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
-        let got = dns_seed(&*book, false, FAST, || async { vec![seed(1)] }, Vec::new(), running()).await;
+        let got = dns_seed(
+            &*book,
+            false,
+            FAST,
+            || async { vec![seed(1)] },
+            Vec::new(),
+            running(),
+        )
+        .await;
         assert_eq!(got, Some(1));
         assert!(started.elapsed() >= FAST.dns_many_peers);
 
         let book = std::sync::Arc::new(Book::default());
-        book.stale.store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
+        book.stale
+            .store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
         let b = book.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
             b.outbound.store(2, Ordering::Relaxed);
         });
         let started = tokio::time::Instant::now();
-        let got = dns_seed(&*book, false, FAST, || async { panic!("seeds queried with enough peers") }, Vec::new(), running()).await;
+        let got = dns_seed(
+            &*book,
+            false,
+            FAST,
+            || async { panic!("seeds queried with enough peers") },
+            Vec::new(),
+            running(),
+        )
+        .await;
         assert_eq!(got, None);
-        assert!(started.elapsed() < FAST.dns_many_peers, "it waited out the whole interval");
+        assert!(
+            started.elapsed() < FAST.dns_many_peers,
+            "it waited out the whole interval"
+        );
     }
 
     #[tokio::test]
     async fn an_empty_book_or_forcednsseed_queries_at_once() {
         let book = Book::default();
         let started = tokio::time::Instant::now();
-        assert_eq!(dns_seed(&book, false, FAST, || async { vec![seed(1)] }, Vec::new(), running()).await, Some(1));
+        assert_eq!(
+            dns_seed(
+                &book,
+                false,
+                FAST,
+                || async { vec![seed(1)] },
+                Vec::new(),
+                running()
+            )
+            .await,
+            Some(1)
+        );
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
         book.outbound.store(8, Ordering::Relaxed);
-        assert_eq!(dns_seed(&book, true, FAST, || async { vec![seed(1)] }, Vec::new(), running()).await, Some(1));
+        assert_eq!(
+            dns_seed(
+                &book,
+                true,
+                FAST,
+                || async { vec![seed(1)] },
+                Vec::new(),
+                running()
+            )
+            .await,
+            Some(1)
+        );
         assert!(started.elapsed() < FAST.dns_few_peers);
     }
 
@@ -334,10 +400,22 @@ mod tests {
     #[tokio::test]
     async fn shutdown_ends_a_wait() {
         let book = Book::default();
-        book.stale.store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
+        book.stale
+            .store(DNS_SEED_DELAY_PEER_THRESHOLD, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::watch::channel(false);
         tx.send(true).unwrap();
-        assert_eq!(dns_seed(&book, false, FAST, || async { vec![seed(1)] }, Vec::new(), rx.clone()).await, None);
+        assert_eq!(
+            dns_seed(
+                &book,
+                false,
+                FAST,
+                || async { vec![seed(1)] },
+                Vec::new(),
+                rx.clone()
+            )
+            .await,
+            None
+        );
         assert!(!fixed_seed(&book, true, FAST, vec![seed(9)], rx).await);
     }
 
@@ -347,18 +425,44 @@ mod tests {
     /// `add_addr_fetch` loop and nothing is queued.
     #[tokio::test]
     async fn proxied_seeds_are_queued_by_name_when_the_seeds_are_queried() {
-        let names = vec![("seed.example".to_string(), 8333), ("seed2.example".to_string(), 8333)];
+        let names = vec![
+            ("seed.example".to_string(), 8333),
+            ("seed2.example".to_string(), 8333),
+        ];
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
-        let got = dns_seed(&book, false, FAST, || async { Vec::new() }, names.clone(), running()).await;
+        let got = dns_seed(
+            &book,
+            false,
+            FAST,
+            || async { Vec::new() },
+            names.clone(),
+            running(),
+        )
+        .await;
         assert_eq!(got, Some(0));
         assert_eq!(*book.fetches.lock().unwrap(), names);
         assert_eq!(book.dials.load(Ordering::Relaxed), 1);
 
         let book = Book::default();
         book.stale.store(50, Ordering::Relaxed);
-        book.outbound.store(SEED_OUTBOUND_CONNECTION_THRESHOLD, Ordering::Relaxed);
-        assert_eq!(dns_seed(&book, false, FAST, || async { Vec::new() }, names, running()).await, None);
-        assert!(book.fetches.lock().unwrap().is_empty(), "queued with enough peers");
+        book.outbound
+            .store(SEED_OUTBOUND_CONNECTION_THRESHOLD, Ordering::Relaxed);
+        assert_eq!(
+            dns_seed(
+                &book,
+                false,
+                FAST,
+                || async { Vec::new() },
+                names,
+                running()
+            )
+            .await,
+            None
+        );
+        assert!(
+            book.fetches.lock().unwrap().is_empty(),
+            "queued with enough peers"
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! scripted peers on loopback. A regtest manager's book admits loopback
 //! addresses; nothing here dials off the host.
 
-use super::survey_tests::{book_add, mk_pm_live, mk_pm_proxied, mk_pm_with, ONION};
+use super::survey_tests::{ONION, book_add, mk_pm_live, mk_pm_proxied, mk_pm_with};
 use super::*;
 use crate::net::crawl::{CrawlConfig, Limits, Timings};
 use crate::net::crawlbook::{Attempt, CrawlAddr, GetaddrResult, SessionKind, SessionResult};
@@ -26,7 +26,12 @@ fn quick() -> Timings {
 }
 
 fn config() -> CrawlConfig {
-    CrawlConfig { dns_seeds: false, fixed_seeds: false, timings: quick(), ..CrawlConfig::default() }
+    CrawlConfig {
+        dns_seeds: false,
+        fixed_seeds: false,
+        timings: quick(),
+        ..CrawlConfig::default()
+    }
 }
 
 fn enable(pm: &PeerManager, config: CrawlConfig) -> &crawl_conn::CrawlRun {
@@ -81,7 +86,10 @@ fn core_script() -> Script {
         user_agent: "/Satoshi:32.1.0/",
         negotiation: vec![NetworkMessage::WtxidRelay, NetworkMessage::SendAddrV2],
         after_verack: vec![
-            NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct { send_compact: false, version: 2 }),
+            NetworkMessage::SendCmpct(bitcoin::p2p::message_compact_blocks::SendCmpct {
+                send_compact: false,
+                version: 2,
+            }),
             NetworkMessage::Ping(77),
             NetworkMessage::FeeFilter(1000),
         ],
@@ -102,17 +110,29 @@ fn core_script() -> Script {
 
 /// Core with its inbound slots full: the handshake, then the close.
 fn evicting_core() -> Script {
-    Script { after_verack: vec![], close_after_verack: true, ..core_script() }
+    Script {
+        after_verack: vec![],
+        close_after_verack: true,
+        ..core_script()
+    }
 }
 
 /// An impostor claiming Core 25.0: `version` and `verack`, nothing between
 /// them, nothing after, the connection held open.
 fn fake_core() -> Script {
-    Script { user_agent: "/Satoshi:25.0.0/", negotiation: vec![], after_verack: vec![], ..core_script() }
+    Script {
+        user_agent: "/Satoshi:25.0.0/",
+        negotiation: vec![],
+        after_verack: vec![],
+        ..core_script()
+    }
 }
 
 fn silent() -> Script {
-    Script { silent: true, ..core_script() }
+    Script {
+        silent: true,
+        ..core_script()
+    }
 }
 
 /// Public IPv4 entries for a `getaddr` answer.
@@ -140,7 +160,9 @@ async fn scripted(ip: &str, script: Script) -> (PeerAddr, Log) {
     let conns = log.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
             let i = {
                 let mut l = conns.lock();
                 l.push(Vec::new());
@@ -201,7 +223,9 @@ async fn serve(mut stream: TcpStream, script: Script, log: Log, i: usize) {
                     .send(NetworkMessage::Version(VersionMessage {
                         version: 70016,
                         services,
-                        timestamp: script.timestamp.unwrap_or(crate::time::now_secs() as i64 - 3),
+                        timestamp: script
+                            .timestamp
+                            .unwrap_or(crate::time::now_secs() as i64 - 3),
                         receiver: Address::new(&zero, ServiceFlags::NONE),
                         sender: Address::new(&zero, services),
                         nonce: 0x5eed,
@@ -237,7 +261,9 @@ async fn serve(mut stream: TcpStream, script: Script, log: Log, i: usize) {
                 }
             }
             NetworkMessage::GetHeaders(_) => {
-                let _ = conn.send(NetworkMessage::Headers(script.headers.clone())).await;
+                let _ = conn
+                    .send(NetworkMessage::Headers(script.headers.clone()))
+                    .await;
             }
             NetworkMessage::GetData(_) if script.hang_up_on_getdata => return,
             NetworkMessage::GetData(inv) if script.notfound => {
@@ -268,7 +294,11 @@ async fn until(secs: u64, f: impl Fn() -> bool) -> bool {
 fn seed_v2(pm: &PeerManager, target: &PeerAddr) {
     let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2;
     let run = pm.crawl.get().unwrap();
-    assert!(run.book.lock().seed(target.clone(), services.to_u64(), crate::time::now_secs()));
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), services.to_u64(), crate::time::now_secs())
+    );
 }
 
 /// A listener that records the first four bytes of every connection and
@@ -276,13 +306,17 @@ fn seed_v2(pm: &PeerManager, target: &PeerAddr) {
 /// first bytes of its ElligatorSwift key.
 async fn first_bytes() -> (PeerAddr, Arc<parking_lot::Mutex<Vec<[u8; 4]>>>) {
     use tokio::io::AsyncReadExt as _;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let firsts: Arc<parking_lot::Mutex<Vec<[u8; 4]>>> = Default::default();
     let seen = firsts.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let mut first = [0u8; 4];
             if stream.read_exact(&mut first).await.is_ok() {
                 seen.lock().push(first);
@@ -301,25 +335,43 @@ async fn first_bytes() -> (PeerAddr, Arc<parking_lot::Mutex<Vec<[u8; 4]>>>) {
 #[test]
 fn crawl_version_fields_are_exact() {
     let (pm, _dir) = mk_pm_with(None);
-    pm.enable_crawl(CrawlConfig { ua_comment: Some("census".into()), ..config() }).unwrap();
+    pm.enable_crawl(CrawlConfig {
+        ua_comment: Some("census".into()),
+        ..config()
+    })
+    .unwrap();
     let to: SocketAddr = "203.0.113.5:8333".parse().unwrap();
     let v = pm.build_version_message(to, ConnType::Crawl);
     assert_eq!(v.version, 70016);
     assert_eq!(v.services, ServiceFlags::NONE);
     assert!(!v.relay);
     assert_eq!(v.start_height, pm.chain_state.tip_height() as i32);
-    assert_eq!(v.user_agent, format!("/satd:{}(crawler; census)/", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        v.user_agent,
+        format!("/satd:{}(crawler; census)/", env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(v.receiver, Address::new(&to, ServiceFlags::NONE));
-    assert_eq!(v.sender, Address::new(&"0.0.0.0:0".parse().unwrap(), ServiceFlags::NONE));
+    assert_eq!(
+        v.sender,
+        Address::new(&"0.0.0.0:0".parse().unwrap(), ServiceFlags::NONE)
+    );
     let now = crate::time::now_secs() as i64;
     assert!((v.timestamp - now).abs() <= 2);
     // The node's own -uacomment is not in it.
-    assert!(!v.user_agent.contains(crate::user_agent().trim_matches('/')) || crate::user_agent() == crate::USER_AGENT);
-    let nonces: HashSet<u64> = (0..64).map(|_| pm.build_version_message(to, ConnType::Crawl).nonce).collect();
+    assert!(
+        !v.user_agent.contains(crate::user_agent().trim_matches('/'))
+            || crate::user_agent() == crate::USER_AGENT
+    );
+    let nonces: HashSet<u64> = (0..64)
+        .map(|_| pm.build_version_message(to, ConnType::Crawl).nonce)
+        .collect();
     assert_eq!(nonces.len(), 64, "a fresh nonce every time");
     let node = pm.build_version_message(to, ConnType::OutboundFullRelay);
     assert_ne!(node.user_agent, v.user_agent);
-    assert!(node.services != ServiceFlags::NONE && node.relay, "the node's own version is unchanged");
+    assert!(
+        node.services != ServiceFlags::NONE && node.relay,
+        "the node's own version is unchanged"
+    );
 }
 
 // ---- The session ----
@@ -339,21 +391,38 @@ async fn a_liveness_session_sends_the_handshake_and_nothing_else() {
     let (target, log) = scripted("127.0.0.1", script).await;
     seed_v2(&pm, &target);
     let out = pm.crawl_session(&target, SessionKind::Liveness).await;
-    assert_eq!((out.result.v2, out.result.v1), (Attempt::Failed, Attempt::Ok), "v1-only: v2, then the v1 redial");
+    assert_eq!(
+        (out.result.v2, out.result.v1),
+        (Attempt::Failed, Attempt::Ok),
+        "v1-only: v2, then the v1 redial"
+    );
     let conns = log.lock().clone();
     assert_eq!(conns.len(), 2, "the v2 attempt and the v1 redial");
-    assert!(conns[0].is_empty(), "the v2 attempt got no v1 message through");
+    assert!(
+        conns[0].is_empty(),
+        "the v2 attempt got no v1 message through"
+    );
     let got = &conns[1];
     let cmds: Vec<&str> = got.iter().map(|m| m.cmd()).collect();
-    assert_eq!(&cmds[..4], ["version", "wtxidrelay", "sendaddrv2", "verack"], "{cmds:?}");
-    assert!(cmds[4..].iter().all(|c| *c == "pong"), "nothing but pongs after the handshake: {cmds:?}");
+    assert_eq!(
+        &cmds[..4],
+        ["version", "wtxidrelay", "sendaddrv2", "verack"],
+        "{cmds:?}"
+    );
+    assert!(
+        cmds[4..].iter().all(|c| *c == "pong"),
+        "nothing but pongs after the handshake: {cmds:?}"
+    );
     assert!(cmds.len() > 4, "the pings were answered: {cmds:?}");
     let obs = out.result.observation.expect("an observation");
     assert_eq!(obs.getaddr, None, "a liveness session sends no getaddr");
     assert!(!obs.v2);
     assert_eq!(obs.user_agent, "/Satoshi:32.1.0/");
     assert_eq!(obs.height, 0);
-    assert!(obs.clock_offset_secs.is_some_and(|o| (-6..=0).contains(&o)), "{obs:?}");
+    assert!(
+        obs.clock_offset_secs.is_some_and(|o| (-6..=0).contains(&o)),
+        "{obs:?}"
+    );
     assert!(obs.handshake_rtt_ms.is_some());
     assert!(out.answer.is_none());
 }
@@ -370,14 +439,31 @@ async fn a_discovery_session_asks_once_probes_and_records() {
     script.after_verack.push(NetworkMessage::GetAddr);
     script.answer = Some(answer(3));
     let (target, log) = scripted("127.0.0.1", script).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None)
+        .await;
     assert_eq!(log.lock().len(), 1, "a seed advertises nothing: v1 alone");
     let got = log.lock()[0].clone();
-    assert_eq!(got.iter().filter(|m| matches!(m, NetworkMessage::GetAddr)).count(), 1);
-    assert!(!got.iter().any(|m| matches!(m, NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_))), "no address to the peer");
+    assert_eq!(
+        got.iter()
+            .filter(|m| matches!(m, NetworkMessage::GetAddr))
+            .count(),
+        1
+    );
+    assert!(
+        !got.iter()
+            .any(|m| matches!(m, NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_))),
+        "no address to the peer"
+    );
     for probe in ["ping", "getdata"] {
-        assert!(got.iter().any(|m| m.cmd() == probe), "{probe} sent: {got:?}");
+        assert!(
+            got.iter().any(|m| m.cmd() == probe),
+            "{probe} sent: {got:?}"
+        );
     }
     // At genesis no stop hash lies past a locator: no getheaders probe.
     assert!(!got.iter().any(|m| m.cmd() == "getheaders"), "{got:?}");
@@ -387,9 +473,20 @@ async fn a_discovery_session_asks_once_probes_and_records() {
     assert_eq!(e.v2_ok, None, "v2 never tried");
     assert!(e.last_discovery.is_some());
     let obs = e.observation.as_ref().unwrap();
-    assert_eq!(obs.getaddr.map(|g| matches!(g, GetaddrResult::Answered { entries: 3, .. })), Some(true), "{obs:?}");
-    assert!(matches!(obs.probes.get(Probe::Ping), Some(ProbeOutcome::Answered(_))));
-    assert_eq!(obs.probes.get(Probe::GetData), Some(ProbeOutcome::Answered(1)));
+    assert_eq!(
+        obs.getaddr
+            .map(|g| matches!(g, GetaddrResult::Answered { entries: 3, .. })),
+        Some(true),
+        "{obs:?}"
+    );
+    assert!(matches!(
+        obs.probes.get(Probe::Ping),
+        Some(ProbeOutcome::Answered(_))
+    ));
+    assert_eq!(
+        obs.probes.get(Probe::GetData),
+        Some(ProbeOutcome::Answered(1))
+    );
     assert_eq!(obs.probes.get(Probe::Unknown), Some(ProbeOutcome::Silent));
     assert_eq!(obs.probes.get(Probe::GetHeaders), None);
     // The answer entered the crawl's book, and only that.
@@ -403,16 +500,29 @@ async fn a_discovery_session_asks_once_probes_and_records() {
 async fn a_v2_attempt_that_received_bytes_is_not_redialled() {
     let (pm, _dir) = mk_pm_with(None);
     enable(&pm, config());
-    let (target, log) = scripted("127.0.0.1", Script { garbage: true, ..core_script() }).await;
+    let (target, log) = scripted(
+        "127.0.0.1",
+        Script {
+            garbage: true,
+            ..core_script()
+        },
+    )
+    .await;
     seed_v2(&pm, &target);
     let out = pm.crawl_session(&target, SessionKind::Liveness).await;
-    assert_eq!((out.result.v2, out.result.v1), (Attempt::Failed, Attempt::NotTried));
+    assert_eq!(
+        (out.result.v2, out.result.v1),
+        (Attempt::Failed, Attempt::NotTried)
+    );
     assert_eq!(log.lock().len(), 1, "no v1 redial");
     // A v1 recheck dials v1 alone, to a node advertising v2 too.
     let (target, log) = scripted("127.0.0.1", core_script()).await;
     seed_v2(&pm, &target);
     let out = pm.crawl_session(&target, SessionKind::V1Recheck).await;
-    assert_eq!((out.result.v2, out.result.v1), (Attempt::NotTried, Attempt::Ok));
+    assert_eq!(
+        (out.result.v2, out.result.v1),
+        (Attempt::NotTried, Attempt::Ok)
+    );
     assert_eq!(log.lock().len(), 1);
 }
 
@@ -431,8 +541,15 @@ async fn a_target_not_advertising_v2_is_dialled_v1_with_no_v2_bytes() {
     assert!(run.book.lock().seed(named.clone(), without, now));
     for (target, firsts) in [(&seed, &firsts), (&named, &named_firsts)] {
         let out = pm.crawl_session(target, SessionKind::Discovery).await;
-        assert_eq!((out.result.v2, out.result.v1), (Attempt::NotTried, Attempt::Failed));
-        assert_eq!(*firsts.lock(), vec![Magic::REGTEST.to_bytes()], "one v1 dial, no v2 bytes");
+        assert_eq!(
+            (out.result.v2, out.result.v1),
+            (Attempt::NotTried, Attempt::Failed)
+        );
+        assert_eq!(
+            *firsts.lock(),
+            vec![Magic::REGTEST.to_bytes()],
+            "one v1 dial, no v2 bytes"
+        );
     }
     // A target not in the book at all is dialled the same way.
     let (stray, firsts) = first_bytes().await;
@@ -450,9 +567,16 @@ async fn a_target_advertising_v2_is_dialled_v2_first() {
     let (target, firsts) = first_bytes().await;
     seed_v2(&pm, &target);
     let out = pm.crawl_session(&target, SessionKind::Discovery).await;
-    assert_eq!((out.result.v2, out.result.v1), (Attempt::Failed, Attempt::Failed));
+    assert_eq!(
+        (out.result.v2, out.result.v1),
+        (Attempt::Failed, Attempt::Failed)
+    );
     let firsts = firsts.lock().clone();
-    assert_eq!(firsts.len(), 2, "the v2 attempt and the v1 redial: {firsts:?}");
+    assert_eq!(
+        firsts.len(),
+        2,
+        "the v2 attempt and the v1 redial: {firsts:?}"
+    );
     assert_ne!(firsts[0], Magic::REGTEST.to_bytes(), "v2 first");
     assert_eq!(firsts[1], Magic::REGTEST.to_bytes(), "then v1");
 }
@@ -466,14 +590,34 @@ async fn after_a_handshake_the_nodes_version_services_decide() {
     let (pm, _dir) = mk_pm_with(None);
     let run = enable(&pm, config());
     let with_v2 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2;
-    let (says_v2, log) = scripted("127.0.0.1", Script { services: with_v2, ..core_script() }).await;
-    assert!(run.book.lock().seed(says_v2.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(says_v2.clone(), SessionKind::Liveness, None).await;
+    let (says_v2, log) = scripted(
+        "127.0.0.1",
+        Script {
+            services: with_v2,
+            ..core_script()
+        },
+    )
+    .await;
+    assert!(
+        run.book
+            .lock()
+            .seed(says_v2.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(says_v2.clone(), SessionKind::Liveness, None)
+        .await;
     assert_eq!(log.lock().len(), 1, "advertised nothing: v1 alone");
-    pm.run_crawl_session(says_v2.clone(), SessionKind::Liveness, None).await;
+    pm.run_crawl_session(says_v2.clone(), SessionKind::Liveness, None)
+        .await;
     let conns = log.lock().clone();
-    assert_eq!(conns.len(), 3, "its version said v2: the v2 attempt, then the v1 redial");
-    assert!(conns[1].is_empty(), "the v2 attempt got no v1 message through");
+    assert_eq!(
+        conns.len(),
+        3,
+        "its version said v2: the v2 attempt, then the v1 redial"
+    );
+    assert!(
+        conns[1].is_empty(),
+        "the v2 attempt got no v1 message through"
+    );
     let book = pm.crawl_book().unwrap();
     let e = book.get(&CrawlAddr::Peer(says_v2)).unwrap();
     assert_eq!((e.v2_ok, e.v1_ok), (Some(false), Some(true)));
@@ -481,9 +625,15 @@ async fn after_a_handshake_the_nodes_version_services_decide() {
 
     let (says_v1, log) = scripted("127.0.0.1", core_script()).await;
     seed_v2(&pm, &says_v1);
-    pm.run_crawl_session(says_v1.clone(), SessionKind::Liveness, None).await;
-    assert_eq!(log.lock().len(), 2, "advertised v2: the v2 attempt and the v1 redial");
-    pm.run_crawl_session(says_v1.clone(), SessionKind::Liveness, None).await;
+    pm.run_crawl_session(says_v1.clone(), SessionKind::Liveness, None)
+        .await;
+    assert_eq!(
+        log.lock().len(),
+        2,
+        "advertised v2: the v2 attempt and the v1 redial"
+    );
+    pm.run_crawl_session(says_v1.clone(), SessionKind::Liveness, None)
+        .await;
     assert_eq!(log.lock().len(), 3, "its version said no v2: v1 alone");
     assert!(!log.lock()[2].is_empty());
 }
@@ -493,17 +643,36 @@ async fn after_a_handshake_the_nodes_version_services_decide() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_discovery_session_ends_by_its_bound() {
     let (pm, _dir) = mk_pm_with(None);
-    enable(&pm, CrawlConfig { probes: false, ..config() });
-    let script = Script { ping_every: Some(Duration::from_millis(100)), ..core_script() };
+    enable(
+        &pm,
+        CrawlConfig {
+            probes: false,
+            ..config()
+        },
+    );
+    let script = Script {
+        ping_every: Some(Duration::from_millis(100)),
+        ..core_script()
+    };
     let (target, _log) = scripted("127.0.0.1", script).await;
     let started = Instant::now();
-    let out = tokio::time::timeout(Duration::from_secs(20), pm.crawl_session(&target, SessionKind::Discovery))
-        .await
-        .expect("the session ended");
+    let out = tokio::time::timeout(
+        Duration::from_secs(20),
+        pm.crawl_session(&target, SessionKind::Discovery),
+    )
+    .await
+    .expect("the session ended");
     let t = quick();
-    assert!(started.elapsed() <= t.session_cap(SessionKind::Discovery, false), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() <= t.session_cap(SessionKind::Discovery, false),
+        "{:?}",
+        started.elapsed()
+    );
     assert!(started.elapsed() >= t.discovery, "it waited for the answer");
-    assert_eq!(out.result.observation.unwrap().getaddr, Some(GetaddrResult::NoAnswer));
+    assert_eq!(
+        out.result.observation.unwrap().getaddr,
+        Some(GetaddrResult::NoAnswer)
+    );
 }
 
 // ---- Isolation ----
@@ -514,11 +683,27 @@ async fn a_discovery_session_ends_by_its_bound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crawl_connections_are_no_peers() {
     let (pm, _dir) = mk_pm_with(None);
-    enable(&pm, CrawlConfig { timings: Timings { passive: Duration::from_secs(3), ..quick() }, ..config() });
+    enable(
+        &pm,
+        CrawlConfig {
+            timings: Timings {
+                passive: Duration::from_secs(3),
+                ..quick()
+            },
+            ..config()
+        },
+    );
     let (target, log) = scripted("127.0.0.1", core_script()).await;
     let pm2 = Arc::clone(&pm);
-    let session = tokio::spawn(async move { pm2.crawl_session(&target, SessionKind::Liveness).await });
-    assert!(until(10, || log.lock().first().is_some_and(|c| c.iter().any(|m| m.cmd() == "verack"))).await);
+    let session =
+        tokio::spawn(async move { pm2.crawl_session(&target, SessionKind::Liveness).await });
+    assert!(
+        until(10, || log
+            .lock()
+            .first()
+            .is_some_and(|c| c.iter().any(|m| m.cmd() == "verack")))
+        .await
+    );
     assert!(pm.peers.read().is_empty());
     assert!(pm.get_peer_info().is_empty());
     assert_eq!(pm.connection_count(), 0);
@@ -534,8 +719,17 @@ async fn crawl_connections_are_no_peers() {
 async fn the_crawl_writes_nothing_to_the_address_book() {
     let (pm, _dir) = mk_pm_with(None);
     let run = enable(&pm, config());
-    let (target, _log) = scripted("127.0.0.1", Script { answer: Some(answer(5)), ..core_script() }).await;
-    let PeerAddr::Socket(sa) = target.clone() else { unreachable!() };
+    let (target, _log) = scripted(
+        "127.0.0.1",
+        Script {
+            answer: Some(answer(5)),
+            ..core_script()
+        },
+    )
+    .await;
+    let PeerAddr::Socket(sa) = target.clone() else {
+        unreachable!()
+    };
     book_add(&pm, sa);
     let snapshot = |pm: &PeerManager| {
         let book = pm.addrman.read();
@@ -546,11 +740,26 @@ async fn the_crawl_writes_nothing_to_the_address_book() {
     let before = snapshot(&pm);
     assert_eq!(before.len(), 1);
     pm.crawl_seed_round().await;
-    assert!(run.book.lock().get(&CrawlAddr::Peer(target.clone())).is_some(), "seeded from the address book");
-    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
+    assert!(
+        run.book
+            .lock()
+            .get(&CrawlAddr::Peer(target.clone()))
+            .is_some(),
+        "seeded from the address book"
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None)
+        .await;
     assert_eq!(run.reached.load(Ordering::Relaxed), 1);
-    assert_eq!(pm.crawl_book().unwrap().len(), 6, "the answer is in the crawl's book");
-    assert_eq!(snapshot(&pm), before, "and nothing changed in the address book");
+    assert_eq!(
+        pm.crawl_book().unwrap().len(),
+        6,
+        "the answer is in the crawl's book"
+    );
+    assert_eq!(
+        snapshot(&pm),
+        before,
+        "and nothing changed in the address book"
+    );
 }
 
 /// A Tor-only node crawls onions only: with clearnet addresses in the book
@@ -558,13 +767,25 @@ async fn the_crawl_writes_nothing_to_the_address_book() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tor_only_node_dials_no_clearnet() {
     let (pm, _dir, _shutdown) = mk_pm_live(Some("127.0.0.1:1"));
-    pm.set_reachable(crate::net::reachable::ReachableNets { ipv4: false, ipv6: false, onion: true, ..Default::default() });
+    pm.set_reachable(crate::net::reachable::ReachableNets {
+        ipv4: false,
+        ipv6: false,
+        onion: true,
+        ..Default::default()
+    });
     let run = enable(&pm, config());
     let now = crate::time::now_secs();
     for i in 1..=20 {
-        assert!(run.book.lock().seed(PeerAddr::Socket(SocketAddr::from(([127, i, 0, 1], 8333))), 0, now - 100));
+        assert!(run.book.lock().seed(
+            PeerAddr::Socket(SocketAddr::from(([127, i, 0, 1], 8333))),
+            0,
+            now - 100
+        ));
     }
-    let onion = PeerAddr::Onion { host: ONION.to_string(), port: 8333 };
+    let onion = PeerAddr::Onion {
+        host: ONION.to_string(),
+        port: 8333,
+    };
     assert!(run.book.lock().seed(onion.clone(), 0, now));
     let mut sessions = tokio::task::JoinSet::new();
     pm.crawl_tick(&mut sessions);
@@ -579,18 +800,36 @@ fn clearnet_through_the_proxy_is_never_crawled_and_crawlnet_only_narrows() {
     use crate::net::crawlbook::Network as Net;
     let public = PeerAddr::Socket("23.1.2.3:8333".parse().unwrap());
     let local = PeerAddr::Socket("127.0.0.5:8333".parse().unwrap());
-    let onion = PeerAddr::Onion { host: ONION.to_string(), port: 8333 };
+    let onion = PeerAddr::Onion {
+        host: ONION.to_string(),
+        port: 8333,
+    };
 
     let (pm, _dir) = mk_pm_proxied("127.0.0.1:1");
     enable(&pm, config());
-    assert!(!pm.crawl_may_dial(&public), "routable clearnet would go through the proxy");
-    assert!(pm.crawl_may_dial(&local), "a local address is dialled directly");
+    assert!(
+        !pm.crawl_may_dial(&public),
+        "routable clearnet would go through the proxy"
+    );
+    assert!(
+        pm.crawl_may_dial(&local),
+        "a local address is dialled directly"
+    );
     assert!(pm.crawl_may_dial(&onion));
 
     let (pm, _dir) = mk_pm_with(None);
-    enable(&pm, CrawlConfig { networks: Some(vec![Net::Onion, Net::Ipv6]), ..config() });
+    enable(
+        &pm,
+        CrawlConfig {
+            networks: Some(vec![Net::Onion, Net::Ipv6]),
+            ..config()
+        },
+    );
     assert!(!pm.crawl_may_dial(&public), "-crawlnet left IPv4 out");
-    assert!(!pm.crawl_may_dial(&onion), "-crawlnet cannot add onion to a node without a proxy");
+    assert!(
+        !pm.crawl_may_dial(&onion),
+        "-crawlnet cannot add onion to a node without a proxy"
+    );
     let (pm, _dir) = mk_pm_with(None);
     enable(&pm, config());
     assert!(pm.crawl_may_dial(&public));
@@ -609,7 +848,11 @@ fn clearnet_through_the_proxy_is_never_crawled_and_crawlnet_only_narrows() {
 
 /// Book `n` scripted silent peers, each on an address of `ip(i)`, and run
 /// one tick: the sessions it started.
-async fn tick_over(limits: Limits, ip: impl Fn(u8) -> String, n: u8) -> (Arc<PeerManager>, tempfile::TempDir, usize) {
+async fn tick_over(
+    limits: Limits,
+    ip: impl Fn(u8) -> String,
+    n: u8,
+) -> (Arc<PeerManager>, tempfile::TempDir, usize) {
     let (pm, dir, _shutdown) = mk_pm_live(None);
     let run = enable(&pm, CrawlConfig { limits, ..config() });
     let now = crate::time::now_secs();
@@ -638,7 +881,12 @@ async fn the_tick_holds_the_rate() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tick_holds_two_sessions_per_netgroup() {
-    let (.., open) = tick_over(Limits::new(100, 8, 100), |i| format!("127.0.{}.1", i + 1), 6).await;
+    let (.., open) = tick_over(
+        Limits::new(100, 8, 100),
+        |i| format!("127.0.{}.1", i + 1),
+        6,
+    )
+    .await;
     assert_eq!(open, 2, "all in 127.0.0.0/16");
 }
 
@@ -649,7 +897,11 @@ async fn one_session_per_target() {
     let (pm, _dir, _shutdown) = mk_pm_live(None);
     let run = enable(&pm, config());
     let (target, log) = scripted("127.0.0.1", silent()).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
     let mut sessions = tokio::task::JoinSet::new();
     pm.crawl_tick(&mut sessions);
     assert!(until(5, || log.lock().len() == 1).await);
@@ -669,7 +921,10 @@ async fn no_session_in_initial_block_download() {
     let (pm, _dir, _shutdown) = mk_pm_live(None);
     let run = enable(&pm, config());
     run.out_of_ibd.store(false, Ordering::Relaxed);
-    assert!(pm.chain_state.is_initial_block_download(), "fixture: a genesis chain is in IBD");
+    assert!(
+        pm.chain_state.is_initial_block_download(),
+        "fixture: a genesis chain is in IBD"
+    );
     let (target, log) = scripted("127.0.0.1", silent()).await;
     assert!(run.book.lock().seed(target, 0, crate::time::now_secs()));
     let mut sessions = tokio::task::JoinSet::new();
@@ -690,7 +945,11 @@ async fn no_session_in_initial_block_download() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_survey_is_superseded_by_the_crawl() {
     let (pm, _dir) = mk_pm_with(None);
-    pm.enable_survey(SurveyConfig { interval: Duration::from_secs(60), probes: false, path: None });
+    pm.enable_survey(SurveyConfig {
+        interval: Duration::from_secs(60),
+        probes: false,
+        path: None,
+    });
     book_add(&pm, SocketAddr::from(([5, 5, 5, 5], 8333)));
     assert_eq!(pm.get_peer_survey(false)["superseded_by_crawl"], false);
     enable(&pm, config());
@@ -717,7 +976,10 @@ async fn a_panic_stops_the_crawl_and_the_node_runs_on() {
     assert!(run.book.lock().seed(target, 0, crate::time::now_secs()));
     run.panic_in_session.store(true, Ordering::Relaxed);
     pm.spawn_crawl();
-    assert!(until(10, || run.stopped.load(Ordering::Relaxed)).await, "the crawl stopped");
+    assert!(
+        until(10, || run.stopped.load(Ordering::Relaxed)).await,
+        "the crawl stopped"
+    );
     assert!(!pm.crawl_may_run());
     // The node's own surfaces still answer.
     assert!(pm.get_peer_info().is_empty());
@@ -730,22 +992,50 @@ async fn the_book_and_its_timers_survive_a_restart() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join(crate::net::crawlbook::CRAWL_FILE);
     let (pm, _d) = mk_pm_with(None);
-    let run = enable(&pm, CrawlConfig { path: Some(path.clone()), ..config() });
+    let run = enable(
+        &pm,
+        CrawlConfig {
+            path: Some(path.clone()),
+            ..config()
+        },
+    );
     let (reached, _) = scripted("127.0.0.1", core_script()).await;
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let down = PeerAddr::Socket(closed);
     let now = crate::time::now_secs();
     for a in [&reached, &down] {
         assert!(run.book.lock().seed(a.clone(), 0, now));
-        pm.run_crawl_session(a.clone(), SessionKind::Discovery, None).await;
+        pm.run_crawl_session(a.clone(), SessionKind::Discovery, None)
+            .await;
     }
     pm.dump_crawl();
     let before = pm.crawl_book().unwrap();
-    assert!(before.get(&CrawlAddr::Peer(reached.clone())).unwrap().last_success.is_some());
-    assert!(before.get(&CrawlAddr::Peer(down.clone())).unwrap().retry_at.is_some());
+    assert!(
+        before
+            .get(&CrawlAddr::Peer(reached.clone()))
+            .unwrap()
+            .last_success
+            .is_some()
+    );
+    assert!(
+        before
+            .get(&CrawlAddr::Peer(down.clone()))
+            .unwrap()
+            .retry_at
+            .is_some()
+    );
 
     let (pm2, _d2) = mk_pm_with(None);
-    enable(&pm2, CrawlConfig { path: Some(path), ..config() });
+    enable(
+        &pm2,
+        CrawlConfig {
+            path: Some(path),
+            ..config()
+        },
+    );
     let after = pm2.crawl_book().unwrap();
     assert_eq!(after.len(), before.len());
     for a in [reached, down] {
@@ -765,10 +1055,13 @@ async fn a_crawl_nonce_is_known_during_its_handshake_only() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = PeerAddr::Socket(listener.local_addr().unwrap());
     let pm2 = Arc::clone(&pm);
-    let session = tokio::spawn(async move { pm2.crawl_session(&target, SessionKind::V1Recheck).await });
+    let session =
+        tokio::spawn(async move { pm2.crawl_session(&target, SessionKind::V1Recheck).await });
     let (stream, _) = listener.accept().await.unwrap();
     let mut conn = Connection::with_magic(stream, Magic::REGTEST);
-    let NetworkMessage::Version(v) = conn.recv().await.unwrap() else { panic!("a version first") };
+    let NetworkMessage::Version(v) = conn.recv().await.unwrap() else {
+        panic!("a version first")
+    };
     assert!(pm.is_crawl_nonce(v.nonce));
     drop(conn);
     let out = session.await.unwrap();
@@ -784,7 +1077,10 @@ async fn a_crawl_nonce_is_known_during_its_handshake_only() {
 async fn an_extreme_version_timestamp_does_not_overflow_the_clock_offset() {
     let (pm, _dir) = mk_pm_with(None);
     enable(&pm, config());
-    let script = Script { timestamp: Some(i64::MIN), ..core_script() };
+    let script = Script {
+        timestamp: Some(i64::MIN),
+        ..core_script()
+    };
     let (target, _log) = scripted("127.0.0.1", script).await;
     let out = pm.crawl_session(&target, SessionKind::Liveness).await;
     assert_eq!(out.result.v1, Attempt::Ok);
@@ -819,21 +1115,39 @@ fn getcrawlinfo_names_why_the_crawl_is_held() {
     let run = enable(&pm, config());
     let state = |pm: &PeerManager| {
         let info = pm.get_crawl_info();
-        (info["state"].as_str().unwrap().to_string(), info["held_by"].clone())
+        (
+            info["state"].as_str().unwrap().to_string(),
+            info["held_by"].clone(),
+        )
     };
     assert_eq!(state(&pm), ("running".to_string(), serde_json::json!([])));
     assert!(pm.crawl_may_run() && pm.crawl_metrics().unwrap().running);
 
     run.out_of_ibd.store(false, Ordering::Relaxed);
-    assert_eq!(state(&pm), ("held".to_string(), serde_json::json!(["initial_block_download"])));
+    assert_eq!(
+        state(&pm),
+        (
+            "held".to_string(),
+            serde_json::json!(["initial_block_download"])
+        )
+    );
     assert!(!pm.crawl_may_run());
     run.out_of_ibd.store(true, Ordering::Relaxed);
 
     pm.set_automatic_outbound(false);
-    assert_eq!(state(&pm), ("held".to_string(), serde_json::json!(["connect"])));
+    assert_eq!(
+        state(&pm),
+        ("held".to_string(), serde_json::json!(["connect"]))
+    );
     assert!(!pm.crawl_may_run());
     pm.set_network_active(false);
-    assert_eq!(state(&pm), ("held".to_string(), serde_json::json!(["connect", "network_inactive"])));
+    assert_eq!(
+        state(&pm),
+        (
+            "held".to_string(),
+            serde_json::json!(["connect", "network_inactive"])
+        )
+    );
     let m = pm.crawl_metrics().unwrap();
     assert!(!m.running && !m.stopped);
     pm.set_automatic_outbound(true);
@@ -842,7 +1156,10 @@ fn getcrawlinfo_names_why_the_crawl_is_held() {
 
     run.stopped.store(true, Ordering::Relaxed);
     let info = pm.get_crawl_info();
-    assert_eq!((info["state"].clone(), info["stopped_by"].clone()), ("stopped".into(), "panic".into()));
+    assert_eq!(
+        (info["state"].clone(), info["stopped_by"].clone()),
+        ("stopped".into(), "panic".into())
+    );
     assert!(!pm.crawl_may_run());
     let m = pm.crawl_metrics().unwrap();
     assert!(!m.running && m.stopped);
@@ -854,17 +1171,42 @@ fn getcrawlinfo_names_why_the_crawl_is_held() {
 #[test]
 fn getcrawlinfo_reports_the_limits_in_force() {
     let (pm, _dir) = mk_pm_with(None);
-    pm.enable_survey(SurveyConfig { interval: Duration::from_secs(60), probes: false, path: None });
+    pm.enable_survey(SurveyConfig {
+        interval: Duration::from_secs(60),
+        probes: false,
+        path: None,
+    });
     let limits = Limits::new(1000, 3, 500);
-    enable(&pm, CrawlConfig { limits, networks: Some(vec![crate::net::crawlbook::Network::Ipv4]), ..config() });
+    enable(
+        &pm,
+        CrawlConfig {
+            limits,
+            networks: Some(vec![crate::net::crawlbook::Network::Ipv4]),
+            ..config()
+        },
+    );
     let info = pm.get_crawl_info();
     let l = &info["limits"];
-    assert_eq!((l["concurrency"].clone(), l["tor_concurrency"].clone(), l["rate"].clone()), (256.into(), 3.into(), 100.into()));
+    assert_eq!(
+        (
+            l["concurrency"].clone(),
+            l["tor_concurrency"].clone(),
+            l["rate"].clone()
+        ),
+        (256.into(), 3.into(), 100.into())
+    );
     assert_eq!(l["liveness"], crate::net::crawlbook::DEFAULT_LIVENESS_SECS);
-    assert_eq!(l["networks"], serde_json::json!(["ipv4"]), "-crawlnet narrows");
+    assert_eq!(
+        l["networks"],
+        serde_json::json!(["ipv4"]),
+        "-crawlnet narrows"
+    );
     assert_eq!(l["bind"], false);
     assert_eq!(info["peersurvey_superseded"], true);
-    assert_eq!(info["book"]["max_entries"], crate::net::crawlbook::MAX_ENTRIES);
+    assert_eq!(
+        info["book"]["max_entries"],
+        crate::net::crawlbook::MAX_ENTRIES
+    );
 }
 
 /// After a discovery session to a scripted Core peer, `getcrawlinfo`
@@ -879,24 +1221,48 @@ async fn getcrawlinfo_and_getcrawlnodes_after_a_session() {
     let mut script = core_script();
     script.answer = Some(answer(3));
     let (target, _log) = scripted("127.0.0.1", script).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None)
+        .await;
 
     let info = pm.get_crawl_info();
-    assert_eq!(info["book"]["entries"], 4, "the peer and the three it named");
+    assert_eq!(
+        info["book"]["entries"], 4,
+        "the peer and the three it named"
+    );
     assert_eq!(info["book"]["learned"]["ipv4"], 4);
-    assert_eq!(info["reachable"], serde_json::json!({ "total": 1, "ipv4": 1, "ipv6": 0, "onion": 0 }));
-    assert_eq!(info["transport"]["v1_v2_untried"]["count"], 1, "a seed advertises no v2");
+    assert_eq!(
+        info["reachable"],
+        serde_json::json!({ "total": 1, "ipv4": 1, "ipv6": 0, "onion": 0 })
+    );
+    assert_eq!(
+        info["transport"]["v1_v2_untried"]["count"], 1,
+        "a seed advertises no v2"
+    );
     assert_eq!(info["transport"]["v1_only"]["count"], 0);
     assert_eq!(info["families"]["core"]["count"], 1);
     assert_eq!(info["sessions"]["reached"], 1);
     assert_eq!(info["sessions"]["unreached"], 0);
-    assert_eq!(info["sessions"]["in_flight"], serde_json::json!({ "clearnet": 0, "tor": 0 }));
+    assert_eq!(
+        info["sessions"]["in_flight"],
+        serde_json::json!({ "clearnet": 0, "tor": 0 })
+    );
     assert!(info["totals"]["totalbytessent"].as_u64().unwrap() > 0);
     assert!(info["totals"]["totalbytesrecv"].as_u64().unwrap() > 0);
-    assert_eq!(pm.net_totals().bytes_sent(), 0, "the crawl's traffic is not the node's");
+    assert_eq!(
+        pm.net_totals().bytes_sent(),
+        0,
+        "the crawl's traffic is not the node's"
+    );
     let text = info.to_string();
-    assert!(!text.contains("127.0.0.1") && !text.contains("23.1.") && !text.contains("Satoshi"), "{text}");
+    assert!(
+        !text.contains("127.0.0.1") && !text.contains("23.1.") && !text.contains("Satoshi"),
+        "{text}"
+    );
 
     let m = pm.crawl_metrics().unwrap();
     assert_eq!((m.aggregate.reachable, m.reached), ([1, 0, 0], 1));
@@ -904,7 +1270,11 @@ async fn getcrawlinfo_and_getcrawlnodes_after_a_session() {
     let rows = pm.get_crawl_nodes(false);
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0]["addr"], target.to_string(), "the reached address first");
+    assert_eq!(
+        rows[0]["addr"],
+        target.to_string(),
+        "the reached address first"
+    );
     assert_eq!(rows[0]["family"], "core");
     assert!(rows[0].get("observation").is_none());
     let rows = pm.get_crawl_nodes(true);
@@ -922,15 +1292,35 @@ fn the_metrics_reuse_a_recent_aggregate() {
     let run = enable(&pm, config());
     assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 0);
     let now = crate::time::now_secs();
-    assert!(run.book.lock().seed(PeerAddr::Socket(SocketAddr::from(([23, 1, 1, 7], 8333))), 0, now));
-    assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 0, "within the window: the aggregate taken before");
-    assert_eq!(pm.get_crawl_info()["book"]["entries"], 0, "getcrawlinfo reuses one under a second old");
+    assert!(run.book.lock().seed(
+        PeerAddr::Socket(SocketAddr::from(([23, 1, 1, 7], 8333))),
+        0,
+        now
+    ));
+    assert_eq!(
+        pm.crawl_metrics().unwrap().aggregate.entries,
+        0,
+        "within the window: the aggregate taken before"
+    );
+    assert_eq!(
+        pm.get_crawl_info()["book"]["entries"],
+        0,
+        "getcrawlinfo reuses one under a second old"
+    );
     // Age the kept aggregate past getcrawlinfo's window, not the metrics'.
     if let Some((at, _)) = run.aggregate.lock().as_mut() {
         *at -= crawl_conn::INFO_AGGREGATE_MAX_AGE;
     }
-    assert_eq!(pm.get_crawl_info()["book"]["entries"], 1, "older: getcrawlinfo takes a new one");
-    assert_eq!(pm.crawl_metrics().unwrap().aggregate.entries, 1, "and the metrics read it");
+    assert_eq!(
+        pm.get_crawl_info()["book"]["entries"],
+        1,
+        "older: getcrawlinfo takes a new one"
+    );
+    assert_eq!(
+        pm.crawl_metrics().unwrap().aggregate.entries,
+        1,
+        "and the metrics read it"
+    );
 }
 
 /// With `-proxy` set, only a routable address goes through the proxy, so
@@ -940,10 +1330,22 @@ fn the_metrics_reuse_a_recent_aggregate() {
 #[test]
 fn getcrawlinfo_networks_agree_with_what_the_crawl_dials_under_a_proxy() {
     let (pm, _dir) = mk_pm_proxied("127.0.0.1:9");
-    enable(&pm, CrawlConfig { networks: Some(vec![crate::net::crawlbook::Network::Ipv4]), ..config() });
+    enable(
+        &pm,
+        CrawlConfig {
+            networks: Some(vec![crate::net::crawlbook::Network::Ipv4]),
+            ..config()
+        },
+    );
     let local = PeerAddr::Socket(SocketAddr::from(([127, 0, 0, 1], 18444)));
-    assert!(pm.crawl_may_dial(&local), "a local address is dialled direct");
-    assert_eq!(pm.get_crawl_info()["limits"]["networks"], serde_json::json!(["ipv4"]));
+    assert!(
+        pm.crawl_may_dial(&local),
+        "a local address is dialled direct"
+    );
+    assert_eq!(
+        pm.get_crawl_info()["limits"]["networks"],
+        serde_json::json!(["ipv4"])
+    );
 }
 
 /// With the crawl off, `getcrawlinfo` has every key it has with the crawl
@@ -977,7 +1379,7 @@ fn getcrawlinfo_off_has_the_same_keys() {
 
 /// A config whose snapshots and export key are under `dir`.
 fn with_files(dir: &std::path::Path) -> CrawlConfig {
-    use crate::net::crawlsnapshot::{KeySource, EXPORT_KEY_FILE, SNAPSHOT_DIR};
+    use crate::net::crawlsnapshot::{EXPORT_KEY_FILE, KeySource, SNAPSHOT_DIR};
     CrawlConfig {
         snapshot_dir: Some(dir.join(SNAPSHOT_DIR)),
         export_key: Some(KeySource::Default(dir.join(EXPORT_KEY_FILE))),
@@ -989,9 +1391,17 @@ fn with_files(dir: &std::path::Path) -> CrawlConfig {
 #[test]
 fn dumpcrawlsnapshot_with_the_crawl_off() {
     let (pm, dir) = mk_pm_with(None);
-    assert!(pm.dump_crawl_snapshot(false).unwrap_err().contains("crawl is off"));
+    assert!(
+        pm.dump_crawl_snapshot(false)
+            .unwrap_err()
+            .contains("crawl is off")
+    );
     assert!(pm.dump_crawl_snapshot(true).is_err());
-    assert!(!dir.path().join(crate::net::crawlsnapshot::EXPORT_KEY_FILE).exists());
+    assert!(
+        !dir.path()
+            .join(crate::net::crawlsnapshot::EXPORT_KEY_FILE)
+            .exists()
+    );
     assert!(!pm.crawl_snapshot_tick(crate::time::now_secs()));
 }
 
@@ -1005,20 +1415,35 @@ async fn dumpcrawlsnapshot_and_the_hourly_snapshot_after_a_session() {
     let (pm, dir) = mk_pm_with(None);
     let run = enable(&pm, with_files(dir.path()));
     let (target, _log) = scripted("127.0.0.1", core_script()).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
-    let PeerAddr::Socket(sa) = target else { unreachable!() };
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None)
+        .await;
+    let PeerAddr::Socket(sa) = target else {
+        unreachable!()
+    };
 
     let keyed = pm.dump_crawl_snapshot(false).unwrap();
     assert_eq!(keyed["total_nodes"], 1, "{keyed}");
-    let key = crawlsnapshot::read_key(&dir.path().join(crawlsnapshot::EXPORT_KEY_FILE)).expect("created");
+    let key =
+        crawlsnapshot::read_key(&dir.path().join(crawlsnapshot::EXPORT_KEY_FILE)).expect("created");
     let node = &keyed["nodes"][crawlsnapshot::node_id(&key, &sa)];
     assert_eq!(node[1], "/Satoshi:32.1.0/", "{keyed}");
     assert_eq!(node[13]["port"], "other");
     let text = keyed.to_string();
-    assert!(!text.contains("127.0.0.1") && !text.contains(&format!(":{}", sa.port())), "{text}");
+    assert!(
+        !text.contains("127.0.0.1") && !text.contains(&format!(":{}", sa.port())),
+        "{text}"
+    );
     assert_eq!(keyed["satd"]["chain"], "regtest");
-    assert_eq!(pm.dump_crawl_snapshot(false).unwrap()["nodes"], keyed["nodes"], "the same key, the same IDs");
+    assert_eq!(
+        pm.dump_crawl_snapshot(false).unwrap()["nodes"],
+        keyed["nodes"],
+        "the same key, the same IDs"
+    );
 
     let raw = pm.dump_crawl_snapshot(true).unwrap();
     assert!(raw["nodes"].get(sa.to_string()).is_some(), "{raw}");
@@ -1032,7 +1457,10 @@ async fn dumpcrawlsnapshot_and_the_hourly_snapshot_after_a_session() {
     let gz = std::fs::read(snaps.join(crawlsnapshot::snapshot_file_name(hour + 5))).unwrap();
     let lines = String::from_utf8(crawlsnapshot::gunzip(&gz).unwrap()).unwrap();
     assert_eq!(lines.lines().count(), 1, "{lines}");
-    assert!(lines.contains(&sa.to_string()), "the hourly snapshot holds the raw address");
+    assert!(
+        lines.contains(&sa.to_string()),
+        "the hourly snapshot holds the raw address"
+    );
 }
 
 /// The start of the current UTC hour, a few minutes back so the session
@@ -1049,19 +1477,40 @@ fn dumpcrawlsnapshot_honours_crawlexportkeyfile() {
     use crate::net::crawlsnapshot::{self, KeySource};
     let (pm, dir) = mk_pm_with(None);
     let path = dir.path().join("census.key");
-    let run = enable(&pm, CrawlConfig { export_key: Some(KeySource::Supplied(path.clone())), ..config() });
+    let run = enable(
+        &pm,
+        CrawlConfig {
+            export_key: Some(KeySource::Supplied(path.clone())),
+            ..config()
+        },
+    );
     let now = crate::time::now_secs();
     let peer = PeerAddr::Socket(SocketAddr::from(([127, 0, 0, 1], 18444)));
     assert!(run.book.lock().seed(peer.clone(), 0, now));
-    let ok = crate::net::crawlbook::SessionResult { v2: Attempt::Failed, v1: Attempt::Ok, observation: None };
-    run.book.lock().record_result(&peer, None, SessionKind::Liveness, ok, now);
-    assert!(pm.dump_crawl_snapshot(false).unwrap_err().contains("census.key"));
+    let ok = crate::net::crawlbook::SessionResult {
+        v2: Attempt::Failed,
+        v1: Attempt::Ok,
+        observation: None,
+    };
+    run.book
+        .lock()
+        .record_result(&peer, None, SessionKind::Liveness, ok, now);
+    assert!(
+        pm.dump_crawl_snapshot(false)
+            .unwrap_err()
+            .contains("census.key")
+    );
     assert!(!path.exists(), "never created");
-    assert!(!dir.path().join(crawlsnapshot::EXPORT_KEY_FILE).exists(), "nor the default");
+    assert!(
+        !dir.path().join(crawlsnapshot::EXPORT_KEY_FILE).exists(),
+        "nor the default"
+    );
     assert!(pm.dump_crawl_snapshot(true).is_ok());
     std::fs::write(&path, [7u8; 32]).unwrap();
     let out = pm.dump_crawl_snapshot(false).unwrap();
-    let PeerAddr::Socket(sa) = peer else { unreachable!() };
+    let PeerAddr::Socket(sa) = peer else {
+        unreachable!()
+    };
     let id = crawlsnapshot::node_id(&crawlsnapshot::ExportKey([7; 32]), &sa);
     assert_eq!(out["nodes"][&id][13]["port"], "default", "{out}");
 }
@@ -1071,7 +1520,14 @@ fn dumpcrawlsnapshot_honours_crawlexportkeyfile() {
 /// Mine `n` blocks on the manager's chain.
 fn mine(pm: &PeerManager, n: u32) {
     let addr = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqdku202";
-    crate::mining::miner::mine_blocks(&pm.chain_state, &pm.mempool, addr, n, crate::mining::miner::DEFAULT_MAX_TRIES).unwrap();
+    crate::mining::miner::mine_blocks(
+        &pm.chain_state,
+        &pm.mempool,
+        addr,
+        n,
+        crate::mining::miner::DEFAULT_MAX_TRIES,
+    )
+    .unwrap();
 }
 
 /// The header of our block at `height`.
@@ -1086,11 +1542,29 @@ fn our_header(pm: &PeerManager, height: u32) -> bitcoin::block::Header {
 async fn chain_check_against(
     pm: &Arc<PeerManager>,
     headers: Vec<bitcoin::block::Header>,
-) -> (Option<crate::net::crawlbook::ChainCheck>, Vec<NetworkMessage>) {
-    let (target, log) = scripted("127.0.0.1", Script { headers, answer: Some(answer(3)), ..core_script() }).await;
+) -> (
+    Option<crate::net::crawlbook::ChainCheck>,
+    Vec<NetworkMessage>,
+) {
+    let (target, log) = scripted(
+        "127.0.0.1",
+        Script {
+            headers,
+            answer: Some(answer(3)),
+            ..core_script()
+        },
+    )
+    .await;
     let out = pm.crawl_session(&target, SessionKind::Discovery).await;
     let obs = out.result.observation.expect("an observation");
-    let sent = log.lock().last().unwrap().iter().filter(|m| m.cmd() == "getheaders").cloned().collect();
+    let sent = log
+        .lock()
+        .last()
+        .unwrap()
+        .iter()
+        .filter(|m| m.cmd() == "getheaders")
+        .cloned()
+        .collect();
     (obs.chain_check, sent)
 }
 
@@ -1123,8 +1597,13 @@ async fn the_chain_check_tells_the_four_outcomes_apart() {
         let (got, sent) = chain_check_against(&pm, headers.clone()).await;
         assert_eq!(got, Some(want), "{headers:?}");
         assert_eq!(sent.len(), 1, "one getheaders: {sent:?}");
-        let NetworkMessage::GetHeaders(g) = &sent[0] else { unreachable!() };
-        assert_eq!((g.locator_hashes.as_slice(), g.stop_hash), ([b2.block_hash()].as_slice(), b3.block_hash()));
+        let NetworkMessage::GetHeaders(g) = &sent[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (g.locator_hashes.as_slice(), g.stop_hash),
+            ([b2.block_hash()].as_slice(), b3.block_hash())
+        );
     }
 }
 
@@ -1134,12 +1613,30 @@ async fn the_chain_check_tells_the_four_outcomes_apart() {
 async fn no_chain_check_without_probes_or_on_a_liveness_session() {
     let (pm, _dir) = mk_pm_with(None);
     mine(&pm, 3);
-    enable(&pm, CrawlConfig { probes: false, ..config() });
+    enable(
+        &pm,
+        CrawlConfig {
+            probes: false,
+            ..config()
+        },
+    );
     let tip = our_header(&pm, 3);
-    let (target, log) = scripted("127.0.0.1", Script { headers: vec![tip], answer: Some(answer(3)), ..core_script() }).await;
+    let (target, log) = scripted(
+        "127.0.0.1",
+        Script {
+            headers: vec![tip],
+            answer: Some(answer(3)),
+            ..core_script()
+        },
+    )
+    .await;
     for kind in [SessionKind::Discovery, SessionKind::Liveness] {
         let out = pm.crawl_session(&target, kind).await;
-        assert_eq!(out.result.observation.expect("an observation").chain_check, None, "{kind:?}");
+        assert_eq!(
+            out.result.observation.expect("an observation").chain_check,
+            None,
+            "{kind:?}"
+        );
     }
     assert!(log.lock().iter().flatten().all(|m| m.cmd() != "getheaders"));
 }
@@ -1153,27 +1650,85 @@ async fn a_crawl_session_is_judged_on_its_crawl_features() {
     use crate::net::fingerprint::{AddrKind, Confidence, Family, Fingerprint};
     let (pm, _dir) = mk_pm_with(None);
     enable(&pm, config());
-    let core = Script { notfound: false, answer: Some(answer(3)), ..core_script() };
+    let core = Script {
+        notfound: false,
+        answer: Some(answer(3)),
+        ..core_script()
+    };
     let (target, _log) = scripted("127.0.0.1", core.clone()).await;
-    let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
+    let obs = pm
+        .crawl_session(&target, SessionKind::Discovery)
+        .await
+        .result
+        .observation
+        .unwrap();
     assert_eq!(obs.probes.get(Probe::GetData), Some(ProbeOutcome::Silent));
-    assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+    assert_eq!(
+        obs.fingerprint,
+        Fingerprint::Known(Family::Core, Confidence::High)
+    );
     assert_eq!(obs.shape, None, "a known shape keeps no raw features");
 
     // Answering with `notfound` is Core too (relay granted by its operator).
-    let (target, _log) = scripted("127.0.0.1", Script { notfound: true, ..core.clone() }).await;
-    let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
-    assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::High));
+    let (target, _log) = scripted(
+        "127.0.0.1",
+        Script {
+            notfound: true,
+            ..core.clone()
+        },
+    )
+    .await;
+    let obs = pm
+        .crawl_session(&target, SessionKind::Discovery)
+        .await
+        .result
+        .observation
+        .unwrap();
+    assert_eq!(
+        obs.fingerprint,
+        Fingerprint::Known(Family::Core, Confidence::High)
+    );
 
     // No row matches: the user agent's claim, never observed, and the
     // raw features are kept as for an unknown shape.
-    let (target, _log) = scripted("127.0.0.1", Script { hang_up_on_getdata: true, ..core }).await;
-    let obs = pm.crawl_session(&target, SessionKind::Discovery).await.result.observation.unwrap();
-    assert_eq!(obs.fingerprint, Fingerprint::Known(Family::Core, Confidence::Claimed));
-    assert_eq!(obs.verdict, Verdict::Classified, "it closed after its transcript settled: not closed early");
+    let (target, _log) = scripted(
+        "127.0.0.1",
+        Script {
+            hang_up_on_getdata: true,
+            ..core
+        },
+    )
+    .await;
+    let obs = pm
+        .crawl_session(&target, SessionKind::Discovery)
+        .await
+        .result
+        .observation
+        .unwrap();
+    assert_eq!(
+        obs.fingerprint,
+        Fingerprint::Known(Family::Core, Confidence::Claimed)
+    );
+    assert_eq!(
+        obs.verdict,
+        Verdict::Classified,
+        "it closed after its transcript settled: not closed early"
+    );
     assert_eq!(obs.fingerprint.observed(), None);
-    let shape = obs.shape.expect("a shape no row matched keeps its raw features");
-    assert_eq!(shape.commands, ["version", "wtxidrelay", "sendaddrv2", "verack", "sendcmpct", "ping"]);
+    let shape = obs
+        .shape
+        .expect("a shape no row matched keeps its raw features");
+    assert_eq!(
+        shape.commands,
+        [
+            "version",
+            "wtxidrelay",
+            "sendaddrv2",
+            "verack",
+            "sendcmpct",
+            "ping"
+        ]
+    );
     assert!(shape.relay);
     assert_eq!(shape.v2, None, "a v1 session");
     assert_eq!(shape.getaddr, Some(AddrKind::AddrV2));
@@ -1190,15 +1745,38 @@ async fn a_session_without_probes_is_judged_with_the_last_answers() {
     // Core's transcript, closing the connection on a probe: no row, so
     // only the user agent's claim.
     // (An answer to `getaddr`, so the probes go out before the session's bound.)
-    let script = Script { answer: Some(answer(3)), hang_up_on_getdata: true, ..core_script() };
+    let script = Script {
+        answer: Some(answer(3)),
+        hang_up_on_getdata: true,
+        ..core_script()
+    };
     let (target, _log) = scripted("127.0.0.1", script).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
-    let fp = |pm: &PeerManager| pm.crawl_book().unwrap().get(&CrawlAddr::Peer(target.clone())).unwrap().observation.clone().unwrap().fingerprint;
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None)
+        .await;
+    let fp = |pm: &PeerManager| {
+        pm.crawl_book()
+            .unwrap()
+            .get(&CrawlAddr::Peer(target.clone()))
+            .unwrap()
+            .observation
+            .clone()
+            .unwrap()
+            .fingerprint
+    };
     let claimed = Fingerprint::Known(Family::Core, Confidence::Claimed);
     assert_eq!(fp(&pm), claimed);
-    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
-    assert_eq!(fp(&pm), claimed, "the liveness session is judged with the disconnect");
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None)
+        .await;
+    assert_eq!(
+        fp(&pm),
+        claimed,
+        "the liveness session is judged with the disconnect"
+    );
 }
 
 /// A peer that closes the connection during the passive wait, before its
@@ -1214,38 +1792,82 @@ async fn a_peer_that_closes_before_its_transcript_settles_is_closed_early() {
     let (pm, _dir) = mk_pm_with(None);
     let run = enable(&pm, config());
     let (target, log) = scripted("127.0.0.1", evicting_core()).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
-    assert!(!log.lock()[0].iter().any(|m| matches!(m, NetworkMessage::GetAddr)), "closed: no getaddr");
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None)
+        .await;
+    assert!(
+        !log.lock()[0]
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetAddr)),
+        "closed: no getaddr"
+    );
     let book = pm.crawl_book().unwrap();
     let e = book.get(&CrawlAddr::Peer(target.clone())).unwrap();
-    assert_eq!((e.v1_ok, e.v2_ok, e.failures), (Some(true), None, 0), "reached over v1, v2 never tried");
+    assert_eq!(
+        (e.v1_ok, e.v2_ok, e.failures),
+        (Some(true), None, 0),
+        "reached over v1, v2 never tried"
+    );
     assert!(e.last_success.is_some() && e.retry_at.is_none());
     let obs = e.observation.as_ref().unwrap();
     assert_eq!(obs.verdict, Verdict::ClosedEarly);
     assert_eq!(obs.fingerprint, Fingerprint::Unknown, "no fingerprint");
     assert_eq!(obs.user_agent, "/Satoshi:32.1.0/");
     assert_eq!(obs.protocol_version, 70016);
-    assert_eq!(obs.services, (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64());
+    assert_eq!(
+        obs.services,
+        (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64()
+    );
     assert_eq!(obs.getaddr, None);
-    assert_eq!(obs.shape.as_ref().map(|s| s.commands.clone()).unwrap(), ["version", "wtxidrelay", "sendaddrv2", "verack"]);
+    assert_eq!(
+        obs.shape.as_ref().map(|s| s.commands.clone()).unwrap(),
+        ["version", "wtxidrelay", "sendaddrv2", "verack"]
+    );
     assert_eq!(run.reached.load(Ordering::Relaxed), 1, "a reached session");
     let agg = crate::net::crawlreport::aggregate(&book, crate::time::now_secs());
-    assert_eq!((agg.reachable_total(), agg.closed_early, agg.unknown), (1, 1, 0));
-    assert_eq!(agg.claimed.iter().sum::<usize>(), 0, "counted under no claim");
+    assert_eq!(
+        (agg.reachable_total(), agg.closed_early, agg.unknown),
+        (1, 1, 0)
+    );
+    assert_eq!(
+        agg.claimed.iter().sum::<usize>(),
+        0,
+        "counted under no claim"
+    );
     *run.aggregate.lock() = None;
     let info = pm.get_crawl_info();
-    assert_eq!(info["closed_early"], serde_json::json!({ "count": 1, "share": 1.0 }), "{info}");
+    assert_eq!(
+        info["closed_early"],
+        serde_json::json!({ "count": 1, "share": 1.0 }),
+        "{info}"
+    );
     assert_eq!(info["families"]["unknown"]["count"], 0);
 
     // The same peer settling on a later session replaces the verdict.
     let (settled, _log) = scripted("127.0.0.1", core_script()).await;
-    let obs = pm.crawl_session(&settled, SessionKind::Liveness).await.result.observation.unwrap();
+    let obs = pm
+        .crawl_session(&settled, SessionKind::Liveness)
+        .await
+        .result
+        .observation
+        .unwrap();
     assert_eq!(obs.verdict, Verdict::Classified);
     // Closing once its transcript has settled is no early close.
-    let late = Script { close_after_verack: true, ..core_script() };
+    let late = Script {
+        close_after_verack: true,
+        ..core_script()
+    };
     let (target, _log) = scripted("127.0.0.1", late).await;
-    let obs = pm.crawl_session(&target, SessionKind::Liveness).await.result.observation.unwrap();
+    let obs = pm
+        .crawl_session(&target, SessionKind::Liveness)
+        .await
+        .result
+        .observation
+        .unwrap();
     assert_eq!(obs.verdict, Verdict::Classified, "{obs:?}");
 }
 
@@ -1259,8 +1881,13 @@ async fn a_silent_core_claimant_is_fake() {
     let (pm, _dir) = mk_pm_with(None);
     let run = enable(&pm, config());
     let (target, _log) = scripted("127.0.0.1", fake_core()).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None)
+        .await;
     let book = pm.crawl_book().unwrap();
     let e = book.get(&CrawlAddr::Peer(target.clone())).unwrap();
     assert_eq!(e.v1_ok, Some(true), "reached");
@@ -1270,14 +1897,45 @@ async fn a_silent_core_claimant_is_fake() {
     assert_eq!(obs.observed_family(), None);
     let agg = crate::net::crawlreport::aggregate(&book, crate::time::now_secs());
     assert_eq!(agg.fake[0], 1, "core, fake");
-    assert_eq!((agg.unknown, agg.claimed.iter().sum::<usize>(), agg.families.iter().sum::<usize>()), (0, 0, 0));
+    assert_eq!(
+        (
+            agg.unknown,
+            agg.claimed.iter().sum::<usize>(),
+            agg.families.iter().sum::<usize>()
+        ),
+        (0, 0, 0)
+    );
 
-    let (negotiated, _log) = scripted("127.0.0.1", Script { after_verack: vec![], ..core_script() }).await;
-    let obs = pm.crawl_session(&negotiated, SessionKind::Liveness).await.result.observation.unwrap();
-    assert_eq!(obs.verdict, Verdict::Classified, "Core's negotiation: no fake");
-    let btcd = Script { user_agent: "/btcwire:0.5.0/btcd:0.27.0/", ..fake_core() };
+    let (negotiated, _log) = scripted(
+        "127.0.0.1",
+        Script {
+            after_verack: vec![],
+            ..core_script()
+        },
+    )
+    .await;
+    let obs = pm
+        .crawl_session(&negotiated, SessionKind::Liveness)
+        .await
+        .result
+        .observation
+        .unwrap();
+    assert_eq!(
+        obs.verdict,
+        Verdict::Classified,
+        "Core's negotiation: no fake"
+    );
+    let btcd = Script {
+        user_agent: "/btcwire:0.5.0/btcd:0.27.0/",
+        ..fake_core()
+    };
     let (btcd, _log) = scripted("127.0.0.1", btcd).await;
-    let obs = pm.crawl_session(&btcd, SessionKind::Liveness).await.result.observation.unwrap();
+    let obs = pm
+        .crawl_session(&btcd, SessionKind::Liveness)
+        .await
+        .result
+        .observation
+        .unwrap();
     assert_eq!(obs.verdict, Verdict::Classified, "only Core has the rule");
 }
 
@@ -1289,24 +1947,58 @@ async fn a_silent_core_claimant_is_fake() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tick_dials_a_due_retry_and_a_settled_session_clears_it() {
     let (pm, _dir, _shutdown) = mk_pm_live(None);
-    let run = enable(&pm, CrawlConfig { liveness_secs: 30 * 24 * 60 * 60, ..config() });
-    let (target, log) = scripted("127.0.0.1", Script { evict_on: vec![0], ..core_script() }).await;
+    let run = enable(
+        &pm,
+        CrawlConfig {
+            liveness_secs: 30 * 24 * 60 * 60,
+            ..config()
+        },
+    );
+    let (target, log) = scripted(
+        "127.0.0.1",
+        Script {
+            evict_on: vec![0],
+            ..core_script()
+        },
+    )
+    .await;
     let key = CrawlAddr::Peer(target.clone());
     // The first session, closed early, two hours ago: its retry is due.
     let then = crate::time::now_secs() - 2 * 60 * 60;
     assert!(run.book.lock().seed(target.clone(), 0, then));
     let out = pm.crawl_session(&target, SessionKind::Discovery).await;
-    assert_eq!(out.result.observation.as_ref().unwrap().verdict, Verdict::ClosedEarly, "fixture");
-    assert!(run.book.lock().record_result(&target, None, SessionKind::Discovery, out.result, then));
-    let r = pm.crawl_book().unwrap().get(&key).unwrap().closed_early_retry;
+    assert_eq!(
+        out.result.observation.as_ref().unwrap().verdict,
+        Verdict::ClosedEarly,
+        "fixture"
+    );
+    assert!(
+        run.book
+            .lock()
+            .record_result(&target, None, SessionKind::Discovery, out.result, then)
+    );
+    let r = pm
+        .crawl_book()
+        .unwrap()
+        .get(&key)
+        .unwrap()
+        .closed_early_retry;
     assert_eq!(r.count, 1);
     assert!(r.due(crate::time::now_secs()));
     *run.aggregate.lock() = None;
     let info = pm.get_crawl_info();
-    assert_eq!(info["retries"], serde_json::json!({ "pending": 1, "exhausted": 0 }), "{info}");
+    assert_eq!(
+        info["retries"],
+        serde_json::json!({ "pending": 1, "exhausted": 0 }),
+        "{info}"
+    );
     assert_eq!(pm.crawl_metrics().unwrap().aggregate.retries_pending, 1);
     let rows = pm.get_crawl_nodes(false);
-    assert_eq!(rows[0]["retry"], serde_json::json!({ "count": 1, "next_due": r.next_due }), "{rows}");
+    assert_eq!(
+        rows[0]["retry"],
+        serde_json::json!({ "count": 1, "next_due": r.next_due }),
+        "{rows}"
+    );
 
     let mut sessions = tokio::task::JoinSet::new();
     pm.crawl_tick(&mut sessions);
@@ -1328,11 +2020,27 @@ async fn the_tick_dials_a_due_retry_and_a_settled_session_clears_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retry_not_yet_due_dials_nothing() {
     let (pm, _dir, _shutdown) = mk_pm_live(None);
-    let run = enable(&pm, CrawlConfig { liveness_secs: 30 * 24 * 60 * 60, ..config() });
+    let run = enable(
+        &pm,
+        CrawlConfig {
+            liveness_secs: 30 * 24 * 60 * 60,
+            ..config()
+        },
+    );
     let (target, log) = scripted("127.0.0.1", evicting_core()).await;
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None).await;
-    let r = pm.crawl_book().unwrap().get(&CrawlAddr::Peer(target.clone())).unwrap().closed_early_retry;
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Discovery, None)
+        .await;
+    let r = pm
+        .crawl_book()
+        .unwrap()
+        .get(&CrawlAddr::Peer(target.clone()))
+        .unwrap()
+        .closed_early_retry;
     assert_eq!(r.count, 1);
     assert!(!r.due(crate::time::now_secs()));
     let mut sessions = tokio::task::JoinSet::new();
@@ -1348,22 +2056,42 @@ async fn a_retry_not_yet_due_dials_nothing() {
 async fn a_settled_address_keeps_its_fingerprint_when_a_later_session_closes_early() {
     let (pm, _dir) = mk_pm_with(None);
     let run = enable(&pm, config());
-    let (target, log) = scripted("127.0.0.1", Script { evict_on: vec![1], ..core_script() }).await;
+    let (target, log) = scripted(
+        "127.0.0.1",
+        Script {
+            evict_on: vec![1],
+            ..core_script()
+        },
+    )
+    .await;
     let key = CrawlAddr::Peer(target.clone());
-    assert!(run.book.lock().seed(target.clone(), 0, crate::time::now_secs()));
-    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    assert!(
+        run.book
+            .lock()
+            .seed(target.clone(), 0, crate::time::now_secs())
+    );
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None)
+        .await;
     let first = pm.crawl_book().unwrap().get(&key).cloned().unwrap();
     let settled = first.observation.clone().unwrap();
     assert_eq!(settled.verdict, Verdict::Classified, "fixture: {settled:?}");
-    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None).await;
+    pm.run_crawl_session(target.clone(), SessionKind::Liveness, None)
+        .await;
     assert_eq!(log.lock().len(), 2);
     let e = pm.crawl_book().unwrap().get(&key).cloned().unwrap();
-    assert_eq!(e.observation.as_ref(), Some(&settled), "the settled observation stands");
+    assert_eq!(
+        e.observation.as_ref(),
+        Some(&settled),
+        "the settled observation stands"
+    );
     assert_eq!(e.reachable_count, 2, "the session counts as reached");
     assert!(e.last_success >= first.last_success);
     assert_eq!(e.closed_early_retry, Default::default(), "no retry");
     *run.aggregate.lock() = None;
     let info = pm.get_crawl_info();
     assert_eq!(info["closed_early"]["count"], 0, "{info}");
-    assert_eq!(info["retries"], serde_json::json!({ "pending": 0, "exhausted": 0 }));
+    assert_eq!(
+        info["retries"],
+        serde_json::json!({ "pending": 0, "exhausted": 0 })
+    );
 }

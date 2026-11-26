@@ -15,9 +15,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use serde_json::Value;
 
 // Reuse the maintained parse_flags / parse_script helpers from the test
@@ -68,13 +66,24 @@ pub fn verify_rust(c: &WorkloadCase) -> bool {
     let spent: Vec<TxOut> = c
         .prev_outputs
         .iter()
-        .map(|(spk, val)| TxOut { value: Amount::from_sat(*val), script_pubkey: ScriptBuf::from_bytes(spk.clone()) })
+        .map(|(spk, val)| TxOut {
+            value: Amount::from_sat(*val),
+            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+        })
         .collect();
     let Ok(precomputed) = consensus::PrecomputedTransactionData::new(&tx, &spent) else {
         return false;
     };
     let spk = bitcoin::Script::from_bytes(&c.script_pubkey);
-    consensus::verify(spk, Amount::from_sat(c.amount), &tx, c.input_index, c.flags, &precomputed).is_ok()
+    consensus::verify(
+        spk,
+        Amount::from_sat(c.amount),
+        &tx,
+        c.input_index,
+        c.flags,
+        &precomputed,
+    )
+    .is_ok()
 }
 
 /// Verify with Bitcoin Core's interpreter (libbitcoinkernel).
@@ -135,9 +144,7 @@ fn build_spending_tx(
 ) -> Transaction {
     let mut buf = Vec::new();
     credit_tx.consensus_encode(&mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
     let mut w = Witness::new();
     for item in witness {
         w.push(item);
@@ -209,11 +216,7 @@ pub fn make_criterion() -> criterion::Criterion {
 /// Run a Rust-vs-C++ comparison bench over a workload, reporting throughput
 /// in elements/sec. Both functions iterate over the full workload per sample
 /// so the number maps directly to verify-rate on the IBD hot path.
-pub fn run_suite(
-    c: &mut criterion::Criterion,
-    group_name: &str,
-    workload: &[WorkloadCase],
-) {
+pub fn run_suite(c: &mut criterion::Criterion, group_name: &str, workload: &[WorkloadCase]) {
     eprintln!("{group_name}: {} cases", workload.len());
     let mut group = c.benchmark_group(group_name);
     group.throughput(criterion::Throughput::Elements(workload.len() as u64));
@@ -395,9 +398,7 @@ pub fn load_real_block(fixture_json: &str) -> (u32, Vec<WorkloadCase>) {
     // Start permissive; fall back if the engines disagree.
     let candidate_flags = [
         CPP_RECOGNIZED_FLAGS, // everything the C++ engine knows
-        kernel_ref::VERIFY_P2SH
-            | kernel_ref::VERIFY_WITNESS
-            | kernel_ref::VERIFY_TAPROOT,
+        kernel_ref::VERIFY_P2SH | kernel_ref::VERIFY_WITNESS | kernel_ref::VERIFY_TAPROOT,
         kernel_ref::VERIFY_P2SH | kernel_ref::VERIFY_WITNESS,
         kernel_ref::VERIFY_P2SH,
         0,
@@ -416,10 +417,7 @@ pub fn load_real_block(fixture_json: &str) -> (u32, Vec<WorkloadCase>) {
             .input
             .iter()
             .map(|inp| {
-                let key = format!(
-                    "{}:{}",
-                    inp.previous_output.txid, inp.previous_output.vout
-                );
+                let key = format!("{}:{}", inp.previous_output.txid, inp.previous_output.vout);
                 let entry = &prevouts_map[&key];
                 let spk = hex::decode(entry["spk"].as_str().unwrap()).unwrap();
                 let value = entry["value"].as_u64().unwrap();
@@ -428,10 +426,7 @@ pub fn load_real_block(fixture_json: &str) -> (u32, Vec<WorkloadCase>) {
             .collect();
 
         for (i, inp) in tx.input.iter().enumerate() {
-            let key = format!(
-                "{}:{}",
-                inp.previous_output.txid, inp.previous_output.vout
-            );
+            let key = format!("{}:{}", inp.previous_output.txid, inp.previous_output.vout);
             let entry = match prevouts_map.get(&key) {
                 Some(e) => e,
                 None => continue,
@@ -509,9 +504,7 @@ pub fn load_bip341_keypath_cases() -> Vec<WorkloadCase> {
         })
         .collect();
 
-    let flags = kernel_ref::VERIFY_P2SH
-        | kernel_ref::VERIFY_WITNESS
-        | kernel_ref::VERIFY_TAPROOT;
+    let flags = kernel_ref::VERIFY_P2SH | kernel_ref::VERIFY_WITNESS | kernel_ref::VERIFY_TAPROOT;
 
     let mut cases = Vec::new();
     for (i, prev) in prevs.iter().enumerate() {

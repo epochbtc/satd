@@ -103,12 +103,11 @@ pub fn audit_blockfiles(
     // Blocks-dir obfuscation key (Core v28+ `xor.dat`; zero = plaintext).
     // Record headers are stored XORed with it, so sizing each record
     // requires de-obfuscating the 8 header bytes we pull.
-    let xor_key = crate::storage::flatfile::read_xor_key(blocks_dir).map_err(|e| {
-        AuditError::Io {
+    let xor_key =
+        crate::storage::flatfile::read_xor_key(blocks_dir).map_err(|e| AuditError::Io {
             path: blocks_dir.join("xor.dat").display().to_string(),
             source: e,
-        }
-    })?;
+        })?;
 
     // 1. Walk block_index, bucket entries by file_number.
     let mut by_file: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -131,7 +130,10 @@ pub fn audit_blockfiles(
             ) {
                 return;
             }
-            by_file.entry(entry.file_number).or_default().push(entry.data_pos);
+            by_file
+                .entry(entry.file_number)
+                .or_default()
+                .push(entry.data_pos);
         })
         .map_err(|e| AuditError::Storage(format!("{:?}", e)))?;
 
@@ -466,7 +468,9 @@ mod tests {
         let mut entry_pruned = dummy_index_entry(0, 9_999_999);
         entry_pruned.status = BlockStatus::Pruned;
         let mut batch = StoreBatch::default();
-        batch.block_index_puts.push((make_hash(1), entry_header_only));
+        batch
+            .block_index_puts
+            .push((make_hash(1), entry_header_only));
         batch.block_index_puts.push((make_hash(2), entry_pruned));
         batch.block_index_puts.push((
             make_hash(3),

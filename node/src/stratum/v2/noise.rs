@@ -81,18 +81,26 @@ pub fn encode_frame(
     let chunks = len.div_ceil(MAX_CHUNK_PLAINTEXT);
     let mut out = Vec::with_capacity(ENCRYPTED_HEADER_SIZE + len + chunks * MAC_LEN);
 
-    let extension_type: u16 = if is_channel_message(msg_type) { CHANNEL_MSG_BIT } else { 0 };
+    let extension_type: u16 = if is_channel_message(msg_type) {
+        CHANNEL_MSG_BIT
+    } else {
+        0
+    };
     let mut header = Vec::with_capacity(ENCRYPTED_HEADER_SIZE);
     header.extend_from_slice(&extension_type.to_le_bytes());
     header.push(msg_type);
     header.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
-    codec.encrypt(&mut header).map_err(|e| TransportError::Noise(format!("encrypt: {e:?}")))?;
+    codec
+        .encrypt(&mut header)
+        .map_err(|e| TransportError::Noise(format!("encrypt: {e:?}")))?;
     out.extend_from_slice(&header);
 
     for chunk in payload.chunks(MAX_CHUNK_PLAINTEXT) {
         let mut buf = Vec::with_capacity(chunk.len() + MAC_LEN);
         buf.extend_from_slice(chunk);
-        codec.encrypt(&mut buf).map_err(|e| TransportError::Noise(format!("encrypt: {e:?}")))?;
+        codec
+            .encrypt(&mut buf)
+            .map_err(|e| TransportError::Noise(format!("encrypt: {e:?}")))?;
         out.extend_from_slice(&buf);
     }
     Ok(out)
@@ -107,9 +115,13 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 ) -> Result<(u8, Vec<u8>), TransportError> {
     let mut header = vec![0u8; ENCRYPTED_HEADER_SIZE];
     reader.read_exact(&mut header).await?;
-    codec.decrypt(&mut header).map_err(|e| TransportError::Noise(format!("decrypt: {e:?}")))?;
+    codec
+        .decrypt(&mut header)
+        .map_err(|e| TransportError::Noise(format!("decrypt: {e:?}")))?;
     if header.len() != HEADER_SIZE {
-        return Err(TransportError::Noise("decrypted header is not 6 bytes".into()));
+        return Err(TransportError::Noise(
+            "decrypted header is not 6 bytes".into(),
+        ));
     }
     let msg_type = header[2];
     let len = u32::from_le_bytes([header[3], header[4], header[5], 0]) as usize;
@@ -122,7 +134,9 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
         let plain = remaining.min(MAX_CHUNK_PLAINTEXT);
         let mut chunk = vec![0u8; plain + MAC_LEN];
         reader.read_exact(&mut chunk).await?;
-        codec.decrypt(&mut chunk).map_err(|e| TransportError::Noise(format!("decrypt: {e:?}")))?;
+        codec
+            .decrypt(&mut chunk)
+            .map_err(|e| TransportError::Noise(format!("decrypt: {e:?}")))?;
         payload.extend_from_slice(&chunk);
         remaining -= plain;
     }
@@ -141,7 +155,12 @@ pub(crate) mod tests {
     }
 
     /// Handshake over an in-memory pipe, with the miner pinning the key.
-    async fn connected_pair() -> (NoiseCodec, NoiseCodec, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    async fn connected_pair() -> (
+        NoiseCodec,
+        NoiseCodec,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
         let (public, private) = authority();
         let (mut server_io, mut client_io) = tokio::io::duplex(1 << 20);
         let server = tokio::spawn(async move {
@@ -161,24 +180,43 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn frames_round_trip_both_ways_across_a_real_handshake() {
         let (mut server, mut client, mut server_io, mut client_io) = connected_pair().await;
-        for payload in [Vec::new(), (0u8..42).collect(), vec![7u8; MAX_INBOUND_PAYLOAD]] {
+        for payload in [
+            Vec::new(),
+            (0u8..42).collect(),
+            vec![7u8; MAX_INBOUND_PAYLOAD],
+        ] {
             let wire = encode_frame(&mut server, super::super::wire::SET_TARGET, &payload).unwrap();
             let chunks = payload.len().div_ceil(MAX_CHUNK_PLAINTEXT);
-            assert_eq!(wire.len(), ENCRYPTED_HEADER_SIZE + payload.len() + chunks * MAC_LEN);
+            assert_eq!(
+                wire.len(),
+                ENCRYPTED_HEADER_SIZE + payload.len() + chunks * MAC_LEN
+            );
             server_io.write_all(&wire).await.unwrap();
             let (t, p) = read_frame(&mut client_io, &mut client).await.unwrap();
             assert_eq!(t, super::super::wire::SET_TARGET);
             assert_eq!(p, payload);
         }
         // A payload past the inbound limit is refused before it is buffered.
-        let wire = encode_frame(&mut server, super::super::wire::SET_TARGET, &vec![0u8; MAX_INBOUND_PAYLOAD + 1]).unwrap();
+        let wire = encode_frame(
+            &mut server,
+            super::super::wire::SET_TARGET,
+            &vec![0u8; MAX_INBOUND_PAYLOAD + 1],
+        )
+        .unwrap();
         server_io.write_all(&wire).await.unwrap();
-        assert!(matches!(read_frame(&mut client_io, &mut client).await, Err(TransportError::TooLarge(_))));
+        assert!(matches!(
+            read_frame(&mut client_io, &mut client).await,
+            Err(TransportError::TooLarge(_))
+        ));
         let (mut server, mut client, mut server_io, mut client_io) = connected_pair().await;
-        let wire = encode_frame(&mut client, super::super::wire::SETUP_CONNECTION, b"hello").unwrap();
+        let wire =
+            encode_frame(&mut client, super::super::wire::SETUP_CONNECTION, b"hello").unwrap();
         client_io.write_all(&wire).await.unwrap();
         let (t, p) = read_frame(&mut server_io, &mut server).await.unwrap();
-        assert_eq!((t, p.as_slice()), (super::super::wire::SETUP_CONNECTION, &b"hello"[..]));
+        assert_eq!(
+            (t, p.as_slice()),
+            (super::super::wire::SETUP_CONNECTION, &b"hello"[..])
+        );
     }
 
     #[tokio::test]
@@ -190,7 +228,10 @@ pub(crate) mod tests {
         });
         let other = super::super::authority::authority_pubkey(&[0x22u8; 32]).unwrap();
         let mut initiator = Initiator::from_raw_k(other).unwrap();
-        client_io.write_all(&initiator.step_0().unwrap()).await.unwrap();
+        client_io
+            .write_all(&initiator.step_0().unwrap())
+            .await
+            .unwrap();
         let mut reply = [0u8; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE];
         client_io.read_exact(&mut reply).await.unwrap();
         assert!(initiator.step_2(reply).is_err());
@@ -200,7 +241,8 @@ pub(crate) mod tests {
     fn channel_messages_carry_the_channel_bit() {
         let (mut server, mut client) = {
             let (public, private) = authority();
-            let mut responder = Responder::from_authority_kp(&public, &private, CERT_VALIDITY).unwrap();
+            let mut responder =
+                Responder::from_authority_kp(&public, &private, CERT_VALIDITY).unwrap();
             let mut initiator = Initiator::without_pk().unwrap();
             let (reply, server) = responder.step_1(initiator.step_0().unwrap()).unwrap();
             (server, initiator.step_2(reply).unwrap())

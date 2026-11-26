@@ -7,19 +7,23 @@
 mod common;
 
 use common::{
-    build_signed_p2tr_keypath_spend, build_signed_p2wpkh_spend_from_block1_coinbase,
-    build_signed_p2wpkh_spend_of_coinbase,
-    block1_coinbase_txid, p2tr_keypath_output, poll_until, test_timeout, DeterministicWallet,
-    TestNode,
+    DeterministicWallet, TestNode, block1_coinbase_txid, build_signed_p2tr_keypath_spend,
+    build_signed_p2wpkh_spend_from_block1_coinbase, build_signed_p2wpkh_spend_of_coinbase,
+    p2tr_keypath_output, poll_until, test_timeout,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::str::FromStr;
 
 /// The `error` of a call the node is expected to refuse, as `(code, message)`.
 fn refused(node: &TestNode, method: &str, params: Vec<Value>) -> (i64, String) {
-    let resp = node.rpc_call_with_params(method, params.clone()).expect("node reachable");
+    let resp = node
+        .rpc_call_with_params(method, params.clone())
+        .expect("node reachable");
     let err = &resp["error"];
-    assert!(!err.is_null(), "{method}{params:?} must be refused; got {resp}");
+    assert!(
+        !err.is_null(),
+        "{method}{params:?} must be refused; got {resp}"
+    );
     (
         err["code"].as_i64().expect("error code"),
         err["message"].as_str().expect("error message").to_string(),
@@ -46,10 +50,16 @@ fn spend_coinbase_to_taproot(
     node: &TestNode,
     wallet: &DeterministicWallet,
     fee: u64,
-) -> (String, String, bitcoin::secp256k1::Keypair, bitcoin::ScriptBuf) {
+) -> (
+    String,
+    String,
+    bitcoin::secp256k1::Keypair,
+    bitcoin::ScriptBuf,
+) {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let (kp, spk) = p2tr_keypath_output(&secp, [0x3c; 32]);
-    let (hex, txid) = build_signed_p2wpkh_spend_from_block1_coinbase(node, wallet, spk.clone(), fee);
+    let (hex, txid) =
+        build_signed_p2wpkh_spend_from_block1_coinbase(node, wallet, spk.clone(), fee);
     (hex, txid, kp, spk)
 }
 
@@ -72,18 +82,37 @@ fn mempool_rpcs_match_core() {
     );
     assert_eq!(
         refused(&node, "sendrawtransaction", vec![json!(hex), json!(1)]),
-        (-8, "Fee rates larger than or equal to 1BTC/kvB are not accepted".to_string())
+        (
+            -8,
+            "Fee rates larger than or equal to 1BTC/kvB are not accepted".to_string()
+        )
     );
     assert_eq!(
-        refused(&node, "sendrawtransaction", vec![json!(hex), json!(0.1), json!(-1)]),
+        refused(
+            &node,
+            "sendrawtransaction",
+            vec![json!(hex), json!(0.1), json!(-1)]
+        ),
         (-3, "Amount out of range".to_string())
     );
     // A rate the transaction exceeds (10,000 sat on ~110 vB).
     assert_eq!(
-        refused(&node, "sendrawtransaction", vec![json!(hex), json!("0.0001")]),
-        (-25, "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_string())
+        refused(
+            &node,
+            "sendrawtransaction",
+            vec![json!(hex), json!("0.0001")]
+        ),
+        (
+            -25,
+            "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_string()
+        )
     );
-    assert!(node.rpc_ok("getrawmempool", vec![]).as_array().unwrap().is_empty());
+    assert!(
+        node.rpc_ok("getrawmempool", vec![])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     // A well-formed limit, given as a string as Core allows.
     let sent = node.rpc_ok("sendrawtransaction", vec![json!(hex), json!("0.10")]);
     assert_eq!(sent, json!(txid));
@@ -109,7 +138,8 @@ fn mempool_rpcs_match_core() {
         "an output the mempool spends is not reported"
     );
     assert!(
-        node.rpc_ok("gettxout", vec![json!(cb_txid), json!(0), json!(false)]).is_object(),
+        node.rpc_ok("gettxout", vec![json!(cb_txid), json!(0), json!(false)])
+            .is_object(),
         "without the mempool the coin is still there"
     );
     let unconfirmed = node.rpc_ok("gettxout", vec![json!(txid), json!(0)]);
@@ -145,7 +175,10 @@ fn sendrawtransaction_of_a_spent_confirmed_transaction_is_missing_inputs() {
     let (child_hex, _) = build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&txid).unwrap(), vout: 0 },
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str(&txid).unwrap(),
+            vout: 0,
+        },
         spk,
         value,
         wallet.address.script_pubkey(),
@@ -153,11 +186,19 @@ fn sendrawtransaction_of_a_spent_confirmed_transaction_is_missing_inputs() {
     );
     node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
     node.mine_blocks(1, &wallet.address.to_string());
-    assert!(node.rpc_ok("getrawmempool", vec![]).as_array().unwrap().is_empty());
+    assert!(
+        node.rpc_ok("getrawmempool", vec![])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     let (code, message) = refused(&node, "sendrawtransaction", vec![json!(hex)]);
     assert_eq!(code, -25, "{message}");
-    assert!(message.contains("bad-txns-inputs-missingorspent"), "{message}");
+    assert!(
+        message.contains("bad-txns-inputs-missingorspent"),
+        "{message}"
+    );
     node.stop();
 }
 
@@ -180,7 +221,10 @@ fn gettxspendingprevout_reads_the_mempool_then_the_chain() {
     let (child_hex, child) = build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 },
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str(&parent).unwrap(),
+            vout: 0,
+        },
         spk,
         50 * 100_000_000 - 10_000,
         wallet.address.script_pubkey(),
@@ -203,11 +247,18 @@ fn gettxspendingprevout_reads_the_mempool_then_the_chain() {
     node.mine_blocks(1, &wallet.address.to_string());
     let block = node.rpc_ok("getbestblockhash", vec![]);
     assert_eq!(
-        ask(&node, json!([parent_out]), json!({"return_spending_tx": true})),
+        ask(
+            &node,
+            json!([parent_out]),
+            json!({"return_spending_tx": true})
+        ),
         json!([{"txid": parent, "vout": 0, "spendingtxid": child, "blockhash": block, "spendingtx": child_hex}]),
         "the confirmed spender, its block and itself"
     );
-    assert_eq!(ask(&node, json!([parent_out]), json!({"mempool_only": true})), json!([parent_out]));
+    assert_eq!(
+        ask(&node, json!([parent_out]), json!({"mempool_only": true})),
+        json!([parent_out])
+    );
 
     node.rpc_ok("invalidateblock", vec![block]);
     let (_, other_spk) = p2tr_keypath_output(&secp, [0x3d; 32]);
@@ -237,7 +288,10 @@ fn mempool_entries_carry_their_chunk() {
     let (child_hex, child) = build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 },
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str(&parent).unwrap(),
+            vout: 0,
+        },
         spk,
         50 * 100_000_000 - 200,
         wallet.address.script_pubkey(),
@@ -246,24 +300,38 @@ fn mempool_entries_carry_their_chunk() {
     node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
     node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
     let weight = |hex: &str| {
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(hex).unwrap()).unwrap();
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(hex).unwrap()).unwrap();
         tx.weight().to_wu()
     };
     let chunk_weight = weight(&parent_hex) + weight(&child_hex);
     let check = |entry: &Value, view: &str| {
         assert_eq!(entry["chunkweight"], json!(chunk_weight), "{view}: {entry}");
-        assert_eq!(entry["fees"]["chunk"].to_string(), "0.00010200", "{view}: {entry}");
+        assert_eq!(
+            entry["fees"]["chunk"].to_string(),
+            "0.00010200",
+            "{view}: {entry}"
+        );
     };
 
     for txid in [&parent, &child] {
-        check(&node.rpc_ok("getmempoolentry", vec![json!(txid)]), "getmempoolentry");
+        check(
+            &node.rpc_ok("getmempoolentry", vec![json!(txid)]),
+            "getmempoolentry",
+        );
     }
     let verbose = node.rpc_ok("getrawmempool", vec![json!(true)]);
     for txid in [&parent, &child] {
         check(&verbose[txid.as_str()], "getrawmempool true");
     }
-    check(&node.rpc_ok("getmempoolancestors", vec![json!(child), json!(true)])[parent.as_str()], "getmempoolancestors true");
-    check(&node.rpc_ok("getmempooldescendants", vec![json!(parent), json!(true)])[child.as_str()], "getmempooldescendants true");
+    check(
+        &node.rpc_ok("getmempoolancestors", vec![json!(child), json!(true)])[parent.as_str()],
+        "getmempoolancestors true",
+    );
+    check(
+        &node.rpc_ok("getmempooldescendants", vec![json!(parent), json!(true)])[child.as_str()],
+        "getmempooldescendants true",
+    );
     node.stop();
 }
 
@@ -281,7 +349,10 @@ fn the_cluster_rpcs_answer_as_core_does() {
     let (child_hex, child) = build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 },
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str(&parent).unwrap(),
+            vout: 0,
+        },
         spk,
         50 * 100_000_000 - 200,
         wallet.address.script_pubkey(),
@@ -290,7 +361,8 @@ fn the_cluster_rpcs_answer_as_core_does() {
     node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
     node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
     let weight = |hex: &str| {
-        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&hex::decode(hex).unwrap()).unwrap();
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(hex).unwrap()).unwrap();
         tx.weight().to_wu()
     };
     let w = weight(&parent_hex) + weight(&child_hex);
@@ -302,20 +374,38 @@ fn the_cluster_rpcs_answer_as_core_does() {
         })
     };
     for txid in [&parent, &child] {
-        assert_eq!(node.rpc_ok("getmempoolcluster", vec![json!(txid)]), cluster("0.00010200"));
+        assert_eq!(
+            node.rpc_ok("getmempoolcluster", vec![json!(txid)]),
+            cluster("0.00010200")
+        );
     }
     let diagram = node.rpc_ok("getmempoolfeeratediagram", vec![]);
-    let points: Vec<(u64, String)> =
-        diagram.as_array().unwrap().iter().map(|p| (p["weight"].as_u64().unwrap(), p["fee"].to_string())).collect();
-    assert_eq!(points, [(0, "0.00000000".to_string()), (w, "0.00010200".to_string())]);
+    let points: Vec<(u64, String)> = diagram
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["weight"].as_u64().unwrap(), p["fee"].to_string()))
+        .collect();
+    assert_eq!(
+        points,
+        [(0, "0.00000000".to_string()), (w, "0.00010200".to_string())]
+    );
 
-    node.rpc_ok("prioritisetransaction", vec![json!(parent), json!(0), json!(-20_000)]);
-    assert_eq!(node.rpc_ok("getmempoolcluster", vec![json!(child)]), cluster("-0.00009800"));
+    node.rpc_ok(
+        "prioritisetransaction",
+        vec![json!(parent), json!(0), json!(-20_000)],
+    );
+    assert_eq!(
+        node.rpc_ok("getmempoolcluster", vec![json!(child)]),
+        cluster("-0.00009800")
+    );
     let diagram = node.rpc_ok("getmempoolfeeratediagram", vec![]);
     assert_eq!(diagram[1]["fee"].to_string(), "-0.00009800", "{diagram}");
 
     // Named parameters, and Core's errors.
-    let named = node.rpc_call_with_named_params("getmempoolcluster", json!({ "txid": parent })).unwrap();
+    let named = node
+        .rpc_call_with_named_params("getmempoolcluster", json!({ "txid": parent }))
+        .unwrap();
     assert_eq!(named["result"]["txcount"], json!(2), "{named}");
     assert_eq!(
         refused(&node, "getmempoolcluster", vec![json!("00".repeat(32))]),
@@ -323,7 +413,10 @@ fn the_cluster_rpcs_answer_as_core_does() {
     );
     assert_eq!(
         refused(&node, "getmempoolcluster", vec![json!("zz")]),
-        (-8, "txid must be of length 64 (not 2, for 'zz')".to_string())
+        (
+            -8,
+            "txid must be of length 64 (not 2, for 'zz')".to_string()
+        )
     );
     node.stop();
 }
@@ -350,18 +443,33 @@ fn a_reorg_trims_the_cluster_its_returned_parent_grows_past_the_limit() {
     let block = node.rpc_ok("getbestblockhash", vec![]);
 
     let mut spenders = Vec::new();
-    let mut prevout = bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout: 0 };
+    let mut prevout = bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_str(&parent).unwrap(),
+        vout: 0,
+    };
     let mut value = 50 * 100_000_000 - 10_000;
     for _ in 0..3 {
-        let (hex, txid) = build_signed_p2tr_keypath_spend(&secp, &kp, prevout, spk.clone(), value, spk.clone(), 10_000);
+        let (hex, txid) = build_signed_p2tr_keypath_spend(
+            &secp,
+            &kp,
+            prevout,
+            spk.clone(),
+            value,
+            spk.clone(),
+            10_000,
+        );
         node.rpc_ok("sendrawtransaction", vec![json!(hex)]);
-        prevout = bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&txid).unwrap(), vout: 0 };
+        prevout = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str(&txid).unwrap(),
+            vout: 0,
+        };
         value -= 10_000;
         spenders.push(txid);
     }
 
     node.rpc_ok("invalidateblock", vec![block]);
-    let mut pool: Vec<String> = serde_json::from_value(node.rpc_ok("getrawmempool", vec![])).unwrap();
+    let mut pool: Vec<String> =
+        serde_json::from_value(node.rpc_ok("getrawmempool", vec![])).unwrap();
     pool.sort();
     let mut expected = vec![parent, spenders[0].clone(), spenders[1].clone()];
     expected.sort();
@@ -385,30 +493,70 @@ fn a_reorg_keeps_a_returned_child_over_cheaper_mempool_spenders() {
     let (kp, spk) = p2tr_keypath_output(&secp, [0x3e; 32]);
     let half = 2_499_990_000u64;
     let outputs = vec![
-        bitcoin::TxOut { value: bitcoin::Amount::from_sat(half), script_pubkey: spk.clone() },
-        bitcoin::TxOut { value: bitcoin::Amount::from_sat(half), script_pubkey: spk.clone() },
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(half),
+            script_pubkey: spk.clone(),
+        },
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(half),
+            script_pubkey: spk.clone(),
+        },
     ];
-    let (parent_hex, parent) = common::build_signed_p2wpkh_spend_to_outputs(&node, &wallet, outputs);
-    let parent_out = |vout| bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&parent).unwrap(), vout };
-    let (child_hex, child) =
-        build_signed_p2tr_keypath_spend(&secp, &kp, parent_out(0), spk.clone(), half, spk.clone(), 100_000);
+    let (parent_hex, parent) =
+        common::build_signed_p2wpkh_spend_to_outputs(&node, &wallet, outputs);
+    let parent_out = |vout| bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_str(&parent).unwrap(),
+        vout,
+    };
+    let (child_hex, child) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        parent_out(0),
+        spk.clone(),
+        half,
+        spk.clone(),
+        100_000,
+    );
     node.rpc_ok("sendrawtransaction", vec![json!(parent_hex)]);
     node.rpc_ok("sendrawtransaction", vec![json!(child_hex)]);
     node.mine_blocks(1, &wallet.address.to_string());
     let block = node.rpc_ok("getbestblockhash", vec![]);
 
-    let (a_hex, a) = build_signed_p2tr_keypath_spend(&secp, &kp, parent_out(1), spk.clone(), half, spk.clone(), 1_000);
-    let a_out = bitcoin::OutPoint { txid: bitcoin::Txid::from_str(&a).unwrap(), vout: 0 };
-    let (b_hex, _b) = build_signed_p2tr_keypath_spend(&secp, &kp, a_out, spk.clone(), half - 1_000, spk.clone(), 1_000);
+    let (a_hex, a) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        parent_out(1),
+        spk.clone(),
+        half,
+        spk.clone(),
+        1_000,
+    );
+    let a_out = bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_str(&a).unwrap(),
+        vout: 0,
+    };
+    let (b_hex, _b) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        a_out,
+        spk.clone(),
+        half - 1_000,
+        spk.clone(),
+        1_000,
+    );
     node.rpc_ok("sendrawtransaction", vec![json!(a_hex)]);
     node.rpc_ok("sendrawtransaction", vec![json!(b_hex)]);
 
     node.rpc_ok("invalidateblock", vec![block]);
-    let mut pool: Vec<String> = serde_json::from_value(node.rpc_ok("getrawmempool", vec![])).unwrap();
+    let mut pool: Vec<String> =
+        serde_json::from_value(node.rpc_ok("getrawmempool", vec![])).unwrap();
     pool.sort();
     let mut expected = vec![parent, child, a];
     expected.sort();
-    assert_eq!(pool, expected, "the child comes back; the chain's tail is trimmed");
+    assert_eq!(
+        pool, expected,
+        "the child comes back; the chain's tail is trimmed"
+    );
 
     node.stop();
 }
@@ -427,9 +575,16 @@ fn a_transaction_with_no_inputs_is_refused_as_core_refuses_it() {
     );
     let tma = node.rpc_ok("testmempoolaccept", vec![json!([EMPTY])]);
     assert_eq!(tma[0]["allowed"], json!(false), "{tma}");
-    assert_eq!(tma[0]["reject-reason"], json!("bad-txns-vin-empty"), "{tma}");
+    assert_eq!(
+        tma[0]["reject-reason"],
+        json!("bad-txns-vin-empty"),
+        "{tma}"
+    );
     let decoded = node.rpc_ok("decoderawtransaction", vec![json!(EMPTY)]);
-    assert_eq!(decoded["txid"], json!("4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a"));
+    assert_eq!(
+        decoded["txid"],
+        json!("4ebd325a4b394cff8c57e8317ccf5a8d0e2bdf1b8526f8aad6c8e43d8240621a")
+    );
     assert_eq!(decoded["vin"], json!([]));
 
     // `generateblock` takes it into the block, which fails `CheckBlock`.
@@ -438,11 +593,19 @@ fn a_transaction_with_no_inputs_is_refused_as_core_refuses_it() {
     let output = node.rpc_ok("getdescriptorinfo", vec![json!("raw(51)")])["descriptor"].clone();
     let (code, message) = refused(&node, "generateblock", vec![output, json!([EMPTY])]);
     assert_eq!(code, -25, "{message}");
-    assert!(message.starts_with("TestBlockValidity failed: bad-txns-vin-empty"), "{message}");
+    assert!(
+        message.starts_with("TestBlockValidity failed: bad-txns-vin-empty"),
+        "{message}"
+    );
 
     // A witness flag with no inputs: Core refuses the bytes.
     assert_eq!(
-        refused(&node, "sendrawtransaction", vec![json!("020000000001000000000000")]).0,
+        refused(
+            &node,
+            "sendrawtransaction",
+            vec![json!("020000000001000000000000")]
+        )
+        .0,
         -22
     );
 }
@@ -469,7 +632,10 @@ fn a_transaction_with_no_inputs_gets_cores_sizes_ids_and_messages() {
 
     let decoded = node.rpc_ok("decoderawtransaction", vec![json!(EMPTY)]);
     assert_eq!(decoded["hash"], json!(EMPTY_TXID), "{decoded}");
-    assert_eq!((&decoded["size"], &decoded["vsize"], &decoded["weight"]), (&json!(10), &json!(10), &json!(40)));
+    assert_eq!(
+        (&decoded["size"], &decoded["vsize"], &decoded["weight"]),
+        (&json!(10), &json!(10), &json!(40))
+    );
 
     let tma = node.rpc_ok("testmempoolaccept", vec![json!([EMPTY])]);
     assert_eq!(tma[0]["wtxid"], json!(EMPTY_TXID), "{tma}");
@@ -492,11 +658,18 @@ fn a_transaction_with_no_inputs_gets_cores_sizes_ids_and_messages() {
         })
     );
 
-    let data = node.rpc_ok("createrawtransaction", vec![json!([]), json!([{"data": "00"}])]);
+    let data = node.rpc_ok(
+        "createrawtransaction",
+        vec![json!([]), json!([{"data": "00"}])],
+    );
     let data = data.as_str().expect("hex").to_string();
     assert_eq!(data, "0200000000010000000000000000036a010000000000");
     let decoded = node.rpc_ok("decoderawtransaction", vec![json!(data)]);
-    assert_eq!(decoded["vout"][0]["scriptPubKey"]["hex"], json!("6a0100"), "{decoded}");
+    assert_eq!(
+        decoded["vout"][0]["scriptPubKey"]["hex"],
+        json!("6a0100"),
+        "{decoded}"
+    );
     let at_least_one = "Make sure the tx has at least one input.";
     assert_eq!(
         refused(&node, "sendrawtransaction", vec![json!(data)]),
@@ -512,7 +685,10 @@ fn a_transaction_with_no_inputs_gets_cores_sizes_ids_and_messages() {
     let output = node.rpc_ok("getdescriptorinfo", vec![json!("raw(51)")])["descriptor"].clone();
     assert_eq!(
         refused(&node, "generateblock", vec![output, json!([data])]),
-        (-22, format!("Transaction decode failed for {data}. {at_least_one}"))
+        (
+            -22,
+            format!("Transaction decode failed for {data}. {at_least_one}")
+        )
     );
 }
 
@@ -552,15 +728,24 @@ fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
     let parent_wtxid = node::validation::decode::wtxid(&parent_tx).to_string();
     let parent_value = parent_tx.output[0].value.to_sat();
     let parent_out = bitcoin::OutPoint::new(bitcoin::Txid::from_str(&parent_txid).unwrap(), 0);
-    let (child, _) =
-        build_signed_p2tr_keypath_spend(&secp, &kp, parent_out, spk.clone(), parent_value, spk.clone(), 10_000);
+    let (child, _) = build_signed_p2tr_keypath_spend(
+        &secp,
+        &kp,
+        parent_out,
+        spk.clone(),
+        parent_value,
+        spk.clone(),
+        10_000,
+    );
     let (dup_child, dup_child_txid, dup_child_wtxid) = with_duplicated_input(&child);
 
     // Two transactions, unrelated to the parent: `dup` spends block 2's
     // coinbase twice, `other` spends block 3's.
-    let (spends_2, _) = build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 2, spk.clone(), 10_000);
+    let (spends_2, _) =
+        build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 2, spk.clone(), 10_000);
     let (dup, dup_txid, dup_wtxid) = with_duplicated_input(&spends_2);
-    let (other, other_txid) = build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 3, spk.clone(), 10_000);
+    let (other, other_txid) =
+        build_signed_p2wpkh_spend_of_coinbase(&node, &wallet, 3, spk.clone(), 10_000);
     let other_wtxid = {
         let tx: bitcoin::Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&other).unwrap()).unwrap();
@@ -586,15 +771,24 @@ fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
     // is its parent.
     assert_eq!(
         node.rpc_ok("testmempoolaccept", vec![json!([parent, dup_child])]),
-        json!([ids(&parent_txid, &parent_wtxid), refusal(&dup_child_txid, &dup_child_wtxid)])
+        json!([
+            ids(&parent_txid, &parent_wtxid),
+            refusal(&dup_child_txid, &dup_child_wtxid)
+        ])
     );
     assert_eq!(
         node.rpc_ok("testmempoolaccept", vec![json!([dup, other])]),
-        json!([refusal(&dup_txid, &dup_wtxid), ids(&other_txid, &other_wtxid)])
+        json!([
+            refusal(&dup_txid, &dup_wtxid),
+            ids(&other_txid, &other_wtxid)
+        ])
     );
     assert_eq!(
         node.rpc_ok("testmempoolaccept", vec![json!([other, dup])]),
-        json!([ids(&other_txid, &other_wtxid), refusal(&dup_txid, &dup_wtxid)])
+        json!([
+            ids(&other_txid, &other_wtxid),
+            refusal(&dup_txid, &dup_wtxid)
+        ])
     );
 
     // `submitpackage` of the member alone.
@@ -616,12 +810,13 @@ fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
             bitcoin::consensus::deserialize(&hex::decode(&spends_3_again).unwrap()).unwrap();
         node::validation::decode::wtxid(&tx).to_string()
     };
-    let conflict = |txid: &str, wtxid: &str| {
-        json!({"txid": txid, "wtxid": wtxid, "package-error": "conflict-in-package"})
-    };
+    let conflict = |txid: &str, wtxid: &str| json!({"txid": txid, "wtxid": wtxid, "package-error": "conflict-in-package"});
     assert_eq!(
         node.rpc_ok("testmempoolaccept", vec![json!([other, spends_3_again])]),
-        json!([conflict(&other_txid, &other_wtxid), conflict(&spends_3_again_txid, &spends_3_again_wtxid)])
+        json!([
+            conflict(&other_txid, &other_wtxid),
+            conflict(&spends_3_again_txid, &spends_3_again_wtxid)
+        ])
     );
 
     // `submitpackage` of the parent and the child: the parent goes in on its
@@ -639,8 +834,16 @@ fn a_member_spending_one_outpoint_twice_is_refused_as_core_refuses_it() {
     let accepted = &results[&parent_wtxid];
     assert_eq!(accepted["txid"], json!(parent_txid), "{sp}");
     assert!(accepted.get("error").is_none(), "{sp}");
-    assert_eq!(accepted["vsize"], json!(parent_tx.weight().to_wu().div_ceil(4)), "{sp}");
+    assert_eq!(
+        accepted["vsize"],
+        json!(parent_tx.weight().to_wu().div_ceil(4)),
+        "{sp}"
+    );
     assert_eq!(accepted["fees"]["base"].as_f64(), Some(0.0001), "{sp}");
-    assert_eq!(accepted["fees"]["effective-includes"], json!([parent_wtxid]), "{sp}");
+    assert_eq!(
+        accepted["fees"]["effective-includes"],
+        json!([parent_wtxid]),
+        "{sp}"
+    );
     assert_eq!(node.rpc_ok("getrawmempool", vec![]), json!([parent_txid]));
 }

@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 use bitcoin::OutPoint;
 use parking_lot::Mutex;
 
+use super::Rejection;
 use super::collect::{Collector, Intake, PullBudget};
 use super::p2p::{GetNapAtt, NapAtt};
 use super::publisher::ChainSource;
-use super::Rejection;
 
 /// How long a publisher has to answer one request.
 pub const PULL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -145,7 +145,11 @@ struct State {
 
 impl Puller {
     pub fn new(collector: Arc<Collector>) -> Self {
-        Puller { collector, state: Mutex::new(State::default()), report: Default::default() }
+        Puller {
+            collector,
+            state: Mutex::new(State::default()),
+            report: Default::default(),
+        }
     }
 
     pub fn collector(&self) -> &Arc<Collector> {
@@ -207,7 +211,9 @@ impl Puller {
         if st.active.contains_key(&peer) || st.active.len() >= MAX_ACTIVE_PULLS {
             return None;
         }
-        if via == Via::Inbound && st.active.values().filter(|a| a.via == Via::Inbound).count() >= MAX_INBOUND_PULLS {
+        if via == Via::Inbound
+            && st.active.values().filter(|a| a.via == Via::Inbound).count() >= MAX_INBOUND_PULLS
+        {
             return None;
         }
         st.last_pull.insert(source.to_owned(), now);
@@ -227,7 +233,13 @@ impl Puller {
 
     /// Take a `napatt` from `peer`. The intake runs here, verifying
     /// signatures, so the caller runs this off the network thread.
-    pub fn on_napatt(&self, chain: &impl ChainSource, peer: PeerId, payload: &[u8], now: Instant) -> Next {
+    pub fn on_napatt(
+        &self,
+        chain: &impl ChainSource,
+        peer: PeerId,
+        payload: &[u8],
+        now: Instant,
+    ) -> Next {
         // The pull stays in place, marked, while its page is taken, so that
         // a disconnect meanwhile ends it rather than being missed.
         let (source, mut budget) = {
@@ -235,7 +247,10 @@ impl Puller {
             match st.active.get_mut(&peer) {
                 Some(a) if !a.taking => {
                     a.taking = true;
-                    (a.source.clone(), std::mem::replace(&mut a.budget, PullBudget::empty()))
+                    (
+                        a.source.clone(),
+                        std::mem::replace(&mut a.budget, PullBudget::empty()),
+                    )
                 }
                 _ => {
                     st.stats.unsolicited += 1;
@@ -246,7 +261,10 @@ impl Puller {
         let end = |st: &mut State| st.active.remove(&peer);
         // If the intake panics, the pull ends rather than holding its slot
         // marked as being taken for good.
-        let _ends_on_panic = EndOnPanic { state: &self.state, peer };
+        let _ends_on_panic = EndOnPanic {
+            state: &self.state,
+            peer,
+        };
         let page = match NapAtt::from_bytes(payload) {
             Ok(page) => page,
             Err(e) => {
@@ -256,8 +274,14 @@ impl Puller {
                 return Next::Misbehaved(format!("malformed napatt: {e}"));
             }
         };
-        let Intake { misbehaved, key_limit, full, .. } =
-            self.collector.intake(chain, &source, page.attestations, &mut budget, now);
+        let Intake {
+            misbehaved,
+            key_limit,
+            full,
+            ..
+        } = self
+            .collector
+            .intake(chain, &source, page.attestations, &mut budget, now);
         let mut st = self.state.lock();
         st.stats.pages += 1;
         st.stats.key_limit += key_limit as u64;
@@ -309,7 +333,8 @@ impl Puller {
             st.active.remove(id);
             st.stats.pulls_timed_out += 1;
         }
-        st.dialing.retain(|_, since| now.saturating_duration_since(*since) < DIALING_EXPIRY);
+        st.dialing
+            .retain(|_, since| now.saturating_duration_since(*since) < DIALING_EXPIRY);
         late
     }
 
@@ -341,7 +366,12 @@ impl Drop for EndOnPanic<'_> {
 
 /// A `getnapatt` for every attestation, after `cursor`.
 fn request(cursor: Option<OutPoint>) -> Vec<u8> {
-    GetNapAtt { anchor_height_min: 0, keys: Vec::new(), cursor }.to_bytes()
+    GetNapAtt {
+        anchor_height_min: 0,
+        keys: Vec::new(),
+        cursor,
+    }
+    .to_bytes()
 }
 
 /// The reason a misbehaving page gives.

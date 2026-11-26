@@ -292,9 +292,10 @@ fn fill_silent_payments(
             // BIP 352 sums the contributing secrets, and an intermediate
             // sum of zero is legal while a final one is not — a transaction
             // whose input keys cancel cannot carry a silent payment at all.
-            let secret_sum = sp::sum_secret_keys(held.iter().map(|h| h.secret))
-                .ok_or("the input secrets sum to zero, so this transaction cannot carry a \
-                        silent payment")?;
+            let secret_sum = sp::sum_secret_keys(held.iter().map(|h| h.secret)).ok_or(
+                "the input secrets sum to zero, so this transaction cannot carry a \
+                        silent payment",
+            )?;
             let (share, proof) = share_and_proof(secp, &secret_sum, scan_key)?;
             raw.global.set(RawPair::new(
                 keys::global::SP_ECDH_SHARE,
@@ -370,11 +371,7 @@ fn fill_silent_payments(
     let scripts: Vec<(usize, Vec<u8>)> = report
         .outputs
         .iter()
-        .filter_map(|o| {
-            o.derived_script
-                .as_ref()
-                .map(|s| (o.index, s.to_bytes()))
-        })
+        .filter_map(|o| o.derived_script.as_ref().map(|s| (o.index, s.to_bytes())))
         .collect();
     if scripts.len() != report.outputs.len() {
         return Err("a silent payment output script could not be derived".to_string());
@@ -399,7 +396,12 @@ fn fill_silent_payments(
             problem.script_state.as_str()
         ));
     }
-    debug_assert!(report.outputs.iter().all(|o| o.script_state == ScriptState::Matches));
+    debug_assert!(
+        report
+            .outputs
+            .iter()
+            .all(|o| o.script_state == ScriptState::Matches)
+    );
     Ok(Vec::new())
 }
 
@@ -434,9 +436,10 @@ fn share_and_proof(
 /// If one does, another signer has chosen the per-input form, and a global
 /// share on top would claim to cover inputs this signer does not hold.
 fn any_input_share(raw: &RawPsbt, scan_key: &PublicKey) -> bool {
-    raw.inputs
-        .iter()
-        .any(|m| m.get(keys::input::SP_ECDH_SHARE, &scan_key.serialize()).is_some())
+    raw.inputs.iter().any(|m| {
+        m.get(keys::input::SP_ECDH_SHARE, &scan_key.serialize())
+            .is_some()
+    })
 }
 
 /// The eligible inputs this signer holds a key for, with the secret that
@@ -588,8 +591,7 @@ pub fn describe(summary: &SignV2Summary) -> Vec<String> {
         ));
     } else if !summary.outputs_complete {
         lines.push(
-            "silent payments: an output script is still missing, so nothing was signed"
-                .to_string(),
+            "silent payments: an output script is still missing, so nothing was signed".to_string(),
         );
     } else {
         lines.push("silent payments: every output script computed and verified".to_string());

@@ -33,15 +33,22 @@ impl WatchedAddresses {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let endpoint = args.next().unwrap_or_else(|| "http://127.0.0.1:50051".into());
-    let cursor_path = args.next().unwrap_or_else(|| "/tmp/satd-watch.cursor".into());
+    let endpoint = args
+        .next()
+        .unwrap_or_else(|| "http://127.0.0.1:50051".into());
+    let cursor_path = args
+        .next()
+        .unwrap_or_else(|| "/tmp/satd-watch.cursor".into());
 
     // Seed the truth with one address; a real integrator's truth already has
     // whatever it persisted before this process started.
     let truth = WatchedAddresses::default();
     truth.insert([0x11; 32]);
 
-    let client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let client = StreamClient::builder(endpoint)
+        .keepalive_default()
+        .connect()
+        .await?;
 
     let loader_truth = truth.clone();
     let config = ResilientWatchConfig::new()
@@ -67,7 +74,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut inserted_second = false;
     loop {
         match watch.next().await? {
-            Event::ScriptMatched { txid, is_output, confirmed, .. } => {
+            Event::ScriptMatched {
+                txid,
+                is_output,
+                confirmed,
+                ..
+            } => {
                 println!(
                     "watch hit tx={} {} ({})",
                     hex(&txid),

@@ -93,9 +93,7 @@ impl ScriptNum {
             self.value != i64::MIN,
             "cannot negate i64::MIN in ScriptNum"
         );
-        Self {
-            value: -self.value,
-        }
+        Self { value: -self.value }
     }
 }
 

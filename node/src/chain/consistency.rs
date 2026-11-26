@@ -158,7 +158,10 @@ impl ChainstateReport {
             ));
         }
         if !self.chain_tx_faults.is_empty() {
-            parts.push(format!("{} chain_tx row(s) wrong", self.chain_tx_faults.len()));
+            parts.push(format!(
+                "{} chain_tx row(s) wrong",
+                self.chain_tx_faults.len()
+            ));
         }
         if !self.unreadable.is_empty() {
             parts.push(format!("{} block(s) unreadable", self.unreadable.len()));
@@ -495,27 +498,45 @@ mod tests {
         let block = BlockHash::all_zeros();
         let cases: [(ChainstateReport, &str); 6] = [
             (
-                ChainstateReport { missing_coins: vec![OutPoint::null()], ..Default::default() },
+                ChainstateReport {
+                    missing_coins: vec![OutPoint::null()],
+                    ..Default::default()
+                },
                 "1 coin(s) missing",
             ),
             (
-                ChainstateReport { unspent_spends: vec![OutPoint::null()], ..Default::default() },
+                ChainstateReport {
+                    unspent_spends: vec![OutPoint::null()],
+                    ..Default::default()
+                },
                 "1 spent coin(s) still present",
             ),
             (
-                ChainstateReport { height_mismatches: vec![7], ..Default::default() },
+                ChainstateReport {
+                    height_mismatches: vec![7],
+                    ..Default::default()
+                },
                 "1 height row(s) wrong",
             ),
             (
-                ChainstateReport { tx_index_wrong: vec![(txid, block)], ..Default::default() },
+                ChainstateReport {
+                    tx_index_wrong: vec![(txid, block)],
+                    ..Default::default()
+                },
                 "1 txindex row(s) wrong",
             ),
             (
-                ChainstateReport { chain_tx_faults: vec![(7, block)], ..Default::default() },
+                ChainstateReport {
+                    chain_tx_faults: vec![(7, block)],
+                    ..Default::default()
+                },
                 "1 chain_tx row(s) wrong",
             ),
             (
-                ChainstateReport { unreadable: vec![block], ..Default::default() },
+                ChainstateReport {
+                    unreadable: vec![block],
+                    ..Default::default()
+                },
                 "1 block(s) unreadable",
             ),
         ];

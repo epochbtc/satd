@@ -3,8 +3,8 @@ use bitcoin::{Block, OutPoint};
 use crate::index::address::AddressIndexConfig;
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter::FilterIndexConfig;
-use crate::storage::{Store, StoreBatch};
 use crate::storage::undo::UndoData;
+use crate::storage::{Store, StoreBatch};
 
 /// Errors returned by `disconnect_block` when the on-disk undo data
 /// is inconsistent with the block being disconnected. Surfaced as a
@@ -12,13 +12,17 @@ use crate::storage::undo::UndoData;
 /// `-reindex-chainstate` instead of an abort.
 #[derive(Debug, thiserror::Error)]
 pub enum DisconnectError {
-    #[error("undo.spent_coins length {actual} does not match expected non-coinbase input count {expected} for block at height {height}")]
+    #[error(
+        "undo.spent_coins length {actual} does not match expected non-coinbase input count {expected} for block at height {height}"
+    )]
     UndoLengthMismatch {
         height: u32,
         expected: usize,
         actual: usize,
     },
-    #[error("undo.spent_coins exhausted at height {height} while reconstructing spending tx {tx_idx} input {vin} (cursor {cursor}, len {len})")]
+    #[error(
+        "undo.spent_coins exhausted at height {height} while reconstructing spending tx {tx_idx} input {vin} (cursor {cursor}, len {len})"
+    )]
     UndoExhausted {
         height: u32,
         tx_idx: usize,
@@ -139,15 +143,16 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
             continue;
         }
         for (vin, input) in tx.input.iter().enumerate() {
-            let coin = undo.spent_coins.get(undo_cursor).ok_or(
-                DisconnectError::UndoExhausted {
+            let coin = undo
+                .spent_coins
+                .get(undo_cursor)
+                .ok_or(DisconnectError::UndoExhausted {
                     height: block_height,
                     tx_idx,
                     vin,
                     cursor: undo_cursor,
                     len: undo.spent_coins.len(),
-                },
-            )?;
+                })?;
             if let Some(key) = crate::index::address::spending_remove_key(
                 address_index,
                 first_txseq + tx_idx as u64,
@@ -187,9 +192,7 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
             // previous_output (the v1 undo format omits outpoints because
             // of exactly this invariant: undo entries are in connect-
             // order, one per non-coinbase input).
-            batch
-                .coin_puts
-                .push((input.previous_output, coin.clone()));
+            batch.coin_puts.push((input.previous_output, coin.clone()));
             undo_cursor += 1;
         }
     }
@@ -280,7 +283,7 @@ pub fn disconnect_block(params: &DisconnectParams) -> Result<StoreBatch, Disconn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::connect::{block_subsidy, connect_block, ConnectParams};
+    use crate::chain::connect::{ConnectParams, block_subsidy, connect_block};
     use crate::storage::coinview::Coin;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFilePos;
@@ -303,9 +306,9 @@ mod tests {
         coinbase: bool,
     ) -> (InMemoryStore, OutPoint, Coin) {
         let store = test_store();
-        let txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
-        );
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+            [0x42; 32],
+        ));
         let outpoint = OutPoint { txid, vout: 0 };
         let coin = Coin {
             amount: 50_000_000,
@@ -434,9 +437,9 @@ mod tests {
     /// Make a unique OutPoint from a single-byte seed.
     fn make_outpoint(seed: u8, vout: u32) -> OutPoint {
         OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([seed; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [seed; 32],
+            )),
             vout,
         }
     }
@@ -472,19 +475,18 @@ mod tests {
         let block = make_coinbase_only_block(1, prev_hash);
         let block_hash = block.block_hash();
 
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height: 1,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -493,8 +495,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         // Extract undo data (for non-genesis coinbase-only blocks, undo has no spent coins)
         let undo = connect_batch
@@ -518,7 +520,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // coin_removes should contain the coinbase output(s)
         let coinbase_txid = block.txdata[0].compute_txid();
@@ -587,7 +590,9 @@ mod tests {
         assert_eq!(batch.sp_tweak_puts.len(), 1);
         assert_eq!(batch.sp_tweak_puts[0].0, 1);
         store.write_batch(batch).unwrap();
-        let row = store.get_sp_tweaks_row(1).expect("row present after connect");
+        let row = store
+            .get_sp_tweaks_row(1)
+            .expect("row present after connect");
         assert_eq!(row.block_hash, block_hash);
         assert!(row.entries.is_empty());
 
@@ -686,19 +691,18 @@ mod tests {
         let block_hash = block.block_hash();
         let prev_hash = BlockHash::all_zeros();
 
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height: 1,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -707,8 +711,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         let undo = connect_batch
             .undo_puts
@@ -730,21 +734,32 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // The spent coin should be restored
-        assert_eq!(batch.coin_puts.len(), 1, "should restore exactly one spent coin");
+        assert_eq!(
+            batch.coin_puts.len(),
+            1,
+            "should restore exactly one spent coin"
+        );
         assert_eq!(batch.coin_puts[0].0, outpoint);
 
         // All outputs from both txs should be removed
         let spending_txid = block.txdata[1].compute_txid();
         let coinbase_txid = block.txdata[0].compute_txid();
         assert!(
-            batch.coin_removes.iter().any(|(op, _, _)| op.txid == spending_txid),
+            batch
+                .coin_removes
+                .iter()
+                .any(|(op, _, _)| op.txid == spending_txid),
             "spending tx outputs should be in coin_removes"
         );
         assert!(
-            batch.coin_removes.iter().any(|(op, _, _)| op.txid == coinbase_txid),
+            batch
+                .coin_removes
+                .iter()
+                .any(|(op, _, _)| op.txid == coinbase_txid),
             "coinbase outputs should be in coin_removes"
         );
 
@@ -770,19 +785,18 @@ mod tests {
         let block_hash = block.block_hash();
         let prev_hash = BlockHash::all_zeros();
 
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height: 1,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -791,8 +805,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         let undo = connect_batch
             .undo_puts
@@ -814,7 +828,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         let (restored_op, restored_coin) = &batch.coin_puts[0];
         assert_eq!(*restored_op, outpoint);
@@ -841,16 +856,16 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(batch.height_hash_removes, vec![5]);
     }
 
     #[test]
     fn test_disconnect_tip_set_to_prev() {
-        let prev_hash = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]),
-        );
+        let prev_hash =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]));
         let block = make_coinbase_only_block(3, prev_hash);
         let undo = UndoData::default();
 
@@ -866,7 +881,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(batch.tip, Some(prev_hash));
     }
@@ -958,19 +974,18 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let block_hash = block.block_hash();
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -979,8 +994,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         let undo = connect_batch
             .undo_puts
@@ -1002,7 +1017,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // All 3 txs' outputs should be in coin_removes
         // coinbase has 1 output, tx1 has 1, tx2 has 1 = 3 total
@@ -1095,19 +1111,18 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
 
         let block_hash = block.block_hash();
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -1116,8 +1131,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         let undo = connect_batch
             .undo_puts
@@ -1139,7 +1154,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // All 3 spent inputs should be restored
         assert_eq!(batch.coin_puts.len(), 3);
@@ -1179,19 +1195,18 @@ mod tests {
         let block = make_block_spending(spend_op, 1, 2, 0xffff_ffff, 0);
         let block_hash = block.block_hash();
 
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height: 1,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -1200,8 +1215,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         let undo = connect_batch
             .undo_puts
@@ -1227,7 +1242,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
         store.write_batch(batch).unwrap();
 
         // The other coin should still be present
@@ -1246,19 +1262,18 @@ mod tests {
         let prev_hash = BlockHash::all_zeros();
 
         // Connect
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height: 1,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -1267,8 +1282,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         let undo = connect_batch
             .undo_puts
@@ -1311,26 +1326,26 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
         store.write_batch(disconnect_batch).unwrap();
 
         // After disconnect, the original coin should be back
         assert!(store.get_coin(&outpoint).is_some());
 
         // Reconnect
-        let reconnect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height: 1,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let reconnect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -1339,14 +1354,19 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
         store.write_batch(reconnect_batch).unwrap();
 
         // After reconnect, state should match original connected state
-        assert!(store.get_coin(&outpoint).is_none(), "spent coin should be gone again");
+        assert!(
+            store.get_coin(&outpoint).is_none(),
+            "spent coin should be gone again"
+        );
         for (op, coin) in &coins_after_connect {
-            let recovered = store.get_coin(op).expect("coin should exist after reconnect");
+            let recovered = store
+                .get_coin(op)
+                .expect("coin should exist after reconnect");
             assert_eq!(recovered.amount, coin.amount);
             assert_eq!(recovered.height, coin.height);
         }
@@ -1355,9 +1375,8 @@ mod tests {
     #[test]
     fn test_disconnect_empty_undo() {
         // Coinbase-only block (not genesis) with empty undo data works fine.
-        let prev_hash = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]),
-        );
+        let prev_hash =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]));
         let block = make_coinbase_only_block(10, prev_hash);
         let undo = UndoData::default();
 
@@ -1373,7 +1392,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // Should still remove coinbase outputs
         assert!(!batch.coin_removes.is_empty());
@@ -1395,19 +1415,18 @@ mod tests {
         let block = make_block_spending(outpoint, 1, 2, 0xffff_ffff, 0);
         let block_hash = block.block_hash();
 
-        let connect_batch =
-            connect_block(&ConnectParams {
-                replay_plan: None,
-                store: &store,
-                block: &block,
-                height: 1,
-                parent_chainwork: &[0u8; 32],
-                flat_pos: default_pos(),
-                script_verifier: &NoopVerifier,
-                median_time_past: 0,
-                network: Network::Regtest,
-                pre_verified_txs: None,
-                num_threads: 1,
+        let connect_batch = connect_block(&ConnectParams {
+            replay_plan: None,
+            store: &store,
+            block: &block,
+            height: 1,
+            parent_chainwork: &[0u8; 32],
+            flat_pos: default_pos(),
+            script_verifier: &NoopVerifier,
+            median_time_past: 0,
+            network: Network::Regtest,
+            pre_verified_txs: None,
+            num_threads: 1,
             precomputed_txids: None,
             script_skip_txs: None,
             address_index: &Default::default(),
@@ -1416,8 +1435,8 @@ mod tests {
             filter_index: &Default::default(),
             phase_tracker: None,
             interrupt: None,
-            })
-                .unwrap();
+        })
+        .unwrap();
 
         let undo = connect_batch
             .undo_puts
@@ -1452,7 +1471,8 @@ mod tests {
             #[cfg(feature = "block-filter-index")]
             filter_index: &Default::default(),
             sp_index: &Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // Every txid that was added by connect_block must be removed by
         // disconnect_block.
@@ -1491,9 +1511,9 @@ mod tests {
     fn disconnect_removes_the_spent_row_of_a_reorged_spend() {
         let store = test_store();
         let outpoint = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x42; 32],
+            )),
             vout: 0,
         };
         const FUNDING_SEQ: u64 = 55;
@@ -1633,7 +1653,10 @@ mod tests {
         // the spending tx's output) and one spending row (for the input).
         let funding_count = connect_batch.addr_funding_puts.len();
         let spending_count = connect_batch.addr_spending_puts.len();
-        assert!(funding_count >= 1, "expected at least one addr_funding_puts");
+        assert!(
+            funding_count >= 1,
+            "expected at least one addr_funding_puts"
+        );
         assert_eq!(spending_count, 1, "expected exactly one addr_spending_puts");
         // Capture the exact keys, not just how many. Since the rows key
         // on transaction ordinals, a disconnect that emitted the right
@@ -1905,10 +1928,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
 
         let genesis_hash = bitcoin::constants::genesis_block(Network::Regtest).block_hash();

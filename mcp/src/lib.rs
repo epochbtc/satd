@@ -7,8 +7,8 @@ use context::McpContext as Ctx;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use rmcp::schemars;
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -25,7 +25,9 @@ pub struct SatdMcpServer {
 struct GetBlockParams {
     #[schemars(description = "Block hash (hex) or height (number)")]
     identifier: String,
-    #[schemars(description = "Output verbosity: 'summary' (header+txids, default), 'full' (decoded txs), 'raw' (hex)")]
+    #[schemars(
+        description = "Output verbosity: 'summary' (header+txids, default), 'full' (decoded txs), 'raw' (hex)"
+    )]
     verbosity: Option<String>,
 }
 
@@ -167,9 +169,13 @@ struct SendTransactionParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct PsbtWorkflowParams {
-    #[schemars(description = "PSBT action: 'create', 'decode', 'analyze', 'combine', 'finalize', 'update', 'convert', 'join'")]
+    #[schemars(
+        description = "PSBT action: 'create', 'decode', 'analyze', 'combine', 'finalize', 'update', 'convert', 'join'"
+    )]
     action: String,
-    #[schemars(description = "Action-specific parameters (psbt, inputs, outputs, psbts, extract, hex_tx, permit_sigdata, descriptors)")]
+    #[schemars(
+        description = "Action-specific parameters (psbt, inputs, outputs, psbts, extract, hex_tx, permit_sigdata, descriptors)"
+    )]
     params: Option<Value>,
 }
 
@@ -225,26 +231,38 @@ struct GetReorgHistoryParams {
 impl SatdMcpServer {
     // === Node Status ===
 
-    #[tool(description = "Get comprehensive node status including chain height, sync progress, mempool summary, peer count, difficulty, and uptime. This is the first tool to call when assessing node health.")]
+    #[tool(
+        description = "Get comprehensive node status including chain height, sync progress, mempool summary, peer count, difficulty, and uptime. This is the first tool to call when assessing node health."
+    )]
     fn get_node_status(&self) -> String {
         tools::node_status::get_node_status(&self.ctx)
     }
 
-    #[tool(description = "Get system resource usage: memory (RSS), UTXO cache statistics, and database info.")]
+    #[tool(
+        description = "Get system resource usage: memory (RSS), UTXO cache statistics, and database info."
+    )]
     fn get_system_info(&self) -> String {
         tools::node_status::get_system_info(&self.ctx)
     }
 
-    #[tool(description = "Get OP_RETURN pruning status (getopreturnpruneinfo): whether -pruneopreturn is on, its depth and size threshold, how many blocks, transactions and outputs are stripped, bytes zeroed and freed, the strip worker's state, and the block files' apparent and allocated size.")]
+    #[tool(
+        description = "Get OP_RETURN pruning status (getopreturnpruneinfo): whether -pruneopreturn is on, its depth and size threshold, how many blocks, transactions and outputs are stripped, bytes zeroed and freed, the strip worker's state, and the block files' apparent and allocated size."
+    )]
     fn get_opreturn_prune_info(&self) -> String {
         tools::node_status::get_opreturn_prune_info(&self.ctx)
     }
 
     // === Blockchain Queries ===
 
-    #[tool(description = "Retrieve a block by hash or height. Verbosity: 'summary' (header + txid list, default), 'full' (decoded transactions), 'raw' (hex-encoded block).")]
+    #[tool(
+        description = "Retrieve a block by hash or height. Verbosity: 'summary' (header + txid list, default), 'full' (decoded transactions), 'raw' (hex-encoded block)."
+    )]
     fn get_block(&self, Parameters(p): Parameters<GetBlockParams>) -> String {
-        tools::blockchain::get_block(&self.ctx, &p.identifier, p.verbosity.as_deref().unwrap_or("summary"))
+        tools::blockchain::get_block(
+            &self.ctx,
+            &p.identifier,
+            p.verbosity.as_deref().unwrap_or("summary"),
+        )
     }
 
     #[tool(description = "Retrieve a block header by hash or height.")]
@@ -252,46 +270,65 @@ impl SatdMcpServer {
         tools::blockchain::get_block_header(&self.ctx, &p.identifier, p.raw.unwrap_or(false))
     }
 
-    #[tool(description = "Get detailed statistics for a block: fee rates, sizes, transaction counts, UTXO changes, SegWit usage.")]
+    #[tool(
+        description = "Get detailed statistics for a block: fee rates, sizes, transaction counts, UTXO changes, SegWit usage."
+    )]
     fn get_block_stats(&self, Parameters(p): Parameters<GetBlockStatsParams>) -> String {
         tools::blockchain::get_block_stats(&self.ctx, &p.identifier)
     }
 
-    #[tool(description = "Get chain analysis: active/fork tips, transaction rate over a block window, and current difficulty.")]
+    #[tool(
+        description = "Get chain analysis: active/fork tips, transaction rate over a block window, and current difficulty."
+    )]
     fn get_chain_info(&self, Parameters(p): Parameters<GetChainInfoParams>) -> String {
         tools::blockchain::get_chain_info(&self.ctx, p.window.unwrap_or(30))
     }
 
-    #[tool(description = "Retrieve headers for a contiguous range of blocks. Maximum 100 blocks per call. Useful for analyzing chain segments.")]
+    #[tool(
+        description = "Retrieve headers for a contiguous range of blocks. Maximum 100 blocks per call. Useful for analyzing chain segments."
+    )]
     fn search_block_range(&self, Parameters(p): Parameters<SearchBlockRangeParams>) -> String {
         tools::blockchain::search_block_range(&self.ctx, p.start_height, p.end_height)
     }
 
     // === Transaction Queries ===
 
-    #[tool(description = "Look up a transaction by txid. Searches both the blockchain and mempool. Optionally provide a block hash hint for faster lookup.")]
+    #[tool(
+        description = "Look up a transaction by txid. Searches both the blockchain and mempool. Optionally provide a block hash hint for faster lookup."
+    )]
     fn get_transaction(&self, Parameters(p): Parameters<GetTransactionParams>) -> String {
         tools::transactions::get_transaction(&self.ctx, &p.txid, p.blockhash.as_deref())
     }
 
-    #[tool(description = "Decode a hex-encoded raw transaction into JSON with all inputs, outputs, and witness data.")]
-    fn decode_raw_transaction(&self, Parameters(p): Parameters<DecodeRawTransactionParams>) -> String {
+    #[tool(
+        description = "Decode a hex-encoded raw transaction into JSON with all inputs, outputs, and witness data."
+    )]
+    fn decode_raw_transaction(
+        &self,
+        Parameters(p): Parameters<DecodeRawTransactionParams>,
+    ) -> String {
         tools::transactions::decode_raw_transaction(&self.ctx, &p.hex_tx)
     }
 
-    #[tool(description = "Decode a hex-encoded script into human-readable opcodes, type classification, and addresses.")]
+    #[tool(
+        description = "Decode a hex-encoded script into human-readable opcodes, type classification, and addresses."
+    )]
     fn decode_script(&self, Parameters(p): Parameters<DecodeScriptParams>) -> String {
         tools::transactions::decode_script(&self.ctx, &p.hex_script)
     }
 
     // === Mempool ===
 
-    #[tool(description = "Get mempool overview: size, byte usage, fee rate distribution histogram (buckets: 0-1, 1-2, 2-5, 5-10, 10-20, 20-50, 50+ sat/vB), and policy settings.")]
+    #[tool(
+        description = "Get mempool overview: size, byte usage, fee rate distribution histogram (buckets: 0-1, 1-2, 2-5, 5-10, 10-20, 20-50, 50+ sat/vB), and policy settings."
+    )]
     fn get_mempool_overview(&self) -> String {
         tools::mempool::get_mempool_overview(&self.ctx)
     }
 
-    #[tool(description = "List mempool transactions with sorting and filtering. Returns txid, fee, fee rate, size, and time for each entry.")]
+    #[tool(
+        description = "List mempool transactions with sorting and filtering. Returns txid, fee, fee rate, size, and time for each entry."
+    )]
     fn list_mempool_transactions(&self, Parameters(p): Parameters<ListMempoolTxParams>) -> String {
         tools::mempool::list_mempool_transactions(
             &self.ctx,
@@ -301,24 +338,32 @@ impl SatdMcpServer {
         )
     }
 
-    #[tool(description = "Get detailed info about a mempool transaction, optionally including its ancestor and descendant dependency chains.")]
+    #[tool(
+        description = "Get detailed info about a mempool transaction, optionally including its ancestor and descendant dependency chains."
+    )]
     fn get_mempool_entry(&self, Parameters(p): Parameters<GetMempoolEntryParams>) -> String {
         tools::mempool::get_mempool_entry(&self.ctx, &p.txid, p.include_relatives.unwrap_or(false))
     }
 
     // === Transaction-filtering policy (design §10) ===
 
-    #[tool(description = "Get transaction-filtering policy info: ruleset path/sha256/version, per-rule match counters since load, fuel-backstop count, and quarantine-class totals. Returns {\"loaded\": false} when no ruleset is active.")]
+    #[tool(
+        description = "Get transaction-filtering policy info: ruleset path/sha256/version, per-rule match counters since load, fuel-backstop count, and quarantine-class totals. Returns {\"loaded\": false} when no ruleset is active."
+    )]
     fn get_policy_info(&self) -> String {
         tools::policy::get_policy_info(&self.ctx)
     }
 
-    #[tool(description = "Get quarantine-class statistics: per-rule rollup (count, bytes, fee-rate span), confirmed-anyway count (quarantined txs later mined), and the foregone-fees estimate (sat). The comparison surface for tuning policy posture.")]
+    #[tool(
+        description = "Get quarantine-class statistics: per-rule rollup (count, bytes, fee-rate span), confirmed-anyway count (quarantined txs later mined), and the foregone-fees estimate (sat). The comparison surface for tuning policy posture."
+    )]
     fn get_quarantine_info(&self) -> String {
         tools::policy::get_quarantine_info(&self.ctx)
     }
 
-    #[tool(description = "List quarantined transactions (the policy hold class), newest-first, optionally filtered to one rule. Each entry: txid, rule, scope (relay/template), entry time, vsize, fee, fee rate.")]
+    #[tool(
+        description = "List quarantined transactions (the policy hold class), newest-first, optionally filtered to one rule. Each entry: txid, rule, scope (relay/template), entry time, vsize, fee, fee rate."
+    )]
     fn list_quarantine(&self, Parameters(p): Parameters<ListQuarantineParams>) -> String {
         tools::policy::list_quarantine(
             &self.ctx,
@@ -328,14 +373,18 @@ impl SatdMcpServer {
         )
     }
 
-    #[tool(description = "Get detail for a single quarantined transaction (the getmempoolentry analogue for the quarantine class): rule, scope, time, vsize/weight, fee, fee rate, and in-mempool parents.")]
+    #[tool(
+        description = "Get detail for a single quarantined transaction (the getmempoolentry analogue for the quarantine class): rule, scope, time, vsize/weight, fee, fee rate, and in-mempool parents."
+    )]
     fn get_quarantine_entry(&self, Parameters(p): Parameters<GetQuarantineEntryParams>) -> String {
         tools::policy::get_quarantine_entry(&self.ctx, &p.txid)
     }
 
     // === Fee Estimation ===
 
-    #[tool(description = "Estimate fee rates for multiple confirmation targets at once. Returns rates in both BTC/kvB and sat/vB. Default targets: 1, 3, 6, 12, 25 blocks.")]
+    #[tool(
+        description = "Estimate fee rates for multiple confirmation targets at once. Returns rates in both BTC/kvB and sat/vB. Default targets: 1, 3, 6, 12, 25 blocks."
+    )]
     fn estimate_fee(&self, Parameters(p): Parameters<EstimateFeeParams>) -> String {
         let targets = p.targets.unwrap_or_else(|| vec![1, 3, 6, 12, 25]);
         tools::fees::estimate_fee(&self.ctx, &targets)
@@ -343,12 +392,16 @@ impl SatdMcpServer {
 
     // === Network/Peers ===
 
-    #[tool(description = "Get information about connected peers. Summary mode (default) gives a compact overview; full mode includes all protocol details.")]
+    #[tool(
+        description = "Get information about connected peers. Summary mode (default) gives a compact overview; full mode includes all protocol details."
+    )]
     fn get_peer_info(&self, Parameters(p): Parameters<GetPeerInfoParams>) -> String {
         tools::network::get_peer_info(&self.ctx, p.summary.unwrap_or(true))
     }
 
-    #[tool(description = "Manage peer connections: disconnect, ban, or unban a peer by address (host:port).")]
+    #[tool(
+        description = "Manage peer connections: disconnect, ban, or unban a peer by address (host:port)."
+    )]
     fn manage_peer(&self, Parameters(p): Parameters<ManagePeerParams>) -> String {
         tools::network::manage_peer(&self.ctx, &p.action, &p.address)
     }
@@ -360,12 +413,16 @@ impl SatdMcpServer {
 
     // === Transaction Construction ===
 
-    #[tool(description = "Create an unsigned raw transaction from specified inputs and outputs. Amounts in BTC.")]
+    #[tool(
+        description = "Create an unsigned raw transaction from specified inputs and outputs. Amounts in BTC."
+    )]
     fn create_transaction(&self, Parameters(p): Parameters<CreateTransactionParams>) -> String {
         tools::construction::create_transaction(&self.ctx, &p.inputs, &p.outputs, p.locktime)
     }
 
-    #[tool(description = "Sign a raw transaction with provided private keys (WIF format). Returns the signed hex and completion status.")]
+    #[tool(
+        description = "Sign a raw transaction with provided private keys (WIF format). Returns the signed hex and completion status."
+    )]
     fn sign_transaction(&self, Parameters(p): Parameters<SignTransactionParams>) -> String {
         tools::construction::sign_transaction(
             &self.ctx,
@@ -376,59 +433,79 @@ impl SatdMcpServer {
         )
     }
 
-    #[tool(description = "Broadcast a signed raw transaction to the network. Returns the transaction ID on success.")]
+    #[tool(
+        description = "Broadcast a signed raw transaction to the network. Returns the transaction ID on success."
+    )]
     fn send_transaction(&self, Parameters(p): Parameters<SendTransactionParams>) -> String {
         tools::construction::send_transaction(&self.ctx, &p.hex_tx, p.allow_quarantined)
     }
 
-    #[tool(description = "Perform PSBT (Partially Signed Bitcoin Transaction) operations. Actions: 'create' (new PSBT from inputs/outputs), 'decode' (show PSBT contents), 'analyze' (check what signatures are needed), 'combine' (merge partial signatures), 'finalize' (complete for broadcast), 'update' (add UTXO info), 'convert' (raw tx to PSBT), 'join' (merge independent PSBTs). Both PSBT version 0 and version 2 (BIP 370) are accepted, including the BIP 375 silent payment fields; a version 2 PSBT decodes to a different JSON shape, and a version 2 PSBT is always answered with a version 2 PSBT.")]
+    #[tool(
+        description = "Perform PSBT (Partially Signed Bitcoin Transaction) operations. Actions: 'create' (new PSBT from inputs/outputs), 'decode' (show PSBT contents), 'analyze' (check what signatures are needed), 'combine' (merge partial signatures), 'finalize' (complete for broadcast), 'update' (add UTXO info), 'convert' (raw tx to PSBT), 'join' (merge independent PSBTs). Both PSBT version 0 and version 2 (BIP 370) are accepted, including the BIP 375 silent payment fields; a version 2 PSBT decodes to a different JSON shape, and a version 2 PSBT is always answered with a version 2 PSBT."
+    )]
     fn psbt_workflow(&self, Parameters(p): Parameters<PsbtWorkflowParams>) -> String {
         tools::construction::psbt_workflow(
             &self.ctx,
             &p.action,
-            p.params.as_ref().unwrap_or(&Value::Object(Default::default())),
+            p.params
+                .as_ref()
+                .unwrap_or(&Value::Object(Default::default())),
         )
     }
 
     // === Mining ===
 
-    #[tool(description = "Get current mining information: difficulty, network hashrate, chain height.")]
+    #[tool(
+        description = "Get current mining information: difficulty, network hashrate, chain height."
+    )]
     fn get_mining_info(&self) -> String {
         tools::mining::get_mining_info(&self.ctx)
     }
 
-    #[tool(description = "Mine blocks to an address (regtest only). Returns array of new block hashes.")]
+    #[tool(
+        description = "Mine blocks to an address (regtest only). Returns array of new block hashes."
+    )]
     fn generate_blocks(&self, Parameters(p): Parameters<GenerateBlocksParams>) -> String {
         tools::mining::generate_blocks(&self.ctx, p.count, &p.address)
     }
 
-    #[tool(description = "Get a block template for mining. Returns template with transactions, previous block hash, target, and coinbase details.")]
+    #[tool(
+        description = "Get a block template for mining. Returns template with transactions, previous block hash, target, and coinbase details."
+    )]
     fn get_block_template(&self) -> String {
         tools::mining::get_block_template(&self.ctx)
     }
 
     // === UTXO ===
 
-    #[tool(description = "Look up a single unspent transaction output by txid and output index. Returns value, script, confirmations, and coinbase status. Returns null if spent.")]
+    #[tool(
+        description = "Look up a single unspent transaction output by txid and output index. Returns value, script, confirmations, and coinbase status. Returns null if spent."
+    )]
     fn get_utxo(&self, Parameters(p): Parameters<GetUtxoParams>) -> String {
         tools::utxo::get_utxo(&self.ctx, &p.txid, p.vout)
     }
 
-    #[tool(description = "Get UTXO set statistics: total unspent outputs, total value, and best block.")]
+    #[tool(
+        description = "Get UTXO set statistics: total unspent outputs, total value, and best block."
+    )]
     fn get_utxo_set_stats(&self) -> String {
         tools::utxo::get_utxo_set_stats(&self.ctx)
     }
 
     // === Address ===
 
-    #[tool(description = "Validate a Bitcoin address and return its type (P2PKH, P2SH, P2WPKH, P2WSH, P2TR), script hex, and witness info.")]
+    #[tool(
+        description = "Validate a Bitcoin address and return its type (P2PKH, P2SH, P2WPKH, P2WSH, P2TR), script hex, and witness info."
+    )]
     fn validate_address(&self, Parameters(p): Parameters<ValidateAddressParams>) -> String {
         tools::address::validate_address(&p.address, self.ctx.network)
     }
 
     // === Operator Ergonomics (PRs #59-#67) ===
 
-    #[tool(description = "Return detailed info for multiple mempool transactions at once. Missing entries are returned as null in the response map.")]
+    #[tool(
+        description = "Return detailed info for multiple mempool transactions at once. Missing entries are returned as null in the response map."
+    )]
     fn get_mempool_entries_bulk(
         &self,
         Parameters(p): Parameters<GetMempoolEntriesBulkParams>,
@@ -436,43 +513,54 @@ impl SatdMcpServer {
         tools::mempool::get_mempool_entries_bulk(&self.ctx, &p.txids)
     }
 
-    #[tool(description = "Return time-windowed mempool snapshots (size, bytes, fee-rate histogram). Useful for tracking mempool state over ~40 minutes of history.")]
+    #[tool(
+        description = "Return time-windowed mempool snapshots (size, bytes, fee-rate histogram). Useful for tracking mempool state over ~40 minutes of history."
+    )]
     fn get_mempool_history(&self, Parameters(p): Parameters<GetMempoolHistoryParams>) -> String {
         tools::mempool::get_mempool_history(&self.ctx, p.since_secs.unwrap_or(3_600))
     }
 
-    #[tool(description = "Return the most recent mempool events (enter, leave_confirmed, leave_evicted, leave_replaced). Snapshot-style; for live streaming use the subscribemempool JSON-RPC subscription.")]
+    #[tool(
+        description = "Return the most recent mempool events (enter, leave_confirmed, leave_evicted, leave_replaced). Snapshot-style; for live streaming use the subscribemempool JSON-RPC subscription."
+    )]
     fn subscribe_mempool_snapshot(
         &self,
         Parameters(p): Parameters<SubscribeMempoolSnapshotParams>,
     ) -> String {
-        tools::mempool::subscribe_mempool_snapshot(
-            &self.ctx,
-            p.limit.unwrap_or(50) as usize,
-        )
+        tools::mempool::subscribe_mempool_snapshot(&self.ctx, p.limit.unwrap_or(50) as usize)
     }
 
-    #[tool(description = "Return the effective node configuration post-merge of CLI flags, profile, and config file. Passwords and cookies are redacted.")]
+    #[tool(
+        description = "Return the effective node configuration post-merge of CLI flags, profile, and config file. Passwords and cookies are redacted."
+    )]
     fn get_config(&self) -> String {
         tools::ergonomics::get_config(&self.ctx)
     }
 
-    #[tool(description = "Return persisted reorg events — depth, fork height, disconnected/reconnected block hashes. Default window: 24 hours.")]
+    #[tool(
+        description = "Return persisted reorg events — depth, fork height, disconnected/reconnected block hashes. Default window: 24 hours."
+    )]
     fn get_reorg_history(&self, Parameters(p): Parameters<GetReorgHistoryParams>) -> String {
         tools::ergonomics::get_reorg_history(&self.ctx, p.since_secs.unwrap_or(86_400))
     }
 
-    #[tool(description = "Render the current Prometheus metrics snapshot as text — useful for ad-hoc inspection without scraping the /metrics HTTP endpoint.")]
+    #[tool(
+        description = "Render the current Prometheus metrics snapshot as text — useful for ad-hoc inspection without scraping the /metrics HTTP endpoint."
+    )]
     fn get_metrics_snapshot(&self) -> String {
         tools::ergonomics::get_metrics_snapshot(&self.ctx)
     }
 
-    #[tool(description = "Liveness check: returns 'ok' plus uptime if the process is running. Mirrors the /healthz HTTP endpoint.")]
+    #[tool(
+        description = "Liveness check: returns 'ok' plus uptime if the process is running. Mirrors the /healthz HTTP endpoint."
+    )]
     fn get_health(&self) -> String {
         tools::ergonomics::get_health(&self.ctx)
     }
 
-    #[tool(description = "Readiness check: returns true once the node is within a few blocks of the header tip. Mirrors the /readyz HTTP endpoint.")]
+    #[tool(
+        description = "Readiness check: returns true once the node is within a few blocks of the header tip. Mirrors the /readyz HTTP endpoint."
+    )]
     fn get_readiness(&self) -> String {
         tools::ergonomics::get_readiness(&self.ctx)
     }
@@ -548,8 +636,11 @@ fn mcp_evaluate(headers: &hyper::HeaderMap, store: &satd_auth::TokenStore) -> Mc
 
 type McpBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
 
-fn mcp_status_response(status: u16, header: Option<(&str, String)>, msg: &'static [u8])
--> hyper::Response<McpBody> {
+fn mcp_status_response(
+    status: u16,
+    header: Option<(&str, String)>,
+    msg: &'static [u8],
+) -> hyper::Response<McpBody> {
     use http_body_util::{BodyExt, Full};
     let body = Full::new(bytes::Bytes::from_static(msg)).boxed();
     let mut builder = hyper::Response::builder().status(status);
@@ -579,7 +670,8 @@ async fn serve_mcp_conn<I, S, B>(
             hyper::Request<hyper::body::Incoming>,
             Response = hyper::Response<B>,
             Error = std::convert::Infallible,
-        > + Send + 'static,
+        > + Send
+        + 'static,
     S::Future: Send + 'static,
     B: hyper::body::Body + Send + 'static,
     B::Data: Send,
@@ -690,8 +782,7 @@ pub async fn serve_http(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        session::local::LocalSessionManager,
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -710,9 +801,7 @@ pub async fn serve_http(
     let session_manager = std::sync::Arc::new(LocalSessionManager::default());
 
     let mcp_service = StreamableHttpService::new(
-        move || {
-            Ok(SatdMcpServer::new(ctx.clone()))
-        },
+        move || Ok(SatdMcpServer::new(ctx.clone())),
         session_manager,
         config,
     );
@@ -911,16 +1000,14 @@ mod conn_tests {
     /// connection task panics and no response is ever written.
     #[tokio::test]
     async fn serve_mcp_conn_serves_a_request_without_panicking() {
-        let svc = hyper::service::service_fn(
-            |_req: hyper::Request<hyper::body::Incoming>| async {
-                Ok::<_, std::convert::Infallible>(
-                    hyper::Response::builder()
-                        .status(204)
-                        .body(Full::new(Bytes::new()))
-                        .unwrap(),
-                )
-            },
-        );
+        let svc = hyper::service::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+            Ok::<_, std::convert::Infallible>(
+                hyper::Response::builder()
+                    .status(204)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+        });
 
         let (client, server) = tokio::io::duplex(4096);
         let server_io = hyper_util::rt::TokioIo::new(server);
@@ -985,7 +1072,13 @@ mod conn_tests {
         // rmcp, so carrying them would only make the logged list misleading.
         assert_eq!(
             hosts,
-            ["localhost", "127.0.0.1", "::1", "padded.example", "node.example"]
+            [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "padded.example",
+                "node.example"
+            ]
         );
     }
 }

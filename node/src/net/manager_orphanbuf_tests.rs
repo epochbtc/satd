@@ -16,7 +16,13 @@ fn peer_manager_over(chain_state: Arc<ChainState>) -> Arc<PeerManager> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // Leak the sender so the channel stays open for the manager's life.
     std::mem::forget(shutdown_tx);
-    PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    )
 }
 
 fn tip_reaches(cs: &ChainState, hash: bitcoin::BlockHash, within: Duration) -> bool {
@@ -37,7 +43,12 @@ fn idle_within(flow: &PeerFlow, within: Duration) -> bool {
 
 /// A synced node at height 3, with blocks 4 and 5 built on it but unknown to
 /// the node.
-fn fixture() -> (Arc<ChainState>, std::path::PathBuf, bitcoin::Block, bitcoin::Block) {
+fn fixture() -> (
+    Arc<ChainState>,
+    std::path::PathBuf,
+    bitcoin::Block,
+    bitcoin::Block,
+) {
     let (cs, dir) = make_chain_state();
     let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
     let mut parent = genesis;
@@ -65,14 +76,31 @@ fn an_unrequested_block_with_an_unknown_parent_is_not_kept() {
     // Block 4's guard is counted out once the processor is done with it,
     // which includes connecting whatever was waiting for it.
     let flow = Arc::new(PeerFlow::new());
-    pm.handle_message(7, NetworkMessage::Block(b4.clone()), InFlight::new(Some(flow.clone())));
-    assert!(idle_within(&flow, Duration::from_secs(10)), "block 4 must be processed");
-    assert_eq!(cs.tip_hash(), b4.block_hash(), "block 4 connects and block 5 was not kept");
-    assert!(cs.get_block_index(&b5.block_hash()).is_none(), "block 5 is unknown to the node");
+    pm.handle_message(
+        7,
+        NetworkMessage::Block(b4.clone()),
+        InFlight::new(Some(flow.clone())),
+    );
+    assert!(
+        idle_within(&flow, Duration::from_secs(10)),
+        "block 4 must be processed"
+    );
+    assert_eq!(
+        cs.tip_hash(),
+        b4.block_hash(),
+        "block 4 connects and block 5 was not kept"
+    );
+    assert!(
+        cs.get_block_index(&b5.block_hash()).is_none(),
+        "block 5 is unknown to the node"
+    );
 
     // Sent again now that its parent is known, it connects.
     pm.handle_message(7, NetworkMessage::Block(b5.clone()), InFlight::new(None));
-    assert!(tip_reaches(&cs, b5.block_hash(), Duration::from_secs(10)), "block 5 must connect");
+    assert!(
+        tip_reaches(&cs, b5.block_hash(), Duration::from_secs(10)),
+        "block 5 must connect"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -112,7 +140,11 @@ fn a_block_waiting_for_its_parent_does_not_hold_the_senders_pong() {
 
     pm.note_blocks_requested(7, &[b5.block_hash()]);
     let flow = Arc::new(PeerFlow::new());
-    pm.handle_message(7, NetworkMessage::Block(b5.clone()), InFlight::new(Some(flow.clone())));
+    pm.handle_message(
+        7,
+        NetworkMessage::Block(b5.clone()),
+        InFlight::new(Some(flow.clone())),
+    );
     assert!(
         idle_within(&flow, Duration::from_secs(10)),
         "the waiting block must not hold the peer's in-flight count ({} in flight)",
@@ -121,7 +153,10 @@ fn a_block_waiting_for_its_parent_does_not_hold_the_senders_pong() {
 
     // It did wait rather than being dropped: it follows its parent in.
     pm.handle_message(7, NetworkMessage::Block(b4.clone()), InFlight::new(None));
-    assert!(tip_reaches(&cs, b5.block_hash(), Duration::from_secs(10)), "block 5 must connect");
+    assert!(
+        tip_reaches(&cs, b5.block_hash(), Duration::from_secs(10)),
+        "block 5 must connect"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

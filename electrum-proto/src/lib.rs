@@ -61,11 +61,11 @@ pub use server::{
 pub use state::ElectrumState;
 pub use status::compute_status_hash;
 pub use subscribe::{HeadersSource, NOTIFY_CHANNEL_CAP, Subscriptions};
-pub use version::{PROTOCOL_MAX, PROTOCOL_MIN, ProtocolVersion, Session};
 pub use types::{
     BalanceResponse, FeeHistogramEntry, GetMerkleResponse, HeadersResponse, HistoryEntry,
     ListUnspentEntry, ScripthashHex, TxidHex,
 };
+pub use version::{PROTOCOL_MAX, PROTOCOL_MIN, ProtocolVersion, Session};
 
 /// rbitcoin's Electrum dialect, which `server.version` also accepts and
 /// answers with, so a client written for rbitcoin negotiates as it does

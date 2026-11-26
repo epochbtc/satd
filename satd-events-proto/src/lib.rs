@@ -20,7 +20,7 @@ pub mod satd {
     }
 }
 
-pub use self::satd::events::v1 as v1;
+pub use self::satd::events::v1;
 
 /// The `NodeEvent.schema_version` this crate's types describe. Mirrors
 /// `node::events::SCHEMA_VERSION` in the satd node; the two are bumped together.

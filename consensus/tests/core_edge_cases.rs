@@ -8,12 +8,10 @@ mod script_edges;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::{sha256, Hash, HashEngine};
-use bitcoin::secp256k1::{Keypair, Scalar, Secp256k1, SecretKey, XOnlyPublicKey, Parity};
+use bitcoin::hashes::{Hash, HashEngine, sha256};
+use bitcoin::secp256k1::{Keypair, Parity, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::transaction::Version;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use consensus::checker::{NoopChecker, SigVersion};
 use consensus::error::ScriptError;
 use consensus::eval::eval_script_simple;
@@ -45,9 +43,7 @@ fn credit_tx(script_pubkey: &[u8], value: u64) -> Transaction {
 fn spend_tx(credit: &Transaction, script_sig: &[u8], witness: &[Vec<u8>]) -> Transaction {
     let mut buf = Vec::new();
     credit.consensus_encode(&mut buf).unwrap();
-    let txid = Txid::from_byte_array(
-        bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array(),
-    );
+    let txid = Txid::from_byte_array(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
     let mut w = Witness::new();
     for item in witness {
         w.push(item);
@@ -85,8 +81,8 @@ fn sha256_hash(data: &[u8]) -> [u8; 32] {
 /// returns the expected constant.
 #[test]
 fn test_sighash_single_bug_returns_uint256_one() {
-    use bitcoin::sighash::SighashCache;
     use bitcoin::hashes::Hash;
+    use bitcoin::sighash::SighashCache;
 
     // Create a tx with 2 inputs but only 1 output.
     // Signing input 1 with SIGHASH_SINGLE should trigger the bug.
@@ -95,13 +91,19 @@ fn test_sighash_single_bug_returns_uint256_one() {
         lock_time: LockTime::ZERO,
         input: vec![
             TxIn {
-                previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             },
             TxIn {
-                previous_output: OutPoint { txid: Txid::all_zeros(), vout: 1 },
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 1,
+                },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
@@ -124,7 +126,8 @@ fn test_sighash_single_bug_returns_uint256_one() {
             let mut expected = [0u8; 32];
             expected[0] = 0x01;
             assert_eq!(
-                hash.as_byte_array(), &expected,
+                hash.as_byte_array(),
+                &expected,
                 "SIGHASH_SINGLE bug should return uint256(1)"
             );
         }
@@ -222,7 +225,11 @@ fn test_scriptnum_overflow_result_usable_non_numeric() {
     ];
     let mut stack = Vec::new();
     let result = eval_script_simple(&mut stack, &script, 0, &checker, SigVersion::Base);
-    assert!(result.is_ok(), "Overflow result used by OP_EQUAL should work: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Overflow result used by OP_EQUAL should work: {:?}",
+        result
+    );
     assert!(stack::cast_to_bool(&stack[0]), "Should be equal");
 }
 
@@ -429,7 +436,13 @@ fn p2sh_scriptsig_push_over_520_bytes_is_rejected() {
     script_sig.extend_from_slice(&(redeem.len() as u16).to_le_bytes());
     script_sig.extend_from_slice(&redeem);
 
-    let result = verify_script(&script_sig, &script_pubkey, &[], flags::VERIFY_P2SH, &NoopChecker);
+    let result = verify_script(
+        &script_sig,
+        &script_pubkey,
+        &[],
+        flags::VERIFY_P2SH,
+        &NoopChecker,
+    );
     assert_eq!(result, Err(ScriptError::PushSize));
 }
 
@@ -460,7 +473,7 @@ fn test_sigpushonly_rejects_non_push() {
 #[test]
 fn test_sigpushonly_accepts_push_only() {
     let result = verify_script(
-        &[0x51, 0x52], // OP_1 OP_2 (both push)
+        &[0x51, 0x52],       // OP_1 OP_2 (both push)
         &[0x93, 0x53, 0x87], // OP_ADD OP_3 OP_EQUAL
         &[],
         flags::VERIFY_SIGPUSHONLY,
@@ -533,7 +546,11 @@ fn test_nulldummy_accepts_empty() {
     let checker = TxSignatureChecker::new(&tx, 0, prev[0].value, &prev);
 
     let result = verify_script(&sig, &spk, &[], flags::VERIFY_NULLDUMMY, &checker);
-    assert!(result.is_ok(), "Empty dummy should pass NULLDUMMY: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Empty dummy should pass NULLDUMMY: {:?}",
+        result.err()
+    );
 }
 
 // =========================================================================
@@ -562,7 +579,11 @@ fn test_negative_zero_rejected_by_minimaldata() {
     let script = vec![0x01, 0x80, 0x91]; // push-1 0x80, OP_NOT
     let mut stack = Vec::new();
     let result = eval_script_simple(
-        &mut stack, &script, flags::VERIFY_MINIMALDATA, &checker, SigVersion::Base,
+        &mut stack,
+        &script,
+        flags::VERIFY_MINIMALDATA,
+        &checker,
+        SigVersion::Base,
     );
     assert_eq!(result, Err(ScriptError::ScriptNum));
 }
@@ -712,7 +733,10 @@ fn test_2swap_leaves_items_below_the_top_four() {
 /// A PUSHDATA2 with one length byte at the end of the script is BAD_OPCODE.
 #[test]
 fn truncated_pushdata2_length_is_bad_opcode_not_panic() {
-    assert_eq!(script_edges::pushdata2_missing_a_length_byte().verify(), Err(ScriptError::BadOpcode));
+    assert_eq!(
+        script_edges::pushdata2_missing_a_length_byte().verify(),
+        Err(ScriptError::BadOpcode)
+    );
 }
 
 /// OP_CHECKSIG runs FindAndDelete over the scriptCode before it checks the
@@ -736,7 +760,10 @@ fn p2sh_redeem_script_with_a_truncated_pushdata2_fails_der_not_panic() {
 /// than the one byte left, so the push fails; with length 1 it is true.
 #[test]
 fn pushdata4_length_uses_all_four_bytes() {
-    assert_eq!(script_edges::pushdata4_length_with_byte_2_set().verify(), Err(ScriptError::BadOpcode));
+    assert_eq!(
+        script_edges::pushdata4_length_with_byte_2_set().verify(),
+        Err(ScriptError::BadOpcode)
+    );
     assert_eq!(script_edges::pushdata4_length_of_one().verify(), Ok(()));
 }
 
@@ -745,7 +772,10 @@ fn pushdata4_length_uses_all_four_bytes() {
 /// valid.
 #[test]
 fn p2sh_redeem_script_pushed_with_pushdata4_256_plus_is_push_only() {
-    assert_eq!(script_edges::p2sh_redeem_script_pushed_with_pushdata4().verify(), Ok(()));
+    assert_eq!(
+        script_edges::p2sh_redeem_script_pushed_with_pushdata4().verify(),
+        Ok(())
+    );
 }
 
 /// The legacy sighash serialises the scriptCode as it is when it holds no
@@ -763,9 +793,15 @@ fn legacy_sighash_keeps_codeseparator_bytes_inside_pushdata1_data() {
 /// length is the wrong length (interpreter.cpp VerifyWitnessProgram).
 #[test]
 fn witness_program_40_bytes() {
-    assert_eq!(script_edges::witness_v1_program_of_40_bytes(0).verify(), Ok(()));
     assert_eq!(
-        script_edges::witness_v1_program_of_40_bytes(flags::VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM).verify(),
+        script_edges::witness_v1_program_of_40_bytes(0).verify(),
+        Ok(())
+    );
+    assert_eq!(
+        script_edges::witness_v1_program_of_40_bytes(
+            flags::VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+        )
+        .verify(),
         Err(ScriptError::DiscourageUpgradableWitnessProgram),
     );
     assert_eq!(
@@ -786,5 +822,8 @@ fn find_and_delete_with_long_pushes_and_const_scriptcode() {
         script_edges::const_scriptcode_finds_a_256_byte_signature().verify(),
         Err(ScriptError::SigFindAndDelete),
     );
-    assert_eq!(script_edges::const_scriptcode_skips_a_signature_inside_pushdata4_data().verify(), Ok(()));
+    assert_eq!(
+        script_edges::const_scriptcode_skips_a_signature_inside_pushdata4_data().verify(),
+        Ok(())
+    );
 }

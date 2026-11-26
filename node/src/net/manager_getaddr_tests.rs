@@ -57,7 +57,6 @@ fn mk_pm_with_proxy(proxy: Option<String>) -> (Arc<PeerManager>, tempfile::TempD
     (pm, dir)
 }
 
-
 fn add_peer(pm: &PeerManager, info: PeerInfo) -> mpsc::Receiver<NetworkMessage> {
     let (tx, rx) = mpsc::channel::<NetworkMessage>(64);
     pm.peers.write().insert(
@@ -101,13 +100,18 @@ fn answered(rx: &mut mpsc::Receiver<NetworkMessage>) -> Option<Vec<SocketAddr>> 
             NetworkMessage::Addr(a) => got
                 .get_or_insert_with(Vec::new)
                 .extend(a.iter().filter_map(|(_, x)| x.socket_addr().ok())),
-            NetworkMessage::AddrV2(a) => got.get_or_insert_with(Vec::new).extend(a.iter().filter_map(|m| {
-                match m.addr {
-                    bitcoin::p2p::address::AddrV2::Ipv4(ip) => Some(SocketAddr::from((ip, m.port))),
-                    bitcoin::p2p::address::AddrV2::Ipv6(ip) => Some(SocketAddr::from((ip, m.port))),
-                    _ => None,
-                }
-            })),
+            NetworkMessage::AddrV2(a) => {
+                got.get_or_insert_with(Vec::new)
+                    .extend(a.iter().filter_map(|m| match m.addr {
+                        bitcoin::p2p::address::AddrV2::Ipv4(ip) => {
+                            Some(SocketAddr::from((ip, m.port)))
+                        }
+                        bitcoin::p2p::address::AddrV2::Ipv6(ip) => {
+                            Some(SocketAddr::from((ip, m.port)))
+                        }
+                        _ => None,
+                    }))
+            }
             _ => {}
         }
     }
@@ -126,13 +130,24 @@ fn an_inbound_peer_gets_one_sample_of_the_address_book() {
     pm.external_addrs.write().push(external);
     let connected = SocketAddr::from(([44, 44, 44, 44], 8333));
     let _c = add_peer(&pm, peer(9, connected, Direction::Outbound));
-    let mut rx = add_peer(&pm, peer(1, SocketAddr::from(([10, 1, 1, 1], 50000)), Direction::Inbound));
+    let mut rx = add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([10, 1, 1, 1], 50000)),
+            Direction::Inbound,
+        ),
+    );
 
     pm.handle_message(1, NetworkMessage::GetAddr, InFlight::adopt(None));
     let got = answered(&mut rx).expect("an inbound peer is answered");
     assert_eq!(got.len(), 200 * 23 / 100, "23% of the book");
-    let book: std::collections::HashSet<PeerAddr> = pm.addrman.read().iter().map(|e| e.addr.clone()).collect();
-    assert!(got.iter().all(|a| book.contains(&PeerAddr::Socket(*a))), "only address-book entries");
+    let book: std::collections::HashSet<PeerAddr> =
+        pm.addrman.read().iter().map(|e| e.addr.clone()).collect();
+    assert!(
+        got.iter().all(|a| book.contains(&PeerAddr::Socket(*a))),
+        "only address-book entries"
+    );
     assert!(!got.contains(&connected), "no live peer list");
     assert!(!got.contains(&external), "not our own address");
 
@@ -147,7 +162,14 @@ fn an_inbound_peer_gets_one_sample_of_the_address_book() {
 fn an_outbound_peer_is_not_answered() {
     let (pm, _dir) = mk_pm();
     fill_book(&pm, 50);
-    let mut rx = add_peer(&pm, peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound));
+    let mut rx = add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([198, 51, 100, 7], 8333)),
+            Direction::Outbound,
+        ),
+    );
     pm.handle_message(1, NetworkMessage::GetAddr, InFlight::adopt(None));
     assert_eq!(answered(&mut rx), None);
 }
@@ -160,32 +182,70 @@ fn an_outbound_peer_is_not_answered() {
 fn the_sample_is_cached_per_listener() {
     let (pm, _dir) = mk_pm();
     fill_book(&pm, 400);
-    let mut a = add_peer(&pm, peer(1, SocketAddr::from(([10, 1, 1, 1], 50000)), Direction::Inbound));
-    let mut b = add_peer(&pm, peer(2, SocketAddr::from(([10, 1, 1, 2], 50000)), Direction::Inbound));
-    let mut onion = peer(3, SocketAddr::from(([127, 0, 0, 1], 50003)), Direction::Inbound);
+    let mut a = add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([10, 1, 1, 1], 50000)),
+            Direction::Inbound,
+        ),
+    );
+    let mut b = add_peer(
+        &pm,
+        peer(
+            2,
+            SocketAddr::from(([10, 1, 1, 2], 50000)),
+            Direction::Inbound,
+        ),
+    );
+    let mut onion = peer(
+        3,
+        SocketAddr::from(([127, 0, 0, 1], 50003)),
+        Direction::Inbound,
+    );
     onion.direction = Direction::Inbound;
     onion.inbound_onion = true;
     let mut o = add_peer(&pm, onion);
     for id in [1, 2, 3] {
         pm.handle_message(id, NetworkMessage::GetAddr, InFlight::adopt(None));
     }
-    let (sa, sb, so) = (answered(&mut a).unwrap(), answered(&mut b).unwrap(), answered(&mut o).unwrap());
+    let (sa, sb, so) = (
+        answered(&mut a).unwrap(),
+        answered(&mut b).unwrap(),
+        answered(&mut o).unwrap(),
+    );
     assert_eq!(sa, sb, "one listener, one cached sample");
     assert_ne!(sa, so, "the onion listener's sample is its own");
 
     // Two onion binds are two listeners (Core's p2p_getaddr_caching.py).
-    let mut onion2 = peer(5, SocketAddr::from(([127, 0, 0, 1], 50005)), Direction::Inbound);
+    let mut onion2 = peer(
+        5,
+        SocketAddr::from(([127, 0, 0, 1], 50005)),
+        Direction::Inbound,
+    );
     onion2.inbound_onion = true;
     onion2.bind_addr = Some(SocketAddr::from(([127, 0, 0, 1], 18446)));
     let mut o2 = add_peer(&pm, onion2);
     pm.handle_message(5, NetworkMessage::GetAddr, InFlight::adopt(None));
-    assert_ne!(answered(&mut o2).unwrap(), so, "another bind, another sample");
+    assert_ne!(
+        answered(&mut o2).unwrap(),
+        so,
+        "another bind, another sample"
+    );
 
-    let mut fresh = peer(4, SocketAddr::from(([10, 1, 1, 4], 50000)), Direction::Inbound);
+    let mut fresh = peer(
+        4,
+        SocketAddr::from(([10, 1, 1, 4], 50000)),
+        Direction::Inbound,
+    );
     fresh.permissions.addr = true;
     let mut f = add_peer(&pm, fresh);
     pm.handle_message(4, NetworkMessage::GetAddr, InFlight::adopt(None));
-    assert_ne!(answered(&mut f).unwrap(), sa, "the addr permission skips the cache");
+    assert_ne!(
+        answered(&mut f).unwrap(),
+        sa,
+        "the addr permission skips the cache"
+    );
 }
 
 /// Our `-externalip` addresses go to an outbound peer on the same IP family
@@ -196,14 +256,30 @@ fn externals_are_advertised_to_outbound_peers_on_their_family() {
     let v4 = SocketAddr::from(([44, 33, 22, 11], 8333));
     let v6: SocketAddr = "[2a01:4f8::50]:8333".parse().unwrap();
     pm.external_addrs.write().extend([v4, v6]);
-    let _r = add_peer(&pm, peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound));
-    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else { panic!("a legacy addr") };
+    let _r = add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([198, 51, 100, 7], 8333)),
+            Direction::Outbound,
+        ),
+    );
+    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else {
+        panic!("a legacy addr")
+    };
     let got: Vec<SocketAddr> = a.iter().filter_map(|(_, x)| x.socket_addr().ok()).collect();
     assert_eq!(got, vec![v4]);
-    let mut onion = peer(2, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    let mut onion = peer(
+        2,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        Direction::Outbound,
+    );
     onion.onion_host = Some("a".repeat(56) + ".onion");
     let _o = add_peer(&pm, onion);
-    assert!(pm.self_advertise_externals(2).is_none(), "nothing clearnet to an onion peer");
+    assert!(
+        pm.self_advertise_externals(2).is_none(),
+        "nothing clearnet to an onion peer"
+    );
 }
 
 /// An `-externalip` address Core calls unroutable is never claimed: not
@@ -225,21 +301,53 @@ fn an_unroutable_externalip_is_never_advertised() {
         public,
         cjdns,
     ]);
-    let _r = add_peer(&pm, peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound));
-    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else { panic!("a legacy addr") };
+    let _r = add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([198, 51, 100, 7], 8333)),
+            Direction::Outbound,
+        ),
+    );
+    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else {
+        panic!("a legacy addr")
+    };
     let got: Vec<SocketAddr> = a.iter().filter_map(|(_, x)| x.socket_addr().ok()).collect();
     assert_eq!(got, vec![public], "only the routable address is advertised");
-    let local: Vec<String> = pm.local_addresses().into_iter().map(|(h, _, _)| h).collect();
+    let local: Vec<String> = pm
+        .local_addresses()
+        .into_iter()
+        .map(|(h, _, _)| h)
+        .collect();
     assert_eq!(local, vec!["44.33.22.11".to_string()]);
 
-    pm.set_reachable(crate::net::reachable::ReachableNets { cjdns: true, cjdns_flip: true, ..Default::default() });
-    let local: Vec<String> = pm.local_addresses().into_iter().map(|(h, _, _)| h).collect();
-    assert_eq!(local, vec!["44.33.22.11".to_string()], "no CJDNS encoding, so no CJDNS self-advertisement");
+    pm.set_reachable(crate::net::reachable::ReachableNets {
+        cjdns: true,
+        cjdns_flip: true,
+        ..Default::default()
+    });
+    let local: Vec<String> = pm
+        .local_addresses()
+        .into_iter()
+        .map(|(h, _, _)| h)
+        .collect();
+    assert_eq!(
+        local,
+        vec!["44.33.22.11".to_string()],
+        "no CJDNS encoding, so no CJDNS self-advertisement"
+    );
 
     pm.set_external_addrs(vec![SocketAddr::from(([10, 1, 2, 3], 8333)), public]);
-    let version = pm.build_version_message(SocketAddr::from(([198, 51, 100, 7], 8333)), ConnType::OutboundFullRelay);
+    let version = pm.build_version_message(
+        SocketAddr::from(([198, 51, 100, 7], 8333)),
+        ConnType::OutboundFullRelay,
+    );
     let dummy = SocketAddr::from(([0, 0, 0, 0], 0));
-    assert_eq!(version.sender.socket_addr().ok(), Some(dummy), "addr_from is Core's dummy, never -externalip");
+    assert_eq!(
+        version.sender.socket_addr().ok(),
+        Some(dummy),
+        "addr_from is Core's dummy, never -externalip"
+    );
 }
 
 /// A block-relay-only link carries no address traffic, so neither our
@@ -248,27 +356,54 @@ fn an_unroutable_externalip_is_never_advertised() {
 #[test]
 fn nothing_is_self_advertised_to_a_block_relay_only_peer() {
     let (pm, _dir) = mk_pm();
-    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
-    *pm.advertised_onion.write() = Some(PeerAddr::Onion { host: "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion".to_string(), port: 8333 });
-    let mut full = peer(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound);
+    pm.external_addrs
+        .write()
+        .push(SocketAddr::from(([44, 33, 22, 11], 8333)));
+    *pm.advertised_onion.write() = Some(PeerAddr::Onion {
+        host: "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion".to_string(),
+        port: 8333,
+    });
+    let mut full = peer(
+        1,
+        SocketAddr::from(([198, 51, 100, 7], 8333)),
+        Direction::Outbound,
+    );
     full.wants_addrv2 = true;
     let _f = add_peer(&pm, full);
-    let mut blocks_only = peer(2, SocketAddr::from(([198, 51, 100, 8], 8333)), Direction::Outbound);
+    let mut blocks_only = peer(
+        2,
+        SocketAddr::from(([198, 51, 100, 8], 8333)),
+        Direction::Outbound,
+    );
     blocks_only.wants_addrv2 = true;
     blocks_only.conn_type = ConnType::BlockRelay;
     let _b = add_peer(&pm, blocks_only);
-    let mut onion_full = peer(3, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    let mut onion_full = peer(
+        3,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        Direction::Outbound,
+    );
     onion_full.wants_addrv2 = true;
     onion_full.onion_host = Some("a".repeat(56) + ".onion");
     let _of = add_peer(&pm, onion_full);
-    let mut onion_blocks = peer(4, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    let mut onion_blocks = peer(
+        4,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        Direction::Outbound,
+    );
     onion_blocks.wants_addrv2 = true;
     onion_blocks.onion_host = Some("b".repeat(56) + ".onion");
     onion_blocks.conn_type = ConnType::BlockRelay;
     let _ob = add_peer(&pm, onion_blocks);
     assert!(pm.self_advertise_externals(1).is_some() && pm.self_advertise_addrv2(3).is_some());
-    assert!(pm.self_advertise_externals(2).is_none(), "no -externalip on a block-relay-only link");
-    assert!(pm.self_advertise_addrv2(4).is_none(), "no onion on a block-relay-only link");
+    assert!(
+        pm.self_advertise_externals(2).is_none(),
+        "no -externalip on a block-relay-only link"
+    );
+    assert!(
+        pm.self_advertise_addrv2(4).is_none(),
+        "no onion on a block-relay-only link"
+    );
 }
 
 const OUR_ONION: &str = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfid.onion";
@@ -281,35 +416,105 @@ const OUR_ONION: &str = "5g72ppm3krkorsfopcm2bi7wlv4ohhs4u4mlseymasn7g7zhdcyjpfi
 #[test]
 fn our_onion_goes_only_to_links_that_hide_our_ip() {
     let (pm, _dir) = mk_pm();
-    *pm.advertised_onion.write() = Some(PeerAddr::Onion { host: OUR_ONION.to_string(), port: 8333 });
+    *pm.advertised_onion.write() = Some(PeerAddr::Onion {
+        host: OUR_ONION.to_string(),
+        port: 8333,
+    });
     let addrv2 = |id, addr: SocketAddr, direction| {
         let mut p = peer(id, addr, direction);
         p.wants_addrv2 = true;
         p
     };
-    let _out = add_peer(&pm, addrv2(1, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Outbound));
-    let _inb = add_peer(&pm, addrv2(2, SocketAddr::from(([198, 51, 100, 8], 50000)), Direction::Inbound));
-    let mut via_onion = addrv2(3, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    let _out = add_peer(
+        &pm,
+        addrv2(
+            1,
+            SocketAddr::from(([198, 51, 100, 7], 8333)),
+            Direction::Outbound,
+        ),
+    );
+    let _inb = add_peer(
+        &pm,
+        addrv2(
+            2,
+            SocketAddr::from(([198, 51, 100, 8], 50000)),
+            Direction::Inbound,
+        ),
+    );
+    let mut via_onion = addrv2(
+        3,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        Direction::Outbound,
+    );
     via_onion.onion_host = Some("a".repeat(56) + ".onion");
     let _vo = add_peer(&pm, via_onion);
-    let mut in_onion = addrv2(4, SocketAddr::from(([127, 0, 0, 1], 50001)), Direction::Inbound);
+    let mut in_onion = addrv2(
+        4,
+        SocketAddr::from(([127, 0, 0, 1], 50001)),
+        Direction::Inbound,
+    );
     in_onion.inbound_onion = true;
     let _io = add_peer(&pm, in_onion);
-    assert!(pm.self_advertise_addrv2(1).is_none(), "not to a direct outbound clearnet peer");
-    assert!(pm.self_advertise_addrv2(2).is_none(), "not to an inbound clearnet peer");
-    assert!(pm.self_advertise_addrv2(3).is_some(), "to an outbound onion peer");
-    assert!(pm.self_advertise_addrv2(4).is_some(), "to a peer in on the onion listener");
+    assert!(
+        pm.self_advertise_addrv2(1).is_none(),
+        "not to a direct outbound clearnet peer"
+    );
+    assert!(
+        pm.self_advertise_addrv2(2).is_none(),
+        "not to an inbound clearnet peer"
+    );
+    assert!(
+        pm.self_advertise_addrv2(3).is_some(),
+        "to an outbound onion peer"
+    );
+    assert!(
+        pm.self_advertise_addrv2(4).is_some(),
+        "to a peer in on the onion listener"
+    );
 
     // Under `-proxy` a routable outbound dial goes through the proxy, so the
     // peer sees the proxy's address, not ours.
     let (proxied, _pdir) = mk_pm_with_proxy(Some("127.0.0.1:9050".to_string()));
-    *proxied.advertised_onion.write() = Some(PeerAddr::Onion { host: OUR_ONION.to_string(), port: 8333 });
-    let _pout = add_peer(&proxied, addrv2(1, SocketAddr::from(([44, 44, 44, 7], 8333)), Direction::Outbound));
-    let _pinb = add_peer(&proxied, addrv2(2, SocketAddr::from(([44, 44, 44, 8], 50000)), Direction::Inbound));
-    let _plan = add_peer(&proxied, addrv2(5, SocketAddr::from(([10, 1, 2, 3], 8333)), Direction::Outbound));
-    assert!(proxied.self_advertise_addrv2(1).is_some(), "to an outbound clearnet peer reached through -proxy");
-    assert!(proxied.self_advertise_addrv2(2).is_none(), "an inbound clearnet peer still sees our IP");
-    assert!(proxied.self_advertise_addrv2(5).is_none(), "a private address is dialled directly, not through -proxy");
+    *proxied.advertised_onion.write() = Some(PeerAddr::Onion {
+        host: OUR_ONION.to_string(),
+        port: 8333,
+    });
+    let _pout = add_peer(
+        &proxied,
+        addrv2(
+            1,
+            SocketAddr::from(([44, 44, 44, 7], 8333)),
+            Direction::Outbound,
+        ),
+    );
+    let _pinb = add_peer(
+        &proxied,
+        addrv2(
+            2,
+            SocketAddr::from(([44, 44, 44, 8], 50000)),
+            Direction::Inbound,
+        ),
+    );
+    let _plan = add_peer(
+        &proxied,
+        addrv2(
+            5,
+            SocketAddr::from(([10, 1, 2, 3], 8333)),
+            Direction::Outbound,
+        ),
+    );
+    assert!(
+        proxied.self_advertise_addrv2(1).is_some(),
+        "to an outbound clearnet peer reached through -proxy"
+    );
+    assert!(
+        proxied.self_advertise_addrv2(2).is_none(),
+        "an inbound clearnet peer still sees our IP"
+    );
+    assert!(
+        proxied.self_advertise_addrv2(5).is_none(),
+        "a private address is dialled directly, not through -proxy"
+    );
 }
 
 /// A `getaddr` reply never carries one of our own addresses, cached or
@@ -325,18 +530,41 @@ fn our_own_addresses_never_come_back_in_getaddr() {
     pm.external_addrs.write().push(external);
     pm.set_advertised_onion(OUR_ONION.to_string(), 8333);
     let stranger = SocketAddr::from(([5, 6, 7, 8], 8333));
-    let entry = |addr| GetAddrEntry { addr, time: 1, services: ServiceFlags::NETWORK };
+    let entry = |addr| GetAddrEntry {
+        addr,
+        time: 1,
+        services: ServiceFlags::NETWORK,
+    };
     let planted = vec![
         entry(PeerAddr::Socket(stranger)),
-        entry(PeerAddr::Onion { host: OUR_ONION.to_uppercase(), port: 8333 }),
-        entry(PeerAddr::Socket(SocketAddr::from(([44, 33, 22, 11], 18333)))),
-        entry(PeerAddr::Socket(SocketAddr::new(IpAddr::V6(std::net::Ipv4Addr::new(44, 33, 22, 11).to_ipv6_mapped()), 8333))),
+        entry(PeerAddr::Onion {
+            host: OUR_ONION.to_uppercase(),
+            port: 8333,
+        }),
+        entry(PeerAddr::Socket(SocketAddr::from((
+            [44, 33, 22, 11],
+            18333,
+        )))),
+        entry(PeerAddr::Socket(SocketAddr::new(
+            IpAddr::V6(std::net::Ipv4Addr::new(44, 33, 22, 11).to_ipv6_mapped()),
+            8333,
+        ))),
     ];
     for onion in [false, true] {
         let key = GetAddrCacheKey { bind: None, onion };
-        pm.addr_response_cache.lock().insert(key, (u64::MAX, planted.clone()));
-        let got: Vec<PeerAddr> = pm.getaddr_reply(key, false).into_iter().map(|e| e.addr).collect();
-        assert_eq!(got, vec![PeerAddr::Socket(stranger)], "only the stranger is handed out (onion listener: {onion})");
+        pm.addr_response_cache
+            .lock()
+            .insert(key, (u64::MAX, planted.clone()));
+        let got: Vec<PeerAddr> = pm
+            .getaddr_reply(key, false)
+            .into_iter()
+            .map(|e| e.addr)
+            .collect();
+        assert_eq!(
+            got,
+            vec![PeerAddr::Socket(stranger)],
+            "only the stranger is handed out (onion listener: {onion})"
+        );
     }
 }
 
@@ -352,20 +580,37 @@ fn withdrawn_and_unadvertised_onions_of_ours_stay_out_of_getaddr() {
     pm.clear_advertised_onion();
     pm.add_own_onions([spare.clone()]);
     let stranger = SocketAddr::from(([5, 6, 7, 8], 8333));
-    let entry = |addr| GetAddrEntry { addr, time: 1, services: ServiceFlags::NETWORK };
-    let key = GetAddrCacheKey { bind: None, onion: false };
+    let entry = |addr| GetAddrEntry {
+        addr,
+        time: 1,
+        services: ServiceFlags::NETWORK,
+    };
+    let key = GetAddrCacheKey {
+        bind: None,
+        onion: false,
+    };
     pm.addr_response_cache.lock().insert(
         key,
         (
             u64::MAX,
             vec![
                 entry(PeerAddr::Socket(stranger)),
-                entry(PeerAddr::Onion { host: OUR_ONION.to_string(), port: 8333 }),
-                entry(PeerAddr::Onion { host: spare.to_uppercase(), port: 9999 }),
+                entry(PeerAddr::Onion {
+                    host: OUR_ONION.to_string(),
+                    port: 8333,
+                }),
+                entry(PeerAddr::Onion {
+                    host: spare.to_uppercase(),
+                    port: 9999,
+                }),
             ],
         ),
     );
-    let got: Vec<PeerAddr> = pm.getaddr_reply(key, false).into_iter().map(|e| e.addr).collect();
+    let got: Vec<PeerAddr> = pm
+        .getaddr_reply(key, false)
+        .into_iter()
+        .map(|e| e.addr)
+        .collect();
     assert_eq!(got, vec![PeerAddr::Socket(stranger)]);
 }
 
@@ -377,18 +622,46 @@ fn withdrawn_and_unadvertised_onions_of_ours_stay_out_of_getaddr() {
 #[test]
 fn a_link_that_hides_our_ip_never_gets_both_our_onion_and_our_ip() {
     let (pm, _dir) = mk_pm_with_proxy(Some("127.0.0.1:9050".to_string()));
-    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
-    let mut proxied = peer(1, SocketAddr::from(([44, 44, 44, 7], 8333)), Direction::Outbound);
+    pm.external_addrs
+        .write()
+        .push(SocketAddr::from(([44, 33, 22, 11], 8333)));
+    let mut proxied = peer(
+        1,
+        SocketAddr::from(([44, 44, 44, 7], 8333)),
+        Direction::Outbound,
+    );
     proxied.wants_addrv2 = true;
     let _p = add_peer(&pm, proxied);
-    let _d = add_peer(&pm, peer(2, SocketAddr::from(([10, 1, 2, 3], 8333)), Direction::Outbound));
-    assert!(pm.self_advertise_externals(1).is_some(), "no onion yet: the proxied peer learns -externalip");
+    let _d = add_peer(
+        &pm,
+        peer(
+            2,
+            SocketAddr::from(([10, 1, 2, 3], 8333)),
+            Direction::Outbound,
+        ),
+    );
+    assert!(
+        pm.self_advertise_externals(1).is_some(),
+        "no onion yet: the proxied peer learns -externalip"
+    );
 
     pm.set_advertised_onion(OUR_ONION.to_string(), 8333);
-    assert!(pm.self_advertise_addrv2(1).is_some(), "the proxied peer is told the onion");
-    assert!(pm.self_advertise_externals(1).is_none(), "and so not our IP");
-    assert!(pm.self_advertise_addrv2(2).is_none(), "a direct peer is not told the onion");
-    assert!(pm.self_advertise_externals(2).is_some(), "but still learns -externalip");
+    assert!(
+        pm.self_advertise_addrv2(1).is_some(),
+        "the proxied peer is told the onion"
+    );
+    assert!(
+        pm.self_advertise_externals(1).is_none(),
+        "and so not our IP"
+    );
+    assert!(
+        pm.self_advertise_addrv2(2).is_none(),
+        "a direct peer is not told the onion"
+    );
+    assert!(
+        pm.self_advertise_externals(2).is_some(),
+        "but still learns -externalip"
+    );
 }
 
 /// Both self-advertisements follow the one read of our onion the handshake
@@ -399,14 +672,27 @@ fn a_link_that_hides_our_ip_never_gets_both_our_onion_and_our_ip() {
 #[test]
 fn both_self_advertisements_follow_the_handshakes_one_read_of_our_onion() {
     let (pm, _dir) = mk_pm_with_proxy(Some("127.0.0.1:9050".to_string()));
-    pm.external_addrs.write().push(SocketAddr::from(([44, 33, 22, 11], 8333)));
-    let mut proxied = peer(1, SocketAddr::from(([44, 44, 44, 7], 8333)), Direction::Outbound);
+    pm.external_addrs
+        .write()
+        .push(SocketAddr::from(([44, 33, 22, 11], 8333)));
+    let mut proxied = peer(
+        1,
+        SocketAddr::from(([44, 44, 44, 7], 8333)),
+        Direction::Outbound,
+    );
     proxied.wants_addrv2 = true;
     let _p = add_peer(&pm, proxied);
     let read_at_handshake: Option<PeerAddr> = None;
     pm.set_advertised_onion(OUR_ONION.to_string(), 8333);
-    assert!(pm.self_advertise_externals_given(1, read_at_handshake.as_ref()).is_some());
-    assert!(pm.self_advertise_addrv2_given(1, read_at_handshake).is_none(), "not both on one hidden link");
+    assert!(
+        pm.self_advertise_externals_given(1, read_at_handshake.as_ref())
+            .is_some()
+    );
+    assert!(
+        pm.self_advertise_addrv2_given(1, read_at_handshake)
+            .is_none(),
+        "not both on one hidden link"
+    );
 }
 
 /// An outbound peer whose `version` says it sees us at `seen`.
@@ -429,31 +715,63 @@ fn reporting_peer(pm: &PeerManager, id: PeerId, addr: SocketAddr, seen: SocketAd
 fn discover_announces_the_address_an_outbound_peer_sees_us_at() {
     let (pm, _dir) = mk_pm();
     let seen = SocketAddr::from(([81, 2, 3, 4], 51234));
-    let _r = add_peer(&pm, reporting_peer(&pm, 1, SocketAddr::from(([44, 1, 1, 1], 8333)), seen));
+    let _r = add_peer(
+        &pm,
+        reporting_peer(&pm, 1, SocketAddr::from(([44, 1, 1, 1], 8333)), seen),
+    );
     pm.set_listen_port(Some(18444));
     assert!(pm.self_advertise_externals(1).is_none(), "off by default");
 
     pm.set_discover(true);
-    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else { panic!("a legacy addr") };
+    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(1) else {
+        panic!("a legacy addr")
+    };
     let got: Vec<SocketAddr> = a.iter().filter_map(|(_, x)| x.socket_addr().ok()).collect();
     assert_eq!(got, vec![SocketAddr::from(([81, 2, 3, 4], 18444))]);
 
-    let key = GetAddrCacheKey { bind: None, onion: true };
-    let entry = |addr| GetAddrEntry { addr, time: 1, services: ServiceFlags::NETWORK };
+    let key = GetAddrCacheKey {
+        bind: None,
+        onion: true,
+    };
+    let entry = |addr| GetAddrEntry {
+        addr,
+        time: 1,
+        services: ServiceFlags::NETWORK,
+    };
     let stranger = PeerAddr::Socket(SocketAddr::from(([5, 6, 7, 8], 8333)));
     let same_ip = PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 4], 8333)));
     let ours = PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 4], 18444)));
-    pm.addr_response_cache.lock().insert(key, (u64::MAX, vec![entry(stranger.clone()), entry(same_ip.clone()), entry(ours)]));
-    let got: Vec<PeerAddr> = pm.getaddr_reply(key, false).into_iter().map(|e| e.addr).collect();
-    assert_eq!(got, vec![stranger, same_ip], "the discovered address is ours and stays out of getaddr; its IP at another port is not");
+    pm.addr_response_cache.lock().insert(
+        key,
+        (
+            u64::MAX,
+            vec![entry(stranger.clone()), entry(same_ip.clone()), entry(ours)],
+        ),
+    );
+    let got: Vec<PeerAddr> = pm
+        .getaddr_reply(key, false)
+        .into_iter()
+        .map(|e| e.addr)
+        .collect();
+    assert_eq!(
+        got,
+        vec![stranger, same_ip],
+        "the discovered address is ours and stays out of getaddr; its IP at another port is not"
+    );
 
     pm.set_discover(false);
     assert!(pm.self_advertise_externals(1).is_none(), "turned off again");
-    assert!(pm.discovered.read().is_empty(), "turning it off forgets what it announced");
+    assert!(
+        pm.discovered.read().is_empty(),
+        "turning it off forgets what it announced"
+    );
 
     pm.set_discover(true);
     pm.set_listen_port(None);
-    assert!(pm.self_advertise_externals(1).is_none(), "a node that does not listen announces nothing");
+    assert!(
+        pm.self_advertise_externals(1).is_none(),
+        "a node that does not listen announces nothing"
+    );
 }
 
 /// A report is the peer's word, so the addresses kept as ours are the
@@ -468,14 +786,24 @@ fn discovered_addresses_are_bounded() {
     for i in 0..n {
         let seen = SocketAddr::from(([81, 2, 3, i + 1], 51234));
         let id = PeerId::from(i + 1);
-        let _r = add_peer(&pm, reporting_peer(&pm, id, SocketAddr::from(([44, 1, 2, i + 1], 8333)), seen));
+        let _r = add_peer(
+            &pm,
+            reporting_peer(&pm, id, SocketAddr::from(([44, 1, 2, i + 1], 8333)), seen),
+        );
         assert!(pm.self_advertise_externals(id).is_some());
     }
     let kept: Vec<SocketAddr> = pm.discovered.read().iter().copied().collect();
     assert_eq!(kept.len(), MAX_DISCOVERED_IPS);
-    assert_eq!(kept.last(), Some(&SocketAddr::from(([81, 2, 3, n], 18444))), "the latest is kept");
+    assert_eq!(
+        kept.last(),
+        Some(&SocketAddr::from(([81, 2, 3, n], 18444))),
+        "the latest is kept"
+    );
     assert!(pm.is_own_address(&PeerAddr::Socket(SocketAddr::from(([81, 2, 3, n], 18444)))));
-    assert!(!pm.is_own_address(&PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 1], 18444)))), "the oldest is dropped");
+    assert!(
+        !pm.is_own_address(&PeerAddr::Socket(SocketAddr::from(([81, 2, 3, 1], 18444)))),
+        "the oldest is dropped"
+    );
 }
 
 /// A report is used only where Core's `IsPeerAddrLocalGood` would, and
@@ -488,29 +816,58 @@ fn discover_skips_hidden_links_bad_reports_and_yields_to_externalip() {
     let (proxied, _d) = mk_pm_with_proxy(Some("127.0.0.1:9050".to_string()));
     proxied.set_listen_port(Some(18444));
     proxied.set_discover(true);
-    let _p = add_peer(&proxied, reporting_peer(&proxied, 1, SocketAddr::from(([44, 1, 1, 2], 8333)), seen));
-    assert!(proxied.self_advertise_externals(1).is_none(), "a proxied peer sees the exit, not us");
+    let _p = add_peer(
+        &proxied,
+        reporting_peer(&proxied, 1, SocketAddr::from(([44, 1, 1, 2], 8333)), seen),
+    );
+    assert!(
+        proxied.self_advertise_externals(1).is_none(),
+        "a proxied peer sees the exit, not us"
+    );
 
     let (pm, _dir) = mk_pm();
     pm.set_listen_port(Some(18444));
     pm.set_discover(true);
     let public = SocketAddr::from(([44, 1, 1, 3], 8333));
-    let _a = add_peer(&pm, reporting_peer(&pm, 1, public, SocketAddr::from(([10, 0, 0, 5], 51234))));
-    let _b = add_peer(&pm, reporting_peer(&pm, 2, SocketAddr::from(([192, 168, 1, 5], 8333)), seen));
-    let _c = add_peer(&pm, reporting_peer(&pm, 3, public, "[2a01:4f8::1]:51234".parse().unwrap()));
+    let _a = add_peer(
+        &pm,
+        reporting_peer(&pm, 1, public, SocketAddr::from(([10, 0, 0, 5], 51234))),
+    );
+    let _b = add_peer(
+        &pm,
+        reporting_peer(&pm, 2, SocketAddr::from(([192, 168, 1, 5], 8333)), seen),
+    );
+    let _c = add_peer(
+        &pm,
+        reporting_peer(&pm, 3, public, "[2a01:4f8::1]:51234".parse().unwrap()),
+    );
     let mut onion = reporting_peer(&pm, 4, SocketAddr::from(([127, 0, 0, 1], 8333)), seen);
     onion.direction = Direction::Inbound;
     onion.inbound_onion = true;
     let _d = add_peer(&pm, onion);
-    assert!(pm.self_advertise_externals(1).is_none(), "an unroutable report");
-    assert!(pm.self_advertise_externals(2).is_none(), "an unroutable peer");
-    assert!(pm.self_advertise_externals(3).is_none(), "a report on the other family");
-    assert!(pm.self_advertise_externals(4).is_none(), "an inbound onion link");
+    assert!(
+        pm.self_advertise_externals(1).is_none(),
+        "an unroutable report"
+    );
+    assert!(
+        pm.self_advertise_externals(2).is_none(),
+        "an unroutable peer"
+    );
+    assert!(
+        pm.self_advertise_externals(3).is_none(),
+        "a report on the other family"
+    );
+    assert!(
+        pm.self_advertise_externals(4).is_none(),
+        "an inbound onion link"
+    );
 
     let external = SocketAddr::from(([44, 33, 22, 11], 8333));
     pm.set_external_addrs(vec![external]);
     let _e = add_peer(&pm, reporting_peer(&pm, 5, public, seen));
-    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(5) else { panic!("a legacy addr") };
+    let Some(NetworkMessage::Addr(a)) = pm.self_advertise_externals(5) else {
+        panic!("a legacy addr")
+    };
     let got: Vec<SocketAddr> = a.iter().filter_map(|(_, x)| x.socket_addr().ok()).collect();
     assert_eq!(got, vec![external], "-externalip wins over the report");
 }

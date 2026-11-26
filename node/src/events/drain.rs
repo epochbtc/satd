@@ -330,7 +330,10 @@ mod tests {
         );
 
         A.processed(1);
-        assert!(waiter.await.unwrap(), "and returns once processed catches up");
+        assert!(
+            waiter.await.unwrap(),
+            "and returns once processed catches up"
+        );
     }
 
     /// A bridge that has returned cannot publish anything ever again, so a

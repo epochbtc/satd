@@ -4,10 +4,13 @@
 use std::os::unix::fs::FileExt;
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
-use bitcoin::{Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, transaction};
+use bitcoin::{
+    Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    transaction,
+};
 
-use super::super::tests::{build_test_block, grind_test_pow, make_chain_state};
 use super::super::ChainError;
+use super::super::tests::{build_test_block, grind_test_pow, make_chain_state};
 use super::*;
 use crate::storage::opreturn_strip::{StripRecord, tx_spans};
 
@@ -89,7 +92,10 @@ fn chain(cs: &ChainState) -> Vec<Block> {
                 coinbase_of(&blocks[0]),
                 vec![ScriptBuf::new(), op_return(BIG, 1), op_return(SMALL, 2)],
             ),
-            spend(coinbase_of(&blocks[1]), vec![ScriptBuf::new(), op_return(SMALL, 3)]),
+            spend(
+                coinbase_of(&blocks[1]),
+                vec![ScriptBuf::new(), op_return(SMALL, 3)],
+            ),
         ],
     );
     connect(cs, &b);
@@ -99,34 +105,48 @@ fn chain(cs: &ChainState) -> Vec<Block> {
         connect(cs, &b);
         blocks.push(b);
     }
-    assert!(!cs.is_initial_block_download(), "premise: the fixture is out of IBD");
+    assert!(
+        !cs.is_initial_block_download(),
+        "premise: the fixture is out of IBD"
+    );
     blocks
 }
 
 /// The block's bytes as they sit in its block file, decoded.
 fn on_disk(cs: &ChainState, hash: &BlockHash) -> Vec<u8> {
     let entry = cs.store.get_block_index(hash).expect("indexed");
-    let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    let path = cs
+        .blocks_dir()
+        .join(format!("blk{:05}.dat", entry.file_number));
     let f = std::fs::File::open(path).unwrap();
     let mut len = [0u8; 8];
-    f.read_exact_at(&mut len, u64::from(entry.data_pos)).unwrap();
+    f.read_exact_at(&mut len, u64::from(entry.data_pos))
+        .unwrap();
     let key = cs.flat_files.lock().xor_key();
     crate::storage::flatfile::xor_in_place(&mut len, &key, u64::from(entry.data_pos));
     let size = u32::from_le_bytes(len[4..8].try_into().unwrap()) as usize;
     let mut data = vec![0u8; size];
-    f.read_exact_at(&mut data, u64::from(entry.data_pos) + 8).unwrap();
+    f.read_exact_at(&mut data, u64::from(entry.data_pos) + 8)
+        .unwrap();
     crate::storage::flatfile::xor_in_place(&mut data, &key, u64::from(entry.data_pos) + 8);
     data
 }
 
 fn write_on_disk(cs: &ChainState, hash: &BlockHash, offset: usize, bytes: &[u8]) {
     let entry = cs.store.get_block_index(hash).expect("indexed");
-    let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    let path = cs
+        .blocks_dir()
+        .join(format!("blk{:05}.dat", entry.file_number));
     let at = u64::from(entry.data_pos) + 8 + offset as u64;
     let mut enc = bytes.to_vec();
     let key = cs.flat_files.lock().xor_key();
     crate::storage::flatfile::xor_in_place(&mut enc, &key, at);
-    std::fs::OpenOptions::new().write(true).open(path).unwrap().write_all_at(&enc, at).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .write_all_at(&enc, at)
+        .unwrap();
 }
 
 /// The bytes of output `vout` of tx `tx` after its opcode, as stored.
@@ -137,12 +157,19 @@ fn payload_on_disk(cs: &ChainState, hash: &BlockHash, tx: usize, vout: usize) ->
 }
 
 fn record(cs: &ChainState, hash: &BlockHash) -> Option<StripRecord> {
-    cs.store.get_opreturn_strip(hash).unwrap().map(|b| StripRecord::decode(&b).unwrap())
+    cs.store
+        .get_opreturn_strip(hash)
+        .unwrap()
+        .map(|b| StripRecord::decode(&b).unwrap())
 }
 
 fn corrupt_warning(cs: &ChainState, hash: &BlockHash) -> Option<String> {
     let id = format!("blockdata.corrupt.{hash}");
-    cs.warnings().list().into_iter().find(|w| w.id == id).map(|w| w.message)
+    cs.warnings()
+        .list()
+        .into_iter()
+        .find(|w| w.id == id)
+        .map(|w| w.message)
 }
 
 fn stats(outcome: StripOutcome) -> StripStats {
@@ -154,10 +181,26 @@ fn stats(outcome: StripOutcome) -> StripStats {
 
 /// `get_stored_block` reads the stripped block with its original identity.
 fn assert_reads_as(cs: &ChainState, original: &Block) {
-    let stored = cs.get_stored_block(&original.block_hash()).expect("the stripped block reads");
+    let stored = cs
+        .get_stored_block(&original.block_hash())
+        .expect("the stripped block reads");
     assert!(stored.is_stripped());
-    assert_eq!(stored.txids(), original.txdata.iter().map(|t| t.compute_txid()).collect::<Vec<_>>());
-    assert_eq!(stored.wtxids(), original.txdata.iter().map(|t| t.compute_wtxid()).collect::<Vec<_>>());
+    assert_eq!(
+        stored.txids(),
+        original
+            .txdata
+            .iter()
+            .map(|t| t.compute_txid())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stored.wtxids(),
+        original
+            .txdata
+            .iter()
+            .map(|t| t.compute_wtxid())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -175,7 +218,10 @@ fn strip_block_records_then_zeroes_the_eligible_payloads() {
     assert_eq!(rec.txs.len(), 1);
     assert_eq!(rec.txs[0].tx_index, 1);
     assert_eq!(rec.txs[0].txid, b.txdata[1].compute_txid());
-    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().all(|x| *x == 0), "the big payload is zeroed");
+    assert!(
+        payload_on_disk(&cs, &hash, 1, 1).iter().all(|x| *x == 0),
+        "the big payload is zeroed"
+    );
     assert_eq!(
         payload_on_disk(&cs, &hash, 1, 2),
         op_return(SMALL, 2).as_bytes()[1..],
@@ -190,7 +236,10 @@ fn strip_block_records_then_zeroes_the_eligible_payloads() {
     assert_eq!(cs.get_block(&hash), None);
     assert_reads_as(&cs, b);
     assert_eq!(corrupt_warning(&cs, &hash), None);
-    assert_eq!(cs.get_block(&blocks[100].block_hash()).as_ref(), Some(&blocks[100]));
+    assert_eq!(
+        cs.get_block(&blocks[100].block_hash()).as_ref(),
+        Some(&blocks[100])
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -207,7 +256,10 @@ fn a_repeat_strip_re_punches_the_recorded_spans() {
 
     // As if the punch never landed.
     write_on_disk(&cs, &hash, 0, &original);
-    assert!(cs.get_stored_block(&hash).is_some(), "a record over intact bytes reads");
+    assert!(
+        cs.get_stored_block(&hash).is_some(),
+        "a record over intact bytes reads"
+    );
     let s = match cs.strip_block(&hash, THRESHOLD).unwrap() {
         StripOutcome::Redone(s) => s,
         other => panic!("expected a redo, got {other:?}"),
@@ -225,7 +277,10 @@ fn nothing_eligible_writes_nothing() {
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
     let before = on_disk(&cs, &hash);
-    assert_eq!(cs.strip_block(&hash, BIG as u64 + 1).unwrap(), StripOutcome::NothingEligible);
+    assert_eq!(
+        cs.strip_block(&hash, BIG as u64 + 1).unwrap(),
+        StripOutcome::NothingEligible
+    );
     assert_eq!(
         cs.strip_block(&blocks[50].block_hash(), 0).unwrap(),
         StripOutcome::NothingEligible,
@@ -252,16 +307,30 @@ fn a_lower_threshold_extends_the_record() {
         StripOutcome::Extended(s) => s,
         other => panic!("expected an extension, got {other:?}"),
     };
-    assert_eq!((s.txs, s.outputs, s.span_bytes), (2, 2, 2 * (SMALL as u64 - 1)));
+    assert_eq!(
+        (s.txs, s.outputs, s.span_bytes),
+        (2, 2, 2 * (SMALL as u64 - 1))
+    );
     let rec = record(&cs, &hash).unwrap();
-    let shape: Vec<(u32, Vec<u32>)> =
-        rec.txs.iter().map(|t| (t.tx_index, t.outputs.iter().map(|o| o.vout).collect())).collect();
+    let shape: Vec<(u32, Vec<u32>)> = rec
+        .txs
+        .iter()
+        .map(|t| (t.tx_index, t.outputs.iter().map(|o| o.vout).collect()))
+        .collect();
     assert_eq!(shape, vec![(1, vec![1, 2]), (2, vec![1])]);
     for (tx, vout) in [(1, 1), (1, 2), (2, 1)] {
-        assert!(payload_on_disk(&cs, &hash, tx, vout).iter().all(|x| *x == 0), "{tx}:{vout}");
+        assert!(
+            payload_on_disk(&cs, &hash, tx, vout)
+                .iter()
+                .all(|x| *x == 0),
+            "{tx}:{vout}"
+        );
     }
     assert_reads_as(&cs, b);
-    assert!(matches!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Redone(_)));
+    assert!(matches!(
+        cs.strip_block(&hash, SMALL as u64).unwrap(),
+        StripOutcome::Redone(_)
+    ));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -284,7 +353,10 @@ fn a_higher_threshold_restrip_keeps_the_record() {
         parent,
         102,
         vec![
-            spend(coinbase_of(&blocks[0]), vec![ScriptBuf::new(), op_return(SMALL, 4)]),
+            spend(
+                coinbase_of(&blocks[0]),
+                vec![ScriptBuf::new(), op_return(SMALL, 4)],
+            ),
             spend(
                 coinbase_of(&blocks[1]),
                 vec![ScriptBuf::new(), op_return(SMALL, 5), op_return(BIG, 6)],
@@ -298,14 +370,24 @@ fn a_higher_threshold_restrip_keeps_the_record() {
         connect(&cs, &next);
         parent = next.block_hash();
     }
-    assert!(!cs.is_initial_block_download(), "premise: the fixture is out of IBD");
+    assert!(
+        !cs.is_initial_block_download(),
+        "premise: the fixture is out of IBD"
+    );
     let hash = b.block_hash();
     cs.strip_block(&hash, SMALL as u64).unwrap();
     let shape = |rec: &StripRecord| -> Vec<(u32, Vec<u32>)> {
-        rec.txs.iter().map(|t| (t.tx_index, t.outputs.iter().map(|o| o.vout).collect())).collect()
+        rec.txs
+            .iter()
+            .map(|t| (t.tx_index, t.outputs.iter().map(|o| o.vout).collect()))
+            .collect()
     };
     let rec = record(&cs, &hash).unwrap();
-    assert_eq!(shape(&rec), vec![(1, vec![1]), (2, vec![1, 2])], "premise: both recorded");
+    assert_eq!(
+        shape(&rec),
+        vec![(1, vec![1]), (2, vec![1, 2])],
+        "premise: both recorded"
+    );
 
     match cs.strip_block(&hash, THRESHOLD).unwrap() {
         StripOutcome::Redone(_) => {}
@@ -329,7 +411,9 @@ fn a_stored_copy_that_fails_check_block_is_refused_and_reported() {
     let before = on_disk(&cs, &hash);
 
     match cs.strip_block(&hash, THRESHOLD) {
-        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("check_block"), "{detail}"),
+        Err(StripError::Corrupt { detail, .. }) => {
+            assert!(detail.contains("check_block"), "{detail}")
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
     let warning = corrupt_warning(&cs, &hash).expect("the corrupt copy is reported");
@@ -353,7 +437,10 @@ fn punched_bytes_with_a_lost_record_are_refused() {
             ..Default::default()
         })
         .unwrap();
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::Corrupt { .. })));
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD),
+        Err(StripError::Corrupt { .. })
+    ));
     assert_eq!(record(&cs, &hash), None);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -362,7 +449,10 @@ fn punched_bytes_with_a_lost_record_are_refused() {
 fn a_node_in_ibd_strips_nothing() {
     let (cs, dir) = make_chain_state();
     let genesis = cs.tip_hash();
-    assert!(cs.is_initial_block_download(), "premise: a genesis-only node is in IBD");
+    assert!(
+        cs.is_initial_block_download(),
+        "premise: a genesis-only node is in IBD"
+    );
     assert!(matches!(
         cs.strip_block(&genesis, 0),
         Err(StripError::NotQuiet("initial block download"))
@@ -376,10 +466,16 @@ fn bulk_load_write_mode_strips_nothing() {
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
     cs.set_write_mode(crate::storage::WriteMode::BulkLoad);
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::NotQuiet(_))));
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD),
+        Err(StripError::NotQuiet(_))
+    ));
     assert_eq!(record(&cs, &hash), None);
     cs.set_write_mode(crate::storage::WriteMode::Normal);
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD).unwrap(),
+        StripOutcome::Stripped(_)
+    ));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -389,9 +485,19 @@ fn a_background_chainstate_strips_nothing() {
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
     let snap = blocks[104].block_hash();
-    cs.attach_background(dir.join("chainstate_background"), 105, snap, [0u8; 32], 64, -1)
-        .unwrap();
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::NotQuiet(_))));
+    cs.attach_background(
+        dir.join("chainstate_background"),
+        105,
+        snap,
+        [0u8; 32],
+        64,
+        -1,
+    )
+    .unwrap();
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD),
+        Err(StripError::NotQuiet(_))
+    ));
     assert_eq!(record(&cs, &hash), None);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -403,12 +509,18 @@ fn only_a_valid_block_on_the_active_chain_is_stripped() {
     let hash = blocks[101].block_hash();
 
     let unknown = BlockHash::from_byte_array([9; 32]);
-    assert!(matches!(cs.strip_block(&unknown, THRESHOLD), Err(StripError::UnknownBlock(_))));
+    assert!(matches!(
+        cs.strip_block(&unknown, THRESHOLD),
+        Err(StripError::UnknownBlock(_))
+    ));
 
     cs.invalidate_block(hash).unwrap();
     assert!(matches!(
         cs.strip_block(&hash, THRESHOLD),
-        Err(StripError::NotValid { status: BlockStatus::Invalid, .. })
+        Err(StripError::NotValid {
+            status: BlockStatus::Invalid,
+            ..
+        })
     ));
     cs.reconsider_block(hash).unwrap();
     assert_eq!(cs.tip_hash(), blocks[104].block_hash());
@@ -423,8 +535,15 @@ fn only_a_valid_block_on_the_active_chain_is_stripped() {
     }
     assert_eq!(cs.tip_hash(), parent, "premise: the fork is active");
     let entry = cs.store.get_block_index(&hash).unwrap();
-    assert_eq!(entry.status, BlockStatus::Valid, "premise: a disconnected block stays Valid");
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD), Err(StripError::NotActive(_))));
+    assert_eq!(
+        entry.status,
+        BlockStatus::Valid,
+        "premise: a disconnected block stays Valid"
+    );
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD),
+        Err(StripError::NotActive(_))
+    ));
     assert_eq!(record(&cs, &hash), None);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -450,19 +569,34 @@ fn a_repoint_before_the_punch_leaves_no_record() {
             cs.repair_block_data_by_append(&b, 102).unwrap(),
             crate::chain::state::BlockDataRepair::Repaired { .. }
         ));
-        assert!(record(cs, &b.block_hash()).is_none(), "the repair dropped the record");
+        assert!(
+            record(cs, &b.block_hash()).is_none(),
+            "the repair dropped the record"
+        );
     }));
 
-    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
+    assert_eq!(
+        cs.strip_block(&hash, SMALL as u64).unwrap(),
+        StripOutcome::Raced
+    );
     let now = cs.store.get_block_index(&hash).unwrap();
-    assert_ne!((now.file_number, now.data_pos), (old.file_number, old.data_pos), "premise: moved");
+    assert_ne!(
+        (now.file_number, now.data_pos),
+        (old.file_number, old.data_pos),
+        "premise: moved"
+    );
     assert_eq!(record(&cs, &hash), None);
     assert_eq!(cs.get_block(&hash).as_ref(), Some(&blocks[101]));
     // Neither copy was punched by the extension.
     let at_old = {
-        let path = cs.blocks_dir().join(format!("blk{:05}.dat", old.file_number));
+        let path = cs
+            .blocks_dir()
+            .join(format!("blk{:05}.dat", old.file_number));
         let mut data = vec![0u8; before.len()];
-        std::fs::File::open(path).unwrap().read_exact_at(&mut data, u64::from(old.data_pos) + 8).unwrap();
+        std::fs::File::open(path)
+            .unwrap()
+            .read_exact_at(&mut data, u64::from(old.data_pos) + 8)
+            .unwrap();
         let key = cs.flat_files.lock().xor_key();
         crate::storage::flatfile::xor_in_place(&mut data, &key, u64::from(old.data_pos) + 8);
         data
@@ -489,18 +623,31 @@ fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
     let invalidate = move |cs: &ChainState| {
         let _accept = cs.accept_lock.lock();
         cs.mark_subtree_invalid(hash).unwrap();
-        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Invalid);
+        assert_eq!(
+            cs.store.get_block_index(&hash).unwrap().status,
+            BlockStatus::Invalid
+        );
     };
 
     // No prior record: none is left.
     *cs.strip.after_plan_hook.lock() = Some(Box::new(invalidate));
     let changes = cs.strip.changes.load(Ordering::Acquire);
-    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(
+        cs.strip_block(&hash, THRESHOLD).unwrap(),
+        StripOutcome::Raced
+    );
     assert_eq!(record(&cs, &hash), None);
     // The raced write counts as a change, as every record write does, so an
     // option-off pass counts again after it.
-    assert_ne!(cs.strip.changes.load(Ordering::Acquire), changes, "the raced write was not counted as a change");
-    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
+    assert_ne!(
+        cs.strip.changes.load(Ordering::Acquire),
+        changes,
+        "the raced write was not counted as a change"
+    );
+    assert!(
+        payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0),
+        "not punched"
+    );
     assert_eq!(cs.get_block(&hash).as_ref(), Some(&blocks[101]));
     let _ = std::fs::remove_dir_all(dir);
 
@@ -508,12 +655,22 @@ fn a_block_invalidated_before_the_punch_keeps_its_prior_record() {
     let (cs, dir) = make_chain_state();
     let blocks = chain(&cs);
     assert_eq!(blocks[101].block_hash(), hash);
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD).unwrap(),
+        StripOutcome::Stripped(_)
+    ));
     let prior = record(&cs, &hash);
     *cs.strip.after_plan_hook.lock() = Some(Box::new(invalidate));
-    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
+    assert_eq!(
+        cs.strip_block(&hash, SMALL as u64).unwrap(),
+        StripOutcome::Raced
+    );
     assert_eq!(record(&cs, &hash), prior);
-    assert_eq!(payload_on_disk(&cs, &hash, 2, 1), op_return(SMALL, 3).as_bytes()[1..], "not punched");
+    assert_eq!(
+        payload_on_disk(&cs, &hash, 2, 1),
+        op_return(SMALL, 3).as_bytes()[1..],
+        "not punched"
+    );
     // Invalid, but its data is still served, through the record.
     assert_reads_as(&cs, &blocks[101]);
     assert_eq!(corrupt_warning(&cs, &hash), None);
@@ -565,7 +722,9 @@ fn an_entry_pointing_at_another_block_is_refused() {
         })
         .unwrap();
     match cs.strip_block(&hash, 0) {
-        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("different block"), "{detail}"),
+        Err(StripError::Corrupt { detail, .. }) => {
+            assert!(detail.contains("different block"), "{detail}")
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert_eq!(record(&cs, &hash), None);
@@ -594,7 +753,10 @@ fn a_prune_before_the_punch_leaves_no_record() {
             })
             .unwrap();
     }));
-    assert_eq!(cs.strip_block(&hash, SMALL as u64).unwrap(), StripOutcome::Raced);
+    assert_eq!(
+        cs.strip_block(&hash, SMALL as u64).unwrap(),
+        StripOutcome::Raced
+    );
     assert_eq!(record(&cs, &hash), None);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -607,10 +769,16 @@ fn a_prune_before_the_punch_leaves_no_record() {
 fn an_extension_refuses_bytes_changed_since_the_first_strip() {
     let (cs, dir) = make_chain_state();
     let blocks = chain(&cs);
-    let mut witness_tx = spend(coinbase_of(&blocks[2]), vec![ScriptBuf::new(), op_return(SMALL, 4)]);
+    let mut witness_tx = spend(
+        coinbase_of(&blocks[2]),
+        vec![ScriptBuf::new(), op_return(SMALL, 4)],
+    );
     witness_tx.input[0].witness = Witness::from_slice(&[vec![0xab; 40]]);
     let mut b = build_test_block(blocks[104].block_hash(), 106, time(106));
-    b.txdata.push(spend(coinbase_of(&blocks[3]), vec![ScriptBuf::new(), op_return(BIG, 5)]));
+    b.txdata.push(spend(
+        coinbase_of(&blocks[3]),
+        vec![ScriptBuf::new(), op_return(BIG, 5)],
+    ));
     b.txdata.push(witness_tx);
     b.txdata[0].input[0].witness = Witness::from_slice(&[[0u8; 32]]);
     let root = b.witness_root().unwrap();
@@ -625,7 +793,10 @@ fn an_extension_refuses_bytes_changed_since_the_first_strip() {
     grind_test_pow(&mut b);
     connect(&cs, &b);
     let hash = b.block_hash();
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD).unwrap(),
+        StripOutcome::Stripped(_)
+    ));
 
     // A witness byte of tx 2, which the extension would record.
     let bytes = on_disk(&cs, &hash);
@@ -637,10 +808,16 @@ fn an_extension_refuses_bytes_changed_since_the_first_strip() {
         .expect("the witness item");
     write_on_disk(&cs, &hash, at, &[0xac]);
     match cs.strip_block(&hash, SMALL as u64) {
-        Err(StripError::Corrupt { detail, .. }) => assert!(detail.contains("recorded hash"), "{detail}"),
+        Err(StripError::Corrupt { detail, .. }) => {
+            assert!(detail.contains("recorded hash"), "{detail}")
+        }
         other => panic!("expected a refusal, got {other:?}"),
     }
-    assert_eq!(record(&cs, &hash).unwrap().txs.len(), 1, "the record is unchanged");
+    assert_eq!(
+        record(&cs, &hash).unwrap().txs.len(),
+        1,
+        "the record is unchanged"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -661,11 +838,20 @@ fn a_block_reorged_out_before_the_punch_is_not_stripped() {
             parent = b.block_hash();
         }
         assert_eq!(cs.tip_hash(), parent, "premise: the fork is active");
-        assert_eq!(cs.store.get_block_index(&hash).unwrap().status, BlockStatus::Valid);
+        assert_eq!(
+            cs.store.get_block_index(&hash).unwrap().status,
+            BlockStatus::Valid
+        );
     }));
-    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(
+        cs.strip_block(&hash, THRESHOLD).unwrap(),
+        StripOutcome::Raced
+    );
     assert_eq!(record(&cs, &hash), None);
-    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0), "not punched");
+    assert!(
+        payload_on_disk(&cs, &hash, 1, 1).iter().any(|x| *x != 0),
+        "not punched"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -675,7 +861,10 @@ fn make_xor_chain_state() -> (ChainState, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "satd-strip-xor-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let flat_files = crate::storage::flatfile::FlatFileManager::with_xor_mode(
         &dir.join("blocks"),
@@ -712,9 +901,15 @@ fn under_a_blocks_xor_key_a_lost_record_is_still_caught() {
     cs.strip_block(&hash, THRESHOLD).unwrap();
     let key = cs.flat_files.lock().xor_key();
     let payload = payload_on_disk(&cs, &hash, 1, 1);
-    assert!(payload.iter().any(|b| *b != 0), "premise: the punch decodes to the key, not zeros");
     assert!(
-        (0..8).any(|p| payload.iter().enumerate().all(|(j, b)| *b == key[(p + j) % 8])),
+        payload.iter().any(|b| *b != 0),
+        "premise: the punch decodes to the key, not zeros"
+    );
+    assert!(
+        (0..8).any(|p| payload
+            .iter()
+            .enumerate()
+            .all(|(j, b)| *b == key[(p + j) % 8])),
         "premise: the punch decodes to the key"
     );
     assert_reads_as(&cs, &blocks[101]);
@@ -725,7 +920,10 @@ fn under_a_blocks_xor_key_a_lost_record_is_still_caught() {
             ..Default::default()
         })
         .unwrap();
-    assert!(cs.get_stored_block(&hash).is_none(), "never served with wrong txids");
+    assert!(
+        cs.get_stored_block(&hash).is_none(),
+        "never served with wrong txids"
+    );
     assert!(cs.get_block(&hash).is_none());
     let warning = corrupt_warning(&cs, &hash).expect("the lost record is reported");
     assert!(warning.contains("lost strip record"), "{warning}");
@@ -740,7 +938,9 @@ fn stored_blocks_connect_and_replay_under_a_blocks_xor_key() {
     let (cs, dir) = make_xor_chain_state();
     let blocks = chain(&cs);
     assert!(
-        blocks.iter().any(|b| cs.store.get_block_index(&b.block_hash()).unwrap().data_pos % 8 != 0),
+        blocks
+            .iter()
+            .any(|b| cs.store.get_block_index(&b.block_hash()).unwrap().data_pos % 8 != 0),
         "premise: some record is not 8-aligned"
     );
 
@@ -752,7 +952,8 @@ fn stored_blocks_connect_and_replay_under_a_blocks_xor_key() {
 
     let plan = rewind(&cs);
     for height in 1..=106u32 {
-        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap()).unwrap();
+        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap())
+            .unwrap();
     }
     assert_eq!(cs.tip_hash(), next.block_hash());
     let _ = std::fs::remove_dir_all(dir);
@@ -770,7 +971,9 @@ fn a_prune_during_the_plan_is_a_race_not_corruption() {
         // file is cut at this block rather than deleted, since an open read
         // handle would still see a deleted file.
         let mut entry = cs.store.get_block_index(&hash).unwrap();
-        let path = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+        let path = cs
+            .blocks_dir()
+            .join(format!("blk{:05}.dat", entry.file_number));
         std::fs::OpenOptions::new()
             .write(true)
             .open(path)
@@ -785,7 +988,10 @@ fn a_prune_during_the_plan_is_a_race_not_corruption() {
             })
             .unwrap();
     }));
-    assert_eq!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Raced);
+    assert_eq!(
+        cs.strip_block(&hash, THRESHOLD).unwrap(),
+        StripOutcome::Raced
+    );
     assert_eq!(corrupt_warning(&cs, &hash), None);
     assert_eq!(record(&cs, &hash), None);
     let _ = std::fs::remove_dir_all(dir);
@@ -812,7 +1018,11 @@ fn rewind(cs: &ChainState) -> crate::chain::replay_plan::ReplayPlan {
     crate::chain::replay_plan::plan_replay_from_block_index(&*cs.store, genesis, None).unwrap()
 }
 
-fn prefetch(cs: &ChainState, plan: &crate::chain::replay_plan::ReplayPlan, height: u32) -> Option<crate::chain::prefetch::PreprocessedBlock> {
+fn prefetch(
+    cs: &ChainState,
+    plan: &crate::chain::replay_plan::ReplayPlan,
+    height: u32,
+) -> Option<crate::chain::prefetch::PreprocessedBlock> {
     crate::chain::prefetch::prefetch_block(
         &*cs.store,
         cs.blocks_dir(),
@@ -849,15 +1059,23 @@ fn both_replay_paths_connect_a_stripped_block_under_its_recorded_txids() {
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
     let stripped = blocks[101].txdata[1].compute_txid();
-    assert!(matches!(cs.strip_block(&hash, THRESHOLD).unwrap(), StripOutcome::Stripped(_)));
-    assert_ne!(on_disk(&cs, &hash), bitcoin::consensus::serialize(&blocks[101]), "premise: punched");
+    assert!(matches!(
+        cs.strip_block(&hash, THRESHOLD).unwrap(),
+        StripOutcome::Stripped(_)
+    ));
+    assert_ne!(
+        on_disk(&cs, &hash),
+        bitcoin::consensus::serialize(&blocks[101]),
+        "premise: punched"
+    );
 
     for prefetched in [false, true] {
         let plan = rewind(&cs);
         for height in 1..=105u32 {
             let planned = plan.hash_at(height).unwrap();
             if prefetched && height == 102 {
-                let pre = prefetch(&cs, &plan, height).expect("the prefetcher reads a stripped block");
+                let pre =
+                    prefetch(&cs, &plan, height).expect("the prefetcher reads a stripped block");
                 assert_eq!(pre.txids[1], stripped, "the recorded txid");
                 assert_eq!(pre.script_skip_txs, [1usize].into_iter().collect());
                 assert!(!pre.script_verified_txs.contains(&1), "never pre-verified");
@@ -866,10 +1084,18 @@ fn both_replay_paths_connect_a_stripped_block_under_its_recorded_txids() {
                 cs.reindex_connect_direct(&plan, height, planned).unwrap();
             }
         }
-        assert_eq!(cs.tip_hash(), blocks[104].block_hash(), "prefetched: {prefetched}");
+        assert_eq!(
+            cs.tip_hash(),
+            blocks[104].block_hash(),
+            "prefetched: {prefetched}"
+        );
         cs.flush_coin_cache().unwrap();
         assert!(
-            cs.get_coin(&OutPoint { txid: stripped, vout: 0 }).is_some(),
+            cs.get_coin(&OutPoint {
+                txid: stripped,
+                vout: 0
+            })
+            .is_some(),
             "the stripped tx's output, under its real txid (prefetched: {prefetched})"
         );
     }
@@ -889,12 +1115,19 @@ fn a_replay_stops_at_a_stripped_block_whose_record_misnames_a_tx() {
 
     let plan = rewind(&cs);
     for height in 1..=101u32 {
-        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap()).unwrap();
+        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap())
+            .unwrap();
     }
-    assert!(prefetch(&cs, &plan, 102).is_none(), "deferred to the direct read");
+    assert!(
+        prefetch(&cs, &plan, 102).is_none(),
+        "deferred to the direct read"
+    );
     match cs.reindex_connect_direct(&plan, 102, hash) {
         Err(ChainError::FlatFile(msg)) => {
-            assert!(msg.contains("strip record") && msg.contains("getblockfrompeer"), "{msg}")
+            assert!(
+                msg.contains("strip record") && msg.contains("getblockfrompeer"),
+                "{msg}"
+            )
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -916,7 +1149,8 @@ fn the_replay_mtp_window_reads_a_stripped_block_through_its_record() {
         None,
     )
     .unwrap();
-    cs.verify_replay_mtp_window(&plan, 105).expect("the window reads");
+    cs.verify_replay_mtp_window(&plan, 105)
+        .expect("the window reads");
     misname_first_stripped_tx(&cs, &hash);
     match cs.verify_replay_mtp_window(&plan, 105) {
         Err(ChainError::FlatFile(msg)) => assert!(msg.contains("strip record"), "{msg}"),
@@ -934,23 +1168,38 @@ fn a_reindex_indexes_a_stripped_side_chain_block() {
     let hash = blocks[101].block_hash();
     cs.strip_block(&hash, THRESHOLD).unwrap();
     let entry = cs.store.get_block_index(&hash).unwrap();
-    let pos = FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos };
+    let pos = FlatFilePos {
+        file_number: entry.file_number,
+        data_pos: entry.data_pos,
+    };
     let headers = std::collections::HashMap::from([(
         hash,
-        super::super::ReindexHeaderRef { header: entry.header, pos },
+        super::super::ReindexHeaderRef {
+            header: entry.header,
+            pos,
+        },
     )]);
-    cs.index_reindex_side_chain(&[(hash, 102, [0u8; 32])], &headers).unwrap();
+    cs.index_reindex_side_chain(&[(hash, 102, [0u8; 32])], &headers)
+        .unwrap();
     let indexed = cs.store.get_block_index(&hash).unwrap();
-    assert_eq!(indexed.status, BlockStatus::DataStored, "indexed, not skipped");
+    assert_eq!(
+        indexed.status,
+        BlockStatus::DataStored,
+        "indexed, not skipped"
+    );
     assert_eq!(indexed.num_tx, 3);
 
     misname_first_stripped_tx(&cs, &hash);
     let mut valid = indexed;
     valid.status = BlockStatus::Valid;
     cs.store
-        .write_batch(StoreBatch { block_index_puts: vec![(hash, valid)], ..Default::default() })
+        .write_batch(StoreBatch {
+            block_index_puts: vec![(hash, valid)],
+            ..Default::default()
+        })
         .unwrap();
-    cs.index_reindex_side_chain(&[(hash, 102, [0u8; 32])], &headers).unwrap();
+    cs.index_reindex_side_chain(&[(hash, 102, [0u8; 32])], &headers)
+        .unwrap();
     assert_eq!(
         cs.store.get_block_index(&hash).unwrap().status,
         BlockStatus::Valid,
@@ -972,21 +1221,34 @@ fn a_reindex_does_not_index_side_blocks_it_cannot_vouch_for() {
     grind_test_pow(&mut side);
     assert_ne!(side.block_hash(), blocks[104].block_hash());
     let other = cs.store.get_block_index(&blocks[50].block_hash()).unwrap();
-    let elsewhere = FlatFilePos { file_number: other.file_number, data_pos: other.data_pos };
+    let elsewhere = FlatFilePos {
+        file_number: other.file_number,
+        data_pos: other.data_pos,
+    };
 
     let mut no_work = side.header;
     no_work.bits = bitcoin::CompactTarget::from_consensus(0x1d00ffff);
     assert!(validation::pow::check_proof_of_work_bounded(&no_work, Network::Regtest).is_err());
     let cases = [
         ("fails proof of work", no_work, elsewhere),
-        ("unreadable", side.header, FlatFilePos { file_number: 99, data_pos: 0 }),
+        (
+            "unreadable",
+            side.header,
+            FlatFilePos {
+                file_number: 99,
+                data_pos: 0,
+            },
+        ),
         ("holds another block", side.header, elsewhere),
     ];
     for (case, header, pos) in cases {
         let hash = header.block_hash();
-        let headers =
-            std::collections::HashMap::from([(hash, super::super::ReindexHeaderRef { header, pos })]);
-        cs.index_reindex_side_chain(&[(hash, 105, [0u8; 32])], &headers).unwrap();
+        let headers = std::collections::HashMap::from([(
+            hash,
+            super::super::ReindexHeaderRef { header, pos },
+        )]);
+        cs.index_reindex_side_chain(&[(hash, 105, [0u8; 32])], &headers)
+            .unwrap();
         assert!(cs.store.get_block_index(&hash).is_none(), "{case}: indexed");
     }
     let _ = std::fs::remove_dir_all(dir);
@@ -1008,11 +1270,15 @@ fn a_replay_names_a_lost_strip_record() {
         .unwrap();
     let plan = rewind(&cs);
     for height in 1..=101u32 {
-        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap()).unwrap();
+        cs.reindex_connect_direct(&plan, height, plan.hash_at(height).unwrap())
+            .unwrap();
     }
     match cs.reindex_connect_direct(&plan, 102, hash) {
         Err(ChainError::FlatFile(msg)) => {
-            assert!(msg.contains("strip record is missing") && msg.contains("-reindex"), "{msg}")
+            assert!(
+                msg.contains("strip record is missing") && msg.contains("-reindex"),
+                "{msg}"
+            )
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -1027,7 +1293,10 @@ fn the_chainstate_audit_reads_a_stripped_block_through_its_record() {
     let (cs, dir) = make_chain_state();
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
-    assert!(cs.verify_chainstate_default().is_consistent(), "premise: consistent before");
+    assert!(
+        cs.verify_chainstate_default().is_consistent(),
+        "premise: consistent before"
+    );
     cs.strip_block(&hash, THRESHOLD).unwrap();
     assert_eq!(cs.get_block(&hash), None, "premise: stripped");
     let report = cs.verify_chainstate_default();
@@ -1056,13 +1325,20 @@ fn invalidate_block_waits_for_a_strip_in_progress() {
         })
     };
     assert!(
-        done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
         "invalidate_block ran while a strip held the lock"
     );
     drop(held);
-    done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("it runs once the strip is done");
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("it runs once the strip is done");
     worker.join().unwrap().expect("invalidate");
-    assert_eq!(cs.store.get_block_index(&tip).unwrap().status, BlockStatus::Invalid);
+    assert_eq!(
+        cs.store.get_block_index(&tip).unwrap().status,
+        BlockStatus::Invalid
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1076,16 +1352,36 @@ fn a_repair_restores_a_stripped_block_in_place() {
     let b = &blocks[101];
     let hash = b.block_hash();
     cs.strip_block(&hash, THRESHOLD).unwrap();
-    assert!(payload_on_disk(&cs, &hash, 1, 1).iter().all(|x| *x == 0), "premise: punched");
+    assert!(
+        payload_on_disk(&cs, &hash, 1, 1).iter().all(|x| *x == 0),
+        "premise: punched"
+    );
     let entry = cs.store.get_block_index(&hash).unwrap();
-    let file = cs.blocks_dir().join(format!("blk{:05}.dat", entry.file_number));
+    let file = cs
+        .blocks_dir()
+        .join(format!("blk{:05}.dat", entry.file_number));
     let len = std::fs::metadata(&file).unwrap().len();
 
-    assert!(matches!(cs.repair_block_data(b).unwrap(), crate::chain::state::BlockDataRepair::Repaired { .. }));
+    assert!(matches!(
+        cs.repair_block_data(b).unwrap(),
+        crate::chain::state::BlockDataRepair::Repaired { .. }
+    ));
     let now = cs.store.get_block_index(&hash).unwrap();
-    assert_eq!((now.file_number, now.data_pos), (entry.file_number, entry.data_pos), "in place");
-    assert_eq!(std::fs::metadata(&file).unwrap().len(), len, "nothing appended");
-    assert_eq!(payload_on_disk(&cs, &hash, 1, 1), op_return(BIG, 1).as_bytes()[1..], "the payload is back");
+    assert_eq!(
+        (now.file_number, now.data_pos),
+        (entry.file_number, entry.data_pos),
+        "in place"
+    );
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().len(),
+        len,
+        "nothing appended"
+    );
+    assert_eq!(
+        payload_on_disk(&cs, &hash, 1, 1),
+        op_return(BIG, 1).as_bytes()[1..],
+        "the payload is back"
+    );
     assert_eq!(record(&cs, &hash), None);
     assert_eq!(cs.get_block(&hash).as_ref(), Some(b));
     assert_eq!(corrupt_warning(&cs, &hash), None);
@@ -1112,12 +1408,22 @@ fn a_repair_appends_when_the_record_does_not_describe_the_block() {
     let mut wrong = record(&cs, &hash).unwrap();
     wrong.filled_sha256[0] ^= 1;
     cs.store
-        .write_batch(StoreBatch { opreturn_strip_puts: vec![(hash, wrong.encode())], ..Default::default() })
+        .write_batch(StoreBatch {
+            opreturn_strip_puts: vec![(hash, wrong.encode())],
+            ..Default::default()
+        })
         .unwrap();
 
-    assert!(matches!(cs.repair_block_data(b).unwrap(), crate::chain::state::BlockDataRepair::Repaired { .. }));
+    assert!(matches!(
+        cs.repair_block_data(b).unwrap(),
+        crate::chain::state::BlockDataRepair::Repaired { .. }
+    ));
     let now = cs.store.get_block_index(&hash).unwrap();
-    assert_ne!((now.file_number, now.data_pos), (entry.file_number, entry.data_pos), "appended");
+    assert_ne!(
+        (now.file_number, now.data_pos),
+        (entry.file_number, entry.data_pos),
+        "appended"
+    );
     assert_eq!(record(&cs, &hash), None);
     assert_eq!(cs.get_block(&hash).as_ref(), Some(b));
     let _ = std::fs::remove_dir_all(dir);
@@ -1143,18 +1449,23 @@ fn an_in_place_restore_waits_for_a_strip_in_progress() {
         })
     };
     assert!(
-        done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
         "the restore ran while a strip held the lock"
     );
     drop(held);
-    done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("it runs once the strip is done");
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("it runs once the strip is done");
     worker.join().unwrap().expect("restore");
     assert_eq!(record(&cs, &blocks[101].block_hash()), None);
     let _ = std::fs::remove_dir_all(dir);
 }
 
 fn pass(cs: &ChainState, max_blocks: u32) -> PassReport {
-    cs.strip_pass(max_blocks, &std::sync::atomic::AtomicBool::new(false)).unwrap()
+    cs.strip_pass(max_blocks, &std::sync::atomic::AtomicBool::new(false))
+        .unwrap()
 }
 
 /// The worker strips only below `tip - depth - 2`: a block a limited peer
@@ -1254,7 +1565,11 @@ fn an_unreadable_record_still_counts_as_stripped() {
         .unwrap();
     cs.load_opreturn_strip_state().unwrap();
     assert!(cs.opreturn_prune_active());
-    assert_eq!(cs.opreturn_strip_summary().unwrap().blocks, 0, "not counted in the totals");
+    assert_eq!(
+        cs.opreturn_strip_summary().unwrap().blocks,
+        0,
+        "not counted in the totals"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1277,28 +1592,45 @@ fn a_reorg_below_the_cursor_rescans_from_the_fork() {
     });
     // Tip 104: heights up to 101 examined, nothing to strip.
     assert_eq!(pass(&cs, 1000).examined, 102);
-    assert_eq!(cs.opreturn_strip_meta().unwrap().last_hash, Some(a[100].block_hash()));
+    assert_eq!(
+        cs.opreturn_strip_meta().unwrap().last_hash,
+        Some(a[100].block_hash())
+    );
 
     // A heavier branch from 100 replaces 101 to 104; its 101 carries a large
     // OP_RETURN.
     let mut b = vec![block_on(
         a[99].block_hash(),
         101,
-        vec![spend(coinbase_of(&a[0]), vec![ScriptBuf::new(), op_return(BIG, 1)])],
+        vec![spend(
+            coinbase_of(&a[0]),
+            vec![ScriptBuf::new(), op_return(BIG, 1)],
+        )],
     )];
     for h in 102..=106 {
-        b.push(build_test_block(b.last().unwrap().block_hash(), h, time(h) + 1));
+        b.push(build_test_block(
+            b.last().unwrap().block_hash(),
+            h,
+            time(h) + 1,
+        ));
     }
     for blk in &b {
         cs.accept_block(blk).expect("accept");
     }
-    assert_eq!(cs.tip_hash(), b[5].block_hash(), "premise: the branch is active");
+    assert_eq!(
+        cs.tip_hash(),
+        b[5].block_hash(),
+        "premise: the branch is active"
+    );
 
     // Tip 106: the pass goes back to 101, examines 101 to 103, strips 101.
     let r = pass(&cs, 1000);
     assert_eq!((r.examined, r.stripped), (3, 1));
     assert!(record(&cs, &b[0].block_hash()).is_some());
-    assert_eq!(cs.opreturn_strip_meta().unwrap().last_hash, Some(b[2].block_hash()));
+    assert_eq!(
+        cs.opreturn_strip_meta().unwrap().last_hash,
+        Some(b[2].block_hash())
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1319,10 +1651,17 @@ fn a_record_removed_elsewhere_leaves_the_totals_after_the_next_pass() {
     let mut wrong = record(&cs, &hash).unwrap();
     wrong.filled_sha256[0] ^= 1;
     cs.store
-        .write_batch(StoreBatch { opreturn_strip_puts: vec![(hash, wrong.encode())], ..Default::default() })
+        .write_batch(StoreBatch {
+            opreturn_strip_puts: vec![(hash, wrong.encode())],
+            ..Default::default()
+        })
         .unwrap();
     cs.repair_block_data(b).unwrap();
-    assert_eq!(record(&cs, &hash), None, "premise: the append removed the record");
+    assert_eq!(
+        record(&cs, &hash),
+        None,
+        "premise: the append removed the record"
+    );
 
     assert_eq!(pass(&cs, 1000), PassReport::default(), "the option is off");
     assert_eq!(cs.opreturn_strip_summary_last().blocks, 0);
@@ -1347,8 +1686,15 @@ fn restoring_the_last_stripped_block_with_the_option_off_finishes() {
     };
     cs.write_strip_meta(&meta).unwrap();
     cs.load_opreturn_strip_state().unwrap();
-    assert!(cs.opreturn_prune_active(), "premise: a stripped block keeps the node limited");
-    assert_eq!(cs.opreturn_strip_meta(), Some(meta), "premise: a record keeps the family");
+    assert!(
+        cs.opreturn_prune_active(),
+        "premise: a stripped block keeps the node limited"
+    );
+    assert_eq!(
+        cs.opreturn_strip_meta(),
+        Some(meta),
+        "premise: a record keeps the family"
+    );
 
     cs.repair_block_data(b).unwrap();
     assert_eq!(record(&cs, &b.block_hash()), None, "premise: restored");
@@ -1357,7 +1703,11 @@ fn restoring_the_last_stripped_block_with_the_option_off_finishes() {
     assert!(!cs.opreturn_prune_active());
     assert_eq!(cs.opreturn_strip_summary_last().blocks, 0);
     assert!(!cs.holds_strip_record(&b.block_hash()));
-    assert_eq!(cs.opreturn_strip_meta(), None, "the strip family is dropped, cursor and all");
+    assert_eq!(
+        cs.opreturn_strip_meta(),
+        None,
+        "the strip family is dropped, cursor and all"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1444,7 +1794,10 @@ fn the_worker_stops_when_nothing_is_left_to_count() {
     let finished = done_rx.recv_timeout(std::time::Duration::from_secs(10));
     stop.store(true, Ordering::Relaxed);
     worker.join().unwrap();
-    assert!(finished.is_ok(), "the worker kept running with nothing to do");
+    assert!(
+        finished.is_ok(),
+        "the worker kept running with nothing to do"
+    );
     assert!(!cs.opreturn_prune_active());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -1455,7 +1808,10 @@ fn the_worker_stops_when_nothing_is_left_to_count() {
 /// make a later pass count again.
 #[test]
 fn a_remove_waiting_in_the_coin_cache_still_finishes() {
-    let store = crate::storage::coin_cache::CoinCache::new(Box::new(crate::storage::db::InMemoryStore::new()), 10);
+    let store = crate::storage::coin_cache::CoinCache::new(
+        Box::new(crate::storage::db::InMemoryStore::new()),
+        10,
+    );
     let (cs, dir) = super::super::tests::make_chain_state_with_store(Box::new(store));
     let blocks = chain(&cs);
     let hash = blocks[101].block_hash();
@@ -1468,7 +1824,10 @@ fn a_remove_waiting_in_the_coin_cache_still_finishes() {
     cs.store
         .write_batch(StoreBatch {
             coin_puts: vec![(
-                OutPoint { txid: <bitcoin::Txid as bitcoin::hashes::Hash>::from_byte_array([7; 32]), vout: 0 },
+                OutPoint {
+                    txid: <bitcoin::Txid as bitcoin::hashes::Hash>::from_byte_array([7; 32]),
+                    vout: 0,
+                },
                 crate::storage::coinview::Coin {
                     amount: 1,
                     script_pubkey: ScriptBuf::new(),
@@ -1483,11 +1842,16 @@ fn a_remove_waiting_in_the_coin_cache_still_finishes() {
         .unwrap();
     cs.forget_strip_summary();
     let mut seen = 0;
-    cs.store.for_each_opreturn_strip(&mut |_, _| seen += 1).unwrap();
+    cs.store
+        .for_each_opreturn_strip(&mut |_, _| seen += 1)
+        .unwrap();
     assert_eq!(seen, 1, "premise: the remove waits in the cache");
 
     pass(&cs, 1000);
-    assert!(!cs.opreturn_prune_active(), "the pass counted the store behind the cache");
+    assert!(
+        !cs.opreturn_prune_active(),
+        "the pass counted the store behind the cache"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1498,15 +1862,23 @@ fn a_remove_waiting_in_the_coin_cache_still_finishes() {
 fn an_idle_pass_does_not_count_again() {
     let (cs, dir) = make_chain_state();
     let blocks = chain(&cs);
-    cs.strip_block(&blocks[101].block_hash(), THRESHOLD).unwrap();
+    cs.strip_block(&blocks[101].block_hash(), THRESHOLD)
+        .unwrap();
     cs.load_opreturn_strip_state().unwrap();
     pass(&cs, 1000);
     let counted_at = cs.strip.summary.lock().unwrap().0;
     pass(&cs, 1000);
-    assert_eq!(cs.strip.summary.lock().unwrap().0, counted_at, "an idle pass counted again");
+    assert_eq!(
+        cs.strip.summary.lock().unwrap().0,
+        counted_at,
+        "an idle pass counted again"
+    );
     cs.forget_strip_summary();
     pass(&cs, 1000);
-    assert!(cs.strip.summary.lock().is_some(), "a change is counted on the next pass");
+    assert!(
+        cs.strip.summary.lock().is_some(),
+        "a change is counted on the next pass"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1524,10 +1896,17 @@ fn a_failed_finish_is_retried_by_the_next_pass() {
     cs.load_opreturn_strip_state().unwrap();
     cs.repair_block_data(b).unwrap();
     controls.fail_next_strip_drop();
-    assert!(cs.strip_pass(1000, &std::sync::atomic::AtomicBool::new(false)).is_err(), "premise: the finish failed");
+    assert!(
+        cs.strip_pass(1000, &std::sync::atomic::AtomicBool::new(false))
+            .is_err(),
+        "premise: the finish failed"
+    );
     assert!(cs.opreturn_prune_active());
     pass(&cs, 1000);
-    assert!(!cs.opreturn_prune_active(), "the failed finish was never retried");
+    assert!(
+        !cs.opreturn_prune_active(),
+        "the failed finish was never retried"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1538,7 +1917,11 @@ fn a_failed_finish_is_retried_by_the_next_pass() {
 fn the_restore_work_list_is_the_stored_records_in_height_order() {
     let (cs, _dir) = make_chain_state();
     let blocks = chain(&cs);
-    let pick = [blocks[40].block_hash(), blocks[5].block_hash(), blocks[90].block_hash()];
+    let pick = [
+        blocks[40].block_hash(),
+        blocks[5].block_hash(),
+        blocks[90].block_hash(),
+    ];
     let unknown = BlockHash::from_byte_array([7; 32]);
     let mut puts: Vec<(BlockHash, Vec<u8>)> = pick.iter().map(|h| (*h, vec![1])).collect();
     puts.push((unknown, vec![1]));
@@ -1551,8 +1934,15 @@ fn the_restore_work_list_is_the_stored_records_in_height_order() {
 
     let heights = |work: &[RestoreItem]| work.iter().map(|i| i.height).collect::<Vec<_>>();
     let ascending = cs.opreturn_restore_work(false).unwrap();
-    assert_eq!(heights(&ascending), vec![6, 41, 91], "the unknown block is left out");
-    assert_eq!(heights(&cs.opreturn_restore_work(true).unwrap()), vec![91, 41, 6]);
+    assert_eq!(
+        heights(&ascending),
+        vec![6, 41, 91],
+        "the unknown block is left out"
+    );
+    assert_eq!(
+        heights(&cs.opreturn_restore_work(true).unwrap()),
+        vec![91, 41, 6]
+    );
     for item in &ascending {
         let block = blocks.iter().find(|b| b.block_hash() == item.hash).unwrap();
         assert_eq!(item.len, serialize(block).len() as u64, "the stored length");
@@ -1564,13 +1954,19 @@ fn the_restore_work_list_is_the_stored_records_in_height_order() {
 #[test]
 fn the_restore_waits_while_the_tip_is_behind() {
     let (cs, dir) = make_chain_state();
-    assert_eq!(cs.opreturn_restore_held_by_tip(), Some("initial block download"));
+    assert_eq!(
+        cs.opreturn_restore_held_by_tip(),
+        Some("initial block download")
+    );
     let blocks = chain(&cs);
     assert_eq!(cs.opreturn_restore_held_by_tip(), None, "caught up");
     let tip = blocks.last().unwrap();
     let next = block_on(tip.block_hash(), 106, Vec::new());
     cs.accept_header(&next.header).expect("header");
-    assert_eq!(cs.opreturn_restore_held_by_tip(), Some("the tip is behind the best header"));
+    assert_eq!(
+        cs.opreturn_restore_held_by_tip(),
+        Some("the tip is behind the best header")
+    );
     connect(&cs, &next);
     assert_eq!(cs.opreturn_restore_held_by_tip(), None);
     let _ = std::fs::remove_dir_all(dir);
@@ -1595,7 +1991,10 @@ fn blocks_dir_usage_reports_st_size_and_st_blocks() {
             expected.1 += meta.blocks() * 512;
         }
     }
-    assert!(expected.0 > 0 && expected.1 > 0, "premise: the block files take space: {expected:?}");
+    assert!(
+        expected.0 > 0 && expected.1 > 0,
+        "premise: the block files take space: {expected:?}"
+    );
     cs.forget_strip_summary();
     assert_eq!(cs.blocks_dir_usage().unwrap(), expected);
     let _ = std::fs::remove_dir_all(dir);

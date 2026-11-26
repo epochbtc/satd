@@ -66,7 +66,11 @@ fn bip352_addresses_round_trip() {
 fn addresses_are_longer_than_a_segwit_address_may_be() {
     let address = sample();
     let text = address.encode(Network::Bitcoin);
-    assert!(text.len() > 90, "expected a long address, got {}", text.len());
+    assert!(
+        text.len() > 90,
+        "expected a long address, got {}",
+        text.len()
+    );
     assert!(text.starts_with("sp1q"), "{text}");
     assert_eq!(SpAddress::decode(&text, Network::Bitcoin).unwrap(), address);
 }
@@ -74,7 +78,12 @@ fn addresses_are_longer_than_a_segwit_address_may_be() {
 #[test]
 fn every_test_network_shares_one_human_readable_part() {
     let address = sample();
-    for network in [Network::Testnet, Network::Testnet4, Network::Signet, Network::Regtest] {
+    for network in [
+        Network::Testnet,
+        Network::Testnet4,
+        Network::Signet,
+        Network::Regtest,
+    ] {
         let text = address.encode(network);
         assert!(text.starts_with("tsp1"), "{network}: {text}");
         // And an address written for one test network decodes on the others,
@@ -118,10 +127,7 @@ fn version_handling_follows_bip352() {
     let address = sample();
 
     for version in [1u8, 15, 30] {
-        let longer = SpAddress {
-            version,
-            ..address
-        };
+        let longer = SpAddress { version, ..address };
         let text = longer.encode(Network::Bitcoin);
         let decoded = SpAddress::decode(&text, Network::Bitcoin).expect("decodes");
         assert_eq!(decoded.version, version);

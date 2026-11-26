@@ -89,7 +89,10 @@ impl BlockFeeProfile {
         let mut txs = Vec::with_capacity(block.txdata.len().saturating_sub(1));
         for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
             if let Some(fee) = tx_fee(tx, &mut prevout_value) {
-                txs.push(TxFee { fee, weight: tx.weight().to_wu() });
+                txs.push(TxFee {
+                    fee,
+                    weight: tx.weight().to_wu(),
+                });
             }
         }
         BlockFeeProfile { txs }
@@ -125,7 +128,12 @@ impl BlockFeeProfile {
         let rates: Vec<(u64, u64)> = self
             .txs
             .iter()
-            .map(|t| (crate::mempool::policy::fee_rate_sat_per_kvb(t.fee, t.weight), t.weight))
+            .map(|t| {
+                (
+                    crate::mempool::policy::fee_rate_sat_per_kvb(t.fee, t.weight),
+                    t.weight,
+                )
+            })
             .filter(|(rate, _)| *rate >= min_relay_sat_per_kvb)
             .collect();
         weighted_percentiles(rates, [HURDLE_PERCENTILE]).map(|[r]| r)
@@ -138,7 +146,10 @@ impl BlockFeeProfile {
 /// Asks for every input's prevout even after one is missing: the undo
 /// cursor behind `prevout_value` is positional, and stopping early would
 /// pair the next transaction's inputs with this one's coins.
-fn tx_fee(tx: &Transaction, prevout_value: &mut impl FnMut(&OutPoint) -> Option<u64>) -> Option<u64> {
+fn tx_fee(
+    tx: &Transaction,
+    prevout_value: &mut impl FnMut(&OutPoint) -> Option<u64>,
+) -> Option<u64> {
     let mut in_sum: Option<u64> = Some(0);
     for input in &tx.input {
         let value = prevout_value(&input.previous_output);
@@ -153,7 +164,11 @@ fn tx_fee(tx: &Transaction, prevout_value: &mut impl FnMut(&OutPoint) -> Option<
 /// weight`, and `:2205` for `avgfeerate`). Zero for a zero weight, as in
 /// Core.
 pub fn sat_per_vb_core(fee: u64, weight: u64) -> u64 {
-    if weight == 0 { 0 } else { fee.saturating_mul(4) / weight }
+    if weight == 0 {
+        0
+    } else {
+        fee.saturating_mul(4) / weight
+    }
 }
 
 /// Core's `CalculatePercentilesByWeight` over `(rate, weight)` pairs: sort
@@ -251,7 +266,10 @@ mod tests {
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut { value: Amount::from_sat(50), script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new(),
+            }],
         }
     }
 
@@ -272,7 +290,10 @@ mod tests {
     }
 
     fn op(n: u8) -> OutPoint {
-        OutPoint { txid: Txid::from_byte_array([n; 32]), vout: 0 }
+        OutPoint {
+            txid: Txid::from_byte_array([n; 32]),
+            vout: 0,
+        }
     }
 
     fn coin(amount: u64) -> Coin {
@@ -286,23 +307,43 @@ mod tests {
     }
 
     fn profile(pairs: &[(u64, u64)]) -> BlockFeeProfile {
-        BlockFeeProfile { txs: pairs.iter().map(|&(fee, weight)| TxFee { fee, weight }).collect() }
+        BlockFeeProfile {
+            txs: pairs
+                .iter()
+                .map(|&(fee, weight)| TxFee { fee, weight })
+                .collect(),
+        }
     }
 
     #[test]
     fn from_undo_prices_every_non_coinbase_tx_in_block_order() {
         let parent = tx_spending(&[op(1)], 9_000, 0);
-        let child = tx_spending(&[OutPoint { txid: parent.compute_txid(), vout: 0 }], 4_000, 0);
+        let child = tx_spending(
+            &[OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            }],
+            4_000,
+            0,
+        );
         let b = block(vec![parent.clone(), child.clone()]);
         // The child's coin is the parent's own output: undo data covers
         // in-block parents, so the CPFP child is priced.
-        let undo = UndoData { spent_coins: vec![coin(10_000), coin(9_000)] };
+        let undo = UndoData {
+            spent_coins: vec![coin(10_000), coin(9_000)],
+        };
         let p = BlockFeeProfile::from_undo(&b, &undo).unwrap();
         assert_eq!(
             p.txs,
             vec![
-                TxFee { fee: 1_000, weight: parent.weight().to_wu() },
-                TxFee { fee: 5_000, weight: child.weight().to_wu() },
+                TxFee {
+                    fee: 1_000,
+                    weight: parent.weight().to_wu()
+                },
+                TxFee {
+                    fee: 5_000,
+                    weight: child.weight().to_wu()
+                },
             ]
         );
     }
@@ -310,20 +351,30 @@ mod tests {
     #[test]
     fn from_undo_refuses_an_undo_row_with_too_few_coins() {
         let b = block(vec![tx_spending(&[op(1), op(2)], 1, 0)]);
-        let undo = UndoData { spent_coins: vec![coin(10)] };
+        let undo = UndoData {
+            spent_coins: vec![coin(10)],
+        };
         assert_eq!(
             BlockFeeProfile::from_undo(&b, &undo),
-            Err(FeeProfileError::UndoMismatch { coins: 1, inputs: 2 })
+            Err(FeeProfileError::UndoMismatch {
+                coins: 1,
+                inputs: 2
+            })
         );
     }
 
     #[test]
     fn from_undo_refuses_an_undo_row_with_surplus_coins() {
         let b = block(vec![tx_spending(&[op(1)], 1, 0)]);
-        let undo = UndoData { spent_coins: vec![coin(10), coin(10)] };
+        let undo = UndoData {
+            spent_coins: vec![coin(10), coin(10)],
+        };
         assert_eq!(
             BlockFeeProfile::from_undo(&b, &undo),
-            Err(FeeProfileError::UndoMismatch { coins: 2, inputs: 1 })
+            Err(FeeProfileError::UndoMismatch {
+                coins: 2,
+                inputs: 1
+            })
         );
     }
 
@@ -335,9 +386,17 @@ mod tests {
         let second = tx_spending(&[op(3)], 100, 0);
         let b = block(vec![first, second.clone()]);
         // First tx: 10 + 10 in, 1000 out -> unpriced. Second: 600 in, 100 out.
-        let undo = UndoData { spent_coins: vec![coin(10), coin(10), coin(600)] };
+        let undo = UndoData {
+            spent_coins: vec![coin(10), coin(10), coin(600)],
+        };
         let p = BlockFeeProfile::from_undo(&b, &undo).unwrap();
-        assert_eq!(p.txs, vec![TxFee { fee: 500, weight: second.weight().to_wu() }]);
+        assert_eq!(
+            p.txs,
+            vec![TxFee {
+                fee: 500,
+                weight: second.weight().to_wu()
+            }]
+        );
     }
 
     /// An input sum that overflows leaves the transaction out without
@@ -347,14 +406,25 @@ mod tests {
         let first = tx_spending(&[op(1), op(2), op(4)], 0, 0);
         let second = tx_spending(&[op(3)], 100, 0);
         let b = block(vec![first, second.clone()]);
-        let undo = UndoData { spent_coins: vec![coin(u64::MAX), coin(1), coin(5), coin(600)] };
+        let undo = UndoData {
+            spent_coins: vec![coin(u64::MAX), coin(1), coin(5), coin(600)],
+        };
         let p = BlockFeeProfile::from_undo(&b, &undo).unwrap();
-        assert_eq!(p.txs, vec![TxFee { fee: 500, weight: second.weight().to_wu() }]);
+        assert_eq!(
+            p.txs,
+            vec![TxFee {
+                fee: 500,
+                weight: second.weight().to_wu()
+            }]
+        );
     }
 
     #[test]
     fn from_lookup_leaves_out_a_tx_with_a_missing_prevout() {
-        let b = block(vec![tx_spending(&[op(1)], 1, 0), tx_spending(&[op(2)], 1, 0)]);
+        let b = block(vec![
+            tx_spending(&[op(1)], 1, 0),
+            tx_spending(&[op(2)], 1, 0),
+        ]);
         let p = BlockFeeProfile::from_lookup(&b, |o| (o.txid == op(2).txid).then_some(11));
         assert_eq!(p.txs.len(), 1);
         assert_eq!(p.txs[0].fee, 10);

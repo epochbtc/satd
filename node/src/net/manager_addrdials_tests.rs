@@ -68,7 +68,13 @@ fn over(chain_state: Arc<ChainState>) -> Arc<PeerManager> {
     let mempool = Arc::new(Mempool::new(1_000_000, 0));
     let fee_estimator = Arc::new(FeeEstimator::new());
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    PeerManager::new(chain_state, mempool, fee_estimator, Network::Regtest, shutdown_rx)
+    PeerManager::new(
+        chain_state,
+        mempool,
+        fee_estimator,
+        Network::Regtest,
+        shutdown_rx,
+    )
 }
 
 /// Out of IBD, so the automatic outbound target is 8 rather than 64: a
@@ -124,7 +130,12 @@ fn addr_msg(addrs: &[SocketAddr]) -> NetworkMessage {
     NetworkMessage::Addr(
         addrs
             .iter()
-            .map(|a| (1_700_000_000, Address::new(a, ServiceFlags::NETWORK | ServiceFlags::WITNESS)))
+            .map(|a| {
+                (
+                    1_700_000_000,
+                    Address::new(a, ServiceFlags::NETWORK | ServiceFlags::WITNESS),
+                )
+            })
             .collect(),
     )
 }
@@ -156,7 +167,11 @@ impl Listener {
                 held.push(stream);
             }
         });
-        Self { addr, accepts, task }
+        Self {
+            addr,
+            accepts,
+            task,
+        }
     }
 
     fn accepts(&self) -> usize {
@@ -191,7 +206,11 @@ async fn wait_for(pm: &PeerManager, cond: impl Fn() -> bool, what: &str) {
             "timed out: {what} (in flight {:?}, dialling {:?}, backoff {:?})",
             pm.dials_in_flight.lock(),
             pm.pending_connections.read(),
-            pm.reconnect_backoff.read().iter().map(|(a, s)| (*a, s.attempts)).collect::<Vec<_>>(),
+            pm.reconnect_backoff
+                .read()
+                .iter()
+                .map(|(a, s)| (*a, s.attempts))
+                .collect::<Vec<_>>(),
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -206,7 +225,10 @@ async fn settle(pm: &PeerManager) {
             let d = pm.dials_in_flight.lock();
             d.automatic + d.added_node + d.extra_network + d.block_relay
         };
-        if in_flight == 0 && pm.pending_connections.read().is_empty() && pm.pending_onion_dials.read().is_empty() {
+        if in_flight == 0
+            && pm.pending_connections.read().is_empty()
+            && pm.pending_onion_dials.read().is_empty()
+        {
             break;
         }
         assert!(Instant::now() < deadline, "dials still in flight");
@@ -229,14 +251,30 @@ fn a_peers_addresses_are_rate_limited_unless_it_has_the_addr_permission() {
     let limited = SocketAddr::from(([127, 0, 0, 1], 40001));
     add_peer(&pm, peer(1, limited, Direction::Inbound));
     pm.handle_message(1, addr_msg(&spread(1, 1000)), InFlight::adopt(None));
-    assert_eq!(addr_counts(&pm, 1), (1, 999), "one token: one address processed, the rest rate-limited");
-    assert_eq!(pm.addrman.read().len(), 1, "one address reached the address book");
+    assert_eq!(
+        addr_counts(&pm, 1),
+        (1, 999),
+        "one token: one address processed, the rest rate-limited"
+    );
+    assert_eq!(
+        pm.addrman.read().len(),
+        1,
+        "one address reached the address book"
+    );
 
-    let mut exempt = peer(2, SocketAddr::from(([127, 0, 0, 1], 40002)), Direction::Inbound);
+    let mut exempt = peer(
+        2,
+        SocketAddr::from(([127, 0, 0, 1], 40002)),
+        Direction::Inbound,
+    );
     exempt.permissions.addr = true;
     add_peer(&pm, exempt);
     pm.handle_message(2, addr_msg(&spread(20, 1000)), InFlight::adopt(None));
-    assert_eq!(addr_counts(&pm, 2), (1000, 0), "the addr permission takes them all");
+    assert_eq!(
+        addr_counts(&pm, 2),
+        (1000, 0),
+        "the addr permission takes them all"
+    );
     assert_eq!(pm.addrman.read().len(), 1001);
 }
 
@@ -246,7 +284,14 @@ fn a_peers_addresses_are_rate_limited_unless_it_has_the_addr_permission() {
 #[test]
 fn the_answer_to_a_getaddr_is_taken_whole() {
     let (pm, _dir) = mk_pm();
-    add_peer(&pm, peer(1, SocketAddr::from(([198, 51, 100, 1], 8333)), Direction::Outbound));
+    add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([198, 51, 100, 1], 8333)),
+            Direction::Outbound,
+        ),
+    );
     pm.note_getaddr_sent(1);
     pm.handle_message(1, addr_msg(&spread(1, 1000)), InFlight::adopt(None));
     let (processed, limited) = addr_counts(&pm, 1);
@@ -258,7 +303,14 @@ fn the_answer_to_a_getaddr_is_taken_whole() {
 fn addrv2_is_rate_limited_too() {
     use bitcoin::p2p::address::{AddrV2, AddrV2Message};
     let (pm, _dir) = mk_pm();
-    add_peer(&pm, peer(1, SocketAddr::from(([127, 0, 0, 1], 40001)), Direction::Inbound));
+    add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([127, 0, 0, 1], 40001)),
+            Direction::Inbound,
+        ),
+    );
     let msg = NetworkMessage::AddrV2(
         spread(1, 500)
             .into_iter()
@@ -281,7 +333,10 @@ fn addrv2_is_rate_limited_too() {
 
 /// Put `addr` in the address book, which the automatic dials draw from.
 fn learn(pm: &PeerManager, addr: SocketAddr) {
-    assert!(pm.addrman.write().add(addr, now_unix_secs()), "fixture: the book takes {addr}");
+    assert!(
+        pm.addrman.write().add(addr, now_unix_secs()),
+        "fixture: the book takes {addr}"
+    );
 }
 
 // ---- Outbound dials ----
@@ -303,9 +358,18 @@ async fn a_reconnect_tick_starts_no_more_automatic_dials_than_free_slots() {
     // Five full-relay dials, and with the target met by those in flight,
     // a block-relay-only one: one a pass.
     pm.reconnect_tick();
-    wait_for(&pm, || total_accepts(&ls) >= 6, "six dials reach a listener").await;
+    wait_for(
+        &pm,
+        || total_accepts(&ls) >= 6,
+        "six dials reach a listener",
+    )
+    .await;
     settle(&pm).await;
-    assert_eq!(total_accepts(&ls), 6, "five free slots, five dials, and a block-relay-only one");
+    assert_eq!(
+        total_accepts(&ls),
+        6,
+        "five free slots, five dials, and a block-relay-only one"
+    );
     assert_eq!(pm.automatic_outbound_peers(), 8, "the target is reached");
 
     // The second block-relay-only peer, then nothing.
@@ -333,12 +397,20 @@ async fn an_added_node_is_dialled_with_the_automatic_slots_full() {
     pm.reconnect_tick();
     wait_for(&pm, || l.accepts() == 1, "the added node is dialled").await;
     settle(&pm).await;
-    let conn_type = pm.peers.read().values().find(|h| h.info.addr == l.addr).map(|h| h.info.conn_type);
+    let conn_type = pm
+        .peers
+        .read()
+        .values()
+        .find(|h| h.info.addr == l.addr)
+        .map(|h| h.info.conn_type);
     assert_eq!(conn_type, Some(ConnType::Manual));
 
     // The automatic limit still holds for an automatic dial.
     let spare = Listener::bind().await;
-    let err = pm.connect_outbound(spare.addr).await.expect_err("the automatic slots are full");
+    let err = pm
+        .connect_outbound(spare.addr)
+        .await
+        .expect_err("the automatic slots are full");
     assert_eq!(err, "max outbound connections reached");
 }
 
@@ -365,7 +437,11 @@ async fn added_nodes_stop_at_eight_and_other_manual_peers_do_not() {
     )
     .await;
     settle(&pm).await;
-    assert_eq!(total_accepts(&added), MAX_ADDNODE_CONNECTIONS, "eight added nodes");
+    assert_eq!(
+        total_accepts(&added),
+        MAX_ADDNODE_CONNECTIONS,
+        "eight added nodes"
+    );
     assert_eq!(total_accepts(&connect), 10, "every other manual peer");
     assert_eq!(pm.added_node_peers(), MAX_ADDNODE_CONNECTIONS);
 
@@ -379,7 +455,12 @@ async fn added_nodes_stop_at_eight_and_other_manual_peers_do_not() {
         .unwrap();
     pm.peers.write().remove(&gone);
     pm.reconnect_tick();
-    wait_for(&pm, || total_accepts(&added) > MAX_ADDNODE_CONNECTIONS, "a ninth dial").await;
+    wait_for(
+        &pm,
+        || total_accepts(&added) > MAX_ADDNODE_CONNECTIONS,
+        "a ninth dial",
+    )
+    .await;
     settle(&pm).await;
     assert_eq!(total_accepts(&added), MAX_ADDNODE_CONNECTIONS + 1);
 }
@@ -396,10 +477,19 @@ async fn onetry_is_outside_the_limits_and_succeeds_for_a_connected_peer() {
     let l = Listener::bind().await;
     let target = PeerAddr::Socket(l.addr);
 
-    pm.connect_peer_addr_onetry(&target, None).await.expect("onetry with the automatic slots full");
-    wait_for(&pm, || l.accepts() == 1, "the onetry dial reaches the listener").await;
+    pm.connect_peer_addr_onetry(&target, None)
+        .await
+        .expect("onetry with the automatic slots full");
+    wait_for(
+        &pm,
+        || l.accepts() == 1,
+        "the onetry dial reaches the listener",
+    )
+    .await;
 
-    pm.connect_peer_addr_onetry(&target, None).await.expect("onetry to a connected peer");
+    pm.connect_peer_addr_onetry(&target, None)
+        .await
+        .expect("onetry to a connected peer");
     settle(&pm).await;
     assert_eq!(l.accepts(), 1, "no second connection");
 
@@ -407,7 +497,11 @@ async fn onetry_is_outside_the_limits_and_succeeds_for_a_connected_peer() {
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let closed_addr = closed.local_addr().unwrap();
     drop(closed);
-    assert!(pm.connect_peer_addr_onetry(&PeerAddr::Socket(closed_addr), None).await.is_err());
+    assert!(
+        pm.connect_peer_addr_onetry(&PeerAddr::Socket(closed_addr), None)
+            .await
+            .is_err()
+    );
 }
 
 /// A peer the operator named waits at most a minute between dials, Core's
@@ -421,8 +515,14 @@ fn a_manual_peers_backoff_stops_at_a_minute() {
         manual.record_failure(MANUAL_RECONNECT_MAX_BACKOFF);
         automatic.record_failure(AUTOMATIC_RECONNECT_MAX_BACKOFF);
     }
-    assert_eq!(manual.backoff_duration(MANUAL_RECONNECT_MAX_BACKOFF), Duration::from_secs(60));
-    assert_eq!(automatic.backoff_duration(AUTOMATIC_RECONNECT_MAX_BACKOFF), Duration::from_secs(300));
+    assert_eq!(
+        manual.backoff_duration(MANUAL_RECONNECT_MAX_BACKOFF),
+        Duration::from_secs(60)
+    );
+    assert_eq!(
+        automatic.backoff_duration(AUTOMATIC_RECONNECT_MAX_BACKOFF),
+        Duration::from_secs(300)
+    );
 }
 
 /// A failed dial backs off, and in the reconnect loop that is per address:
@@ -436,8 +536,11 @@ async fn a_failed_manual_redial_backs_off_by_the_manual_cap() {
     drop(closed);
     assert!(pm.addnode_add(&addr.to_string(), PeerAddr::Socket(addr)));
     for _ in 0..10 {
-        pm.reconnect_backoff.write().entry(addr).or_insert_with(ReconnectState::new).next_attempt =
-            Instant::now();
+        pm.reconnect_backoff
+            .write()
+            .entry(addr)
+            .or_insert_with(ReconnectState::new)
+            .next_attempt = Instant::now();
         pm.reconnect_tick();
         settle(&pm).await;
     }
@@ -477,7 +580,11 @@ async fn a_new_tip_leaves_reconnect_backoff_alone() {
     let run = tokio::spawn(async move { pm_run.run().await });
     // The run loop sees the new tip on its first maintenance pass, 500 ms in.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let attempts = pm.reconnect_backoff.read().get(&waiting).map(|s| s.attempts);
+    let attempts = pm
+        .reconnect_backoff
+        .read()
+        .get(&waiting)
+        .map(|s| s.attempts);
     run.abort();
     *pm.ibd.write() = None;
     let _ = std::fs::remove_dir_all(&dir);
@@ -501,14 +608,20 @@ async fn a_dial_that_connects_clears_its_backoff() {
     pm.reconnect_tick();
     wait_for(&pm, || l.accepts() == 1, "the address is dialled").await;
     settle(&pm).await;
-    assert_eq!(pm.reconnect_backoff.read().get(&l.addr).map(|s| s.attempts), Some(0));
+    assert_eq!(
+        pm.reconnect_backoff.read().get(&l.addr).map(|s| s.attempts),
+        Some(0)
+    );
 }
 
 // ---- Bans and dials ----
 
 fn ban(pm: &PeerManager, target: crate::net::ban::BanTarget) {
     let now = crate::time::now_secs();
-    pm.ban_list.write().add(&target, now, now + 3600).expect("ban");
+    pm.ban_list
+        .write()
+        .add(&target, now, now + 3600)
+        .expect("ban");
 }
 
 /// Core checks bans for automatic connections only: a manual one is opened
@@ -522,10 +635,18 @@ async fn a_banned_manual_peer_is_dialled_and_a_banned_learned_one_is_not() {
     let learned = Listener::bind().await;
     assert!(pm.addnode_add(&manual.addr.to_string(), PeerAddr::Socket(manual.addr)));
     learn(&pm, learned.addr);
-    ban(&pm, crate::net::ban::BanTarget::Net(ipnet::IpNet::from(IpAddr::from([127, 0, 0, 1]))));
+    ban(
+        &pm,
+        crate::net::ban::BanTarget::Net(ipnet::IpNet::from(IpAddr::from([127, 0, 0, 1]))),
+    );
 
     pm.reconnect_tick();
-    wait_for(&pm, || manual.accepts() == 1, "the banned added node is dialled").await;
+    wait_for(
+        &pm,
+        || manual.accepts() == 1,
+        "the banned added node is dialled",
+    )
+    .await;
     settle(&pm).await;
     assert_eq!(learned.accepts(), 0, "the banned learned address is not");
     let err = pm
@@ -549,25 +670,48 @@ async fn a_banned_onion_host_is_neither_learned_nor_dialled_automatically() {
     // Learned before the ban, so only the reconnect loop can hold it back.
     learn_onion(&pm, &banned, 8333);
     learn_onion(&pm, &open, 8333);
-    assert!(pm.add_peer_addr(PeerAddr::Onion { host: named.clone(), port: 8333 }));
+    assert!(pm.add_peer_addr(PeerAddr::Onion {
+        host: named.clone(),
+        port: 8333
+    }));
     for h in [&banned, &named] {
         ban(&pm, crate::net::ban::BanTarget::Onion(h.clone()));
     }
 
     pm.reconnect_tick();
-    let tried = |h: &str| pm.onion_reconnect_backoff.read().contains_key(&format!("{h}:8333"));
-    wait_for(&pm, || tried(&open) && tried(&named), "the open host and the named one are dialled").await;
+    let tried = |h: &str| {
+        pm.onion_reconnect_backoff
+            .read()
+            .contains_key(&format!("{h}:8333"))
+    };
+    wait_for(
+        &pm,
+        || tried(&open) && tried(&named),
+        "the open host and the named one are dialled",
+    )
+    .await;
     settle(&pm).await;
     assert!(!tried(&banned), "the banned learned host is not");
 
     // Gossip naming a banned host does not add it.
     let later = host(4);
     ban(&pm, crate::net::ban::BanTarget::Onion(later.clone()));
-    let mut announcer = peer(7, SocketAddr::from(([198, 51, 100, 7], 8333)), Direction::Inbound);
+    let mut announcer = peer(
+        7,
+        SocketAddr::from(([198, 51, 100, 7], 8333)),
+        Direction::Inbound,
+    );
     announcer.permissions.addr = true;
     add_peer(&pm, announcer);
-    pm.handle_message(7, onion_addrv2(&[(later.clone(), 8333), (host(5), 8333)]), InFlight::adopt(None));
-    assert!(!book_holds_onion(&pm, &later), "a banned onion host is not learned");
+    pm.handle_message(
+        7,
+        onion_addrv2(&[(later.clone(), 8333), (host(5), 8333)]),
+        InFlight::adopt(None),
+    );
+    assert!(
+        !book_holds_onion(&pm, &later),
+        "a banned onion host is not learned"
+    );
     assert!(book_holds_onion(&pm, &host(5)), "an open one is");
 }
 
@@ -585,11 +729,28 @@ fn setban_of_an_onion_host_disconnects_that_peer_only() {
         info.onion_host = Some(h);
         add_peer(&pm, info);
     }
-    add_peer(&pm, peer(3, SocketAddr::from(([198, 51, 100, 3], 8333)), Direction::Outbound));
+    add_peer(
+        &pm,
+        peer(
+            3,
+            SocketAddr::from(([198, 51, 100, 3], 8333)),
+            Direction::Outbound,
+        ),
+    );
     let now = crate::time::now_secs();
-    pm.set_ban_subnet(&crate::net::ban::BanTarget::Onion(host('a')), true, now, now + 3600).unwrap();
+    pm.set_ban_subnet(
+        &crate::net::ban::BanTarget::Onion(host('a')),
+        true,
+        now,
+        now + 3600,
+    )
+    .unwrap();
     let ids: std::collections::BTreeSet<PeerId> = pm.peers.read().keys().copied().collect();
-    assert_eq!(ids, [2, 3].into_iter().collect(), "only the banned onion peer is disconnected");
+    assert_eq!(
+        ids,
+        [2, 3].into_iter().collect(),
+        "only the banned onion peer is disconnected"
+    );
 
     // A ban of an IP range does not reach onion peers through their placeholder.
     pm.set_ban_subnet(
@@ -599,7 +760,10 @@ fn setban_of_an_onion_host_disconnects_that_peer_only() {
         now + 3600,
     )
     .unwrap();
-    assert!(pm.peers.read().contains_key(&2), "the other onion peer stays");
+    assert!(
+        pm.peers.read().contains_key(&2),
+        "the other onion peer stays"
+    );
 }
 
 /// A full address book makes room for a new address by dropping a terrible
@@ -612,10 +776,24 @@ fn a_full_book_replaces_a_terrible_entry() {
     let full = crate::net::addrman::MAX_ENTRIES;
     // 64 per /16, across enough groups to fill the book, and each source's
     // share (#1264) from a /16 of its own.
-    let addr_at = |i: usize| SocketAddr::from(([11 + (i / 64 / 256) as u8, ((i / 64) % 256) as u8, 1, (i % 64) as u8 + 1], 8333));
+    let addr_at = |i: usize| {
+        SocketAddr::from((
+            [
+                11 + (i / 64 / 256) as u8,
+                ((i / 64) % 256) as u8,
+                1,
+                (i % 64) as u8 + 1,
+            ],
+            8333,
+        ))
+    };
     let share = crate::net::addrman::MAX_NEW_PER_SOURCE_GROUP;
     for i in 0..full {
-        pm.add_learned_addr_from(addr_at(i), 9, IpAddr::from([150 + (i / share) as u8, 1, 1, 1]));
+        pm.add_learned_addr_from(
+            addr_at(i),
+            9,
+            IpAddr::from([150 + (i / share) as u8, 1, 1, 1]),
+        );
     }
     assert_eq!(pm.addrman.read().len(), full, "fixture: the book is full");
     // A source with nothing in the book: only the book's cap holds it back.
@@ -623,14 +801,22 @@ fn a_full_book_replaces_a_terrible_entry() {
 
     let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
     pm.add_learned_addr_from(fresh, 9, source);
-    assert!(!pm.addrman.read().contains(&fresh.into()), "nothing terrible: refused");
+    assert!(
+        !pm.addrman.read().contains(&fresh.into()),
+        "nothing terrible: refused"
+    );
 
     let stale = addr_at(0);
     for _ in 0..3 {
-        pm.addrman.write().mark_attempt(&stale.into(), now_unix_secs() - 120);
+        pm.addrman
+            .write()
+            .mark_attempt(&stale.into(), now_unix_secs() - 120);
     }
     pm.add_learned_addr_from(fresh, 9, source);
-    assert!(pm.addrman.read().contains(&fresh.into()), "the new address takes the terrible one's place");
+    assert!(
+        pm.addrman.read().contains(&fresh.into()),
+        "the new address takes the terrible one's place"
+    );
     assert!(!pm.addrman.read().contains(&stale.into()));
     assert_eq!(pm.addrman.read().len(), full);
 }
@@ -646,9 +832,19 @@ async fn a_failed_redial_counts_as_an_attempt() {
     drop(closed);
     pm.add_learned_addr_from(addr, 9, IpAddr::from([198, 51, 100, 1]));
     pm.reconnect_tick();
-    wait_for(&pm, || pm.reconnect_backoff.read().contains_key(&addr), "the dial fails").await;
+    wait_for(
+        &pm,
+        || pm.reconnect_backoff.read().contains_key(&addr),
+        "the dial fails",
+    )
+    .await;
     settle(&pm).await;
-    let attempts = pm.addrman.read().iter().find(|e| e.addr == addr.into()).map(|e| e.attempts);
+    let attempts = pm
+        .addrman
+        .read()
+        .iter()
+        .find(|e| e.addr == addr.into())
+        .map(|e| e.attempts);
     assert_eq!(attempts, Some(1));
 }
 
@@ -665,17 +861,27 @@ fn a_full_group_replaces_a_terrible_entry_and_its_backoff() {
     }
     let fresh = in_group(100);
     pm.add_learned_addr_from(fresh, 9, source);
-    assert!(!pm.addrman.read().contains(&fresh.into()), "nothing terrible: refused");
+    assert!(
+        !pm.addrman.read().contains(&fresh.into()),
+        "nothing terrible: refused"
+    );
 
     let stale = in_group(0);
     for _ in 0..3 {
-        pm.addrman.write().mark_attempt(&stale.into(), now_unix_secs() - 120);
+        pm.addrman
+            .write()
+            .mark_attempt(&stale.into(), now_unix_secs() - 120);
     }
-    pm.reconnect_backoff.write().insert(stale, ReconnectState::new());
+    pm.reconnect_backoff
+        .write()
+        .insert(stale, ReconnectState::new());
     pm.add_learned_addr_from(fresh, 9, source);
     assert!(pm.addrman.read().contains(&fresh.into()));
     assert!(!pm.addrman.read().contains(&stale.into()));
-    assert!(!pm.reconnect_backoff.read().contains_key(&stale), "its backoff is dropped");
+    assert!(
+        !pm.reconnect_backoff.read().contains_key(&stale),
+        "its backoff is dropped"
+    );
 }
 
 /// A book full of tried addresses, all unseen for over 30 days, still makes
@@ -695,7 +901,10 @@ fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
             book.mark_good(a, long_ago);
         }
         assert_eq!(book.len(), full, "fixture: the book is full");
-        assert!(book.iter().filter(|e| e.tried).count() > full / 2, "fixture: mostly tried");
+        assert!(
+            book.iter().filter(|e| e.tried).count() > full / 2,
+            "fixture: mostly tried"
+        );
     }
     let fresh = SocketAddr::from(([99, 1, 1, 1], 8333));
     pm.add_learned_addr_from(fresh, 9, IpAddr::from([198, 51, 100, 1]));
@@ -712,7 +921,13 @@ fn a_book_full_of_stale_tried_entries_takes_a_new_address() {
 fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
     use crate::net::reachable::ReachableNets;
     let (pm, _dir) = mk_pm();
-    pm.set_reachable(ReachableNets { ipv4: true, ipv6: false, onion: false, cjdns: false, cjdns_flip: false });
+    pm.set_reachable(ReachableNets {
+        ipv4: true,
+        ipv6: false,
+        onion: false,
+        cjdns: false,
+        cjdns_flip: false,
+    });
     let source = IpAddr::from([198, 51, 100, 1]);
     let v4 = SocketAddr::from(([44, 1, 2, 3], 8333));
     let v6: SocketAddr = "[2001:4860::7]:8333".parse().unwrap();
@@ -720,19 +935,34 @@ fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
     pm.add_learned_addr_from(v4, 9, source);
     pm.add_learned_addr_from(v6, 9, source);
     assert!(pm.addrman.read().contains(&v4.into()));
-    assert!(!pm.addrman.read().contains(&v6.into()), "an unreachable network's address is not kept");
+    assert!(
+        !pm.addrman.read().contains(&v6.into()),
+        "an unreachable network's address is not kept"
+    );
 
     assert!(pm.may_dial(&v4.into()));
-    assert!(!pm.may_dial(&v6.into()), "no automatic dial to an unreachable network");
+    assert!(
+        !pm.may_dial(&v6.into()),
+        "no automatic dial to an unreachable network"
+    );
     pm.manual_addrs.write().insert(v6);
-    assert!(pm.may_dial(&v6.into()), "-onlynet does not affect manual connections");
+    assert!(
+        pm.may_dial(&v6.into()),
+        "-onlynet does not affect manual connections"
+    );
 
     // Seeds go through the same gate, onion seeds included.
     let v6b: SocketAddr = "[2001:4860::8]:8333".parse().unwrap();
     pm.add_learned_peer_addr(&PeerAddr::Socket(v6b));
     assert!(!pm.addrman.read().contains(&v6b.into()));
-    pm.add_learned_peer_addr(&PeerAddr::Onion { host: onion_host(1), port: 8333 });
-    assert!(!book_holds_onion(&pm, &onion_host(1)), "onion is not reachable");
+    pm.add_learned_peer_addr(&PeerAddr::Onion {
+        host: onion_host(1),
+        port: 8333,
+    });
+    assert!(
+        !book_holds_onion(&pm, &onion_host(1)),
+        "onion is not reachable"
+    );
 }
 
 /// `-onion=0` refuses every `.onion` dial, a manual peer's included, before
@@ -742,7 +972,10 @@ fn onlynet_gates_automatic_dials_and_gossip_but_not_manual_peers() {
 async fn onion_zero_refuses_even_a_manual_onion_dial() {
     let (pm, _dir) = mk_pm();
     pm.set_onion_disabled(true);
-    let err = pm.dial_onion(&("a".repeat(56) + ".onion"), 8333).await.expect_err("disabled");
+    let err = pm
+        .dial_onion(&("a".repeat(56) + ".onion"), 8333)
+        .await
+        .expect_err("disabled");
     assert!(err.contains("-onion=0"), "{err}");
 }
 
@@ -758,9 +991,21 @@ fn an_address_book_of_unreachable_addresses_does_not_count() {
     pm.add_learned_addr_from(v4, 9, IpAddr::from([198, 51, 100, 1]));
     assert!(!pm.addrman_is_empty());
     assert!(pm.addrman_has_reachable());
-    pm.set_reachable(ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false });
-    assert!(!pm.addrman_is_empty(), "the clearnet entry is still in the book");
-    assert!(!pm.addrman_has_reachable(), "but it is not on a reachable network");
+    pm.set_reachable(ReachableNets {
+        ipv4: false,
+        ipv6: false,
+        onion: true,
+        cjdns: false,
+        cjdns_flip: false,
+    });
+    assert!(
+        !pm.addrman_is_empty(),
+        "the clearnet entry is still in the book"
+    );
+    assert!(
+        !pm.addrman_has_reachable(),
+        "but it is not on a reachable network"
+    );
 }
 
 // ---- Services an outbound peer states (Core's `SetServices`) ----
@@ -771,7 +1016,13 @@ fn an_address_book_of_unreachable_addresses_does_not_count() {
 async fn handshake_stating(services: ServiceFlags) -> (Result<VersionMessage, String>, u64) {
     let (pm, _dir) = mk_pm();
     let (result, target) = handshake_as(&pm, ConnType::OutboundFullRelay, services).await;
-    let book = pm.addrman.read().iter().find(|e| e.addr == target.into()).map(|e| e.services).unwrap();
+    let book = pm
+        .addrman
+        .read()
+        .iter()
+        .find(|e| e.addr == target.into())
+        .map(|e| e.services)
+        .unwrap();
     (result, book)
 }
 
@@ -788,8 +1039,14 @@ async fn handshake_as(
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
-    pm.addrman.write().add_from(target, now_unix_secs(), 1 | 8, "198.51.100.7".parse::<IpAddr>().unwrap());
-    let (dialed, accepted) = tokio::join!(tokio::net::TcpStream::connect(target), listener.accept());
+    pm.addrman.write().add_from(
+        target,
+        now_unix_secs(),
+        1 | 8,
+        "198.51.100.7".parse::<IpAddr>().unwrap(),
+    );
+    let (dialed, accepted) =
+        tokio::join!(tokio::net::TcpStream::connect(target), listener.accept());
     let (dialed, (accepted, _)) = (dialed.unwrap(), accepted.unwrap());
     let mut info = peer(1, target, Direction::Outbound);
     info.state = PeerState::Connecting;
@@ -798,7 +1055,8 @@ async fn handshake_as(
     let mut ours = Connection::with_magic(dialed, Magic::REGTEST);
     let mut theirs = Connection::with_magic(accepted, Magic::REGTEST);
 
-    let handshake = pm.perform_handshake(1, &mut ours, Direction::Outbound, crate::time::now_secs());
+    let handshake =
+        pm.perform_handshake(1, &mut ours, Direction::Outbound, crate::time::now_secs());
     let remote = async {
         loop {
             if matches!(theirs.recv().await, Ok(NetworkMessage::Version(_)) | Err(_)) {
@@ -836,13 +1094,20 @@ async fn an_outbound_peers_version_sets_its_addresss_services() {
     let stated = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
     let (result, book) = handshake_stating(stated).await;
     result.expect("the handshake completes");
-    assert_eq!(book, stated.to_u64(), "the book holds what the peer stated, not what gossip said");
+    assert_eq!(
+        book,
+        stated.to_u64(),
+        "the book holds what the peer stated, not what gossip said"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_dropped_for_lacking_services_is_recorded_as_lacking_them() {
     let (result, book) = handshake_stating(ServiceFlags::WITNESS).await;
-    assert!(result.is_err(), "an automatic peer without NODE_NETWORK is dropped");
+    assert!(
+        result.is_err(),
+        "an automatic peer without NODE_NETWORK is dropped"
+    );
     assert_eq!(book, ServiceFlags::WITNESS.to_u64());
 }
 
@@ -856,7 +1121,8 @@ fn a_peer_the_book_first_learns_by_connecting_keeps_its_stated_services() {
     let mut info = peer(1, target, Direction::Outbound);
     info.conn_type = ConnType::Manual;
     add_peer(&pm, info);
-    let stated = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
+    let stated =
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::from(1 << 30);
     let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
     pm.handle_peer_connected(
         1,
@@ -872,7 +1138,12 @@ fn a_peer_the_book_first_learns_by_connecting_keeps_its_stated_services() {
             relay: true,
         },
     );
-    let book = pm.addrman.read().iter().find(|e| e.addr == target.into()).map(|e| e.services);
+    let book = pm
+        .addrman
+        .read()
+        .iter()
+        .find(|e| e.addr == target.into())
+        .map(|e| e.services);
     assert_eq!(book, Some(stated.to_u64()));
 }
 
@@ -889,12 +1160,21 @@ fn onion_host(i: usize) -> String {
 
 /// Put an onion in the address book, as gossip or `peers.dat` would.
 fn learn_onion(pm: &PeerManager, host: &str, port: u16) {
-    let addr = PeerAddr::Onion { host: host.to_string(), port };
-    assert!(pm.addrman.write().add(addr.clone(), now_unix_secs()), "fixture: the book takes {addr}");
+    let addr = PeerAddr::Onion {
+        host: host.to_string(),
+        port,
+    };
+    assert!(
+        pm.addrman.write().add(addr.clone(), now_unix_secs()),
+        "fixture: the book takes {addr}"
+    );
 }
 
 fn book_holds_onion(pm: &PeerManager, host: &str) -> bool {
-    pm.addrman.read().iter().any(|e| matches!(&e.addr, PeerAddr::Onion { host: h, .. } if h == host))
+    pm.addrman
+        .read()
+        .iter()
+        .any(|e| matches!(&e.addr, PeerAddr::Onion { host: h, .. } if h == host))
 }
 
 /// An `addrv2` announcing `onions` as BIP 155 `TorV3` entries.
@@ -906,7 +1186,9 @@ fn onion_addrv2(onions: &[(String, u16)]) -> NetworkMessage {
             .map(|(host, port)| AddrV2Message {
                 time: 1_700_000_000,
                 services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-                addr: AddrV2::TorV3(crate::net::peer::onion_host_to_torv3_pubkey(host).expect("a v3 onion")),
+                addr: AddrV2::TorV3(
+                    crate::net::peer::onion_host_to_torv3_pubkey(host).expect("a v3 onion"),
+                ),
                 port: *port,
             })
             .collect(),
@@ -934,8 +1216,15 @@ fn an_onion_learned_from_gossip_survives_a_restart() {
     info.permissions.addr = true;
     add_peer(&pm, info);
     let host = onion_host(1);
-    pm.handle_message(7, onion_addrv2(&[(host.clone(), 9333)]), InFlight::adopt(None));
-    assert!(book_holds_onion(&pm, &host), "gossip puts the onion in the book");
+    pm.handle_message(
+        7,
+        onion_addrv2(&[(host.clone(), 9333)]),
+        InFlight::adopt(None),
+    );
+    assert!(
+        book_holds_onion(&pm, &host),
+        "gossip puts the onion in the book"
+    );
 
     let path = dir.path().join("peers.dat");
     pm.dump_addrman(&path);
@@ -946,8 +1235,14 @@ fn an_onion_learned_from_gossip_survives_a_restart() {
         .into_iter()
         .find(|e| matches!(&e.addr, PeerAddr::Onion { host: h, port: 9333 } if *h == host))
         .expect("the onion is there after a restart");
-    assert_eq!(entry.source, crate::net::addrman::NetAddr::Ip(announcer.ip()));
-    assert_eq!(entry.services, (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64());
+    assert_eq!(
+        entry.source,
+        crate::net::addrman::NetAddr::Ip(announcer.ip())
+    );
+    assert_eq!(
+        entry.services,
+        (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64()
+    );
     assert_eq!(restarted.addrman_counts()["onion"].new, 1);
 
     leave_ibd(&restarted);
@@ -964,12 +1259,24 @@ fn an_onion_learned_from_gossip_survives_a_restart() {
 #[test]
 fn an_onion_peers_announcements_have_its_onion_as_their_source() {
     let (pm, _dir) = mk_pm_tor();
-    let mut via_tor = peer(3, SocketAddr::from(([0, 0, 0, 0], 9333)), Direction::Outbound);
+    let mut via_tor = peer(
+        3,
+        SocketAddr::from(([0, 0, 0, 0], 9333)),
+        Direction::Outbound,
+    );
     via_tor.onion_host = Some(onion_host(7));
     via_tor.permissions.addr = true;
     add_peer(&pm, via_tor);
-    pm.handle_message(3, onion_addrv2(&[(onion_host(8), 9333)]), InFlight::adopt(None));
-    let entry = pm.addrman_snapshot().into_iter().find(|e| e.addr.is_onion()).expect("learned");
+    pm.handle_message(
+        3,
+        onion_addrv2(&[(onion_host(8), 9333)]),
+        InFlight::adopt(None),
+    );
+    let entry = pm
+        .addrman_snapshot()
+        .into_iter()
+        .find(|e| e.addr.is_onion())
+        .expect("learned");
     assert_eq!(entry.source.addr_string(), onion_host(7));
     assert_eq!(entry.source.network_name(), "onion");
 }
@@ -985,7 +1292,11 @@ fn a_connected_onion_moves_to_tried() {
     let (pm, _dir) = mk_pm_tor();
     let host = onion_host(2);
     learn_onion(&pm, &host, 9333);
-    let mut info = peer(1, SocketAddr::from(([0, 0, 0, 0], 9333)), Direction::Outbound);
+    let mut info = peer(
+        1,
+        SocketAddr::from(([0, 0, 0, 0], 9333)),
+        Direction::Outbound,
+    );
     info.onion_host = Some(host.clone());
     info.conn_type = ConnType::OutboundFullRelay;
     add_peer(&pm, info);
@@ -1009,7 +1320,10 @@ fn a_connected_onion_moves_to_tried() {
     let book = pm.addrman.read();
     assert!(book.is_tried(&target), "the onion is tried");
     assert_eq!(book.get(&target).map(|e| e.services), Some(stated.to_u64()));
-    assert!(!book.contains(&PeerAddr::Socket(SocketAddr::from(([0, 0, 0, 0], 9333)))), "not the placeholder");
+    assert!(
+        !book.contains(&PeerAddr::Socket(SocketAddr::from(([0, 0, 0, 0], 9333)))),
+        "not the placeholder"
+    );
 }
 
 /// A tried-collision incumbent passes its test only by a connection to the
@@ -1020,10 +1334,17 @@ fn a_connected_onion_moves_to_tried() {
 fn an_onion_twin_on_another_port_does_not_test_the_entry() {
     let (pm, _dir) = mk_pm_tor();
     let host = onion_host(4);
-    let mut twin = peer(1, SocketAddr::from(([0, 0, 0, 0], 9444)), Direction::Outbound);
+    let mut twin = peer(
+        1,
+        SocketAddr::from(([0, 0, 0, 0], 9444)),
+        Direction::Outbound,
+    );
     twin.onion_host = Some(host.clone());
     add_peer(&pm, twin);
-    assert!(!pm.is_book_addr_connected(&PeerAddr::Onion { host: host.clone(), port: 9333 }));
+    assert!(!pm.is_book_addr_connected(&PeerAddr::Onion {
+        host: host.clone(),
+        port: 9333
+    }));
     assert!(pm.is_book_addr_connected(&PeerAddr::Onion { host, port: 9444 }));
 }
 
@@ -1036,11 +1357,20 @@ async fn a_failed_onion_dial_counts_against_the_onion() {
     let host = onion_host(5);
     learn_onion(&pm, &host, 9333);
     pm.reconnect_tick();
-    let tried = || pm.onion_reconnect_backoff.read().contains_key(&format!("{host}:9333"));
+    let tried = || {
+        pm.onion_reconnect_backoff
+            .read()
+            .contains_key(&format!("{host}:9333"))
+    };
     wait_for(&pm, tried, "the onion is dialled").await;
     settle(&pm).await;
     let target = PeerAddr::Onion { host, port: 9333 };
-    let entry = pm.addrman.read().get(&target).cloned().expect("still in the book");
+    let entry = pm
+        .addrman
+        .read()
+        .get(&target)
+        .cloned()
+        .expect("still in the book");
     assert_eq!(entry.attempts, 1);
     assert_eq!(entry.last_success, 0);
 }
@@ -1051,7 +1381,13 @@ async fn a_failed_onion_dial_counts_against_the_onion() {
 fn onlynet_onion_draws_only_onion_entries() {
     use crate::net::reachable::ReachableNets;
     let (pm, _dir) = mk_pm_tor();
-    pm.set_reachable(ReachableNets { ipv4: false, ipv6: false, onion: true, cjdns: false, cjdns_flip: false });
+    pm.set_reachable(ReachableNets {
+        ipv4: false,
+        ipv6: false,
+        onion: true,
+        cjdns: false,
+        cjdns_flip: false,
+    });
     leave_ibd(&pm);
     // As `peers.dat` would hold them from before the flag.
     for a in spread(44, 6) {
@@ -1060,8 +1396,11 @@ fn onlynet_onion_draws_only_onion_entries() {
     for i in 0..3 {
         learn_onion(&pm, &onion_host(i * 16), 9333);
     }
-    let all: Vec<PeerAddr> =
-        pm.reserve_automatic_dials(Instant::now(), &[]).into_iter().map(|(a, _slot)| a).collect();
+    let all: Vec<PeerAddr> = pm
+        .reserve_automatic_dials(Instant::now(), &[])
+        .into_iter()
+        .map(|(a, _slot)| a)
+        .collect();
     assert_eq!(all.len(), 3, "{all:?}");
     assert!(all.iter().all(PeerAddr::is_onion), "only onions: {all:?}");
 }
@@ -1073,7 +1412,13 @@ fn onlynet_onion_draws_only_onion_entries() {
 fn onions_in_the_book_wait_for_a_proxy() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
-    assert!(pm.addrman.write().add(PeerAddr::Onion { host: onion_host(1), port: 9333 }, now_unix_secs()));
+    assert!(pm.addrman.write().add(
+        PeerAddr::Onion {
+            host: onion_host(1),
+            port: 9333
+        },
+        now_unix_secs()
+    ));
     assert!(onions_dialled(&pm).is_empty());
 
     let (tor, _dir) = mk_pm_tor();
@@ -1105,21 +1450,36 @@ fn an_onion_dial_passes_over_a_peer_it_just_tried() {
     leave_ibd(&pm);
     // Seven of the eight automatic slots taken: room for one onion dial.
     fill_automatic(&pm, MAX_OUTBOUND - 1);
-    let onions: Vec<PeerAddr> = (0..3).map(|i| PeerAddr::Onion { host: onion_host(i), port: 8333 }).collect();
+    let onions: Vec<PeerAddr> = (0..3)
+        .map(|i| PeerAddr::Onion {
+            host: onion_host(i),
+            port: 8333,
+        })
+        .collect();
     for o in &onions {
         assert!(pm.addrman.write().add(o.clone(), now_unix_secs()));
     }
-    let tried_now = || ReconnectState { attempts: 0, next_attempt: Instant::now(), last_try: Some(Instant::now()) };
+    let tried_now = || ReconnectState {
+        attempts: 0,
+        next_attempt: Instant::now(),
+        last_try: Some(Instant::now()),
+    };
     {
         let mut backoff = pm.onion_reconnect_backoff.write();
         for o in &onions[..2] {
             backoff.insert(o.to_string(), tried_now());
         }
     }
-    assert_eq!(onions_dialled(&pm), vec![onions[2].clone()], "the one not tried lately");
+    assert_eq!(
+        onions_dialled(&pm),
+        vec![onions[2].clone()],
+        "the one not tried lately"
+    );
 
     // Tried lately, all of them: there is nothing else, so one is dialled.
-    pm.onion_reconnect_backoff.write().insert(onions[2].to_string(), tried_now());
+    pm.onion_reconnect_backoff
+        .write()
+        .insert(onions[2].to_string(), tried_now());
     assert_eq!(onions_dialled(&pm).len(), 1);
 }
 
@@ -1131,13 +1491,24 @@ fn removing_a_manual_twin_keeps_the_learned_onion() {
     let (pm, _dir) = mk_pm_tor();
     let host = onion_host(3);
     learn_onion(&pm, &host, 9333);
-    let twin = PeerAddr::Onion { host: host.clone(), port: 9444 };
+    let twin = PeerAddr::Onion {
+        host: host.clone(),
+        port: 9444,
+    };
     assert!(pm.add_peer_addr(twin.clone()));
-    assert!(!pm.addrman.read().contains(&twin), "a named onion is not a book entry");
+    assert!(
+        !pm.addrman.read().contains(&twin),
+        "a named onion is not a book entry"
+    );
     assert!(pm.manual_onion_addrs.read().contains(&twin));
     assert!(pm.remove_peer_addr(&twin));
     assert!(!pm.manual_onion_addrs.read().contains(&twin));
-    assert!(pm.addrman.read().contains(&PeerAddr::Onion { host, port: 9333 }), "the learned entry stays");
+    assert!(
+        pm.addrman
+            .read()
+            .contains(&PeerAddr::Onion { host, port: 9333 }),
+        "the learned entry stays"
+    );
 }
 
 /// A dial to an onion that left the book while it ran leaves no backoff
@@ -1146,17 +1517,29 @@ fn removing_a_manual_twin_keeps_the_learned_onion() {
 async fn an_onion_dropped_mid_dial_leaves_no_backoff() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
-    let gone = PeerAddr::Onion { host: onion_host(8), port: 9333 };
+    let gone = PeerAddr::Onion {
+        host: onion_host(8),
+        port: 9333,
+    };
     let slot = pm.reserve_dial(DialBudget::Automatic).unwrap();
     pm.spawn_redial(gone.clone(), slot, AUTOMATIC_RECONNECT_MAX_BACKOFF);
     settle(&pm).await;
-    assert!(!pm.onion_reconnect_backoff.read().contains_key(&gone.to_string()));
+    assert!(
+        !pm.onion_reconnect_backoff
+            .read()
+            .contains_key(&gone.to_string())
+    );
     // One in the book gets its backoff, as before.
     let listed = onion_host(9);
     learn_onion(&pm, &listed, 9333);
     pm.reconnect_tick();
     let key = format!("{listed}:9333");
-    wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the listed onion backs off").await;
+    wait_for(
+        &pm,
+        || pm.onion_reconnect_backoff.read().contains_key(&key),
+        "the listed onion backs off",
+    )
+    .await;
 }
 
 // ---- Feelers (#1149) ----
@@ -1170,7 +1553,8 @@ fn feeler_due(pm: &PeerManager) {
 /// grant goes back at the end of this call.
 fn feeler_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
     feeler_due(pm);
-    pm.reserve_feeler(Instant::now(), &[]).map(|(target, _grant)| target)
+    pm.reserve_feeler(Instant::now(), &[])
+        .map(|(target, _grant)| target)
 }
 
 /// #1149: Core opens a feeler only once the outbound targets are met, its
@@ -1186,10 +1570,17 @@ fn no_feeler_while_the_automatic_target_is_unmet() {
     feeler_due(&pm);
     let due = *pm.next_feeler.lock();
     assert_eq!(pm.reserve_feeler(Instant::now(), &[]).map(|(t, _)| t), None);
-    assert_eq!(*pm.next_feeler.lock(), due, "the timer waits for the target");
+    assert_eq!(
+        *pm.next_feeler.lock(),
+        due,
+        "the timer waits for the target"
+    );
 
     fill_automatic(&pm, 8);
-    assert_eq!(feeler_target(&pm), Some(SocketAddr::from(([44, 1, 2, 3], 8333)).into()));
+    assert_eq!(
+        feeler_target(&pm),
+        Some(SocketAddr::from(([44, 1, 2, 3], 8333)).into())
+    );
 }
 
 /// The timer is set again by each feeler, to a time drawn around Core's
@@ -1216,7 +1607,14 @@ fn a_feeler_tests_a_new_entry_in_any_group() {
     leave_ibd(&pm);
     fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_automatic(&pm, 7);
-    add_peer(&pm, peer(1, SocketAddr::from(([44, 1, 0, 1], 8333)), Direction::Outbound));
+    add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([44, 1, 0, 1], 8333)),
+            Direction::Outbound,
+        ),
+    );
     let tried = SocketAddr::from(([45, 1, 2, 3], 8333));
     // In the group of a peer the node holds, 44.1.0.0/16.
     let fresh = SocketAddr::from(([44, 1, 9, 9], 8333));
@@ -1225,7 +1623,10 @@ fn a_feeler_tests_a_new_entry_in_any_group() {
         assert!(book.mark_good(tried, now_unix_secs()));
         assert!(book.add(fresh, now_unix_secs()));
     }
-    assert!(pm.reserve_automatic_dials(Instant::now(), &[]).is_empty(), "fixture: the target is met");
+    assert!(
+        pm.reserve_automatic_dials(Instant::now(), &[]).is_empty(),
+        "fixture: the target is met"
+    );
     for _ in 0..20 {
         assert_eq!(feeler_target(&pm), Some(fresh.into()));
     }
@@ -1244,7 +1645,11 @@ fn a_feeler_needs_only_a_useful_address_book() {
     fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     fill_automatic(&pm, 8);
     let now = now_unix_secs();
-    assert!(pm.addrman.write().add_from(neither, now, ServiceFlags::WITNESS.to_u64(), source));
+    assert!(
+        pm.addrman
+            .write()
+            .add_from(neither, now, ServiceFlags::WITNESS.to_u64(), source)
+    );
     assert_eq!(feeler_target(&pm), None, "no address book worth testing");
     let services = (ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS).to_u64();
     assert!(pm.addrman.write().add_from(limited, now, services, source));
@@ -1259,7 +1664,11 @@ fn a_feeler_takes_no_automatic_slot() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
     fill_automatic(&pm, 7);
-    let mut feeler = peer(1, SocketAddr::from(([44, 1, 2, 3], 8333)), Direction::Outbound);
+    let mut feeler = peer(
+        1,
+        SocketAddr::from(([44, 1, 2, 3], 8333)),
+        Direction::Outbound,
+    );
     feeler.conn_type = ConnType::Feeler;
     feeler.state = PeerState::Connecting;
     add_peer(&pm, feeler);
@@ -1272,8 +1681,16 @@ fn a_feeler_takes_no_automatic_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_feeler_moves_a_new_entry_to_tried() {
     let (pm, _dir) = mk_pm();
-    let (result, target) = handshake_as(&pm, ConnType::Feeler, ServiceFlags::NETWORK | ServiceFlags::WITNESS).await;
-    assert!(result.unwrap_err().contains("feeler"), "closed after version");
+    let (result, target) = handshake_as(
+        &pm,
+        ConnType::Feeler,
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+    )
+    .await;
+    assert!(
+        result.unwrap_err().contains("feeler"),
+        "closed after version"
+    );
     assert!(pm.addrman.read().is_tried(&target.into()));
     assert!(pm.peers.read().is_empty(), "the feeler is gone");
 }
@@ -1296,10 +1713,18 @@ async fn a_failed_feeler_counts_an_attempt() {
     pm.reconnect_tick();
     let tried = || pm.reconnect_backoff.read().contains_key(&closed);
     wait_for(&pm, tried, "the feeler dials").await;
-    let entry = pm.addrman.read().get(&closed.into()).cloned().expect("still in the book");
+    let entry = pm
+        .addrman
+        .read()
+        .get(&closed.into())
+        .cloned()
+        .expect("still in the book");
     assert_eq!(entry.attempts, 1);
     assert!(!pm.addrman.read().is_tried(&closed.into()));
-    assert!(pm.pending_typed_dials.read().is_empty(), "the grant went back");
+    assert!(
+        pm.pending_typed_dials.read().is_empty(),
+        "the grant went back"
+    );
 }
 
 // ---- An extra peer for a network with none (#1156) ----
@@ -1313,7 +1738,8 @@ fn extra_network_due(pm: &PeerManager) {
 /// made due first. The slot goes back at the end of this call.
 fn extra_network_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
     extra_network_due(pm);
-    pm.reserve_extra_network_peer(Instant::now(), &[]).map(|(target, _net, _slot)| target)
+    pm.reserve_extra_network_peer(Instant::now(), &[])
+        .map(|(target, _net, _slot)| target)
 }
 
 /// `n` connected full-relay IPv4 peers, each in a public /16 of its own
@@ -1339,11 +1765,23 @@ fn an_extra_peer_goes_to_the_reachable_network_with_none() {
     let host = onion_host(1);
     learn_onion(&pm, &host, 8333);
     for _ in 0..20 {
-        assert_eq!(extra_network_target(&pm), Some(PeerAddr::Onion { host: host.clone(), port: 8333 }));
+        assert_eq!(
+            extra_network_target(&pm),
+            Some(PeerAddr::Onion {
+                host: host.clone(),
+                port: 8333
+            })
+        );
     }
     let now = Instant::now();
-    assert!(*pm.next_extra_network_peer.lock() > now - Duration::from_millis(100), "the timer is set again");
-    assert!(pm.reserve_extra_network_peer(now, &[]).is_none(), "not due again yet");
+    assert!(
+        *pm.next_extra_network_peer.lock() > now - Duration::from_millis(100),
+        "the timer is set again"
+    );
+    assert!(
+        pm.reserve_extra_network_peer(now, &[]).is_none(),
+        "not due again yet"
+    );
 }
 
 /// No network lacks a peer, or the book has nothing on the one that does:
@@ -1358,15 +1796,32 @@ fn no_extra_peer_without_a_network_to_reach() {
     learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
     extra_network_due(&pm);
     let due = *pm.next_extra_network_peer.lock();
-    assert_eq!(pm.reserve_extra_network_peer(Instant::now(), &[]).map(|(t, _, _)| t), None, "no onion or IPv6 in the book");
-    assert_eq!(*pm.next_extra_network_peer.lock(), due, "the timer stays due");
+    assert_eq!(
+        pm.reserve_extra_network_peer(Instant::now(), &[])
+            .map(|(t, _, _)| t),
+        None,
+        "no onion or IPv6 in the book"
+    );
+    assert_eq!(
+        *pm.next_extra_network_peer.lock(),
+        due,
+        "the timer stays due"
+    );
 
     // An onion peer held, and an onion in the book: every network has one.
-    let mut onion = peer(3000, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    let mut onion = peer(
+        3000,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        Direction::Outbound,
+    );
     onion.onion_host = Some(onion_host(2));
     add_peer(&pm, onion);
     learn_onion(&pm, &onion_host(3), 8333);
-    assert_eq!(extra_network_target(&pm), None, "an onion peer is already held");
+    assert_eq!(
+        extra_network_target(&pm),
+        None,
+        "an onion peer is already held"
+    );
 }
 
 /// Without a proxy, onions are not reachable: an onion in the book is not
@@ -1399,7 +1854,10 @@ fn no_extra_peer_off_the_full_relay_target() {
     assert_eq!(extra_network_target(&pm), None, "below the target");
     // A dial in flight brings the count to the target.
     let slot = pm.reserve_dial(DialBudget::Automatic).unwrap();
-    assert!(extra_network_target(&pm).is_some(), "at the target, the dial in flight counted");
+    assert!(
+        extra_network_target(&pm).is_some(),
+        "at the target, the dial in flight counted"
+    );
     drop(slot);
 
     fill_ipv4(&pm, MAX_OUTBOUND + 1);
@@ -1432,12 +1890,18 @@ fn one_extra_network_dial_at_a_time() {
     learn_onion(&pm, &onion_host(1), 8333);
     learn_onion(&pm, &onion_host(2), 8333);
     extra_network_due(&pm);
-    let first = pm.reserve_extra_network_peer(Instant::now(), &[]).expect("the first extra dial");
+    let first = pm
+        .reserve_extra_network_peer(Instant::now(), &[])
+        .expect("the first extra dial");
     assert_eq!(extra_network_target(&pm), None, "the first is in flight");
     // A full-relay peer drops while the first dials: the count is back at
     // the target, and still no second dial.
     pm.peers.write().remove(&2000);
-    assert_eq!(extra_network_target(&pm), None, "the first is still in flight");
+    assert_eq!(
+        extra_network_target(&pm),
+        None,
+        "the first is still in flight"
+    );
     drop(first);
     fill_ipv4(&pm, MAX_OUTBOUND);
     assert!(extra_network_target(&pm).is_some());
@@ -1456,9 +1920,17 @@ fn a_network_being_dialled_draws_no_extra_peer() {
     pm.pending_onion_dials.write().clear();
     let v6: SocketAddr = "[2001:4860::1]:8333".parse().unwrap();
     learn(&pm, v6);
-    pm.pending_connections.write().insert("[2001:4860::2]:8333".parse().unwrap());
+    pm.pending_connections
+        .write()
+        .insert("[2001:4860::2]:8333".parse().unwrap());
     for _ in 0..20 {
-        assert_eq!(extra_network_target(&pm), Some(PeerAddr::Onion { host: onion_host(1), port: 8333 }));
+        assert_eq!(
+            extra_network_target(&pm),
+            Some(PeerAddr::Onion {
+                host: onion_host(1),
+                port: 8333
+            })
+        );
     }
 }
 
@@ -1485,17 +1957,29 @@ fn the_extra_peer_survives_eviction_as_the_only_one_on_its_network() {
     let (pm, _dir) = mk_pm_tor();
     leave_ibd(&pm);
     for i in 0..MAX_OUTBOUND {
-        let mut info = peer(2000 + i as PeerId, SocketAddr::from(([60 + i as u8, 1, 0, 1], 8333)), Direction::Outbound);
+        let mut info = peer(
+            2000 + i as PeerId,
+            SocketAddr::from(([60 + i as u8, 1, 0, 1], 8333)),
+            Direction::Outbound,
+        );
         info.last_block_announcement = 1000 + i as u64;
         info.conn_time -= Duration::from_secs(60);
         add_peer(&pm, info);
     }
-    let mut onion = peer(3000, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    let mut onion = peer(
+        3000,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        Direction::Outbound,
+    );
     onion.onion_host = Some(onion_host(1));
     onion.last_block_announcement = 0;
     onion.conn_time -= Duration::from_secs(60);
     add_peer(&pm, onion);
-    assert_eq!(pm.evict_extra_outbound_peer(), Some(2000), "the oldest IPv4 announcement");
+    assert_eq!(
+        pm.evict_extra_outbound_peer(),
+        Some(2000),
+        "the oldest IPv4 announcement"
+    );
     assert!(pm.peers.read().contains_key(&3000));
     assert_eq!(pm.evict_extra_outbound_peer(), None, "back at the target");
 }
@@ -1513,9 +1997,18 @@ async fn the_reconnect_loop_dials_the_extra_peer() {
     extra_network_due(&pm);
     pm.reconnect_tick();
     let key = format!("{host}:8333");
-    wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the onion is dialled").await;
+    wait_for(
+        &pm,
+        || pm.onion_reconnect_backoff.read().contains_key(&key),
+        "the onion is dialled",
+    )
+    .await;
     settle(&pm).await;
-    assert_eq!(pm.dials_in_flight.lock().extra_network, 0, "the slot went back");
+    assert_eq!(
+        pm.dials_in_flight.lock().extra_network,
+        0,
+        "the slot went back"
+    );
 }
 
 // ---- Automatic block-relay-only peers (#1225) ----
@@ -1524,7 +2017,11 @@ async fn the_reconnect_loop_dials_the_extra_peer() {
 /// ids from 4000.
 fn fill_block_relay(pm: &PeerManager, n: usize) {
     for i in 0..n {
-        let mut info = peer(4000 + i as PeerId, SocketAddr::from(([80 + i as u8, 1, 0, 1], 8333)), Direction::Outbound);
+        let mut info = peer(
+            4000 + i as PeerId,
+            SocketAddr::from(([80 + i as u8, 1, 0, 1], 8333)),
+            Direction::Outbound,
+        );
         info.conn_type = ConnType::BlockRelay;
         add_peer(pm, info);
     }
@@ -1533,7 +2030,8 @@ fn fill_block_relay(pm: &PeerManager, n: usize) {
 /// The address a block-relay-only peer would be dialled at now. The slot
 /// goes back at the end of this call.
 fn block_relay_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
-    pm.reserve_block_relay_peer(Instant::now(), &[]).map(|(target, _slot)| target)
+    pm.reserve_block_relay_peer(Instant::now(), &[])
+        .map(|(target, _slot)| target)
 }
 
 /// #1225: Core opens block-relay-only peers once the full-relay target is
@@ -1561,10 +2059,20 @@ fn block_relay_peers_stop_at_two() {
     learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
     fill_automatic(&pm, MAX_OUTBOUND);
     fill_block_relay(&pm, 1);
-    let in_flight = pm.reserve_block_relay_peer(Instant::now(), &[]).expect("the second");
-    assert_eq!(block_relay_target(&pm), None, "one connected, one being dialled");
+    let in_flight = pm
+        .reserve_block_relay_peer(Instant::now(), &[])
+        .expect("the second");
+    assert_eq!(
+        block_relay_target(&pm),
+        None,
+        "one connected, one being dialled"
+    );
     let held = pm.dials_in_flight.lock();
-    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &held).is_err(), "nor by addconnection");
+    assert!(
+        pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &held)
+            .is_err(),
+        "nor by addconnection"
+    );
     drop(held);
     drop(in_flight);
     assert!(block_relay_target(&pm).is_some());
@@ -1587,12 +2095,18 @@ fn the_block_relay_limit_follows_maxconnections() {
     }
     pm.set_max_connections(MAX_OUTBOUND);
     assert_eq!(block_relay_target(&pm), None, "-maxconnections=8");
-    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default()).is_err());
+    assert!(
+        pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default())
+            .is_err()
+    );
     pm.set_max_connections(9);
     assert!(block_relay_target(&pm).is_some(), "-maxconnections=9");
     fill_block_relay(&pm, 1);
     assert_eq!(block_relay_target(&pm), None, "the one at 9 is open");
-    assert!(pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default()).is_err());
+    assert!(
+        pm.check_outbound_limit_for(ConnType::BlockRelay, &[], &DialsInFlight::default())
+            .is_err()
+    );
 }
 
 /// A block-relay-only peer takes an outbound grant, Core's `semOutbound`:
@@ -1609,10 +2123,15 @@ fn no_block_relay_peer_without_an_outbound_grant() {
     pm.pending_typed_dials.write().push(ConnType::Feeler);
     assert_eq!(block_relay_target(&pm), None);
     pm.pending_typed_dials.write().clear();
-    let block_relay = pm.reserve_block_relay_peer(Instant::now(), &[]).expect("the last grant");
+    let block_relay = pm
+        .reserve_block_relay_peer(Instant::now(), &[])
+        .expect("the last grant");
     // The dial in flight holds the last grant: no feeler.
     feeler_due(&pm);
-    assert!(pm.reserve_feeler(Instant::now(), &[]).is_none(), "the block-relay-only dial holds the grant");
+    assert!(
+        pm.reserve_feeler(Instant::now(), &[]).is_none(),
+        "the block-relay-only dial holds the grant"
+    );
     drop(block_relay);
 }
 
@@ -1627,8 +2146,13 @@ fn a_block_relay_peer_takes_no_full_relay_slot() {
     fill_automatic(&pm, MAX_OUTBOUND - 1);
     fill_block_relay(&pm, 1);
     pm.pending_typed_dials.write().push(ConnType::BlockRelay);
-    let slot = pm.reserve_dial(DialBudget::Automatic).expect("the eighth full-relay slot");
-    assert!(pm.reserve_dial(DialBudget::Automatic).is_err(), "the target is met");
+    let slot = pm
+        .reserve_dial(DialBudget::Automatic)
+        .expect("the eighth full-relay slot");
+    assert!(
+        pm.reserve_dial(DialBudget::Automatic).is_err(),
+        "the target is met"
+    );
     drop(slot);
 }
 
@@ -1640,11 +2164,22 @@ fn block_relay_peers_keep_the_netgroup_rule() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
     fill_automatic(&pm, MAX_OUTBOUND - 1);
-    add_peer(&pm, peer(1, SocketAddr::from(([44, 1, 0, 1], 8333)), Direction::Outbound));
+    add_peer(
+        &pm,
+        peer(
+            1,
+            SocketAddr::from(([44, 1, 0, 1], 8333)),
+            Direction::Outbound,
+        ),
+    );
     fill_block_relay(&pm, 1); // 80.1.0.1
     learn(&pm, SocketAddr::from(([44, 1, 9, 9], 8333)));
     learn(&pm, SocketAddr::from(([80, 1, 9, 9], 8333)));
-    assert_eq!(block_relay_target(&pm), None, "both candidates share a held group");
+    assert_eq!(
+        block_relay_target(&pm),
+        None,
+        "both candidates share a held group"
+    );
     let fresh = SocketAddr::from(([45, 1, 2, 3], 8333));
     learn(&pm, fresh);
     for _ in 0..20 {
@@ -1654,11 +2189,19 @@ fn block_relay_peers_keep_the_netgroup_rule() {
     for id in [1, 1000, 1001] {
         pm.peers.write().remove(&id);
     }
-    let mut dials: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now(), &[]).into_iter().map(|(a, _)| a).collect();
+    let mut dials: Vec<PeerAddr> = pm
+        .reserve_automatic_dials(Instant::now(), &[])
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect();
     dials.sort();
-    let mut want: Vec<PeerAddr> = vec![SocketAddr::from(([44, 1, 9, 9], 8333)).into(), fresh.into()];
+    let mut want: Vec<PeerAddr> =
+        vec![SocketAddr::from(([44, 1, 9, 9], 8333)).into(), fresh.into()];
     want.sort();
-    assert_eq!(dials, want, "not 80.1.9.9, in the block-relay-only peer's group");
+    assert_eq!(
+        dials, want,
+        "not 80.1.9.9, in the block-relay-only peer's group"
+    );
 }
 
 /// The feeler and the extra-network peer wait for the block-relay-only
@@ -1702,12 +2245,22 @@ async fn the_reconnect_loop_dials_a_block_relay_peer() {
             other => panic!("no version: {other:?}"),
         }
     };
-    assert!(!version.relay, "a block-relay-only link asks for no transactions");
     assert!(
-        pm.peers.read().values().any(|h| h.info.addr == target && h.info.conn_type == ConnType::BlockRelay),
+        !version.relay,
+        "a block-relay-only link asks for no transactions"
+    );
+    assert!(
+        pm.peers
+            .read()
+            .values()
+            .any(|h| h.info.addr == target && h.info.conn_type == ConnType::BlockRelay),
         "typed block-relay-only"
     );
-    assert_eq!(pm.dials_in_flight.lock().block_relay, 0, "the slot went back");
+    assert_eq!(
+        pm.dials_in_flight.lock().block_relay,
+        0,
+        "the slot went back"
+    );
 }
 
 /// None under `-connect`, which turns the node's own dials off.
@@ -1736,11 +2289,22 @@ fn a_block_relay_peer_passes_over_this_passes_dials() {
     let fresh = SocketAddr::from(([46, 1, 2, 3], 8333));
     learn(&pm, same);
     learn(&pm, same_group);
-    let dialled = [PeerAddr::from(same), SocketAddr::from(([45, 1, 9, 9], 8333)).into()];
-    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &dialled).map(|(t, _)| t), None);
+    let dialled = [
+        PeerAddr::from(same),
+        SocketAddr::from(([45, 1, 9, 9], 8333)).into(),
+    ];
+    assert_eq!(
+        pm.reserve_block_relay_peer(Instant::now(), &dialled)
+            .map(|(t, _)| t),
+        None
+    );
     learn(&pm, fresh);
     for _ in 0..20 {
-        assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &dialled).map(|(t, _)| t), Some(fresh.into()));
+        assert_eq!(
+            pm.reserve_block_relay_peer(Instant::now(), &dialled)
+                .map(|(t, _)| t),
+            Some(fresh.into())
+        );
     }
 
     // A regtest address in no network group: passed over by address.
@@ -1749,22 +2313,36 @@ fn a_block_relay_peer_passes_over_this_passes_dials() {
     fill_automatic(&pm, MAX_OUTBOUND);
     let local = SocketAddr::from(([127, 0, 0, 1], 18444));
     learn(&pm, local);
-    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[local.into()]).map(|(t, _)| t), None);
-    assert_eq!(pm.reserve_block_relay_peer(Instant::now(), &[]).map(|(t, _)| t), Some(local.into()));
+    assert_eq!(
+        pm.reserve_block_relay_peer(Instant::now(), &[local.into()])
+            .map(|(t, _)| t),
+        None
+    );
+    assert_eq!(
+        pm.reserve_block_relay_peer(Instant::now(), &[])
+            .map(|(t, _)| t),
+        Some(local.into())
+    );
 }
 
 // ---- Anchors (#1150) ----
 
-use crate::net::anchors::{self, Anchor, ANCHORS_FILE};
+use crate::net::anchors::{self, ANCHORS_FILE, Anchor};
 
 fn anchor(addr: SocketAddr) -> Anchor {
-    Anchor { addr: addr.into(), services: ServiceFlags::NETWORK | ServiceFlags::WITNESS }
+    Anchor {
+        addr: addr.into(),
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+    }
 }
 
 /// The anchors a pass would dial now, in order. The slots go back at the
 /// end of this call; the anchors taken stay taken.
 fn anchor_targets(pm: &Arc<PeerManager>) -> Vec<PeerAddr> {
-    pm.reserve_anchor_dials(Instant::now()).into_iter().map(|(t, _slot)| t).collect()
+    pm.reserve_anchor_dials(Instant::now())
+        .into_iter()
+        .map(|(t, _slot)| t)
+        .collect()
 }
 
 /// Core dials its anchors before any full-relay peer, in the first branch
@@ -1774,12 +2352,25 @@ fn anchor_targets(pm: &Arc<PeerManager>) -> Vec<PeerAddr> {
 fn anchors_are_dialled_before_the_full_relay_target_is_met() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
-    let (a, b) = (SocketAddr::from(([44, 1, 2, 3], 8333)), SocketAddr::from(([45, 1, 2, 3], 8333)));
+    let (a, b) = (
+        SocketAddr::from(([44, 1, 2, 3], 8333)),
+        SocketAddr::from(([45, 1, 2, 3], 8333)),
+    );
     *pm.anchors.lock() = vec![anchor(a), anchor(b)];
-    assert!(pm.automatic_open(&pm.dials_in_flight.lock()) < pm.automatic_outbound_target(), "fixture");
+    assert!(
+        pm.automatic_open(&pm.dials_in_flight.lock()) < pm.automatic_outbound_target(),
+        "fixture"
+    );
     let dials = pm.reserve_anchor_dials(Instant::now());
-    assert_eq!(dials.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(), vec![b.into(), a.into()]);
-    assert_eq!(pm.dials_in_flight.lock().block_relay, 2, "each holds a block-relay-only place");
+    assert_eq!(
+        dials.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+        vec![b.into(), a.into()]
+    );
+    assert_eq!(
+        pm.dials_in_flight.lock().block_relay,
+        2,
+        "each holds a block-relay-only place"
+    );
     drop(dials);
     assert_eq!(pm.dials_in_flight.lock().block_relay, 0);
 }
@@ -1805,7 +2396,10 @@ fn an_anchor_is_tried_once() {
 fn anchors_keep_the_block_relay_limit() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
-    let (a, b) = (SocketAddr::from(([44, 1, 2, 3], 8333)), SocketAddr::from(([45, 1, 2, 3], 8333)));
+    let (a, b) = (
+        SocketAddr::from(([44, 1, 2, 3], 8333)),
+        SocketAddr::from(([45, 1, 2, 3], 8333)),
+    );
     fill_block_relay(&pm, 1);
     *pm.anchors.lock() = vec![anchor(a), anchor(b)];
     assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(b)]);
@@ -1815,9 +2409,17 @@ fn anchors_keep_the_block_relay_limit() {
     leave_ibd(&pm);
     *pm.anchors.lock() = vec![anchor(a), anchor(b)];
     pm.set_max_connections(MAX_OUTBOUND);
-    assert_eq!(anchor_targets(&pm), Vec::<PeerAddr>::new(), "-maxconnections=8");
+    assert_eq!(
+        anchor_targets(&pm),
+        Vec::<PeerAddr>::new(),
+        "-maxconnections=8"
+    );
     pm.set_max_connections(9);
-    assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(b)], "-maxconnections=9");
+    assert_eq!(
+        anchor_targets(&pm),
+        vec![PeerAddr::from(b)],
+        "-maxconnections=9"
+    );
 }
 
 /// An anchor takes an outbound grant, Core's `semOutbound`.
@@ -1843,8 +2445,16 @@ type SkipCase = (&'static str, Anchor, Box<dyn Fn(&PeerManager)>);
 fn anchors_are_passed_over_as_in_core() {
     let good = SocketAddr::from(([46, 1, 2, 3], 8333));
     let cases: Vec<SkipCase> = vec![
-        ("an invalid address", anchor(SocketAddr::from(([0, 0, 0, 0], 8333))), Box::new(|_| {})),
-        ("port 0", anchor(SocketAddr::from(([47, 1, 2, 3], 0))), Box::new(|_| {})),
+        (
+            "an invalid address",
+            anchor(SocketAddr::from(([0, 0, 0, 0], 8333))),
+            Box::new(|_| {}),
+        ),
+        (
+            "port 0",
+            anchor(SocketAddr::from(([47, 1, 2, 3], 0))),
+            Box::new(|_| {}),
+        ),
         (
             "the node's own address",
             anchor(SocketAddr::from(([47, 1, 2, 3], 8333))),
@@ -1852,7 +2462,10 @@ fn anchors_are_passed_over_as_in_core() {
         ),
         (
             "no desirable services",
-            Anchor { addr: SocketAddr::from(([47, 1, 2, 3], 8333)).into(), services: ServiceFlags::NONE },
+            Anchor {
+                addr: SocketAddr::from(([47, 1, 2, 3], 8333)).into(),
+                services: ServiceFlags::NONE,
+            },
             Box::new(|_| {}),
         ),
         (
@@ -1863,13 +2476,23 @@ fn anchors_are_passed_over_as_in_core() {
         (
             "a banned address",
             anchor(SocketAddr::from(([47, 1, 2, 3], 8333))),
-            Box::new(|pm| ban(pm, crate::net::ban::BanTarget::Net(ipnet::IpNet::from(IpAddr::from([47, 1, 2, 3]))))),
+            Box::new(|pm| {
+                ban(
+                    pm,
+                    crate::net::ban::BanTarget::Net(ipnet::IpNet::from(IpAddr::from([
+                        47, 1, 2, 3,
+                    ]))),
+                )
+            }),
         ),
         (
             "an unreachable network",
             anchor("[2001:4860::1]:8333".parse().unwrap()),
             Box::new(|pm| {
-                pm.set_reachable(crate::net::reachable::ReachableNets { ipv6: false, ..Default::default() })
+                pm.set_reachable(crate::net::reachable::ReachableNets {
+                    ipv6: false,
+                    ..Default::default()
+                })
             }),
         ),
     ];
@@ -1889,7 +2512,10 @@ fn anchors_are_passed_over_as_in_core() {
 fn a_second_anchor_in_one_group_is_passed_over() {
     let (pm, _dir) = mk_pm();
     leave_ibd(&pm);
-    let (a, b) = (SocketAddr::from(([44, 1, 2, 3], 8333)), SocketAddr::from(([44, 1, 9, 9], 8333)));
+    let (a, b) = (
+        SocketAddr::from(([44, 1, 2, 3], 8333)),
+        SocketAddr::from(([44, 1, 9, 9], 8333)),
+    );
     *pm.anchors.lock() = vec![anchor(a), anchor(b)];
     assert_eq!(anchor_targets(&pm), vec![PeerAddr::from(b)]);
 
@@ -1913,10 +2539,18 @@ fn the_full_relay_draw_passes_over_the_anchors() {
     learn(&pm, a);
     learn(&pm, same_group);
     let taken = [PeerAddr::from(a)];
-    let drawn: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now(), &taken).into_iter().map(|(t, _)| t).collect();
+    let drawn: Vec<PeerAddr> = pm
+        .reserve_automatic_dials(Instant::now(), &taken)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
     assert_eq!(drawn, Vec::<PeerAddr>::new());
     learn(&pm, other);
-    let drawn: Vec<PeerAddr> = pm.reserve_automatic_dials(Instant::now(), &taken).into_iter().map(|(t, _)| t).collect();
+    let drawn: Vec<PeerAddr> = pm
+        .reserve_automatic_dials(Instant::now(), &taken)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
     assert_eq!(drawn, vec![PeerAddr::from(other)]);
 
     // A regtest address in no network group: passed over by address.
@@ -1925,7 +2559,11 @@ fn the_full_relay_draw_passes_over_the_anchors() {
     let local = SocketAddr::from(([127, 0, 0, 1], 18444));
     learn(&pm, local);
     let drawn = pm.reserve_automatic_dials(Instant::now(), &[local.into()]);
-    assert!(drawn.is_empty(), "{:?}", drawn.iter().map(|(t, _)| t).collect::<Vec<_>>());
+    assert!(
+        drawn.is_empty(),
+        "{:?}",
+        drawn.iter().map(|(t, _)| t).collect::<Vec<_>>()
+    );
 }
 
 /// The seed path dials learned addresses at once; anchors not yet dialled
@@ -1947,8 +2585,19 @@ fn anchors_are_written_at_a_stop_and_read_once_at_a_start() {
     let (pm, dir) = mk_pm();
     let path = dir.path().join(ANCHORS_FILE);
     fill_automatic(&pm, 2);
-    add_peer(&pm, peer(10, SocketAddr::from(([9, 9, 9, 9], 8333)), Direction::Inbound));
-    for (id, ip) in [(4002, [83, 1, 0, 1]), (4000, [81, 1, 0, 1]), (4001, [82, 1, 0, 1])] {
+    add_peer(
+        &pm,
+        peer(
+            10,
+            SocketAddr::from(([9, 9, 9, 9], 8333)),
+            Direction::Inbound,
+        ),
+    );
+    for (id, ip) in [
+        (4002, [83, 1, 0, 1]),
+        (4000, [81, 1, 0, 1]),
+        (4001, [82, 1, 0, 1]),
+    ] {
         let mut info = peer(id, SocketAddr::from((ip, 8333)), Direction::Outbound);
         info.conn_type = ConnType::BlockRelay;
         info.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
@@ -1956,18 +2605,34 @@ fn anchors_are_written_at_a_stop_and_read_once_at_a_start() {
     }
     pm.dump_anchors(&path);
     let written = anchors::read(&path, pm.chain_state.p2p_magic().to_bytes()).unwrap();
-    assert_eq!(written, vec![anchor(SocketAddr::from(([81, 1, 0, 1], 8333))), anchor(SocketAddr::from(([82, 1, 0, 1], 8333)))]);
+    assert_eq!(
+        written,
+        vec![
+            anchor(SocketAddr::from(([81, 1, 0, 1], 8333))),
+            anchor(SocketAddr::from(([82, 1, 0, 1], 8333)))
+        ]
+    );
 
-    anchors::write(&path, pm.chain_state.p2p_magic().to_bytes(), &[
-        anchor(SocketAddr::from(([44, 1, 2, 3], 8333))),
-        anchor(SocketAddr::from(([45, 1, 2, 3], 8333))),
-        anchor(SocketAddr::from(([46, 1, 2, 3], 8333))),
-    ])
+    anchors::write(
+        &path,
+        pm.chain_state.p2p_magic().to_bytes(),
+        &[
+            anchor(SocketAddr::from(([44, 1, 2, 3], 8333))),
+            anchor(SocketAddr::from(([45, 1, 2, 3], 8333))),
+            anchor(SocketAddr::from(([46, 1, 2, 3], 8333))),
+        ],
+    )
     .unwrap();
     let (pm, _dir2) = mk_pm();
     pm.load_anchors(&path);
     assert!(!path.exists(), "deleted on read");
-    assert_eq!(*pm.anchors.lock(), vec![anchor(SocketAddr::from(([44, 1, 2, 3], 8333))), anchor(SocketAddr::from(([45, 1, 2, 3], 8333)))]);
+    assert_eq!(
+        *pm.anchors.lock(),
+        vec![
+            anchor(SocketAddr::from(([44, 1, 2, 3], 8333))),
+            anchor(SocketAddr::from(([45, 1, 2, 3], 8333)))
+        ]
+    );
 }
 
 /// An onion block-relay-only peer is written with its port, and one that
@@ -1977,14 +2642,24 @@ fn an_onion_anchor_keeps_its_port() {
     let (pm, dir) = mk_pm();
     let path = dir.path().join(ANCHORS_FILE);
     let host = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
-    let mut info = peer(4000, SocketAddr::from(([0, 0, 0, 0], 8333)), Direction::Outbound);
+    let mut info = peer(
+        4000,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        Direction::Outbound,
+    );
     info.conn_type = ConnType::BlockRelay;
     info.onion_host = Some(host.to_string());
     add_peer(&pm, info);
     pm.dump_anchors(&path);
     assert_eq!(
         anchors::read(&path, pm.chain_state.p2p_magic().to_bytes()).unwrap(),
-        vec![Anchor { addr: PeerAddr::Onion { host: host.to_string(), port: 8333 }, services: ServiceFlags::NONE }]
+        vec![Anchor {
+            addr: PeerAddr::Onion {
+                host: host.to_string(),
+                port: 8333
+            },
+            services: ServiceFlags::NONE
+        }]
     );
 }
 
@@ -1998,7 +2673,12 @@ fn connect_neither_reads_nor_writes_anchors() {
     fill_block_relay(&pm, 1);
     pm.dump_anchors(&path);
     assert!(!path.exists(), "nothing written");
-    anchors::write(&path, pm.chain_state.p2p_magic().to_bytes(), &[anchor(SocketAddr::from(([44, 1, 2, 3], 8333)))]).unwrap();
+    anchors::write(
+        &path,
+        pm.chain_state.p2p_magic().to_bytes(),
+        &[anchor(SocketAddr::from(([44, 1, 2, 3], 8333)))],
+    )
+    .unwrap();
     pm.load_anchors(&path);
     assert!(path.exists(), "left where it is");
     assert!(pm.anchors.lock().is_empty());
@@ -2018,7 +2698,12 @@ async fn a_restart_dials_its_anchors_first_as_block_relay_only() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
     let path = dir.path().join(ANCHORS_FILE);
-    anchors::write(&path, pm.chain_state.p2p_magic().to_bytes(), &[anchor(target)]).unwrap();
+    anchors::write(
+        &path,
+        pm.chain_state.p2p_magic().to_bytes(),
+        &[anchor(target)],
+    )
+    .unwrap();
     pm.load_anchors(&path);
     assert!(!path.exists());
     pm.reconnect_tick();
@@ -2034,9 +2719,15 @@ async fn a_restart_dials_its_anchors_first_as_block_relay_only() {
             other => panic!("no version: {other:?}"),
         }
     };
-    assert!(!version.relay, "a block-relay-only link asks for no transactions");
     assert!(
-        pm.peers.read().values().any(|h| h.info.addr == target && h.info.conn_type == ConnType::BlockRelay),
+        !version.relay,
+        "a block-relay-only link asks for no transactions"
+    );
+    assert!(
+        pm.peers
+            .read()
+            .values()
+            .any(|h| h.info.addr == target && h.info.conn_type == ConnType::BlockRelay),
         "typed block-relay-only"
     );
     assert!(pm.anchors.lock().is_empty());
@@ -2109,8 +2800,12 @@ async fn addconnection_opens_a_block_relay_only_onion_and_it_is_anchored() {
     );
     let host = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
     let socks = tokio::spawn(mute_socks5(listener));
-    pm.add_connection(&format!("{host}:8333"), 18444, ConnType::BlockRelay, false).expect("accepted");
-    let (_held, asked) = tokio::time::timeout(Duration::from_secs(10), socks).await.expect("proxied").unwrap();
+    pm.add_connection(&format!("{host}:8333"), 18444, ConnType::BlockRelay, false)
+        .expect("accepted");
+    let (_held, asked) = tokio::time::timeout(Duration::from_secs(10), socks)
+        .await
+        .expect("proxied")
+        .unwrap();
     assert_eq!(asked, host);
     let typed = || {
         pm.peers.read().values().any(|h| {
@@ -2126,7 +2821,13 @@ async fn addconnection_opens_a_block_relay_only_onion_and_it_is_anchored() {
     pm.dump_anchors(&path);
     assert_eq!(
         anchors::read(&path, pm.chain_state.p2p_magic().to_bytes()).unwrap(),
-        vec![Anchor { addr: PeerAddr::Onion { host: host.to_string(), port: 8333 }, services: ServiceFlags::NONE }]
+        vec![Anchor {
+            addr: PeerAddr::Onion {
+                host: host.to_string(),
+                port: 8333
+            },
+            services: ServiceFlags::NONE
+        }]
     );
 }
 
@@ -2142,7 +2843,10 @@ async fn the_loop_dials_its_anchors_at_once() {
     let run = tokio::spawn(async move { pm_run.run().await });
     let accepted = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
     run.abort();
-    assert!(accepted.is_ok(), "the anchor is dialled within the first ticks");
+    assert!(
+        accepted.is_ok(),
+        "the anchor is dialled within the first ticks"
+    );
     assert!(pm.anchors.lock().is_empty());
 }
 
@@ -2154,7 +2858,9 @@ fn recent_tip(pm: &PeerManager) {
     use crate::chain::state::tests::build_test_block;
     let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
     let block = build_test_block(genesis, 1, crate::time::now_secs() as u32);
-    pm.chain_state.accept_block(&block).expect("connect block 1");
+    pm.chain_state
+        .accept_block(&block)
+        .expect("connect block 1");
     leave_ibd(pm);
 }
 
@@ -2177,7 +2883,8 @@ fn extra_block_relay_due(pm: &PeerManager) {
 }
 
 fn extra_block_relay_target(pm: &Arc<PeerManager>) -> Option<PeerAddr> {
-    pm.reserve_extra_block_relay_peer(Instant::now(), &[]).map(|(target, _slot)| target)
+    pm.reserve_extra_block_relay_peer(Instant::now(), &[])
+        .map(|(target, _slot)| target)
 }
 
 /// #1155: no extra block-relay-only peer before initial sync is over. Core
@@ -2192,13 +2899,19 @@ fn no_extra_block_relay_peer_before_the_tip_is_recent() {
     learn(&pm, SocketAddr::from(([44, 1, 2, 3], 8333)));
     extra_block_relay_due(&pm);
     pm.maybe_start_extra_block_relay_peers();
-    assert!(!pm.start_extra_block_relay_peers.load(Ordering::Relaxed), "the genesis tip is years old");
+    assert!(
+        !pm.start_extra_block_relay_peers.load(Ordering::Relaxed),
+        "the genesis tip is years old"
+    );
     assert_eq!(extra_block_relay_target(&pm), None);
 
     recent_tip(&pm);
     pm.maybe_start_extra_block_relay_peers();
     assert!(pm.start_extra_block_relay_peers.load(Ordering::Relaxed));
-    assert_eq!(extra_block_relay_target(&pm), Some(SocketAddr::from(([44, 1, 2, 3], 8333)).into()));
+    assert_eq!(
+        extra_block_relay_target(&pm),
+        Some(SocketAddr::from(([44, 1, 2, 3], 8333)).into())
+    );
 }
 
 /// The extra peer waits for both targets, as Core reaches its branch past
@@ -2214,8 +2927,16 @@ fn the_extra_block_relay_peer_waits_for_the_targets_and_the_timer() {
     fill_block_relay(&pm, 1);
     extra_block_relay_due(&pm);
     let due = *pm.next_extra_block_relay.lock();
-    assert_eq!(extra_block_relay_target(&pm), None, "one block-relay-only place is open");
-    assert_eq!(*pm.next_extra_block_relay.lock(), due, "the timer waits for the targets");
+    assert_eq!(
+        extra_block_relay_target(&pm),
+        None,
+        "one block-relay-only place is open"
+    );
+    assert_eq!(
+        *pm.next_extra_block_relay.lock(),
+        due,
+        "the timer waits for the targets"
+    );
 
     fill_block_relay(&pm, MAX_OUTBOUND_BLOCK_RELAY);
     let now = Instant::now();
@@ -2230,10 +2951,15 @@ fn the_extra_block_relay_peer_waits_for_the_targets_and_the_timer() {
 fn one_extra_block_relay_peer_at_a_time() {
     let (pm, _dir, _addr) = extra_block_relay_fixture();
     learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
-    let first = pm.reserve_extra_block_relay_peer(Instant::now(), &[]).expect("the first");
+    let first = pm
+        .reserve_extra_block_relay_peer(Instant::now(), &[])
+        .expect("the first");
     extra_block_relay_due(&pm);
     assert_eq!(extra_block_relay_target(&pm), None);
-    assert_eq!(pm.block_relay_open(&pm.dials_in_flight.lock()), MAX_OUTBOUND_BLOCK_RELAY + 1);
+    assert_eq!(
+        pm.block_relay_open(&pm.dials_in_flight.lock()),
+        MAX_OUTBOUND_BLOCK_RELAY + 1
+    );
     drop(first);
     assert!(extra_block_relay_target(&pm).is_some());
 }
@@ -2250,7 +2976,11 @@ fn no_extra_block_relay_peer_without_an_outbound_grant() {
     assert!(extra_block_relay_target(&pm).is_some());
     extra_block_relay_due(&pm);
     pm.pending_typed_dials.write().push(ConnType::Feeler);
-    assert_eq!(extra_block_relay_target(&pm), None, "a feeler holds the eleventh");
+    assert_eq!(
+        extra_block_relay_target(&pm),
+        None,
+        "a feeler holds the eleventh"
+    );
 }
 
 /// Under `-connect` no extra block-relay-only peer is opened.
@@ -2266,11 +2996,20 @@ fn connect_opens_no_extra_block_relay_peer() {
 /// A block-relay-only peer, past the minimum connect time, that last gave
 /// the node a block at `last_block` (0 = never).
 fn aged_block_relay(pm: &PeerManager, id: PeerId, last_block: u64) {
-    let mut info = peer(id, SocketAddr::from(([90 + (id % 100) as u8, 1, 0, 1], 8333)), Direction::Outbound);
+    let mut info = peer(
+        id,
+        SocketAddr::from(([90 + (id % 100) as u8, 1, 0, 1], 8333)),
+        Direction::Outbound,
+    );
     info.conn_type = ConnType::BlockRelay;
     info.conn_time -= Duration::from_secs(60);
     add_peer(pm, info);
-    pm.peers.read().get(&id).unwrap().stats.set_last_block(last_block);
+    pm.peers
+        .read()
+        .get(&id)
+        .unwrap()
+        .stats
+        .set_last_block(last_block);
 }
 
 /// #1155, Core's `EvictExtraOutboundPeers`: with a third block-relay-only
@@ -2283,15 +3022,27 @@ fn the_extra_block_relay_peer_that_brought_nothing_newer_goes() {
     aged_block_relay(&pm, 1, 500);
     aged_block_relay(&pm, 2, 400);
     aged_block_relay(&pm, 3, 0);
-    assert_eq!(pm.evict_extra_block_relay_peer(), Some(3), "the youngest brought no block");
+    assert_eq!(
+        pm.evict_extra_block_relay_peer(),
+        Some(3),
+        "the youngest brought no block"
+    );
     assert_eq!(pm.evict_extra_block_relay_peer(), None, "two left");
 
     aged_block_relay(&pm, 4, 600);
-    assert_eq!(pm.evict_extra_block_relay_peer(), Some(2), "the youngest is newer: the second-youngest goes");
+    assert_eq!(
+        pm.evict_extra_block_relay_peer(),
+        Some(2),
+        "the youngest is newer: the second-youngest goes"
+    );
     assert!(pm.peers.read().contains_key(&4));
 
     aged_block_relay(&pm, 5, 600);
-    assert_eq!(pm.evict_extra_block_relay_peer(), Some(5), "a tie: the youngest goes");
+    assert_eq!(
+        pm.evict_extra_block_relay_peer(),
+        Some(5),
+        "a tie: the youngest goes"
+    );
 }
 
 /// The chosen peer stays this time if it connected less than
@@ -2303,10 +3054,18 @@ fn a_new_extra_block_relay_peer_gets_its_minimum_connect_time() {
     leave_ibd(&pm);
     aged_block_relay(&pm, 1, 500);
     aged_block_relay(&pm, 2, 400);
-    let mut young = peer(3, SocketAddr::from(([93, 1, 0, 1], 8333)), Direction::Outbound);
+    let mut young = peer(
+        3,
+        SocketAddr::from(([93, 1, 0, 1], 8333)),
+        Direction::Outbound,
+    );
     young.conn_type = ConnType::BlockRelay;
     add_peer(&pm, young);
-    assert_eq!(pm.evict_extra_block_relay_peer(), None, "connected just now");
+    assert_eq!(
+        pm.evict_extra_block_relay_peer(),
+        None,
+        "connected just now"
+    );
     pm.peers.write().get_mut(&3).unwrap().info.conn_time -= Duration::from_secs(60);
     assert_eq!(pm.evict_extra_block_relay_peer(), Some(3));
 }
@@ -2319,7 +3078,11 @@ fn the_block_relay_surplus_follows_the_limit() {
     leave_ibd(&pm);
     aged_block_relay(&pm, 1, 500);
     aged_block_relay(&pm, 2, 0);
-    assert_eq!(pm.evict_extra_block_relay_peer(), None, "two is the default limit");
+    assert_eq!(
+        pm.evict_extra_block_relay_peer(),
+        None,
+        "two is the default limit"
+    );
     pm.set_max_connections(9);
     assert_eq!(pm.evict_extra_block_relay_peer(), Some(2));
 }
@@ -2336,11 +3099,23 @@ async fn the_reconnect_loop_dials_the_extra_block_relay_peer() {
     learn_onion(&pm, &host, 8333);
     extra_block_relay_due(&pm);
     pm.reconnect_tick();
-    assert!(pm.start_extra_block_relay_peers.load(Ordering::Relaxed), "the loop starts them");
+    assert!(
+        pm.start_extra_block_relay_peers.load(Ordering::Relaxed),
+        "the loop starts them"
+    );
     let key = format!("{host}:8333");
-    wait_for(&pm, || pm.onion_reconnect_backoff.read().contains_key(&key), "the onion is dialled").await;
+    wait_for(
+        &pm,
+        || pm.onion_reconnect_backoff.read().contains_key(&key),
+        "the onion is dialled",
+    )
+    .await;
     settle(&pm).await;
-    assert_eq!(pm.dials_in_flight.lock().extra_block_relay, 0, "the slot went back");
+    assert_eq!(
+        pm.dials_in_flight.lock().extra_block_relay,
+        0,
+        "the slot went back"
+    );
 }
 
 /// The chosen peer stays this time while a block is being downloaded from
@@ -2381,11 +3156,20 @@ fn the_extra_block_relay_dial_holds_its_grant() {
     let (pm, _dir, _addr) = extra_block_relay_fixture();
     pm.set_max_connections(11);
     learn(&pm, SocketAddr::from(([45, 1, 2, 3], 8333)));
-    let extra = pm.reserve_extra_block_relay_peer(Instant::now(), &[]).expect("the extra peer");
+    let extra = pm
+        .reserve_extra_block_relay_peer(Instant::now(), &[])
+        .expect("the extra peer");
     feeler_due(&pm);
-    assert!(pm.reserve_feeler(Instant::now(), &[]).is_none(), "the extra dial holds the grant");
+    assert!(
+        pm.reserve_feeler(Instant::now(), &[]).is_none(),
+        "the extra dial holds the grant"
+    );
     let held = pm.dials_in_flight.lock();
-    assert!(pm.check_outbound_limit_for(ConnType::Feeler, &[], &held).is_err(), "nor by addconnection");
+    assert!(
+        pm.check_outbound_limit_for(ConnType::Feeler, &[], &held)
+            .is_err(),
+        "nor by addconnection"
+    );
     drop(held);
     drop(extra);
     assert!(feeler_target(&pm).is_some());
@@ -2418,7 +3202,10 @@ async fn the_extra_block_relay_peer_skips_this_passes_block_relay_dial() {
     pm.reconnect_tick();
     let in_flight = pm.dials_in_flight.lock();
     assert_eq!(in_flight.block_relay, 1, "the regular dial");
-    assert_eq!(in_flight.extra_block_relay, 0, "no second dial to the same address");
+    assert_eq!(
+        in_flight.extra_block_relay, 0,
+        "no second dial to the same address"
+    );
 }
 
 /// A feeler passes over an address another dial of the same pass took (the
@@ -2448,9 +3235,16 @@ fn the_extra_network_peer_skips_this_passes_dials() {
     learn_onion(&pm, &host, 8333);
     extra_network_due(&pm);
     let onion = PeerAddr::Onion { host, port: 8333 };
-    assert!(pm.reserve_extra_network_peer(Instant::now(), std::slice::from_ref(&onion)).is_none());
+    assert!(
+        pm.reserve_extra_network_peer(Instant::now(), std::slice::from_ref(&onion))
+            .is_none()
+    );
     extra_network_due(&pm);
-    assert_eq!(pm.reserve_extra_network_peer(Instant::now(), &[]).map(|(t, _, _)| t), Some(onion));
+    assert_eq!(
+        pm.reserve_extra_network_peer(Instant::now(), &[])
+            .map(|(t, _, _)| t),
+        Some(onion)
+    );
 }
 
 /// The reconnect loop hands the block-relay-only dial of a pass to the
@@ -2465,8 +3259,15 @@ async fn the_feeler_skips_this_passes_block_relay_dial() {
     learn_onion(&pm, &onion_host(10), 8333);
     feeler_due(&pm);
     pm.reconnect_tick();
-    assert_eq!(pm.dials_in_flight.lock().block_relay, 1, "the block-relay-only dial");
-    assert!(!pm.pending_typed_dials.read().contains(&ConnType::Feeler), "no feeler to the same address");
+    assert_eq!(
+        pm.dials_in_flight.lock().block_relay,
+        1,
+        "the block-relay-only dial"
+    );
+    assert!(
+        !pm.pending_typed_dials.read().contains(&ConnType::Feeler),
+        "no feeler to the same address"
+    );
 }
 
 // ---- An extra full-relay peer for a stale tip (#1122) ----
@@ -2492,15 +3293,29 @@ fn a_stale_tip_opens_one_extra_full_relay_peer_and_eviction_closes_it() {
 
     let t0 = 1_800_000_000;
     pm.check_for_stale_tip(t0);
-    assert!(!pm.try_new_outbound_peer.load(Ordering::Relaxed), "a tip just seen is not stale");
-    assert!(pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none(), "no extra peer at the target");
+    assert!(
+        !pm.try_new_outbound_peer.load(Ordering::Relaxed),
+        "a tip just seen is not stale"
+    );
+    assert!(
+        pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none(),
+        "no extra peer at the target"
+    );
 
     // 30 minutes and a second later, past the 10-minute check interval.
     pm.check_for_stale_tip(t0 + 3 * POW_TARGET_SPACING_SECS + 1);
-    assert!(pm.try_new_outbound_peer.load(Ordering::Relaxed), "the stale tip was not noticed");
-    let (target, slot) = pm.reserve_stale_tip_peer(Instant::now(), &[]).expect("an extra full-relay dial");
+    assert!(
+        pm.try_new_outbound_peer.load(Ordering::Relaxed),
+        "the stale tip was not noticed"
+    );
+    let (target, slot) = pm
+        .reserve_stale_tip_peer(Instant::now(), &[])
+        .expect("an extra full-relay dial");
     assert_eq!(target, PeerAddr::Socket(extra));
-    assert!(pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none(), "one extra dial at a time");
+    assert!(
+        pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none(),
+        "one extra dial at a time"
+    );
     drop(slot);
 
     // The extra peer connects: nine full-relay peers, one past the target.
@@ -2508,9 +3323,17 @@ fn a_stale_tip_opens_one_extra_full_relay_peer_and_eviction_closes_it() {
     info.last_block_announcement = crate::time::now_secs();
     info.conn_time -= Duration::from_secs(60);
     add_peer(&pm, info);
-    let evicted = pm.evict_extra_outbound_peer_and_settle().expect("a surplus full-relay peer is dropped");
-    assert_ne!(evicted, 5000, "the peer that announced a block most recently stays");
-    assert!(!pm.try_new_outbound_peer.load(Ordering::Relaxed), "extra peers stop after the eviction");
+    let evicted = pm
+        .evict_extra_outbound_peer_and_settle()
+        .expect("a surplus full-relay peer is dropped");
+    assert_ne!(
+        evicted, 5000,
+        "the peer that announced a block most recently stays"
+    );
+    assert!(
+        !pm.try_new_outbound_peer.load(Ordering::Relaxed),
+        "extra peers stop after the eviction"
+    );
     assert!(pm.reserve_stale_tip_peer(Instant::now(), &[]).is_none());
 }
 
@@ -2527,7 +3350,10 @@ fn a_tip_that_moves_is_not_stale() {
     // As if the tip had been another block until now: it moved.
     *pm.last_tip_update.lock() = Some((bitcoin::BlockHash::all_zeros(), t0));
     pm.check_for_stale_tip(t0 + 3 * POW_TARGET_SPACING_SECS + 2 + STALE_CHECK_INTERVAL_SECS);
-    assert!(!pm.try_new_outbound_peer.load(Ordering::Relaxed), "a tip that moved is not stale");
+    assert!(
+        !pm.try_new_outbound_peer.load(Ordering::Relaxed),
+        "a tip that moved is not stale"
+    );
 }
 
 /// Not under `-connect`, as Core checks `GetUseAddrmanOutgoing`.

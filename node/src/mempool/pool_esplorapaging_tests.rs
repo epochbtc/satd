@@ -30,7 +30,12 @@ fn admission_times_reports_each_pooled_txid_and_skips_the_rest() {
     let pool = Mempool::new(1_000_000, 1_000);
     for (byte, time) in [(1u8, 300u64), (2, 100)] {
         pool.insert_entry_for_test(txid(byte), tx(byte), 1_000);
-        pool.inner.write().entries.get_mut(&txid(byte)).unwrap().time = time;
+        pool.inner
+            .write()
+            .entries
+            .get_mut(&txid(byte))
+            .unwrap()
+            .time = time;
     }
     assert_eq!(
         pool.admission_times(&[txid(2), txid(9), txid(1)]),

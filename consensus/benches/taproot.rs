@@ -7,7 +7,7 @@
 //!
 //! Run: `cargo bench --bench taproot`
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 mod common;
 use common::{load_bip341_keypath_cases, make_criterion, run_suite};

@@ -316,8 +316,7 @@ mod tests {
     fn p2sh_script() -> ScriptBuf {
         ScriptBuf::from_bytes(vec![
             0xa9, 0x14, // OP_HASH160 PUSH20
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0x87, // OP_EQUAL
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x87, // OP_EQUAL
         ])
     }
 
@@ -376,8 +375,20 @@ mod tests {
             ("P2WSH", p2wsh_script(), 43, 67, 330),
             ("P2TR", p2tr_script(), 43, 67, 330),
             ("P2A", p2a_script(), 13, 67, 240),
-            ("unknown witness version", unknown_witness_script(), 31, 67, 294),
-            ("bare 10-byte script", ScriptBuf::from_bytes(vec![0xff; 10]), 19, 148, 501),
+            (
+                "unknown witness version",
+                unknown_witness_script(),
+                31,
+                67,
+                294,
+            ),
+            (
+                "bare 10-byte script",
+                ScriptBuf::from_bytes(vec![0xff; 10]),
+                19,
+                148,
+                501,
+            ),
         ];
         for (name, script, output_size, spend_size, expected) in vectors {
             assert_eq!(
@@ -477,7 +488,10 @@ mod tests {
             ),
             // `OP_RETURN` then a non-push: Core's Solver needs push-only
             // after the `OP_RETURN` for NULL_DATA.
-            ("OP_RETURN OP_CHECKSIG", ScriptBuf::from_bytes(vec![0x6a, 0xac])),
+            (
+                "OP_RETURN OP_CHECKSIG",
+                ScriptBuf::from_bytes(vec![0x6a, 0xac]),
+            ),
             (
                 "P2PK with a bad key prefix",
                 ScriptBuf::from_bytes({

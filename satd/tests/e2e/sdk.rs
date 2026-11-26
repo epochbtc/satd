@@ -18,8 +18,8 @@ use satd_events_client::{
 };
 
 use crate::common::{
-    block1_coinbase_txid, build_signed_p2wpkh_spend_seq, display_to_internal_hex, e2e_test_timeout,
-    write_authfile, DeterministicWallet, StreamingNode, TokenSpec,
+    DeterministicWallet, StreamingNode, TokenSpec, block1_coinbase_txid,
+    build_signed_p2wpkh_spend_seq, display_to_internal_hex, e2e_test_timeout, write_authfile,
 };
 
 const WALLET_SEED: u8 = 0x11;
@@ -27,7 +27,9 @@ const WALLET_SEED: u8 = 0x11;
 // ---- node-driving helpers (mirrors streaming.rs; that module's are private) --
 
 async fn start_async(args: Vec<&'static str>) -> StreamingNode {
-    tokio::task::spawn_blocking(move || StreamingNode::start(&args)).await.unwrap()
+    tokio::task::spawn_blocking(move || StreamingNode::start(&args))
+        .await
+        .unwrap()
 }
 
 /// Start a node and mine 101 blocks to the wallet so block-1's coinbase is
@@ -42,19 +44,27 @@ async fn matured_node_args(args: Vec<&'static str>) -> (StreamingNode, Determini
     let wallet = DeterministicWallet::from_secret([WALLET_SEED; 32]);
     let addr = wallet.address.to_string();
     let rpc = sn.node.rpc_handle();
-    tokio::task::spawn_blocking(move || rpc.mine(101, &addr)).await.unwrap();
+    tokio::task::spawn_blocking(move || rpc.mine(101, &addr))
+        .await
+        .unwrap();
     (sn, wallet)
 }
 
 async fn coinbase1(sn: &StreamingNode) -> String {
     let rpc = sn.node.rpc_handle();
-    tokio::task::spawn_blocking(move || block1_coinbase_txid(&rpc)).await.unwrap()
+    tokio::task::spawn_blocking(move || block1_coinbase_txid(&rpc))
+        .await
+        .unwrap()
 }
 
 async fn mine_n(sn: &StreamingNode, n: u32) {
     let rpc = sn.node.rpc_handle();
-    let addr = DeterministicWallet::from_secret([0x99; 32]).address.to_string();
-    tokio::task::spawn_blocking(move || rpc.mine(n, &addr)).await.unwrap();
+    let addr = DeterministicWallet::from_secret([0x99; 32])
+        .address
+        .to_string();
+    tokio::task::spawn_blocking(move || rpc.mine(n, &addr))
+        .await
+        .unwrap();
 }
 
 /// Build + broadcast a block-1-coinbase spend to `dest_seed`'s address; returns
@@ -65,7 +75,9 @@ async fn broadcast_spend(
     dest_seed: u8,
     fee: u64,
 ) -> (String, bitcoin::ScriptBuf) {
-    let dest = DeterministicWallet::from_secret([dest_seed; 32]).address.script_pubkey();
+    let dest = DeterministicWallet::from_secret([dest_seed; 32])
+        .address
+        .script_pubkey();
     let rpc = sn.node.rpc_handle();
     let w = wallet.clone();
     let dest2 = dest.clone();
@@ -75,7 +87,9 @@ async fn broadcast_spend(
     .await
     .unwrap();
     let rpc2 = sn.node.rpc_handle();
-    let got = tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw)).await.unwrap();
+    let got = tokio::task::spawn_blocking(move || rpc2.send_raw_tx(&raw))
+        .await
+        .unwrap();
     assert_eq!(got, txid, "sendrawtransaction returns the computed txid");
     (txid, dest)
 }
@@ -99,13 +113,19 @@ async fn next_matching(
 ) -> Event {
     let fut = async {
         loop {
-            let ev = stream.message().await.expect("no stream error").expect("not closed");
+            let ev = stream
+                .message()
+                .await
+                .expect("no stream error")
+                .expect("not closed");
             if pred(&ev) {
                 return ev;
             }
         }
     };
-    tokio::time::timeout(e2e_test_timeout(secs), fut).await.expect("matching event within timeout")
+    tokio::time::timeout(e2e_test_timeout(secs), fut)
+        .await
+        .expect("matching event within timeout")
 }
 
 /// A tweaks-only cold sync anchored below the first block. A cursor names the
@@ -113,7 +133,12 @@ async fn next_matching(
 fn tweak_cold_sync_opts() -> SubscribeOptions {
     SubscribeOptions {
         categories: Categories::TWEAKS,
-        from_cursor: Some(Cursor { height: 0, tx_index: 0, mempool_seq: 0, instance_id: 0 }),
+        from_cursor: Some(Cursor {
+            height: 0,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 0,
+        }),
         ..Default::default()
     }
 }
@@ -121,15 +146,17 @@ fn tweak_cold_sync_opts() -> SubscribeOptions {
 /// The height of the next `BlockTweaks`. A `ReplayGap` is fatal here rather than
 /// logged: it names blocks that were never delivered, and an unscanned block is
 /// an unseen payment.
-async fn next_tweak_height(
-    sub: &mut satd_events_client::ResilientSubscription,
-    secs: u64,
-) -> u32 {
+async fn next_tweak_height(sub: &mut satd_events_client::ResilientSubscription, secs: u64) -> u32 {
     loop {
         match next_resilient(sub, secs).await {
             Event::BlockTweaks { height, .. } => return height,
-            Event::ReplayGap { resume_height, first_height } => {
-                panic!("replay gap ({resume_height}, {first_height}): a scan must never skip a block")
+            Event::ReplayGap {
+                resume_height,
+                first_height,
+            } => {
+                panic!(
+                    "replay gap ({resume_height}, {first_height}): a scan must never skip a block"
+                )
             }
             _ => continue,
         }
@@ -151,7 +178,10 @@ async fn sdk_subscribe_delivers_block_connected() {
     let sn = start_async(vec![]).await;
     let mut client = connect(&sn).await;
     let mut stream = client
-        .subscribe(SubscribeOptions { categories: Categories::CHAIN, ..Default::default() })
+        .subscribe(SubscribeOptions {
+            categories: Categories::CHAIN,
+            ..Default::default()
+        })
         .await
         .expect("subscribe");
     // Subscribe is live-only; let it register before mining.
@@ -159,8 +189,13 @@ async fn sdk_subscribe_delivers_block_connected() {
 
     mine_n(&sn, 1).await;
 
-    let ev = next_matching(&mut stream, 15, |e| matches!(e, Event::BlockConnected { .. })).await;
-    let Event::BlockConnected { height, .. } = ev else { unreachable!() };
+    let ev = next_matching(&mut stream, 15, |e| {
+        matches!(e, Event::BlockConnected { .. })
+    })
+    .await;
+    let Event::BlockConnected { height, .. } = ev else {
+        unreachable!()
+    };
     assert_eq!(height, 1, "first mined block is height 1");
     // The confirmed cursor was captured and advanced.
     assert_eq!(stream.cursor().map(|c| c.height), Some(1));
@@ -173,12 +208,25 @@ async fn sdk_subscribe_delivers_block_connected() {
 async fn sdk_learns_the_node_version() {
     let sn = start_async(vec![]).await;
     let mut client = connect(&sn).await;
-    assert_eq!(client.node_version(), None, "nothing is known before a stream opens");
-    let _stream = client.subscribe(SubscribeOptions::default()).await.expect("subscribe");
-    assert_eq!(client.node_version().as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        client.node_version(),
+        None,
+        "nothing is known before a stream opens"
+    );
+    let _stream = client
+        .subscribe(SubscribeOptions::default())
+        .await
+        .expect("subscribe");
+    assert_eq!(
+        client.node_version().as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
     let mut fresh = connect(&sn).await;
     let _watch = fresh.watch().await.expect("watch");
-    assert_eq!(fresh.node_version().as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        fresh.node_version().as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
 }
 
 /// `watch` + `add_outpoints` delivers `OutpointSpent` in the mempool, then again
@@ -191,13 +239,27 @@ async fn sdk_watch_outpoint_spent_mempool_then_confirmed() {
 
     let mut client = connect(&sn).await;
     let (watch, mut stream) = client.watch().await.expect("watch");
-    watch.add_outpoints([(cb_bytes, 0)]).await.expect("add_outpoints");
+    watch
+        .add_outpoints([(cb_bytes, 0)])
+        .await
+        .expect("add_outpoints");
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     let (spend_txid, _dest) = broadcast_spend(&sn, &wallet, 0x55, 10_000).await;
 
-    let ev = next_matching(&mut stream, 15, |e| matches!(e, Event::OutpointSpent { .. })).await;
-    let Event::OutpointSpent { outpoint, spending_txid, confirmed, .. } = ev else { unreachable!() };
+    let ev = next_matching(&mut stream, 15, |e| {
+        matches!(e, Event::OutpointSpent { .. })
+    })
+    .await;
+    let Event::OutpointSpent {
+        outpoint,
+        spending_txid,
+        confirmed,
+        ..
+    } = ev
+    else {
+        unreachable!()
+    };
     assert!(!confirmed, "first match is in the mempool");
     assert_eq!(outpoint.txid, cb_bytes.to_vec());
     assert_eq!(outpoint.vout, 0);
@@ -210,7 +272,9 @@ async fn sdk_watch_outpoint_spent_mempool_then_confirmed() {
         |e| matches!(e, Event::OutpointSpent { confirmed, .. } if *confirmed),
     )
     .await;
-    let Event::OutpointSpent { confirmed, .. } = ev else { unreachable!() };
+    let Event::OutpointSpent { confirmed, .. } = ev else {
+        unreachable!()
+    };
     assert!(confirmed, "second match is confirmed");
 }
 
@@ -231,9 +295,11 @@ async fn sdk_resilient_watch_re_sends_a_rate_limited_add() {
     let autharg: &'static str =
         Box::leak(format!("--authfile={}", fixture.authfile.display()).into_boxed_str());
     let (sn, wallet) = matured_node_args(vec![autharg, "--events-grpc-auth=1"]).await;
-    let dest = DeterministicWallet::from_secret([0x66; 32]).address.script_pubkey();
+    let dest = DeterministicWallet::from_secret([0x66; 32])
+        .address
+        .script_pubkey();
     let scripthash: [u8; 32] = {
-        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::hashes::{Hash, sha256};
         sha256::Hash::hash(dest.as_bytes()).to_byte_array()
     };
 
@@ -243,7 +309,10 @@ async fn sdk_resilient_watch_re_sends_a_rate_limited_add() {
         .await
         .expect("connect with the token");
     let mut watch = client.resilient_watch(ResilientWatchConfig::new());
-    watch.add_scripts([(scripthash, None)]).await.expect("add_scripts");
+    watch
+        .add_scripts([(scripthash, None)])
+        .await
+        .expect("add_scripts");
 
     // Pull events in the background until the match arrives; anything else that
     // reaches the caller first must not be the refusal.
@@ -251,7 +320,9 @@ async fn sdk_resilient_watch_re_sends_a_rate_limited_add() {
         loop {
             match watch.next().await.expect("no stream error") {
                 Event::ScriptMatched { scripthash: sh, .. } => return sh,
-                Event::WatchAddRejected(r) => panic!("a rate-limited add reached the caller: {r:?}"),
+                Event::WatchAddRejected(r) => {
+                    panic!("a rate-limited add reached the caller: {r:?}")
+                }
                 _ => {}
             }
         }
@@ -264,7 +335,11 @@ async fn sdk_resilient_watch_re_sends_a_rate_limited_add() {
         .await
         .expect("the throttled script matched within the timeout")
         .expect("watch task");
-    assert_eq!(sh, scripthash.to_vec(), "the re-sent watch delivered the payment");
+    assert_eq!(
+        sh,
+        scripthash.to_vec(),
+        "the re-sent watch delivered the payment"
+    );
 }
 
 /// A privacy-preserving prefix watch: register a coarse bucket, receive the
@@ -273,7 +348,9 @@ async fn sdk_resilient_watch_re_sends_a_rate_limited_add() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sdk_prefix_watch_local_refilter() {
     let (sn, wallet) = matured_node().await;
-    let dest = DeterministicWallet::from_secret([0x59; 32]).address.script_pubkey();
+    let dest = DeterministicWallet::from_secret([0x59; 32])
+        .address
+        .script_pubkey();
 
     // Hold the real script client-side; register only its 8-bit bucket.
     let mut watcher = PrefixWatcher::new();
@@ -282,7 +359,10 @@ async fn sdk_prefix_watch_local_refilter() {
 
     let mut client = connect(&sn).await;
     let (watch, mut stream) = client.watch().await.expect("watch");
-    watch.add_script_prefixes(prefixes).await.expect("add_script_prefixes");
+    watch
+        .add_script_prefixes(prefixes)
+        .await
+        .expect("add_script_prefixes");
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // Fund `dest` — it appears as an output of the broadcast spend.
@@ -306,8 +386,15 @@ async fn sdk_prefix_watch_local_refilter() {
     .expect("a prefix delivery re-filters to our funding output");
 
     assert!(found.is_match());
-    let f = found.funding.iter().find(|f| f.scripthash == dest_sh).unwrap();
-    assert_eq!(f.script_pubkey, dest, "re-filtered to the exact watched script");
+    let f = found
+        .funding
+        .iter()
+        .find(|f| f.scripthash == dest_sh)
+        .unwrap();
+    assert_eq!(
+        f.script_pubkey, dest,
+        "re-filtered to the exact watched script"
+    );
 }
 
 /// Durable cursor replay: capture the cursor on a live stream, drop it, mine a
@@ -320,13 +407,22 @@ async fn sdk_cursor_replay_resumes_across_reconnect() {
 
     // First connection: mine 2 blocks, consume them, capture the cursor.
     let mut stream = client
-        .subscribe(SubscribeOptions { categories: Categories::CHAIN, ..Default::default() })
+        .subscribe(SubscribeOptions {
+            categories: Categories::CHAIN,
+            ..Default::default()
+        })
         .await
         .expect("subscribe");
     tokio::time::sleep(Duration::from_millis(600)).await;
     mine_n(&sn, 2).await;
-    let _ = next_matching(&mut stream, 15, |e| matches!(e, Event::BlockConnected { height: 1, .. })).await;
-    let _ = next_matching(&mut stream, 15, |e| matches!(e, Event::BlockConnected { height: 2, .. })).await;
+    let _ = next_matching(&mut stream, 15, |e| {
+        matches!(e, Event::BlockConnected { height: 1, .. })
+    })
+    .await;
+    let _ = next_matching(&mut stream, 15, |e| {
+        matches!(e, Event::BlockConnected { height: 2, .. })
+    })
+    .await;
     let cursor = *stream.cursor().expect("cursor captured");
     assert_eq!(cursor.height, 2);
 
@@ -344,8 +440,13 @@ async fn sdk_cursor_replay_resumes_across_reconnect() {
         })
         .await
         .expect("resubscribe");
-    let ev = next_matching(&mut stream, 15, |e| matches!(e, Event::BlockConnected { .. })).await;
-    let Event::BlockConnected { height, .. } = ev else { unreachable!() };
+    let ev = next_matching(&mut stream, 15, |e| {
+        matches!(e, Event::BlockConnected { .. })
+    })
+    .await;
+    let Event::BlockConnected { height, .. } = ev else {
+        unreachable!()
+    };
     assert_eq!(height, 3, "replay resumes at cursor.height + 1, no gap");
 }
 
@@ -360,14 +461,24 @@ async fn sdk_resilient_subscribe_replays_from_cursor() {
     // server replays heights 2 and 3.
     let base = SubscribeOptions {
         categories: Categories::CHAIN,
-        from_cursor: Some(Cursor { height: 1, tx_index: 0, mempool_seq: 0, instance_id: 0 }),
+        from_cursor: Some(Cursor {
+            height: 1,
+            tx_index: 0,
+            mempool_seq: 0,
+            instance_id: 0,
+        }),
         ..Default::default()
     };
     let mut sub = client.resilient_subscribe(base, ResilientConfig::new());
 
     let ev = next_resilient(&mut sub, 15).await;
-    let Event::BlockConnected { height, .. } = ev else { panic!("expected block, got {ev:?}") };
-    assert_eq!(height, 2, "resilient subscription replays from cursor.height + 1");
+    let Event::BlockConnected { height, .. } = ev else {
+        panic!("expected block, got {ev:?}")
+    };
+    assert_eq!(
+        height, 2,
+        "resilient subscription replays from cursor.height + 1"
+    );
 }
 
 /// A tweak scan killed mid-stream resumes without skipping a block, repeating at
@@ -402,7 +513,11 @@ async fn sdk_tweak_scan_resumes_after_a_kill_without_skipping_a_block() {
     for _ in 0..3 {
         before.push(next_tweak_height(&mut sub, 20).await);
     }
-    assert_eq!(before, vec![1, 2, 3], "cold sync replays the taproot era in height order");
+    assert_eq!(
+        before,
+        vec![1, 2, 3],
+        "cold sync replays the taproot era in height order"
+    );
     drop(sub);
     drop(client);
 
@@ -481,9 +596,9 @@ async fn sdk_tweak_scan_committed_shutdown_resumes_with_no_repeat() {
 /// changed". The row on disk is untouched throughout; only the served view moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sdk_tweak_cut_through_drops_spent_entries() {
-    use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::OutPoint;
     use crate::common::{build_signed_p2tr_keypath_spend, p2tr_keypath_output};
+    use bitcoin::OutPoint;
+    use bitcoin::secp256k1::Secp256k1;
     use std::str::FromStr;
 
     let (sn, wallet) = matured_node_args(vec!["-silentpaymentindex=1"]).await;
@@ -503,7 +618,9 @@ async fn sdk_tweak_cut_through_drops_spent_entries() {
     .await
     .unwrap();
     let rpc = sn.node.rpc_handle();
-    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw)).await.unwrap();
+    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw))
+        .await
+        .unwrap();
     mine_n(&sn, 1).await;
     let funded_height = 102u32;
     let funded_txid = bitcoin::Txid::from_str(&txid_str).expect("txid");
@@ -516,8 +633,15 @@ async fn sdk_tweak_cut_through_drops_spent_entries() {
     assert_eq!(entries.0.len(), 1, "the eligible transaction is indexed");
     assert!(!entries.1, "nothing filtered with cut-through off");
     let (entries, filtered) = tweaks_at(&client, funded_height, true, true).await;
-    assert_eq!(entries.len(), 1, "an unspent taproot output survives cut-through");
-    assert!(!filtered, "nothing was dropped, so the block is not `filtered`");
+    assert_eq!(
+        entries.len(),
+        1,
+        "an unspent taproot output survives cut-through"
+    );
+    assert!(
+        !filtered,
+        "nothing was dropped, so the block is not `filtered`"
+    );
     assert_eq!(entries[0].taproot_outputs.len(), 1);
     assert_eq!(entries[0].taproot_outputs[0].vout, 0);
 
@@ -526,14 +650,21 @@ async fn sdk_tweak_cut_through_drops_spent_entries() {
     let (raw_spend, _spend_txid) = build_signed_p2tr_keypath_spend(
         &secp,
         &kp,
-        OutPoint { txid: funded_txid, vout: 0 },
+        OutPoint {
+            txid: funded_txid,
+            vout: 0,
+        },
         p2tr.clone(),
         funded_value,
-        DeterministicWallet::from_secret([0x44; 32]).address.script_pubkey(),
+        DeterministicWallet::from_secret([0x44; 32])
+            .address
+            .script_pubkey(),
         fee,
     );
     let rpc = sn.node.rpc_handle();
-    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw_spend)).await.unwrap();
+    tokio::task::spawn_blocking(move || rpc.send_raw_tx(&raw_spend))
+        .await
+        .unwrap();
     mine_n(&sn, 1).await;
 
     // Same height, same row, spent coin: the entry is cut and the block admits
@@ -545,7 +676,11 @@ async fn sdk_tweak_cut_through_drops_spent_entries() {
     // Control: with the filter off the same height still serves the entry, so
     // what changed is the view, not the index.
     let (entries, filtered) = tweaks_at(&client, funded_height, false, true).await;
-    assert_eq!(entries.len(), 1, "the stored row is untouched by cut-through");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the stored row is untouched by cut-through"
+    );
     assert!(!filtered);
 }
 
@@ -575,11 +710,18 @@ async fn tweaks_at(
         })
         .await
         .expect("tweaks subscribe");
-    let ev = next_matching(&mut stream, 20, |e| {
-        matches!(e, Event::BlockTweaks { height: h, .. } if *h == height)
-    })
+    let ev = next_matching(
+        &mut stream,
+        20,
+        |e| matches!(e, Event::BlockTweaks { height: h, .. } if *h == height),
+    )
     .await;
-    let Event::BlockTweaks { entries, filtered, .. } = ev else { unreachable!() };
+    let Event::BlockTweaks {
+        entries, filtered, ..
+    } = ev
+    else {
+        unreachable!()
+    };
     (entries, filtered)
 }
 
@@ -594,7 +736,10 @@ async fn sdk_status_events_decode_typed() {
     let sn = start_async(vec![]).await;
     let mut client = connect(&sn).await;
     let mut stream = client
-        .subscribe(SubscribeOptions { categories: Categories::STATUS, ..Default::default() })
+        .subscribe(SubscribeOptions {
+            categories: Categories::STATUS,
+            ..Default::default()
+        })
         .await
         .expect("subscribe");
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -603,15 +748,30 @@ async fn sdk_status_events_decode_typed() {
     crate::streaming::sighup_with_conf(&sn, "alertdiskfreemb=17592186044416\n").await;
 
     let ev = next_matching(&mut stream, 45, |e| matches!(e, Event::Status { .. })).await;
-    let Event::Status { kind, state, severity, message, details } = ev else { unreachable!() };
+    let Event::Status {
+        kind,
+        state,
+        severity,
+        message,
+        details,
+    } = ev
+    else {
+        unreachable!()
+    };
     assert_eq!(kind, StatusKind::DiskLow);
     assert_eq!(state, StatusState::Raised);
     assert_eq!(severity, StatusSeverity::Critical);
-    assert!(!message.is_empty(), "a status event always carries a message");
+    assert!(
+        !message.is_empty(),
+        "a status event always carries a message"
+    );
     // `details` is the machine-readable half; a client switches on `kind` and
     // reads these rather than parsing the message.
     assert!(details.contains_key("free_bytes"), "details: {details:?}");
-    assert!(details.contains_key("threshold_bytes"), "details: {details:?}");
+    assert!(
+        details.contains_key("threshold_bytes"),
+        "details: {details:?}"
+    );
     // Severity is ordered, so a client filters with a comparison.
     assert!(severity >= StatusSeverity::Warning);
     // Status events are not replayable and must not advance a resume position.
@@ -626,7 +786,10 @@ async fn sdk_status_absent_without_the_category_bit() {
     let sn = start_async(vec![]).await;
     let mut client = connect(&sn).await;
     let mut stream = client
-        .subscribe(SubscribeOptions { categories: Categories::CHAIN, ..Default::default() })
+        .subscribe(SubscribeOptions {
+            categories: Categories::CHAIN,
+            ..Default::default()
+        })
         .await
         .expect("subscribe");
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -636,8 +799,7 @@ async fn sdk_status_absent_without_the_category_bit() {
 
     // Read a bounded number of events; a status body among them would be a bug.
     for _ in 0..4 {
-        let Ok(Ok(Some(ev))) =
-            tokio::time::timeout(Duration::from_secs(5), stream.message()).await
+        let Ok(Ok(Some(ev))) = tokio::time::timeout(Duration::from_secs(5), stream.message()).await
         else {
             break;
         };
@@ -649,10 +811,7 @@ async fn sdk_status_absent_without_the_category_bit() {
 }
 
 /// Next event from a `ResilientSubscription`, panicking on timeout / error.
-async fn next_resilient(
-    sub: &mut satd_events_client::ResilientSubscription,
-    secs: u64,
-) -> Event {
+async fn next_resilient(sub: &mut satd_events_client::ResilientSubscription, secs: u64) -> Event {
     let fut = async {
         loop {
             match sub.next().await {

@@ -130,12 +130,14 @@ pub fn repair_lost_connect_delta(
         )));
     }
 
-    let parent = store.get_block_index(&block.header.prev_blockhash).ok_or_else(|| {
-        RepairError::SignatureMismatch(format!(
-            "parent {} missing from the block index",
-            block.header.prev_blockhash
-        ))
-    })?;
+    let parent = store
+        .get_block_index(&block.header.prev_blockhash)
+        .ok_or_else(|| {
+            RepairError::SignatureMismatch(format!(
+                "parent {} missing from the block index",
+                block.header.prev_blockhash
+            ))
+        })?;
     if parent.height + 1 != height {
         return Err(RepairError::SignatureMismatch(format!(
             "parent height {} does not precede block height {}",
@@ -235,8 +237,9 @@ pub fn repair_lost_connect_delta(
     }
     // The parent's count anchors the rebuilt chain_tx series; connect
     // would silently restart from zero without it.
-    let parent_chain_tx =
-        store.get_cumulative_tx_count(&block.header.prev_blockhash).ok_or_else(|| {
+    let parent_chain_tx = store
+        .get_cumulative_tx_count(&block.header.prev_blockhash)
+        .ok_or_else(|| {
             RepairError::SignatureMismatch(format!(
                 "parent {} has no cumulative tx count",
                 block.header.prev_blockhash
@@ -252,19 +255,24 @@ pub fn repair_lost_connect_delta(
         if timestamps.len() == 11 || mtp_cursor.height == 0 {
             break;
         }
-        mtp_cursor = store.get_block_index(&mtp_cursor.header.prev_blockhash).ok_or_else(|| {
-            RepairError::SignatureMismatch(format!(
-                "header chain is broken at {} while computing MTP",
-                mtp_cursor.header.prev_blockhash
-            ))
-        })?;
+        mtp_cursor = store
+            .get_block_index(&mtp_cursor.header.prev_blockhash)
+            .ok_or_else(|| {
+                RepairError::SignatureMismatch(format!(
+                    "header chain is broken at {} while computing MTP",
+                    mtp_cursor.header.prev_blockhash
+                ))
+            })?;
     }
     timestamps.sort_unstable();
     let median_time_past = timestamps[timestamps.len() / 2];
 
     // Rebuild the delta with the production connect path — full
     // validation, scripts included: every prevout is still present.
-    let flat_pos = FlatFilePos { file_number: entry.file_number, data_pos: entry.data_pos };
+    let flat_pos = FlatFilePos {
+        file_number: entry.file_number,
+        data_pos: entry.data_pos,
+    };
     let mut batch = connect::connect_block(&ConnectParams {
         replay_plan: None,
         store,
@@ -308,12 +316,20 @@ pub fn repair_lost_connect_delta(
     // intra-block events and pass through untouched, exactly as they
     // do via CoinCache in production.
     let intra_block_pairs: HashSet<OutPoint> = {
-        let removed: HashSet<OutPoint> =
-            batch.coin_removes.iter().map(|(op, _, _)| *op).collect();
-        batch.coin_puts.iter().map(|(op, _)| *op).filter(|op| removed.contains(op)).collect()
+        let removed: HashSet<OutPoint> = batch.coin_removes.iter().map(|(op, _, _)| *op).collect();
+        batch
+            .coin_puts
+            .iter()
+            .map(|(op, _)| *op)
+            .filter(|op| removed.contains(op))
+            .collect()
     };
-    batch.coin_puts.retain(|(op, _)| !intra_block_pairs.contains(op));
-    batch.coin_removes.retain(|(op, _, _)| !intra_block_pairs.contains(op));
+    batch
+        .coin_puts
+        .retain(|(op, _)| !intra_block_pairs.contains(op));
+    batch
+        .coin_removes
+        .retain(|(op, _, _)| !intra_block_pairs.contains(op));
 
     // Descendants connected over the hole computed their cumulative tx
     // counts from a missing parent (`unwrap_or(0)`); rewrite every row
@@ -393,13 +409,19 @@ pub fn repair_lost_connect_delta(
         }
     }
     if store.get_undo(&block_hash).is_none() {
-        return Err(RepairError::Postcondition("undo data missing after write".into()));
+        return Err(RepairError::Postcondition(
+            "undo data missing after write".into(),
+        ));
     }
     if store.get_block_hash_by_height(height) != Some(block_hash) {
-        return Err(RepairError::Postcondition("height index row missing after write".into()));
+        return Err(RepairError::Postcondition(
+            "height index row missing after write".into(),
+        ));
     }
     if store.get_tip() != Some(tip_hash) {
-        return Err(RepairError::Postcondition("tip moved — it must stay at the descendant".into()));
+        return Err(RepairError::Postcondition(
+            "tip moved — it must stay at the descendant".into(),
+        ));
     }
     if store.get_cumulative_tx_count(&block_hash)
         != Some(parent_chain_tx + block.txdata.len() as u64)
@@ -437,7 +459,10 @@ mod tests {
             script_pubkey: bitcoin::ScriptBuf::new(),
         }];
         for _ in 0..extra_outputs {
-            output.push(TxOut { value: Amount::ZERO, script_pubkey: bitcoin::ScriptBuf::new() });
+            output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            });
         }
         Transaction {
             version: Version(2),
@@ -493,7 +518,9 @@ mod tests {
         let genesis = seal(BlockHash::all_zeros(), 0, vec![make_coinbase(0, 0)]);
         let genesis_hash = genesis.block_hash();
         let mut batch = StoreBatch::default();
-        batch.block_index_puts.push((genesis_hash, index_entry(&genesis, 0, BlockStatus::Valid)));
+        batch
+            .block_index_puts
+            .push((genesis_hash, index_entry(&genesis, 0, BlockStatus::Valid)));
         batch.height_hash_puts.push((0, genesis_hash));
         batch.tip = Some(genesis_hash);
         batch.chain_tx_puts.push((genesis_hash, 1));
@@ -542,7 +569,10 @@ mod tests {
             version: Version(2),
             lock_time: bitcoin::blockdata::locktime::absolute::LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint { txid: spend.compute_txid(), vout: 0 },
+                previous_output: OutPoint {
+                    txid: spend.compute_txid(),
+                    vout: 0,
+                },
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -555,9 +585,10 @@ mod tests {
         let block1 = seal(genesis_hash, 1, vec![make_coinbase(1, 0), spend, chained]);
         let block1_hash = block1.block_hash();
         let mut batch = StoreBatch::default();
-        batch
-            .block_index_puts
-            .push((block1_hash, index_entry(&block1, 1, BlockStatus::DataStored)));
+        batch.block_index_puts.push((
+            block1_hash,
+            index_entry(&block1, 1, BlockStatus::DataStored),
+        ));
         store.write_batch(batch).unwrap();
 
         // Block 2 sits over the hole, exactly as production left it: its
@@ -579,7 +610,10 @@ mod tests {
         batch2.height_hash_puts.push((2, block2_hash));
         batch2.tip = Some(block2_hash);
         batch2.coin_puts.push((
-            OutPoint { txid: cb2_txid, vout: 0 },
+            OutPoint {
+                txid: cb2_txid,
+                vout: 0,
+            },
             Coin {
                 amount: block2.txdata[0].output[0].value.to_sat(),
                 script_pubkey: block2.txdata[0].output[0].script_pubkey.clone(),
@@ -588,7 +622,9 @@ mod tests {
                 txseq: node_index::TXSEQ_UNKNOWN,
             },
         ));
-        batch2.undo_puts.push((block2_hash, crate::storage::undo::UndoData::default()));
+        batch2
+            .undo_puts
+            .push((block2_hash, crate::storage::undo::UndoData::default()));
         // The wrong numbering: parent count read as zero.
         batch2.chain_tx_puts.push((block2_hash, 1));
         batch2.tx_loc_puts.push((cb2_txid, 0));
@@ -633,9 +669,18 @@ mod tests {
         assert_eq!(report.coins_created, 2);
         assert_eq!(report.tx_index_rows, 3);
         // The address index keeps the gross intra-block events.
-        assert_eq!(report.chain_tx_rewrites, 1, "block 2's zero-anchored count must be rewritten");
-        assert!(store.get_coin(&seeded).is_some(), "dry run must not touch the store");
-        assert!(store.get_undo(&block1_hash).is_none(), "dry run must not touch the store");
+        assert_eq!(
+            report.chain_tx_rewrites, 1,
+            "block 2's zero-anchored count must be rewritten"
+        );
+        assert!(
+            store.get_coin(&seeded).is_some(),
+            "dry run must not touch the store"
+        );
+        assert!(
+            store.get_undo(&block1_hash).is_none(),
+            "dry run must not touch the store"
+        );
 
         // Apply.
         let report = repair_lost_connect_delta(
@@ -654,13 +699,21 @@ mod tests {
         // intra-block-spent output does NOT, every index row is back,
         // and the tip never moved.
         assert!(store.get_coin(&seeded).is_none());
-        let intra = OutPoint { txid: block1.txdata[1].compute_txid(), vout: 0 };
+        let intra = OutPoint {
+            txid: block1.txdata[1].compute_txid(),
+            vout: 0,
+        };
         assert!(
             store.get_coin(&intra).is_none(),
             "intra-block-spent output must not be resurrected"
         );
         assert!(
-            store.get_coin(&OutPoint { txid: block1.txdata[2].compute_txid(), vout: 0 }).is_some()
+            store
+                .get_coin(&OutPoint {
+                    txid: block1.txdata[2].compute_txid(),
+                    vout: 0
+                })
+                .is_some()
         );
         for tx in &block1.txdata {
             assert_eq!(store.get_tx_location(&tx.compute_txid()), Some(block1_hash));
@@ -704,13 +757,21 @@ mod tests {
         assert_eq!(report.coins_created, 2);
         assert_eq!(report.coins_spent, 1);
 
-        let intra = OutPoint { txid: block1.txdata[1].compute_txid(), vout: 0 };
+        let intra = OutPoint {
+            txid: block1.txdata[1].compute_txid(),
+            vout: 0,
+        };
         assert!(
             store.get_coin(&intra).is_none(),
             "intra-block-spent output must not be resurrected in RocksDB"
         );
         assert!(
-            store.get_coin(&OutPoint { txid: block1.txdata[2].compute_txid(), vout: 0 }).is_some()
+            store
+                .get_coin(&OutPoint {
+                    txid: block1.txdata[2].compute_txid(),
+                    vout: 0
+                })
+                .is_some()
         );
         assert!(store.get_coin(&seeded).is_none());
         assert!(store.get_undo(&block1_hash).is_some());
@@ -739,14 +800,23 @@ mod tests {
             )
         };
         let err = repair(true).unwrap_err();
-        assert!(matches!(err, RepairError::Stripped(h) if h == hash), "got: {err}");
+        assert!(
+            matches!(err, RepairError::Stripped(h) if h == hash),
+            "got: {err}"
+        );
         assert!(err.to_string().contains("-reindex-chainstate"), "{err}");
-        assert!(store.get_coin(&seeded).is_some() && store.get_undo(&hash).is_none(), "nothing written");
+        assert!(
+            store.get_coin(&seeded).is_some() && store.get_undo(&hash).is_none(),
+            "nothing written"
+        );
 
         let mut batch = crate::storage::StoreBatch::default();
         batch.opreturn_strip_removes.push(hash);
         store.write_batch(batch).unwrap();
-        assert!(repair(false).is_ok(), "without the record the same block passes");
+        assert!(
+            repair(false).is_ok(),
+            "without the record the same block passes"
+        );
     }
 
     /// The height row of a lost delta may or may not have survived. A row
@@ -769,7 +839,10 @@ mod tests {
         };
 
         let foreign = BlockHash::from_byte_array([0x77; 32]);
-        let batch = StoreBatch { height_hash_puts: vec![(1, foreign)], ..Default::default() };
+        let batch = StoreBatch {
+            height_hash_puts: vec![(1, foreign)],
+            ..Default::default()
+        };
         store.write_batch(batch).unwrap();
         match repair(true).unwrap_err() {
             RepairError::SignatureMismatch(msg) => {
@@ -778,9 +851,15 @@ mod tests {
             other => panic!("expected SignatureMismatch, got: {other}"),
         }
         assert_eq!(store.get_block_hash_by_height(1), Some(foreign));
-        assert!(store.get_coin(&seeded).is_some() && store.get_undo(&block1_hash).is_none(), "nothing written");
+        assert!(
+            store.get_coin(&seeded).is_some() && store.get_undo(&block1_hash).is_none(),
+            "nothing written"
+        );
 
-        let batch = StoreBatch { height_hash_puts: vec![(1, block1_hash)], ..Default::default() };
+        let batch = StoreBatch {
+            height_hash_puts: vec![(1, block1_hash)],
+            ..Default::default()
+        };
         store.write_batch(batch).unwrap();
         assert!(repair(true).unwrap().applied);
         assert!(store.get_undo(&block1_hash).is_some());
@@ -807,7 +886,9 @@ mod tests {
             }
             let hash = block.block_hash();
             let mut batch = StoreBatch::default();
-            batch.block_index_puts.push((hash, index_entry(&block, h, BlockStatus::Valid)));
+            batch
+                .block_index_puts
+                .push((hash, index_entry(&block, h, BlockStatus::Valid)));
             batch.height_hash_puts.push((h, hash));
             batch.chain_tx_puts.push((hash, u64::from(h) + 1));
             batch.tip = Some(hash);
@@ -837,7 +918,9 @@ mod tests {
         // base + 2000 with a non-final sequence.
         let locked = Transaction {
             version: Version(2),
-            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::from_consensus(base + 2000),
+            lock_time: bitcoin::blockdata::locktime::absolute::LockTime::from_consensus(
+                base + 2000,
+            ),
             input: vec![TxIn {
                 previous_output: seeded,
                 script_sig: bitcoin::ScriptBuf::new(),
@@ -852,9 +935,10 @@ mod tests {
         let block12 = seal(parent_hash, 12, vec![make_coinbase(12, 0), locked]);
         let block12_hash = block12.block_hash();
         let mut batch = StoreBatch::default();
-        batch
-            .block_index_puts
-            .push((block12_hash, index_entry(&block12, 12, BlockStatus::DataStored)));
+        batch.block_index_puts.push((
+            block12_hash,
+            index_entry(&block12, 12, BlockStatus::DataStored),
+        ));
         store.write_batch(batch).unwrap();
 
         // Block 13 connected over the hole.
@@ -910,7 +994,10 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(matches!(err, RepairError::SignatureMismatch(_)), "got: {err}");
+        assert!(
+            matches!(err, RepairError::SignatureMismatch(_)),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -947,7 +1034,10 @@ mod tests {
         // connected over it); the right fix there is a normal restart.
         let (store, block1, block2_hash, _seeded) = make_holed_store();
         // Point the tip at block 1 itself.
-        let batch = StoreBatch { tip: Some(block1.block_hash()), ..Default::default() };
+        let batch = StoreBatch {
+            tip: Some(block1.block_hash()),
+            ..Default::default()
+        };
         store.write_batch(batch).unwrap();
         let _ = block2_hash;
 
@@ -961,6 +1051,9 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(matches!(err, RepairError::SignatureMismatch(_)), "got: {err}");
+        assert!(
+            matches!(err, RepairError::SignatureMismatch(_)),
+            "got: {err}"
+        );
     }
 }

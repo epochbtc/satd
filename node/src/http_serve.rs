@@ -80,7 +80,11 @@ impl SocketCap {
     pub fn new(max: usize) -> Self {
         let max = clamp_cap(max);
         Self {
-            permits: Arc::new(Semaphore::new(if max == 0 { Semaphore::MAX_PERMITS } else { max })),
+            permits: Arc::new(Semaphore::new(if max == 0 {
+                Semaphore::MAX_PERMITS
+            } else {
+                max
+            })),
             max,
         }
     }
@@ -335,10 +339,8 @@ where
     // `spawn_tls_surface` fell back to jsonrpsee's helper — and so ignored
     // `-rpcservertimeout` entirely.
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    S: tower::Service<
-            hyper::Request<hyper::body::Incoming>,
-            Response = hyper::Response<B>,
-        > + Clone
+    S: tower::Service<hyper::Request<hyper::body::Incoming>, Response = hyper::Response<B>>
+        + Clone
         + Send
         + 'static,
     S::Error: Into<tower::BoxError>,
@@ -376,7 +378,6 @@ where
     };
     Ok(result?)
 }
-
 
 /// A socket that carries its listener's connection-cap permit.
 ///
@@ -494,7 +495,9 @@ impl<I> WriteDeadline<I> {
         };
         // `tokio::time::sleep` saturates a deadline past the end of time, so
         // no budget can overflow here.
-        let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
         if stalled.as_mut().poll(cx).is_ready() {
             self.stalled = None;
             return Poll::Ready(Err(std::io::Error::new(
@@ -632,7 +635,8 @@ impl<B> EndAtShutdown<B> {
                     // A dropped sender is a shutdown too: nothing is left to
                     // signal one.
                     let _ = rx.wait_for(|stopping| *stopping).await;
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             }),
         }
     }
@@ -692,7 +696,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let router = Router::new().route("/ping", get(|| async { "pong" }));
         let (sd_tx, sd_rx) = watch::channel(false);
-        tokio::spawn(serve_http_listener("test", listener, Transport::Plain, router, limits, sd_rx));
+        tokio::spawn(serve_http_listener(
+            "test",
+            listener,
+            Transport::Plain,
+            router,
+            limits,
+            sd_rx,
+        ));
         (addr, sd_tx)
     }
 
@@ -715,13 +726,19 @@ mod tests {
         // The kernel completes the third TCP handshake from the backlog; the
         // accept loop then drops it, so the request gets no answer.
         let mut c3 = TcpStream::connect(addr).await.unwrap();
-        assert!(ping(&mut c3).await.is_none(), "third socket must be dropped at capacity");
+        assert!(
+            ping(&mut c3).await.is_none(),
+            "third socket must be dropped at capacity"
+        );
 
         drop(c1);
         let mut admitted = false;
         for _ in 0..100 {
             let mut c = TcpStream::connect(addr).await.unwrap();
-            if ping(&mut c).await.is_some_and(|r| r.starts_with("HTTP/1.1 200")) {
+            if ping(&mut c)
+                .await
+                .is_some_and(|r| r.starts_with("HTTP/1.1 200"))
+            {
                 admitted = true;
                 break;
             }
@@ -767,7 +784,10 @@ mod tests {
         let mut admitted = false;
         for _ in 0..100 {
             let mut c = TcpStream::connect(b).await.unwrap();
-            if ping(&mut c).await.is_some_and(|r| r.starts_with("HTTP/1.1 200")) {
+            if ping(&mut c)
+                .await
+                .is_some_and(|r| r.starts_with("HTTP/1.1 200"))
+            {
                 admitted = true;
                 break;
             }
@@ -797,7 +817,10 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf)).await,
             Ok(Ok(0)) | Ok(Err(_))
         );
-        assert!(closed, "an idle keep-alive connection must be closed after the timeout");
+        assert!(
+            closed,
+            "an idle keep-alive connection must be closed after the timeout"
+        );
 
         // Without a timeout the same connection stays open.
         let (addr, sd_tx2) = start(ListenerLimits {
@@ -830,7 +853,10 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf)).await,
             Ok(Ok(0)) | Ok(Err(_))
         );
-        assert!(closed, "a silent connection must be closed after the timeout");
+        assert!(
+            closed,
+            "a silent connection must be closed after the timeout"
+        );
         let _ = sd_tx.send(true);
     }
 
@@ -977,7 +1003,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(admitted, "closing the upgraded socket must release its slot");
+        assert!(
+            admitted,
+            "closing the upgraded socket must release its slot"
+        );
         let _ = sd_tx.send(true);
     }
 
@@ -988,7 +1017,11 @@ mod tests {
         tokio::spawn(async move {
             for i in 0..n {
                 tokio::time::sleep(every).await;
-                if tx.send(bytes::Bytes::from(format!("tick {i}\n"))).await.is_err() {
+                if tx
+                    .send(bytes::Bytes::from(format!("tick {i}\n")))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1006,7 +1039,9 @@ mod tests {
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-            self.0.poll_recv(cx).map(|t| t.map(|b| Ok(hyper::body::Frame::data(b))))
+            self.0
+                .poll_recv(cx)
+                .map(|t| t.map(|b| Ok(hyper::body::Frame::data(b))))
         }
     }
 
@@ -1086,7 +1121,9 @@ mod tests {
         ));
 
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        c.write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         let got = read_ticks(&mut c, 10).await;
         assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
         let _ = sd_tx.send(true);
@@ -1097,8 +1134,14 @@ mod tests {
     /// task, so the listener answered nothing.
     #[tokio::test]
     async fn a_huge_idle_timeout_is_clamped_not_panicking() {
-        assert_eq!(clamp_timeout(Duration::from_secs(u64::MAX)), TIMEOUT_CEILING);
-        assert_eq!(clamp_timeout(Duration::from_secs(30)), Duration::from_secs(30));
+        assert_eq!(
+            clamp_timeout(Duration::from_secs(u64::MAX)),
+            TIMEOUT_CEILING
+        );
+        assert_eq!(
+            clamp_timeout(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
         let (addr, sd_tx) = start(ListenerLimits {
             sockets: SocketCap::new(0),
             idle_timeout: Some(Duration::from_secs(u64::MAX)),
@@ -1108,7 +1151,8 @@ mod tests {
         let mut c = TcpStream::connect(addr).await.unwrap();
         let resp = ping(&mut c).await;
         assert!(
-            resp.as_deref().is_some_and(|r| r.starts_with("HTTP/1.1 200")),
+            resp.as_deref()
+                .is_some_and(|r| r.starts_with("HTTP/1.1 200")),
             "a huge timeout must still serve: {resp:?}"
         );
         let _ = sd_tx.send(true);
@@ -1143,7 +1187,9 @@ mod tests {
             got
         });
         let mut w = WriteDeadline::new(a, Some(budget));
-        w.write_all(&[0u8; 1024]).await.expect("a slow reader is not a stall");
+        w.write_all(&[0u8; 1024])
+            .await
+            .expect("a slow reader is not a stall");
         assert_eq!(reader.await.unwrap(), 1024);
     }
 
@@ -1174,18 +1220,27 @@ mod tests {
         ));
 
         let mut stalled = TcpStream::connect(addr).await.unwrap();
-        stalled.write_all(b"GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        stalled
+            .write_all(b"GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         // The client never reads. The next socket waits for the slot.
         let mut admitted = false;
         for _ in 0..100 {
             let mut c = TcpStream::connect(addr).await.unwrap();
-            if ping(&mut c).await.is_some_and(|r| r.starts_with("HTTP/1.1 200")) {
+            if ping(&mut c)
+                .await
+                .is_some_and(|r| r.starts_with("HTTP/1.1 200"))
+            {
                 admitted = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(admitted, "a client that stopped reading must not keep its slot");
+        assert!(
+            admitted,
+            "a client that stopped reading must not keep its slot"
+        );
         drop(stalled);
         let _ = sd_tx.send(true);
     }
@@ -1203,7 +1258,10 @@ mod tests {
             get(|| async {
                 axum::response::Response::builder()
                     .header("content-type", "text/event-stream")
-                    .body(axum::body::Body::new(TickBody(ticker(1000, Duration::from_millis(100)))))
+                    .body(axum::body::Body::new(TickBody(ticker(
+                        1000,
+                        Duration::from_millis(100),
+                    ))))
                     .unwrap()
             }),
         );
@@ -1222,7 +1280,9 @@ mod tests {
         ));
 
         let mut c = TcpStream::connect(addr).await.unwrap();
-        c.write_all(b"GET /sse HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        c.write_all(b"GET /sse HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
         let mut got = read_ticks(&mut c, 2).await;
         let _ = sd_tx.send(true);
         let mut buf = [0u8; 1024];
@@ -1235,12 +1295,20 @@ mod tests {
             }
         };
         assert!(ended, "shutdown must end an open SSE stream: {got:?}");
-        assert!(got.ends_with("0\r\n\r\n"), "the stream ends cleanly: {got:?}");
+        assert!(
+            got.ends_with("0\r\n\r\n"),
+            "the stream ends cleanly: {got:?}"
+        );
     }
 
     #[test]
     fn event_streams_are_recognised_by_content_type() {
-        let resp = |ct: &str| hyper::Response::builder().header("content-type", ct).body(()).unwrap();
+        let resp = |ct: &str| {
+            hyper::Response::builder()
+                .header("content-type", ct)
+                .body(())
+                .unwrap()
+        };
         assert!(is_event_stream(&resp("text/event-stream")));
         assert!(is_event_stream(&resp("Text/Event-Stream; charset=utf-8")));
         assert!(!is_event_stream(&resp("application/json")));

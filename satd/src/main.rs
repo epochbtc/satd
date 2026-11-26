@@ -2,9 +2,9 @@ mod alert;
 mod config;
 mod fast_start;
 mod fd_budget;
+mod logcontrol;
 mod notify;
 mod notifyhooks;
-mod logcontrol;
 mod reload;
 
 #[global_allocator]
@@ -76,7 +76,6 @@ impl Drop for ApiRuntimeGuard {
         }
     }
 }
-
 
 /// Print the operator-facing FATAL block for a tip whose ancestry the
 /// chainstate never fully connected. Split out because it is needed twice:
@@ -229,7 +228,8 @@ fn write_rebuild_marker(
 fn shell_quote(path: &std::path::Path) -> String {
     let s = path.display().to_string();
     if !s.is_empty()
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+:@,".contains(&b))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@,".contains(&b))
     {
         s
     } else {
@@ -301,7 +301,12 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
     );
     let found_blocks = match &contents {
         SignetDirContents::ThisSignet { blocks_dir, .. } => blocks_dir.clone(),
-        _ => candidates.iter().rev().find(|d| d.exists()).cloned().unwrap_or_else(|| candidates[0].clone()),
+        _ => candidates
+            .iter()
+            .rev()
+            .find(|d| d.exists())
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone()),
     };
     let mut commands: Vec<String> = Vec::new();
     let mv = |commands: &mut Vec<String>, from: &Path, to: &Path| {
@@ -311,7 +316,11 @@ fn check_old_signet_datadir(config: &Config, net_datadir: &std::path::Path) {
             let aside = (1..)
                 .map(|n| {
                     let mut a = to.as_os_str().to_os_string();
-                    a.push(if n == 1 { ".unused".to_string() } else { format!(".unused.{n}") });
+                    a.push(if n == 1 {
+                        ".unused".to_string()
+                    } else {
+                        format!(".unused.{n}")
+                    });
                     PathBuf::from(a)
                 })
                 .find(|a| !a.exists())
@@ -458,7 +467,7 @@ fn startup_signals(
     replay_stop_budget: Arc<std::sync::atomic::AtomicU64>,
 ) -> impl std::future::Future<Output = ()> {
     use node::shutdown::StopRequest;
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
     async move {
@@ -548,62 +557,69 @@ fn report_ancestry_damage(
     net_datadir: &std::path::Path,
 ) {
     const SHOW: usize = 16;
-        // The two faults are not mutually exclusive — the walk can
-        // classify holes and then hit a broken pointer below them — and
-        // they do not have the same remedy. Report each one that is
-        // present, then give a single remedy, because the stronger fault
-        // dictates it: -reindex-chainstate trusts the block index, so a
-        // broken pointer makes it a multi-hour replay that ends where it
-        // started.
+    // The two faults are not mutually exclusive — the walk can
+    // classify holes and then hit a broken pointer below them — and
+    // they do not have the same remedy. Report each one that is
+    // present, then give a single remedy, because the stronger fault
+    // dictates it: -reindex-chainstate trusts the block index, so a
+    // broken pointer makes it a multi-hour replay that ends where it
+    // started.
+    eprintln!("FATAL: this node's UTXO set does not agree with the chain its tip claims.\n");
+    if let Some(broken) = &audit.broken {
         eprintln!(
-            "FATAL: this node's UTXO set does not agree with the chain its tip claims.\n"
-        );
-        if let Some(broken) = &audit.broken {
-            eprintln!(
-                "  * The tip's ancestry could not be walked: {:?}\n    \
+            "  * The tip's ancestry could not be walked: {:?}\n    \
                  The block index disagrees with itself, so this node cannot establish\n    \
                  which blocks its UTXO set was built from.\n    \
                  Walked {} block(s) down to height {} before stopping.\n",
-                broken, audit.blocks_checked, audit.lowest_height,
-            );
-        }
-        if !audit.holes.is_empty() {
-            eprintln!(
-                "  * The tip stands on {} block(s) that were never connected.\n    \
+            broken, audit.blocks_checked, audit.lowest_height,
+        );
+    }
+    if !audit.holes.is_empty() {
+        eprintln!(
+            "  * The tip stands on {} block(s) that were never connected.\n    \
                  The UTXO set is missing every output those blocks created, so this\n    \
                  node would answer gettxout and every wallet-facing index incorrectly\n    \
                  while reporting a healthy synced tip.\n    \
                  Affected heights: {:?}{}\n",
-                audit.holes.len(),
-                audit.holes.iter().take(SHOW).map(|a| a.height).collect::<Vec<_>>(),
-                if audit.holes.len() > SHOW { " (truncated)" } else { "" },
-            );
-        }
-        if audit.broken.is_some() {
-            eprintln!(
-                "Refusing to start. Rebuild the block index with -reindex.\n\
+            audit.holes.len(),
+            audit
+                .holes
+                .iter()
+                .take(SHOW)
+                .map(|a| a.height)
+                .collect::<Vec<_>>(),
+            if audit.holes.len() > SHOW {
+                " (truncated)"
+            } else {
+                ""
+            },
+        );
+    }
+    if audit.broken.is_some() {
+        eprintln!(
+            "Refusing to start. Rebuild the block index with -reindex.\n\
                  -reindex-chainstate will NOT fix this: it trusts the same block index."
-            );
-        } else {
-            eprintln!("Refusing to start. Rebuild the UTXO set with -reindex-chainstate.");
-        }
-        if prune_mb > 0 {
-            // Every remedy above replays blocks from the flat files, and a
-            // pruned node has deleted them. -reindex-chainstate refuses
-            // outright (its replay plan skips Pruned entries), -reindex
-            // rebuilds a truncated chain from what is left, and the audit
-            // tool cannot read blocks that are gone.
-            eprintln!(
-                "\n\
+        );
+    } else {
+        eprintln!("Refusing to start. Rebuild the UTXO set with -reindex-chainstate.");
+    }
+    if prune_mb > 0 {
+        // Every remedy above replays blocks from the flat files, and a
+        // pruned node has deleted them. -reindex-chainstate refuses
+        // outright (its replay plan skips Pruned entries), -reindex
+        // rebuilds a truncated chain from what is left, and the audit
+        // tool cannot read blocks that are gone.
+        eprintln!(
+            "\n\
                  This node is pruned (-prune={}), so none of the above can replay the\n\
                  missing blocks — their data has been deleted. Fetch the affected\n\
                  heights back from a peer with getblockfrompeer and repair them, or\n\
                  resync from scratch.",
-                prune_mb,
-            );
-        } else {
-            eprintln!(
-                "\n\
+            prune_mb,
+        );
+    } else {
+        eprintln!(
+            "\n\
                  Before reindexing, you can see exactly what disagrees without starting\n\
                  the node — it reads the blocks back and checks them against the UTXO set:\n\
                  \n\
@@ -611,9 +627,9 @@ fn report_ancestry_damage(
                  \n\
                  A small hole may be cheaper to repair with satd-chainstate-repair than to\n\
                  reindex. Both tools require the node to be stopped.",
-                net_datadir.display(),
-            );
-        }
+            net_datadir.display(),
+        );
+    }
 }
 
 /// How long the core runtime is given, once `run` has returned, to finish
@@ -727,7 +743,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             node::shutdown::exit_now(1);
         }
     };
-    replay_stop_budget.store(config.max_shutdown_secs, std::sync::atomic::Ordering::Relaxed);
+    replay_stop_budget.store(
+        config.max_shutdown_secs,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Install the user agent (built from -uacomment, already validated during
     // config load) before anything can advertise or report it: peers read it
@@ -918,7 +937,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // `config.maxconnections` keeps the operator's value so a SIGHUP diffs
     // against what was configured; the peer manager gets the fitted one.
     let fd_needs = fd_budget::needs(&config);
-    let fd_available = fd_budget::raise_fd_limit(fd_budget::wanted(&fd_needs, config.maxconnections));
+    let fd_available =
+        fd_budget::raise_fd_limit(fd_budget::wanted(&fd_needs, config.maxconnections));
     let fd_plan = match fd_budget::plan(&fd_needs, config.maxconnections, fd_available) {
         Ok(plan) => plan,
         Err(e) => {
@@ -1031,9 +1051,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 eprintln!("Error removing a stale rebuild marker: {e}");
                 node::shutdown::exit_now(1);
             }
-            tracing::info!(
-                "Removed a rebuild marker left by a chainstate that no longer exists"
-            );
+            tracing::info!("Removed a rebuild marker left by a chainstate that no longer exists");
         }
         Some(found) => match interrupted_rebuild_action(
             found,
@@ -1131,9 +1149,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 }
             }
         }
-        Err(e @ node::storage::StoreError::SchemaMismatch { stored: Some(v), expected })
-            if config.upgradechainstate && v > expected =>
-        {
+        Err(
+            e @ node::storage::StoreError::SchemaMismatch {
+                stored: Some(v),
+                expected,
+            },
+        ) if config.upgradechainstate && v > expected => {
             eprintln!(
                 "Error opening chain database: {e}\nThis datadir was written by a newer satd. \
                  -upgradechainstate never downgrades a chainstate; run with \
@@ -1194,17 +1215,21 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     }
     if let (Some(user), Some(pass)) = (&config.rpcuser, &config.rpcpassword) {
-        credentials.userpass.push(node::rpc::auth::UserPassCredential {
-            username: user.clone(),
-            password: pass.clone(),
-        });
+        credentials
+            .userpass
+            .push(node::rpc::auth::UserPassCredential {
+                username: user.clone(),
+                password: pass.clone(),
+            });
     }
     for entry in &config.rpcauth {
-        credentials.rpcauth.push(node::rpc::auth::RpcAuthCredential {
-            username: entry.username.clone(),
-            salt: entry.salt.clone(),
-            hash: entry.hash.clone(),
-        });
+        credentials
+            .rpcauth
+            .push(node::rpc::auth::RpcAuthCredential {
+                username: entry.username.clone(),
+                salt: entry.salt.clone(),
+                hash: entry.hash.clone(),
+            });
     }
     // Operator-lockout guard: enabling the unified auth layer must never strip
     // the operator's own Core-compatible credential path. In normal flows the
@@ -1239,8 +1264,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 );
                 // Attach the in-process accounting backend so per-token
                 // rate-limit / watch-quota state is tracked and enforced.
-                let store = store
-                    .with_accounting(std::sync::Arc::new(satd_auth::LocalAccounting::new()));
+                let store =
+                    store.with_accounting(std::sync::Arc::new(satd_auth::LocalAccounting::new()));
                 Some(Arc::new(store))
             }
             Err(e) => {
@@ -1547,27 +1572,31 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
         ConsensusEngine::RustShadow => {
             tracing::info!("Consensus: rust-shadow (cpp authoritative, rust shadow)");
-            Box::new(ShadowVerifier::new(
-                Box::new(ConsensusVerifier::new(config.network)),
-                Box::new(RustVerifier::new(config.network)),
-                "cpp",
-                "rust",
-                config.shadow_queue_size,
-                config.shadow_workers,
+            Box::new(
+                ShadowVerifier::new(
+                    Box::new(ConsensusVerifier::new(config.network)),
+                    Box::new(RustVerifier::new(config.network)),
+                    "cpp",
+                    "rust",
+                    config.shadow_queue_size,
+                    config.shadow_workers,
+                )
+                .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)),
             )
-            .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)))
         }
         ConsensusEngine::CppShadow => {
             tracing::info!("Consensus: cpp-shadow (rust authoritative, cpp shadow)");
-            Box::new(ShadowVerifier::new(
-                Box::new(RustVerifier::new(config.network)),
-                Box::new(ConsensusVerifier::new(config.network)),
-                "rust",
-                "cpp",
-                config.shadow_queue_size,
-                config.shadow_workers,
+            Box::new(
+                ShadowVerifier::new(
+                    Box::new(RustVerifier::new(config.network)),
+                    Box::new(ConsensusVerifier::new(config.network)),
+                    "rust",
+                    "cpp",
+                    config.shadow_queue_size,
+                    config.shadow_workers,
+                )
+                .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)),
             )
-            .with_queue_bytes(config.shadow_queue_mb.saturating_mul(1 << 20)))
         }
     };
     let chain_state = match ChainState::new_with_signet_challenge(
@@ -1671,7 +1700,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 );
             } else if config.restore_opreturns {
                 tracing::info!("-restoreopreturns: no block is stripped, nothing to restore");
-            } else if config.opreturn_prune_peers != node::storage::opreturn_strip::PrunePeers::default() {
+            } else if config.opreturn_prune_peers
+                != node::storage::opreturn_strip::PrunePeers::default()
+            {
                 tracing::warn!(
                     "-pruneopreturnpeers={} is ignored: -pruneopreturn is off and no block is stripped",
                     config.opreturn_prune_peers.as_str()
@@ -1717,11 +1748,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // resume and the reindex (#884): Core's hook is live for the whole of
     // startup, so a `reindex.halted` or `reindex.short` must fire it too. A
     // warning `ChainState::new` itself recorded is sent on install.
-    if let Some(cmd_template) = config
-        .alert_notify
-        .clone()
-        .filter(|c| !c.trim().is_empty())
-    {
+    if let Some(cmd_template) = config.alert_notify.clone().filter(|c| !c.trim().is_empty()) {
         tracing::warn!(
             "-alertnotify configured; running a command on each new node warning. {}",
             notifyhooks::STREAMING_API_NOTICE
@@ -1902,8 +1929,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 );
             }
             if !audit.holes.is_empty() {
-                let heights: Vec<u32> =
-                    audit.holes.iter().take(SHOW).map(|a| a.height).collect();
+                let heights: Vec<u32> = audit.holes.iter().take(SHOW).map(|a| a.height).collect();
                 tracing::error!(
                     holes = audit.holes.len(),
                     heights = ?heights,
@@ -2018,8 +2044,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // it is `None`; `record()` only enqueues on actual reorgs, so an
             // unconfigured webhook costs one idle task and nothing on the hot
             // path.
-            let shared: reload::SharedWebhook =
-                Arc::new(parking_lot::RwLock::new(reload::webhook_target_from(&config)));
+            let shared: reload::SharedWebhook = Arc::new(parking_lot::RwLock::new(
+                reload::webhook_target_from(&config),
+            ));
             let (tx, rx) = tokio::sync::mpsc::channel::<node::chain::reorg_log::ReorgRecord>(64);
             reorg_log.set_webhook_sender(tx);
             // On the API runtime, not the consensus core: this task does
@@ -2309,7 +2336,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // regtest alone: it exists to test forking scenarios, and honouring it on a
     // live network would signal for deployments the node knows nothing about.
     node::mining::template::set_block_version_override(
-        if config.network == bitcoin::Network::Regtest { config.blockversion } else { None },
+        if config.network == bitcoin::Network::Regtest {
+            config.blockversion
+        } else {
+            None
+        },
     );
 
     // Core's `nBytesPerSigOp`, process-wide, before anything is priced.
@@ -2396,10 +2427,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(node::chain::events::ChainEvent::BlockConnected {
-                        height,
-                        ..
-                    }) => {
+                    Ok(node::chain::events::ChainEvent::BlockConnected { height, .. }) => {
                         if height >= target_height {
                             if stop_tx.send_if_modified(|stop| !std::mem::replace(stop, true)) {
                                 tracing::info!(
@@ -2440,11 +2468,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // detached spawn-per-block — so an IBD/`-reindex` replay (thousands of
     // blocks/sec from disk) can't fork-bomb the host. See `notifyhooks` for
     // the full rationale. An empty/blank command is treated as unset.
-    if let Some(cmd_template) = config
-        .block_notify
-        .clone()
-        .filter(|c| !c.trim().is_empty())
-    {
+    if let Some(cmd_template) = config.block_notify.clone().filter(|c| !c.trim().is_empty()) {
         tracing::warn!(
             "-blocknotify configured; running a command on each new best block. {}",
             notifyhooks::STREAMING_API_NOTICE
@@ -2564,7 +2588,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let max = config.stream_prefix_max_bits.clamp(1, 32) as u8;
         let min = config.stream_prefix_min_bits.clamp(1, 32) as u8;
         let min = min.min(max);
-        if (min as u32, max as u32) != (config.stream_prefix_min_bits, config.stream_prefix_max_bits)
+        if (min as u32, max as u32)
+            != (config.stream_prefix_min_bits, config.stream_prefix_max_bits)
         {
             tracing::warn!(
                 target: "events",
@@ -2627,19 +2652,22 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // `Config::load` already validated that the cert and key are set
             // together and that mTLS implies a client CA, so a present cert is
             // sufficient to build the params here.
-            config.events_grpc_tls_cert.as_ref().map(|cert| satd_events::GrpcTlsParams {
-                cert_path: cert.clone(),
-                key_path: config
-                    .events_grpc_tls_key
-                    .clone()
-                    .expect("config validated cert+key are set together"),
-                mtls_enabled: config.events_grpc_mtls,
-                mtls_client_ca: config.events_grpc_mtls_client_ca.clone(),
-                mtls_client_allow: config.events_grpc_mtls_client_allow.clone(),
-                handshake_timeout: std::time::Duration::from_secs(
-                    config.events_grpc_tls_handshake_timeout,
-                ),
-            }),
+            config
+                .events_grpc_tls_cert
+                .as_ref()
+                .map(|cert| satd_events::GrpcTlsParams {
+                    cert_path: cert.clone(),
+                    key_path: config
+                        .events_grpc_tls_key
+                        .clone()
+                        .expect("config validated cert+key are set together"),
+                    mtls_enabled: config.events_grpc_mtls,
+                    mtls_client_ca: config.events_grpc_mtls_client_ca.clone(),
+                    mtls_client_allow: config.events_grpc_mtls_client_allow.clone(),
+                    handshake_timeout: std::time::Duration::from_secs(
+                        config.events_grpc_tls_handshake_timeout,
+                    ),
+                }),
         )
         .await
         {
@@ -2726,7 +2754,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 mempool.set_emit_raw_tx(false);
             }
             Err(e) => {
-                tracing::error!("Bitcoin Core ZMQ bind task failed: {e}; ZMQ notifications are disabled");
+                tracing::error!(
+                    "Bitcoin Core ZMQ bind task failed: {e}; ZMQ notifications are disabled"
+                );
                 mempool.set_emit_raw_tx(false);
             }
         }
@@ -2863,15 +2893,14 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // fire even with the operator opting in via `--peerblockfilters=1`.
     let filter_index_store: std::sync::Arc<dyn node::storage::Store> =
         chain_state.store_ref().clone();
-    let filter_index: std::sync::Arc<dyn node_filter_index::FilterIndex> = std::sync::Arc::new(
-        node::index::filter::RocksFilterIndex::new(
+    let filter_index: std::sync::Arc<dyn node_filter_index::FilterIndex> =
+        std::sync::Arc::new(node::index::filter::RocksFilterIndex::new(
             filter_index_store,
             node_filter_index::FilterIndexConfig {
                 enabled: config.blockfilterindex,
                 peer_serve: config.peerblockfilters,
             },
-        ),
-    );
+        ));
 
     {
         let task_index = mempool_addr_index.clone();
@@ -2953,7 +2982,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         // Given here, not set afterwards: the constructor starts the IBD
         // connector, which on a restart with blocks already stored ahead of
         // the tip is connecting before this call returns.
-        config.stopatheight.map(|height| (height, shutdown_tx.clone())),
+        config
+            .stopatheight
+            .map(|height| (height, shutdown_tx.clone())),
     );
 
     // A headers sync that finds the clock far behind the chain asks for a
@@ -3035,7 +3066,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // aside.
     peer_manager.set_max_outbound_full_relay(config.maxoutboundfullrelay);
     peer_manager.set_alt_slots(config.alt_slot_config());
-    for w in node::net::altslots::outbound_limit_warnings(config.maxoutboundfullrelay, config.altslots) {
+    for w in
+        node::net::altslots::outbound_limit_warnings(config.maxoutboundfullrelay, config.altslots)
+    {
         tracing::warn!("{w}");
     }
     if config.altslots > 0 {
@@ -3063,14 +3096,20 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let crawl_config = config.crawl_config(Some(&net_datadir));
         let limits = crawl_config.limits;
         if limits.clearnet == 0 && limits.tor == 0 {
-            tracing::warn!("The crawl is off: the file-descriptor limit leaves no room for a crawl session");
+            tracing::warn!(
+                "The crawl is off: the file-descriptor limit leaves no room for a crawl session"
+            );
         } else if let Err(e) = peer_manager.enable_crawl(crawl_config) {
             tracing::warn!("The crawl is off: {e}");
         } else {
             peer_manager.spawn_crawl();
             let from = match config.crawlbind.as_slice() {
                 [] => "this host's IP address".to_string(),
-                binds => binds.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(" and "),
+                binds => binds
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" and "),
             };
             tracing::warn!(
                 "Crawl enabled: it will dial tens of thousands of addresses from {from}; other operators' monitors \
@@ -3078,7 +3117,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                  host, or -crawlbind, keeps the node's own address out of it."
             );
             if config.peersurvey {
-                tracing::info!("-peersurvey is superseded by -crawl: the survey opens no connection");
+                tracing::info!(
+                    "-peersurvey is superseded by -crawl: the survey opens no connection"
+                );
             }
         }
     }
@@ -3278,7 +3319,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         // password is set, so -listenonion works without a torrc
         // HashedControlPassword.
         node::net::tor::HiddenService {
-            control: config.torcontrol.clone().unwrap_or_else(|| "127.0.0.1:9051".to_string()),
+            control: config
+                .torcontrol
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:9051".to_string()),
             password: config.torpassword.clone(),
             virtual_port: config.port,
             target,
@@ -3511,9 +3555,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             "sp-index backfill cursor restored from metadata"
         );
     }
-    let sp_backfill_handle = std::sync::Arc::new(node::index::silent_payments::BackfillHandle::new(
-        sp_initial_cursor,
-    ));
+    let sp_backfill_handle = std::sync::Arc::new(
+        node::index::silent_payments::BackfillHandle::new(sp_initial_cursor),
+    );
 
     let (sp_backfill_cmd_tx, sp_backfill_cmd_rx) =
         tokio::sync::mpsc::channel::<node::index::silent_payments::BackfillCommand>(1);
@@ -3582,10 +3626,11 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     };
 
     let recent_window_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let recent_window_thread = {
-        let chain = chain_state.clone();
-        let cancel = recent_window_cancel.clone();
-        std::thread::Builder::new()
+    let recent_window_thread =
+        {
+            let chain = chain_state.clone();
+            let cancel = recent_window_cancel.clone();
+            std::thread::Builder::new()
             .name("utxo-recent-window".into())
             .spawn(move || match node::storage::build_recent_window_with_retries(
                 || chain.build_recent_window(&cancel),
@@ -3616,7 +3661,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 );
             })
             .ok()
-    };
+        };
     {
         let cancel = recent_window_cancel.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -3669,9 +3714,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 mtls_enabled: config.rpc_mtls,
                 mtls_client_ca: config.rpc_mtls_client_ca.clone(),
                 mtls_client_allow: config.rpc_mtls_client_allow.clone(),
-                handshake_timeout: std::time::Duration::from_secs(
-                    config.rpc_tls_handshake_timeout,
-                ),
+                handshake_timeout: std::time::Duration::from_secs(config.rpc_tls_handshake_timeout),
                 // Socket-level connection cap. Derived from the single
                 // source of truth (`RPC_MAX_CONNECTIONS`) so the plain-HTTP
                 // and TLS surfaces provably share one number rather than two
@@ -3713,9 +3756,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 mtls_enabled: config.rpc_readonly_mtls,
                 mtls_client_ca: config.rpc_readonly_mtls_client_ca.clone(),
                 mtls_client_allow: config.rpc_readonly_mtls_client_allow.clone(),
-                handshake_timeout: std::time::Duration::from_secs(
-                    config.rpc_tls_handshake_timeout,
-                ),
+                handshake_timeout: std::time::Duration::from_secs(config.rpc_tls_handshake_timeout),
                 max_connections: node::rpc::server::RPC_MAX_CONNECTIONS as usize,
             }),
             Err(e) => {
@@ -3762,7 +3803,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let opened = if config.napstorerecover {
             node::nap::Publisher::open_recovering(path, &*chain_state).map(|(p, aside)| {
                 if let Some((aside, why)) = aside {
-                    let moved: Vec<String> = aside.iter().map(|p| p.display().to_string()).collect();
+                    let moved: Vec<String> =
+                        aside.iter().map(|p| p.display().to_string()).collect();
                     tracing::warn!(
                         target: "nap",
                         "NAP: the attestation store did not read back ({why}); moved it to {} \
@@ -3806,9 +3848,16 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // collecting. The set is rebuilt by collection, so a file that does not
     // read back is moved aside rather than refusing to start.
     let nap_aggregator = if config.napaggregator {
-        let path = net_datadir.join("nap").join("aggregate").join("aggregate.dat");
+        let path = net_datadir
+            .join("nap")
+            .join("aggregate")
+            .join("aggregate.dat");
         let max = config.napaggregatormax;
-        let aggregate = match node::nap::aggregate::Aggregate::open_with_max(path.clone(), &*chain_state, max) {
+        let aggregate = match node::nap::aggregate::Aggregate::open_with_max(
+            path.clone(),
+            &*chain_state,
+            max,
+        ) {
             Ok(a) => a,
             Err(why) => {
                 let secs = std::time::SystemTime::now()
@@ -3817,7 +3866,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 let mut aside = path.clone().into_os_string();
                 aside.push(format!(".bad-{secs}"));
                 if let Err(e) = std::fs::rename(&path, &aside) {
-                    eprintln!("Error loading the NAP aggregate ({why}); moving it aside failed: {e}");
+                    eprintln!(
+                        "Error loading the NAP aggregate ({why}); moving it aside failed: {e}"
+                    );
                     auth.cleanup();
                     node::shutdown::exit_now(1);
                 }
@@ -4024,7 +4075,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let (path, magic) = &fee_history_file;
         match fee_estimator.history().write().load(path, *magic) {
             Ok(0) => {}
-            Ok(n) => tracing::info!(target: "fees", blocks = n, "Loaded fee history from {}", path.display()),
+            Ok(n) => {
+                tracing::info!(target: "fees", blocks = n, "Loaded fee history from {}", path.display())
+            }
             Err(e) => tracing::warn!(
                 target: "fees",
                 file = %path.display(),
@@ -4051,19 +4104,23 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
     // path as the detectors. The background full check runs on the API
     // runtime, off the consensus core, and does nothing until a template is
     // queued for it.
-    chain_state.template_validity().install_alert_sink(node::mining::validity::AlertSink {
-        warnings: chain_state.warnings().clone(),
-        publisher: event_publisher.clone(),
-        health: health_state.clone(),
-    });
+    chain_state
+        .template_validity()
+        .install_alert_sink(node::mining::validity::AlertSink {
+            warnings: chain_state.warnings().clone(),
+            publisher: event_publisher.clone(),
+            health: health_state.clone(),
+        });
     // AssumeUTXO background validation (catch-up stalled, handoff failing,
     // snapshot proven invalid) reports through the same path. Anything it
     // raised before this point is sent out now.
-    chain_state.background_alerts().install_sink(node::health::AlertSink {
-        warnings: chain_state.warnings().clone(),
-        publisher: event_publisher.clone(),
-        health: health_state.clone(),
-    });
+    chain_state
+        .background_alerts()
+        .install_sink(node::health::AlertSink {
+            warnings: chain_state.warnings().clone(),
+            publisher: event_publisher.clone(),
+            health: health_state.clone(),
+        });
     {
         let _api_guard = api_handle.enter();
         chain_state.template_validity().install_full_checker(
@@ -4141,15 +4198,15 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             // Operator input: report it, never abort on a stack trace. An
             // unbracketed IPv6 literal is the common way to get here
             // (`-mcpbind=::1` joins to `::1:<port>`, which is not an address).
-            let mcp_bind: SocketAddr = match crate::config::parse_p2p_bind(&config.mcp_bind, mcp_port)
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("Error: -mcpbind/-mcpport: {e}");
-                    auth.cleanup();
-                    node::shutdown::exit_now(1);
-                }
-            };
+            let mcp_bind: SocketAddr =
+                match crate::config::parse_p2p_bind(&config.mcp_bind, mcp_port) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("Error: -mcpbind/-mcpport: {e}");
+                        auth.cleanup();
+                        node::shutdown::exit_now(1);
+                    }
+                };
             let tls_configured = config.mcp_tls_cert.is_some() && config.mcp_tls_key.is_some();
             // Safety guard: MCP exposes block-connecting tools. A non-loopback
             // bind is refused unless the operator opted into authenticated
@@ -4521,9 +4578,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                     let tls_bind: SocketAddr = match addr_str.parse() {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!(
-                                "Error: invalid --esploratlsbind {addr_str:?}: {e}"
-                            );
+                            eprintln!("Error: invalid --esploratlsbind {addr_str:?}: {e}");
                             auth.cleanup();
                             node::shutdown::exit_now(1);
                         }
@@ -4551,17 +4606,16 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                             node::shutdown::exit_now(1);
                         }
                     };
-                    let tls_listener =
-                        match tokio::net::TcpListener::bind(tls_bind).await {
-                            Ok(l) => l,
-                            Err(e) => {
-                                eprintln!(
-                                    "Error: esplora TLS listener could not bind to {tls_bind}: {e}"
-                                );
-                                auth.cleanup();
-                                node::shutdown::exit_now(1);
-                            }
-                        };
+                    let tls_listener = match tokio::net::TcpListener::bind(tls_bind).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!(
+                                "Error: esplora TLS listener could not bind to {tls_bind}: {e}"
+                            );
+                            auth.cleanup();
+                            node::shutdown::exit_now(1);
+                        }
+                    };
                     Some((tls_bind, tls_listener, acceptor))
                 }
             };
@@ -4818,15 +4872,18 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             .stratum_tls_bind
             .as_deref()
             .map(|raw| parse_bind("stratumtlsbind", raw));
-        let stratum_v2 = config.stratum_v2_bind.as_deref().map(|raw| node::stratum::V2Config {
-            bind: parse_bind("stratumv2bind", raw),
-            key_path: config
-                .stratum_v2_key
-                .clone()
-                .unwrap_or_else(|| config.network_datadir().join("stratum_v2.key")),
-            max_channels: config.stratum_v2_max_channels,
-            job_declaration: config.stratum_v2_jd,
-        });
+        let stratum_v2 = config
+            .stratum_v2_bind
+            .as_deref()
+            .map(|raw| node::stratum::V2Config {
+                bind: parse_bind("stratumv2bind", raw),
+                key_path: config
+                    .stratum_v2_key
+                    .clone()
+                    .unwrap_or_else(|| config.network_datadir().join("stratum_v2.key")),
+                max_channels: config.stratum_v2_max_channels,
+                job_declaration: config.stratum_v2_jd,
+            });
         // Validated against the network when the config loaded.
         let fallback_address = config.stratum_address.as_deref().map(|a| {
             a.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
@@ -5075,7 +5132,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         // opens every `-seednode` (`AddAddrFetch`; its `ConnectNode` hands
         // the name to the proxy). Core uses none under -connect.
         if config.proxy.is_some() {
-            for (host, port) in node::net::dns::operator_seed_names(&config.seednode, config.network) {
+            for (host, port) in
+                node::net::dns::operator_seed_names(&config.seednode, config.network)
+            {
                 if config.automatic_outbound {
                     peer_manager.add_addr_fetch(host, port);
                 } else {
@@ -5143,7 +5202,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
                 force,
                 node::net::seeding::SeedTimings::CORE,
                 || async move {
-                    node::net::dns::resolve_seeds_with(network, proxy.as_deref(), &signet_seeds).await
+                    node::net::dns::resolve_seeds_with(network, proxy.as_deref(), &signet_seeds)
+                        .await
                 },
                 fetch,
                 shutdown,
@@ -5155,7 +5215,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         let pm = peer_manager.clone();
         let fixed = node::net::dns::fixed_seeds_for_network(config.network);
         // Core adds them at once only when nothing else can fill the book.
-        let other_sources = dns_seeding || !config.seednode.is_empty() || !config.addnode.is_empty();
+        let other_sources =
+            dns_seeding || !config.seednode.is_empty() || !config.addnode.is_empty();
         let shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             node::net::seeding::fixed_seed(
@@ -5200,7 +5261,8 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         ) {
             Ok(stats) => {
                 mempool_file_read = stats.file_read;
-                if stats.accepted > 0 || stats.skipped > 0 || stats.expired > 0 || stats.deltas > 0 {
+                if stats.accepted > 0 || stats.skipped > 0 || stats.expired > 0 || stats.deltas > 0
+                {
                     tracing::info!(
                         accepted = stats.accepted,
                         skipped = stats.skipped,
@@ -5502,9 +5564,12 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         .filter(|c| !c.trim().is_empty())
     {
         let hook_bound = (shutdown_deadline / 2).max(std::time::Duration::from_secs(1));
-        if tokio::time::timeout(hook_bound, notifyhooks::run_once("shutdownnotify", &cmd, None))
-            .await
-            .is_err()
+        if tokio::time::timeout(
+            hook_bound,
+            notifyhooks::run_once("shutdownnotify", &cmd, None),
+        )
+        .await
+        .is_err()
         {
             tracing::warn!(
                 "shutdownnotify command did not finish within its share of the shutdown \
@@ -5532,7 +5597,9 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         budget_secs = rpc_budget.as_secs(),
         "Shutdown: waiting for running RPC calls to finish"
     );
-    let rpc_drained = tokio::time::timeout(rpc_budget, server_handle.stopped()).await.is_ok();
+    let rpc_drained = tokio::time::timeout(rpc_budget, server_handle.stopped())
+        .await
+        .is_ok();
     if rpc_drained {
         tracing::info!("RPC server stopped");
     } else {
@@ -5571,7 +5638,10 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             .unwrap_or(false)
     };
     if connector_stopped {
-        tracing::info!(tip_height = chain_state.tip_height(), "Block connector stopped");
+        tracing::info!(
+            tip_height = chain_state.tip_height(),
+            "Block connector stopped"
+        );
     } else {
         tracing::warn!(
             waited_secs = connector_budget.as_secs(),
@@ -5842,9 +5912,10 @@ async fn start_metrics_startup(
     let tls = match config.metrics_tls_bind.as_ref() {
         None => None,
         Some(addr_str) => {
-            let (Some(cert), Some(key)) =
-                (config.metrics_tls_cert.as_ref(), config.metrics_tls_key.as_ref())
-            else {
+            let (Some(cert), Some(key)) = (
+                config.metrics_tls_cert.as_ref(),
+                config.metrics_tls_key.as_ref(),
+            ) else {
                 eprintln!("Error: --metricstlsbind requires --metricstlscert AND --metricstlskey");
                 auth.cleanup();
                 node::shutdown::exit_now(1);
@@ -6490,7 +6561,6 @@ async fn persist_sp_failed_with_cleanup(
     }
 }
 
-
 /// The Esplora SSE stream semaphore: `-esplorasseconns`, clamped to
 /// [`node::http_serve::CAP_CEILING`] since tokio's `Semaphore::new` panics
 /// above `usize::MAX >> 3`. `0` means no cap: a semaphore with
@@ -6501,7 +6571,9 @@ fn esplora_sse_semaphore(max: usize) -> std::sync::Arc<tokio::sync::Semaphore> {
         s.add_permits(usize::MAX >> 8);
         s
     } else {
-        std::sync::Arc::new(tokio::sync::Semaphore::new(node::http_serve::clamp_cap(max)))
+        std::sync::Arc::new(tokio::sync::Semaphore::new(node::http_serve::clamp_cap(
+            max,
+        )))
     }
 }
 
@@ -6514,7 +6586,9 @@ mod esplora_sse_semaphore_tests {
         let sem = super::esplora_sse_semaphore(usize::MAX);
         assert_eq!(sem.available_permits(), node::http_serve::CAP_CEILING);
         assert_eq!(super::esplora_sse_semaphore(5).available_permits(), 5);
-        assert!(super::esplora_sse_semaphore(0).available_permits() > node::http_serve::CAP_CEILING);
+        assert!(
+            super::esplora_sse_semaphore(0).available_permits() > node::http_serve::CAP_CEILING
+        );
     }
 }
 
@@ -6563,7 +6637,7 @@ mod startup_tests {
 
 #[cfg(test)]
 mod interrupted_rebuild_tests {
-    use super::{describe_ago, interrupted_rebuild_action, InterruptedRebuild};
+    use super::{InterruptedRebuild, describe_ago, interrupted_rebuild_action};
     use node::rebuild_marker::{Found, RebuildKind, RebuildMarker};
 
     const NOW: u64 = 1_790_000_000;
@@ -6581,7 +6655,11 @@ mod interrupted_rebuild_tests {
 
     fn resumable(found: Found, schema: u32) -> Found {
         match found {
-            Found::Marker(m) => Found::Marker(RebuildMarker { resumable: true, schema, ..m }),
+            Found::Marker(m) => Found::Marker(RebuildMarker {
+                resumable: true,
+                schema,
+                ..m
+            }),
             other => other,
         }
     }
@@ -6604,7 +6682,10 @@ mod interrupted_rebuild_tests {
             }
             other => panic!("a plain start must refuse, got {other:?}"),
         }
-        assert_eq!(act(&m, false, false, true), InterruptedRebuild::RestartChainstateRebuild);
+        assert_eq!(
+            act(&m, false, false, true),
+            InterruptedRebuild::RestartChainstateRebuild
+        );
         assert_eq!(act(&m, false, true, false), InterruptedRebuild::Proceed);
         assert_eq!(act(&m, false, true, true), InterruptedRebuild::Proceed);
         assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
@@ -6652,8 +6733,14 @@ mod interrupted_rebuild_tests {
     #[test]
     fn an_unreadable_marker_needs_an_explicit_flag() {
         let m = Found::Unreadable("expected value".into());
-        assert!(matches!(act(&m, false, false, false), InterruptedRebuild::Refuse(_)));
-        assert!(matches!(act(&m, false, false, true), InterruptedRebuild::Refuse(_)));
+        assert!(matches!(
+            act(&m, false, false, false),
+            InterruptedRebuild::Refuse(_)
+        ));
+        assert!(matches!(
+            act(&m, false, false, true),
+            InterruptedRebuild::Refuse(_)
+        ));
         assert_eq!(act(&m, false, true, false), InterruptedRebuild::Proceed);
         assert_eq!(act(&m, true, false, false), InterruptedRebuild::Proceed);
     }
@@ -6683,7 +6770,10 @@ mod interrupted_rebuild_tests {
             Some(900_000),
             "the shutdown marker outlives a deleted chain database"
         );
-        assert_eq!(floor(Some(970_000), Some(&unfinished), Some(969_000)), Some(970_000));
+        assert_eq!(
+            floor(Some(970_000), Some(&unfinished), Some(969_000)),
+            Some(970_000)
+        );
         let unreadable = Found::Unreadable("expected value".into());
         assert_eq!(floor(Some(5), Some(&unreadable), None), Some(5));
     }
@@ -6696,12 +6786,7 @@ mod interrupted_rebuild_tests {
     fn a_pruned_node_has_no_reindex_floor() {
         let unfinished = marker(RebuildKind::Full);
         assert_eq!(
-            super::reindex_coverage_floor(
-                Some(970_000),
-                Some(&unfinished),
-                Some(970_000),
-                true
-            ),
+            super::reindex_coverage_floor(Some(970_000), Some(&unfinished), Some(970_000), true),
             None
         );
     }
@@ -6853,7 +6938,10 @@ mod exit_path_tests {
             for (at, open) in code.match_indices(&format!("{module}{{")) {
                 let list = &code[at + open.len()..];
                 let list = &list[..list.find('}').unwrap_or(list.len())];
-                if list.split(',').any(|item| item == "exit" || item.starts_with("exitas")) {
+                if list
+                    .split(',')
+                    .any(|item| item == "exit" || item.starts_with("exitas"))
+                {
                     lines.push(line_of[at]);
                 }
             }
@@ -6909,7 +6997,9 @@ mod exit_path_tests {
             assert!(libc_exit_lines(src).is_empty(), "flagged {src:?}");
         }
         assert_eq!(
-            libc_exit_lines("/* one\ntwo */\nlet s = \"a\nb\";\nuse std::process::{\n    exit,\n};"),
+            libc_exit_lines(
+                "/* one\ntwo */\nlet s = \"a\nb\";\nuse std::process::{\n    exit,\n};"
+            ),
             vec![5],
             "a hit is reported on its first line"
         );
@@ -6946,8 +7036,15 @@ mod exit_path_tests {
                 }
             }
         }
-        assert!(calls.is_empty(), "exit through node::shutdown::exit_now instead: {calls:?}");
-        assert_eq!(marked.len(), 1, "only the exit_now tests' control may exit(): {marked:?}");
+        assert!(
+            calls.is_empty(),
+            "exit through node::shutdown::exit_now instead: {calls:?}"
+        );
+        assert_eq!(
+            marked.len(),
+            1,
+            "only the exit_now tests' control may exit(): {marked:?}"
+        );
     }
 
     /// A panic that unwound out of `main` would end the process through

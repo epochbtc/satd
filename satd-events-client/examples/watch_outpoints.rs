@@ -13,7 +13,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "http://127.0.0.1:50051".into());
 
-    let mut client = StreamClient::builder(endpoint).keepalive_default().connect().await?;
+    let mut client = StreamClient::builder(endpoint)
+        .keepalive_default()
+        .connect()
+        .await?;
     let (watch, mut events) = client.watch().await?;
 
     // Replace with real outpoints (txid bytes in internal order, vout). The
@@ -22,7 +25,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     watch.add_outpoints([(txid, 0), (txid, 1)]).await?;
 
     while let Some(event) = events.message().await? {
-        if let Event::OutpointSpent { outpoint, spending_txid, confirmed, .. } = event {
+        if let Event::OutpointSpent {
+            outpoint,
+            spending_txid,
+            confirmed,
+            ..
+        } = event
+        {
             println!(
                 "outpoint {}:{} spent by {} ({})",
                 hex(&outpoint.txid),

@@ -351,9 +351,7 @@ pub(crate) fn resolve_funding_rows_for(
             amount,
         ));
     }
-    out.sort_by(|(a, _), (b, _)| {
-        (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout))
-    });
+    out.sort_by(|(a, _), (b, _)| (a.height, a.txid, a.vout).cmp(&(b.height, b.txid, b.vout)));
     out
 }
 
@@ -455,9 +453,7 @@ pub(crate) fn resolve_spending_rows_for(
             },
         ));
     }
-    out.sort_by(|(a, _), (b, _)| {
-        (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin))
-    });
+    out.sort_by(|(a, _), (b, _)| (a.height, a.txid, a.vin).cmp(&(b.height, b.txid, b.vin)));
     out
 }
 
@@ -495,8 +491,8 @@ pub fn read_tip_read_only(
     let db_err = |e: rocksdb::Error| StoreError::Database(e.to_string());
     let opts = Options::default();
     let cfs = rocksdb::DB::list_cf(&opts, chainstate_dir).map_err(db_err)?;
-    let db = rocksdb::DB::open_cf_for_read_only(&opts, chainstate_dir, &cfs, false)
-        .map_err(db_err)?;
+    let db =
+        rocksdb::DB::open_cf_for_read_only(&opts, chainstate_dir, &cfs, false).map_err(db_err)?;
     let (Some(meta), Some(index)) = (db.cf_handle(CF_METADATA), db.cf_handle(CF_BLOCK_INDEX))
     else {
         return Ok(None);
@@ -694,16 +690,14 @@ pub struct RocksDbStore {
     /// writes in exactly that gap through a layer (a `CoinCache`) that owns
     /// this store.
     #[cfg(test)]
-    recent_window_test_pause: parking_lot::Mutex<
-        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-    >,
+    recent_window_test_pause:
+        parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     /// Test hook: when set, the next batch write that touches the strip
     /// family signals the sender once its `WriteBatch` holds the family's
     /// handle, and waits on the receiver before writing it.
     #[cfg(test)]
-    strip_write_test_pause: parking_lot::Mutex<
-        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-    >,
+    strip_write_test_pause:
+        parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl RocksDbStore {
@@ -737,7 +731,8 @@ impl RocksDbStore {
     pub fn create_checkpoint(&self, path: &Path) -> Result<(), StoreError> {
         let cp = rocksdb::checkpoint::Checkpoint::new(&self.db)
             .map_err(|e| StoreError::Database(e.to_string()))?;
-        cp.create_checkpoint(path).map_err(|e| StoreError::Database(e.to_string()))
+        cp.create_checkpoint(path)
+            .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Open the chainstate with explicit storage tuning. `path` is the
@@ -918,10 +913,7 @@ impl RocksDbStore {
             // `prefix_iterator_cf` over a single scripthash short-
             // circuits to the matching SST blocks instead of scanning.
             // Marked hot.
-            ColumnFamilyDescriptor::new(
-                CF_ADDR_FUNDING_V3,
-                make_cf_opts(true, 32, Some(16), true),
-            ),
+            ColumnFamilyDescriptor::new(CF_ADDR_FUNDING_V3, make_cf_opts(true, 32, Some(16), true)),
             ColumnFamilyDescriptor::new(
                 CF_ADDR_SPENDING_V3,
                 make_cf_opts(true, 32, Some(16), true),
@@ -1471,9 +1463,7 @@ impl RocksDbStore {
     fn read_prune_height(&self) -> Option<u32> {
         let cf = self.db.cf_handle(CF_METADATA)?;
         match self.db.get_cf(&cf, PRUNE_HEIGHT_KEY) {
-            Ok(Some(v)) if v.len() == 4 => {
-                Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
-            }
+            Ok(Some(v)) if v.len() == 4 => Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]])),
             _ => None,
         }
     }
@@ -1650,9 +1640,8 @@ impl RocksDbStore {
         if matches!(name, CF_ADDR_FUNDING_V3 | CF_ADDR_SPENDING_V3) {
             cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(16));
         } else if matches!(name, CF_SPENT) {
-            cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(
-                node_index::TXSEQ_LEN,
-            ));
+            cf_opts
+                .set_prefix_extractor(SliceTransform::create_fixed_prefix(node_index::TXSEQ_LEN));
         }
         cf_opts
     }
@@ -1822,7 +1811,11 @@ impl RocksDbStore {
         let window = RecentHeightWindow::empty(self.tip_bytes_for_window()?);
         let cf = self.cf(CF_METADATA);
         self.db
-            .put_cf(&cf, UTXO_RECENT_HEIGHTS_KEY, Self::encode_recent_window(&window)?)
+            .put_cf(
+                &cf,
+                UTXO_RECENT_HEIGHTS_KEY,
+                Self::encode_recent_window(&window)?,
+            )
             .map_err(|e| StoreError::Database(e.to_string()))?;
         *state = RecentWindowState::Live(window);
         Ok(())
@@ -1986,7 +1979,9 @@ impl RocksDbStore {
         // Only a put creates the strip family. A remove for a block that
         // never had a record must not, or every datadir would become one
         // an older release refuses to open.
-        let _strip_cf = batch.has_opreturn_strip_ops().then(|| self.strip_cf_gate.read());
+        let _strip_cf = batch
+            .has_opreturn_strip_ops()
+            .then(|| self.strip_cf_gate.read());
         if !batch.opreturn_strip_puts.is_empty() || batch.opreturn_strip_meta.is_some() {
             self.create_opreturn_strip_cf()?;
         }
@@ -2101,18 +2096,15 @@ impl RocksDbStore {
             let dominant_status = if entry.status == BlockStatus::HeaderOnly {
                 match seen_in_batch.get(hash).copied() {
                     Some(s) => Some(s),
-                    None => match self
-                        .db
-                        .get_cf(&cf_bi, hash_bytes(hash))
-                        .map_err(|e| {
-                            StoreError::Database(format!(
-                                "block-index dominance guard get_cf({}): {}",
-                                hash, e
-                            ))
-                        })? {
+                    None => match self.db.get_cf(&cf_bi, hash_bytes(hash)).map_err(|e| {
+                        StoreError::Database(format!(
+                            "block-index dominance guard get_cf({}): {}",
+                            hash, e
+                        ))
+                    })? {
                         Some(bytes) => {
-                            let existing: BlockIndexEntry = bincode::deserialize(&bytes)
-                                .map_err(|e| {
+                            let existing: BlockIndexEntry =
+                                bincode::deserialize(&bytes).map_err(|e| {
                                     StoreError::Serialization(format!(
                                         "block-index dominance guard deserialize({}): {}",
                                         hash, e
@@ -2222,7 +2214,11 @@ impl RocksDbStore {
         if want_tx_ordinals && (!batch.tx_loc_puts.is_empty() || !batch.tx_loc_removes.is_empty()) {
             let cf_txl = self.cf(CF_TX_LOC);
             for (txid, seq) in &batch.tx_loc_puts {
-                wb.put_cf(&cf_txl, txid_bytes(txid), node_index::encode_txseq(TxSeq(*seq)));
+                wb.put_cf(
+                    &cf_txl,
+                    txid_bytes(txid),
+                    node_index::encode_txseq(TxSeq(*seq)),
+                );
             }
             for txid in &batch.tx_loc_removes {
                 wb.delete_cf(&cf_txl, txid_bytes(txid));
@@ -2401,9 +2397,8 @@ impl RocksDbStore {
                 let key = backfill_temp_key(outpoint);
                 let mut value = [0u8; TEMP_VALUE_LEN];
                 value[..32].copy_from_slice(sh);
-                value[32..].copy_from_slice(&node_index::encode_txseq(node_index::TxSeq(
-                    *funding_txseq,
-                )));
+                value[32..]
+                    .copy_from_slice(&node_index::encode_txseq(node_index::TxSeq(*funding_txseq)));
                 wb.put_cf(&cf_temp, key, value);
             }
         }
@@ -2513,7 +2508,11 @@ impl RocksDbStore {
                 adv.started_at_unix.to_be_bytes(),
             );
             if adv.snapshot_tip_hash != [0u8; 32] {
-                wb.put_cf(&cf_meta, scur::META_KEY_SNAPSHOT_HASH, adv.snapshot_tip_hash);
+                wb.put_cf(
+                    &cf_meta,
+                    scur::META_KEY_SNAPSHOT_HASH,
+                    adv.snapshot_tip_hash,
+                );
             }
         }
 
@@ -2558,8 +2557,8 @@ impl RocksDbStore {
         // and held across it: see `RocksDbStore::recent_window`. A batch with
         // neither coin deltas nor a tip cannot change the window or the tip
         // it is stamped with, so it never takes the lock.
-        let mut recent_guard = (!recent_deltas.is_empty() || batch.tip.is_some())
-            .then(|| self.recent_window.lock());
+        let mut recent_guard =
+            (!recent_deltas.is_empty() || batch.tip.is_some()).then(|| self.recent_window.lock());
         let mut next_window: Option<RecentHeightWindow> = None;
         if let Some(RecentWindowState::Live(window)) = recent_guard.as_deref() {
             let mut next = window.clone();
@@ -2669,7 +2668,10 @@ impl Store for RocksDbStore {
             .map_err(|e| StoreError::Database(format!("drop_cf({CF_OPRETURN_STRIP}): {e}")))
     }
 
-    fn for_each_opreturn_strip(&self, f: &mut dyn FnMut(&BlockHash, &[u8])) -> Result<(), StoreError> {
+    fn for_each_opreturn_strip(
+        &self,
+        f: &mut dyn FnMut(&BlockHash, &[u8]),
+    ) -> Result<(), StoreError> {
         let Some(cf) = self.db.cf_handle(CF_OPRETURN_STRIP) else {
             return Ok(());
         };
@@ -2854,8 +2856,7 @@ impl Store for RocksDbStore {
         // automatic compactions on this CF for the duration, which is fine
         // because we're forcing the work anyway.
         let cf = self.cf(CF_COINS);
-        self.db
-            .compact_range_cf::<&[u8], &[u8]>(&cf, None, None);
+        self.db.compact_range_cf::<&[u8], &[u8]>(&cf, None, None);
         // compact_range_cf is fire-and-wait in the FFI; the call returns
         // only after compaction completes. There is no error channel from
         // the C++ side here — failures surface via subsequent operations.
@@ -3584,11 +3585,13 @@ impl Store for RocksDbStore {
             // batch, so a decode failure means on-disk corruption or a version
             // this binary predates — surface it rather than fabricate a partial
             // row or fake an empty height.
-            Some(bytes) => node_sp_index::SpBlockRow::decode(&bytes).map(Some).map_err(|e| {
-                StoreError::Database(format!(
-                    "sp_tweaks row at height {height} failed to decode: {e}"
-                ))
-            }),
+            Some(bytes) => node_sp_index::SpBlockRow::decode(&bytes)
+                .map(Some)
+                .map_err(|e| {
+                    StoreError::Database(format!(
+                        "sp_tweaks row at height {height} failed to decode: {e}"
+                    ))
+                }),
         }
     }
 
@@ -3617,8 +3620,7 @@ impl Store for RocksDbStore {
         // progress gauge reads high for a backfill that just began (#549).
         let snap = self.db.snapshot();
         let read_u8 = |k: &[u8]| -> Option<u8> {
-            snap
-                .get_cf(&cf, k)
+            snap.get_cf(&cf, k)
                 .ok()
                 .flatten()
                 .and_then(|v| v.first().copied())
@@ -3888,8 +3890,7 @@ impl Store for RocksDbStore {
         // progress gauge reads high for a backfill that just began (#549).
         let snap = self.db.snapshot();
         let read_u8 = |k: &[u8]| -> Option<u8> {
-            snap
-                .get_cf(&cf, k)
+            snap.get_cf(&cf, k)
                 .ok()
                 .flatten()
                 .and_then(|v| v.first().copied())
@@ -3989,8 +3990,7 @@ impl Store for RocksDbStore {
         // progress gauge reads high for a backfill that just began (#549).
         let snap = self.db.snapshot();
         let read_u8 = |k: &[u8]| -> Option<u8> {
-            snap
-                .get_cf(&cf, k)
+            snap.get_cf(&cf, k)
                 .ok()
                 .flatten()
                 .and_then(|v| v.first().copied())
@@ -4112,7 +4112,10 @@ mod tests {
         let missing = BlockHash::from_byte_array([1; 32]);
         let corrupt = BlockHash::from_byte_array([2; 32]);
         let cf = store.cf(CF_UNDO);
-        store.db.put_cf(&cf, hash_bytes(&corrupt), b"not an undo row").unwrap();
+        store
+            .db
+            .put_cf(&cf, hash_bytes(&corrupt), b"not an undo row")
+            .unwrap();
         assert!(matches!(store.read_undo(&missing), Ok(None)));
         assert!(store.read_undo(&corrupt).is_err());
         assert_eq!(store.get_undo(&corrupt), None);
@@ -4134,7 +4137,11 @@ mod tests {
     /// `ALL_CFS`, so equality with `DIAG_CFS` closes the loop.
     #[test]
     fn diag_cf_list_names_every_descriptor() {
-        let mut all: Vec<&str> = ALL_CFS.iter().copied().filter(|n| *n != "default").collect();
+        let mut all: Vec<&str> = ALL_CFS
+            .iter()
+            .copied()
+            .filter(|n| *n != "default")
+            .collect();
         let mut diag: Vec<&str> = DIAG_CFS.to_vec();
         all.sort_unstable();
         diag.sort_unstable();
@@ -4204,9 +4211,14 @@ mod tests {
         for i in 0..10u8 {
             let mut entry = genesis_entry.clone();
             entry.height = i as u32;
-            batch
-                .block_index_puts
-                .push((if i == 0 { genesis_hash } else { make_block_hash(i) }, entry));
+            batch.block_index_puts.push((
+                if i == 0 {
+                    genesis_hash
+                } else {
+                    make_block_hash(i)
+                },
+                entry,
+            ));
         }
         store.write_batch(batch).unwrap();
 
@@ -4238,9 +4250,7 @@ mod tests {
         let (store, _dir) = temp_store(false);
 
         let mk_op = |seed: u8| OutPoint {
-            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-                [seed; 32],
-            )),
+            txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([seed; 32])),
             vout: 0,
         };
         let mk_coin = |amount: u64| Coin {
@@ -4329,7 +4339,11 @@ mod tests {
             None,
             "tx_loc put+remove pair must net to absent — the remove wins"
         );
-        assert_eq!(store.get_tx_seq(&kept), Some(1), "unpaired put must survive");
+        assert_eq!(
+            store.get_tx_seq(&kept),
+            Some(1),
+            "unpaired put must survive"
+        );
         assert_eq!(
             store.txids_of_seqs(&[0, 1]),
             vec![None, Some(kept)],
@@ -4511,7 +4525,9 @@ mod tests {
         // Inject corrupt bytes directly via the inner db handle —
         // bypasses write_batch's normal serialize path.
         let cf_bi = store.cf(CF_BLOCK_INDEX);
-        store.db.put_cf(&cf_bi, hash_bytes(&hash), b"not-a-block-index-entry")
+        store
+            .db
+            .put_cf(&cf_bi, hash_bytes(&hash), b"not-a-block-index-entry")
             .expect("direct put_cf for corrupt fixture");
 
         // Now attempt a HeaderOnly write for the same hash. The
@@ -4533,7 +4549,9 @@ mod tests {
 
         // The corrupt bytes must still be on disk — the failed batch
         // did not silently overwrite them.
-        let raw = store.db.get_cf(&cf_bi, hash_bytes(&hash))
+        let raw = store
+            .db
+            .get_cf(&cf_bi, hash_bytes(&hash))
             .expect("get_cf")
             .expect("entry still present");
         assert_eq!(
@@ -4905,7 +4923,10 @@ mod tests {
         let (store, dir) = temp_store(false);
         recent_build(&store);
         let cache = crate::storage::coin_cache::CoinCache::new(Box::new(store), 16);
-        let tip = StoreBatch { tip: Some(make_block_hash(0x01)), ..Default::default() };
+        let tip = StoreBatch {
+            tip: Some(make_block_hash(0x01)),
+            ..Default::default()
+        };
         cache.write_batch(tip).unwrap();
         (cache, dir)
     }
@@ -4926,16 +4947,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cache.coin_count(), count, "utxo_count vs coins on disk");
-        assert_eq!(cache.coin_total_amount(), amount, "total_amount vs coins on disk");
+        assert_eq!(
+            cache.coin_total_amount(),
+            amount,
+            "total_amount vs coins on disk"
+        );
         let hist = cache.utxo_height_hist();
-        let buckets = hist.len().max(by_height.keys().map(|h| (h / HEIGHT_HIST_BUCKET) as usize + 1).max().unwrap_or(0));
+        let buckets = hist.len().max(
+            by_height
+                .keys()
+                .map(|h| (h / HEIGHT_HIST_BUCKET) as usize + 1)
+                .max()
+                .unwrap_or(0),
+        );
         for bucket in 0..buckets {
             let walked: u64 = by_height
                 .iter()
                 .filter(|(h, _)| (**h / HEIGHT_HIST_BUCKET) as usize == bucket)
                 .map(|(_, n)| n)
                 .sum();
-            assert_eq!(hist.get(bucket).copied().unwrap_or(0), walked, "height histogram bucket {bucket}");
+            assert_eq!(
+                hist.get(bucket).copied().unwrap_or(0),
+                walked,
+                "height histogram bucket {bucket}"
+            );
         }
         let window = cache.utxo_recent_heights().expect("window is live");
         for height in window.base..=window.top() {
@@ -4987,7 +5022,9 @@ mod tests {
         let (cache, _dir) = counted_cache();
         let x = make_outpoint(0x33, 0);
         cache.write_batch(put(x, make_coin(7_000, 999))).unwrap();
-        cache.write_batch(put(make_outpoint(0x34, 0), make_coin(1_000, 5))).unwrap();
+        cache
+            .write_batch(put(make_outpoint(0x34, 0), make_coin(1_000, 5)))
+            .unwrap();
         assert_counters_match_coins(&cache);
 
         cache.write_batch(remove(x, 7_000, 999)).unwrap();
@@ -5004,7 +5041,9 @@ mod tests {
     #[test]
     fn a_coin_created_and_spent_twice_in_one_window_is_never_counted() {
         let (cache, _dir) = counted_cache();
-        cache.write_batch(put(make_outpoint(0x35, 0), make_coin(1_000, 5))).unwrap();
+        cache
+            .write_batch(put(make_outpoint(0x35, 0), make_coin(1_000, 5)))
+            .unwrap();
         assert_counters_match_coins(&cache);
 
         let o = make_outpoint(0x36, 0);
@@ -5227,7 +5266,9 @@ mod tests {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15 ^ u64::from(salt);
         (0..n)
             .map(|i| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((make_outpoint(salt, i)), ((x >> 33) as u32) % max_height)
             })
             .collect()
@@ -5243,7 +5284,10 @@ mod tests {
         );
         assert!(matches!(
             recent_build(&store),
-            RecentWindowBuild::Built { coins_scanned: 0, .. }
+            RecentWindowBuild::Built {
+                coins_scanned: 0,
+                ..
+            }
         ));
         assert_eq!(recent_build(&store), RecentWindowBuild::AlreadyLive);
 
@@ -5336,7 +5380,10 @@ mod tests {
             assert!(persisted_recent_window(&store).is_none());
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
-        assert!(store.utxo_recent_heights().is_none(), "no key on disk: absent");
+        assert!(
+            store.utxo_recent_heights().is_none(),
+            "no key on disk: absent"
+        );
         let total: u64 = recount_by_height(&store).values().sum();
         match recent_build(&store) {
             RecentWindowBuild::Built {
@@ -5381,7 +5428,9 @@ mod tests {
         batch
             .coin_removes
             .push((spent_inside.0, 1_000, spent_inside.1));
-        batch.coin_removes.push((spent_below.0, 1_000, spent_below.1));
+        batch
+            .coin_removes
+            .push((spent_below.0, 1_000, spent_below.1));
         store.write_batch(batch).unwrap();
         assert!(
             persisted_recent_window(&store).is_none(),
@@ -5393,7 +5442,11 @@ mod tests {
             .unwrap()
             .expect("not cancelled");
         drop(snapshot);
-        assert_eq!(scanned, before.len() as u64, "the scan reads the snapshot only");
+        assert_eq!(
+            scanned,
+            before.len() as u64,
+            "the scan reads the snapshot only"
+        );
         let pending = store
             .recent_window_finish(window)
             .unwrap()
@@ -5472,7 +5525,10 @@ mod tests {
         store
             .write_batch(puts(&[(make_outpoint(0x09, 1_000), 3)]))
             .unwrap();
-        assert!(matches!(recent_build(&store), RecentWindowBuild::Built { .. }));
+        assert!(matches!(
+            recent_build(&store),
+            RecentWindowBuild::Built { .. }
+        ));
         assert_recent_window_exact(&store);
     }
 
@@ -5520,7 +5576,11 @@ mod tests {
         batch.coin_removes.push((make_outpoint(0x0a, 0), 1_000, 9));
         batch.coin_removes.push((make_outpoint(0x0a, 1), 1_000, 9));
         store.write_batch(batch).unwrap();
-        assert_eq!(recent_live(&store).count_at(9), Some(0), "clamped, not wrapped");
+        assert_eq!(
+            recent_live(&store).count_at(9),
+            Some(0),
+            "clamped, not wrapped"
+        );
         store
             .write_batch(puts(&[(make_outpoint(0x0a, 2), 9)]))
             .unwrap();
@@ -5597,7 +5657,9 @@ mod tests {
         mem.write_batch(spend_mem).unwrap();
 
         let r = recent_live(&rocks);
-        let m = mem.utxo_recent_heights().expect("in-memory window is always live");
+        let m = mem
+            .utxo_recent_heights()
+            .expect("in-memory window is always live");
         for height in tip - (RECENT_WINDOW - 1)..=tip {
             assert_eq!(r.count_at(height), m.count_at(height), "height {height}");
         }
@@ -5725,7 +5787,9 @@ mod tests {
 
     #[test]
     fn test_address_index_write_batch_funding_put_then_read() {
-        use crate::index::address::{AddrFundingRowV3, encode_funding_key_v3, encode_funding_value};
+        use crate::index::address::{
+            AddrFundingRowV3, encode_funding_key_v3, encode_funding_value,
+        };
 
         let (store, _dir) = temp_store(false);
         let row = AddrFundingRowV3 {
@@ -5741,11 +5805,7 @@ mod tests {
 
         let cf = store.cf(CF_ADDR_FUNDING_V3);
         let encoded = encode_funding_key_v3(&row.key());
-        let raw = store
-            .db
-            .get_cf(&cf, encoded)
-            .unwrap()
-            .expect("row present");
+        let raw = store.db.get_cf(&cf, encoded).unwrap().expect("row present");
         assert_eq!(
             raw.as_slice(),
             encode_funding_value(row.amount_sat).as_slice()
@@ -5774,11 +5834,7 @@ mod tests {
 
         let cf = store.cf(CF_ADDR_SPENDING_V3);
         let encoded = encode_spending_key_v3(&row.key());
-        let raw = store
-            .db
-            .get_cf(&cf, encoded)
-            .unwrap()
-            .expect("row present");
+        let raw = store.db.get_cf(&cf, encoded).unwrap().expect("row present");
         assert_eq!(
             raw.as_slice(),
             encode_spending_value(row.funding_txseq, row.funding_vout).as_slice()
@@ -6039,10 +6095,7 @@ mod tests {
             // Wipe the marker (simulating a datadir from before this
             // schema bump).
             let cf = store.cf(CF_METADATA);
-            store
-                .db
-                .delete_cf(&cf, SPENT_COMPLETE_KEY)
-                .unwrap();
+            store.db.delete_cf(&cf, SPENT_COMPLETE_KEY).unwrap();
         }
         let store = RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap();
         assert!(!store.spent_complete());
@@ -6474,9 +6527,7 @@ mod tests {
 
     #[test]
     fn test_address_index_metrics_reflect_committed_rows_only() {
-        use crate::index::address::{
-            AddrFundingRowV3, AddrSpendingRowV3, scripthash_of, stats,
-        };
+        use crate::index::address::{AddrFundingRowV3, AddrSpendingRowV3, scripthash_of, stats};
 
         // Use a fresh process snapshot to compute deltas — the static
         // counters accumulate across tests in the same binary.
@@ -6678,8 +6729,10 @@ mod tests {
                 .map(|n| ColumnFamilyDescriptor::new(n, Options::default()))
                 .collect();
             let db = DB::open_cf_descriptors(&opts, path.join("chainstate"), cfs).unwrap();
-            db.delete_cf(&db.cf_handle(CF_METADATA).unwrap(), SCHEMA_KEY).unwrap();
-            db.put_cf(&db.cf_handle(CF_COINS).unwrap(), b"coin", b"x").unwrap();
+            db.delete_cf(&db.cf_handle(CF_METADATA).unwrap(), SCHEMA_KEY)
+                .unwrap();
+            db.put_cf(&db.cf_handle(CF_COINS).unwrap(), b"coin", b"x")
+                .unwrap();
         }
         let err = RocksDbStore::open(&path, false, 16, false, -1)
             .err()
@@ -6687,7 +6740,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                StoreError::SchemaMismatch { stored: None, expected: CURRENT_SCHEMA_VERSION }
+                StoreError::SchemaMismatch {
+                    stored: None,
+                    expected: CURRENT_SCHEMA_VERSION
+                }
             ),
             "{err:?}"
         );
@@ -6711,7 +6767,10 @@ mod tests {
             matches!(err, StoreError::SchemaMismatch { stored: Some(v), .. } if v == CURRENT_SCHEMA_VERSION + 1),
             "{err:?}"
         );
-        assert_eq!(read_schema_version_raw(&path), Some(CURRENT_SCHEMA_VERSION + 1));
+        assert_eq!(
+            read_schema_version_raw(&path),
+            Some(CURRENT_SCHEMA_VERSION + 1)
+        );
     }
 
     /// Reindex flow: an older chainstate with populated retired CFs opens
@@ -6732,7 +6791,10 @@ mod tests {
             assert!(store.db.cf_handle("addr_funding").is_some());
             drop(store);
             // Refused after the open: nothing changed on disk.
-            assert_eq!(read_schema_version_raw(&path), Some(CURRENT_SCHEMA_VERSION - 1));
+            assert_eq!(
+                read_schema_version_raw(&path),
+                Some(CURRENT_SCHEMA_VERSION - 1)
+            );
             let cfs = DB::list_cf(&Options::default(), path.join("chainstate")).unwrap();
             assert!(cfs.iter().any(|c| c == "addr_funding"), "{cfs:?}");
             assert!(cfs.iter().any(|c| c == "addr_spending"), "{cfs:?}");
@@ -6767,7 +6829,9 @@ mod tests {
         // index, tip, ordinals — written WAL-less as during IBD/reindex.
         let (hash, entry) = regtest_genesis_entry();
         let mut batch = StoreBatch::default();
-        batch.coin_puts.push((make_outpoint(0xAA, 0), make_coin(50_000, 1)));
+        batch
+            .coin_puts
+            .push((make_outpoint(0xAA, 0), make_coin(50_000, 1)));
         batch.block_index_puts.push((hash, entry));
         batch.tip = Some(hash);
         batch.height_hash_puts.push((1, hash));
@@ -6775,9 +6839,7 @@ mod tests {
         batch.tx_loc_puts.push((txid, 0));
         batch.txseq_txid_puts.push((0, txid));
         batch.txseq_block_puts.push((0, 1));
-        store
-            .write_batch_mode(batch, WriteMode::BulkLoad)
-            .unwrap();
+        store.write_batch_mode(batch, WriteMode::BulkLoad).unwrap();
 
         store.flush_durable().unwrap();
 

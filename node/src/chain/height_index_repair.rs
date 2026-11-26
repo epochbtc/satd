@@ -343,9 +343,8 @@ mod tests {
     /// index and the height index, returning the hashes by height.
     fn seed_chain(store: &InMemoryStore, n: u32) -> Vec<BlockHash> {
         let mut hashes = Vec::new();
-        let mut prev = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [0u8; 32],
-        ));
+        let mut prev =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32]));
         let mut batch = StoreBatch::default();
         for height in 0..n {
             let header = header_with(prev, height);
@@ -381,8 +380,7 @@ mod tests {
     fn a_clean_index_is_left_alone() {
         let store = InMemoryStore::new();
         let hashes = seed_chain(&store, 20);
-        let audit =
-            audit_and_repair_height_index(&store, hashes[19], 19).unwrap();
+        let audit = audit_and_repair_height_index(&store, hashes[19], 19).unwrap();
         assert!(audit.is_clean());
         assert!(audit.repaired.is_empty());
         assert_eq!(audit.rows_scanned, 20);
@@ -462,9 +460,8 @@ mod tests {
     fn a_wrong_but_present_row_is_left_untouched() {
         let store = InMemoryStore::new();
         let hashes = seed_chain(&store, 20);
-        let bogus = BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
-            [0xAB; 32],
-        ));
+        let bogus =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xAB; 32]));
         let batch = StoreBatch {
             height_hash_puts: vec![(8, bogus)],
             ..Default::default()
@@ -513,8 +510,8 @@ mod tests {
                 (f8h, entry(f8, 8, BlockStatus::Valid)),
                 (f9h, entry(f9, 9, BlockStatus::Valid)),
             ],
-            height_hash_puts: vec![(9, f9h)],   // present-but-wrong anchor
-            height_hash_removes: vec![8],        // the gap
+            height_hash_puts: vec![(9, f9h)], // present-but-wrong anchor
+            height_hash_removes: vec![8],     // the gap
             ..Default::default()
         };
         store.write_batch(batch).unwrap();
@@ -720,7 +717,10 @@ mod tests {
         punch_gaps(&store, 10..90);
 
         let audit = audit_and_repair_height_index(&store, hashes[99], 99).unwrap();
-        assert!(!audit.skipped_bulk, "80 gaps is under the floor, share or no");
+        assert!(
+            !audit.skipped_bulk,
+            "80 gaps is under the floor, share or no"
+        );
         assert_eq!(audit.repaired.len(), 80);
         assert_eq!(store.get_block_hash_by_height(50), Some(hashes[50]));
     }
@@ -750,7 +750,10 @@ mod tests {
         store.write_batch(demote).unwrap();
 
         let audit = audit_and_repair_height_index(&store, hashes[1_999], 1_999).unwrap();
-        assert!(!audit.skipped_bulk, "5% of the range does not trip the guard");
+        assert!(
+            !audit.skipped_bulk,
+            "5% of the range does not trip the guard"
+        );
         assert_eq!(audit.pending_validation.len(), 100);
         assert!(audit.repaired.is_empty(), "not one row may be written");
         assert!(audit.unrepairable.is_empty(), "unvalidated is not a fault");
@@ -827,9 +830,8 @@ mod tests {
 
         // Sever the chain at height 10 by pointing its entry at a parent the
         // index does not know.
-        let unknown = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0xCD; 32]),
-        );
+        let unknown =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xCD; 32]));
         let severed = header_with(unknown, 10);
         let batch = StoreBatch {
             block_index_puts: vec![(hashes[10], entry(severed, 10, BlockStatus::Valid))],
@@ -871,9 +873,8 @@ mod tests {
     fn a_row_disagreeing_with_the_tips_ancestry_is_reported_not_overwritten() {
         let store = InMemoryStore::new();
         let hashes = seed_chain(&store, 20);
-        let bogus = BlockHash::from_raw_hash(
-            bitcoin::hashes::sha256d::Hash::from_byte_array([0xAB; 32]),
-        );
+        let bogus =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xAB; 32]));
         // A gap low down so the walk covers height 12, plus a polluted row.
         punch_gap(&store, 3);
         let batch = StoreBatch {

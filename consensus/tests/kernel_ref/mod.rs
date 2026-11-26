@@ -83,16 +83,23 @@ pub fn verify_with_flags(
     let txdata = PrecomputedTransactionData::new(&ktx, &spent)
         .map_err(|_| Error::ERR_SPENT_OUTPUTS_MISMATCH)?;
     let spk = ScriptPubkey::new(spent_output_script).map_err(|_| Error::ERR_SCRIPT)?;
-    bitcoinkernel::verify(&spk, Some(amount as i64), &ktx, input_index, Some(flags), &txdata)
-        .map_err(|e| match e {
-            KernelError::ScriptVerify(ScriptVerifyError::InvalidFlags)
-            | KernelError::ScriptVerify(ScriptVerifyError::InvalidFlagsCombination) => {
-                Error::ERR_INVALID_FLAGS
-            }
-            KernelError::ScriptVerify(ScriptVerifyError::SpentOutputsRequired) => {
-                Error::ERR_SPENT_OUTPUTS_REQUIRED
-            }
-            KernelError::ScriptVerify(ScriptVerifyError::TxInputIndex) => Error::ERR_TX_INDEX,
-            _ => Error::ERR_SCRIPT,
-        })
+    bitcoinkernel::verify(
+        &spk,
+        Some(amount as i64),
+        &ktx,
+        input_index,
+        Some(flags),
+        &txdata,
+    )
+    .map_err(|e| match e {
+        KernelError::ScriptVerify(ScriptVerifyError::InvalidFlags)
+        | KernelError::ScriptVerify(ScriptVerifyError::InvalidFlagsCombination) => {
+            Error::ERR_INVALID_FLAGS
+        }
+        KernelError::ScriptVerify(ScriptVerifyError::SpentOutputsRequired) => {
+            Error::ERR_SPENT_OUTPUTS_REQUIRED
+        }
+        KernelError::ScriptVerify(ScriptVerifyError::TxInputIndex) => Error::ERR_TX_INDEX,
+        _ => Error::ERR_SCRIPT,
+    })
 }

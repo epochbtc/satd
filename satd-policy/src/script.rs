@@ -407,8 +407,7 @@ mod tests {
             None => toks.is_empty(),
             Some((PatToken::AnyRun, rest)) => {
                 // Zero tokens, or consume one and stay on the same star.
-                ref_match(toks, rest)
-                    || (!toks.is_empty() && ref_match(&toks[1..], pat))
+                ref_match(toks, rest) || (!toks.is_empty() && ref_match(&toks[1..], pat))
             }
             Some((p, rest)) => {
                 !toks.is_empty() && token_matches(&toks[0], p) && ref_match(&toks[1..], rest)
@@ -428,8 +427,14 @@ mod tests {
     fn glob_matches_reference_exhaustively_incl_multistar() {
         // Token alphabet: two distinct opcodes.
         let alphabet = [
-            ScriptToken { op: 0xaa, data: None },
-            ScriptToken { op: 0xbb, data: None },
+            ScriptToken {
+                op: 0xaa,
+                data: None,
+            },
+            ScriptToken {
+                op: 0xbb,
+                data: None,
+            },
         ];
         // Pattern alphabet includes two `AnyRun`s so generated patterns routinely
         // contain multiple stars (the case under suspicion).
@@ -474,7 +479,8 @@ mod tests {
                 let got = glob_search(text, pat);
                 let want = ref_match(text, &padded(pat));
                 assert_eq!(
-                    got, want,
+                    got,
+                    want,
                     "mismatch: pat={pat:?} text_ops={:?}",
                     text.iter().map(|t| t.op).collect::<Vec<_>>()
                 );

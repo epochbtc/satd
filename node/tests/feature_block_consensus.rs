@@ -71,7 +71,7 @@ use bitcoin::{
     Txid, Witness,
 };
 
-use node::chain::connect::{block_subsidy, check_block_version, connect_block, ConnectParams};
+use node::chain::connect::{ConnectParams, block_subsidy, check_block_version, connect_block};
 use node::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use node::storage::coinview::Coin;
 use node::storage::db::InMemoryStore;
@@ -135,14 +135,20 @@ const REGTEST_POWLIMIT_BITS: u32 = 0x207f_ffff;
 const BASE_TIME: u32 = 1_700_000_000;
 
 fn pos() -> FlatFilePos {
-    FlatFilePos { file_number: 0, data_pos: 0 }
+    FlatFilePos {
+        file_number: 0,
+        data_pos: 0,
+    }
 }
 
 /// A coinbase paying `value` sats, with a BIP34 height-encoded scriptSig.
 fn coinbase(height: u32, value: u64) -> Transaction {
     coinbase_with_outputs(
         height,
-        vec![TxOut { value: Amount::from_sat(value), script_pubkey: bitcoin::ScriptBuf::new() }],
+        vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
     )
 }
 
@@ -231,7 +237,13 @@ fn store_with_coin(amount: u64, height: u32, coinbase: bool) -> (InMemoryStore, 
     (store, outpoint)
 }
 
-fn spending_tx(prevout: OutPoint, value: u64, version: i32, sequence: u32, locktime: u32) -> Transaction {
+fn spending_tx(
+    prevout: OutPoint,
+    value: u64,
+    version: i32,
+    sequence: u32,
+    locktime: u32,
+) -> Transaction {
     Transaction {
         version: Version(version),
         lock_time: LockTime::from_consensus(locktime),
@@ -241,7 +253,10 @@ fn spending_tx(prevout: OutPoint, value: u64, version: i32, sequence: u32, lockt
             sequence: Sequence(sequence),
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(value), script_pubkey: bitcoin::ScriptBuf::new() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
     }
 }
 
@@ -313,7 +328,10 @@ fn case_empty_block_under_real_merkle_root() -> Satd {
 
 fn case_first_tx_not_coinbase() -> Satd {
     let not_cb = spending_tx(
-        OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+        OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        },
         50_0000_0000,
         1,
         0xffff_ffff,
@@ -323,7 +341,10 @@ fn case_first_tx_not_coinbase() -> Satd {
 }
 
 fn case_multiple_coinbase() -> Satd {
-    cb(&block_of(vec![coinbase(1, 50_0000_0000), coinbase(1, 25_0000_0000)]))
+    cb(&block_of(vec![
+        coinbase(1, 50_0000_0000),
+        coinbase(1, 25_0000_0000),
+    ]))
 }
 
 fn case_bad_merkle_root() -> Satd {
@@ -395,7 +416,10 @@ fn case_witness_commitment_missing() -> Satd {
     let mut witness = Witness::new();
     witness.push([0x01; 72]);
     let mut spend = spending_tx(
-        OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+        OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        },
         49_0000_0000,
         1,
         0xffff_ffff,
@@ -412,7 +436,10 @@ fn case_tx_no_inputs() -> Satd {
         version: Version::ONE,
         lock_time: LockTime::ZERO,
         input: vec![],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: bitcoin::ScriptBuf::new() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
     })
 }
 
@@ -421,7 +448,10 @@ fn case_tx_no_outputs() -> Satd {
         version: Version::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([0xab; 32]),
+                vout: 0,
+            },
             script_sig: bitcoin::ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::default(),
@@ -436,7 +466,10 @@ fn case_tx_no_outputs() -> Satd {
 /// `bad-txns-vout-toolarge`.
 fn case_tx_output_negative() -> Satd {
     tx(&spending_tx(
-        OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+        OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        },
         // -1 as int64_t.
         u64::MAX,
         1,
@@ -447,7 +480,10 @@ fn case_tx_output_negative() -> Satd {
 
 fn case_tx_output_over_max() -> Satd {
     tx(&spending_tx(
-        OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+        OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        },
         21_000_001 * 100_000_000,
         1,
         0xffff_ffff,
@@ -456,7 +492,10 @@ fn case_tx_output_over_max() -> Satd {
 }
 
 fn case_tx_duplicate_inputs() -> Satd {
-    let op = OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 };
+    let op = OutPoint {
+        txid: Txid::from_byte_array([0xab; 32]),
+        vout: 0,
+    };
     let dup = TxIn {
         previous_output: op,
         script_sig: bitcoin::ScriptBuf::new(),
@@ -467,7 +506,10 @@ fn case_tx_duplicate_inputs() -> Satd {
         version: Version::ONE,
         lock_time: LockTime::ZERO,
         input: vec![dup.clone(), dup],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: bitcoin::ScriptBuf::new() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
     })
 }
 
@@ -489,7 +531,10 @@ fn case_non_coinbase_null_input() -> Satd {
         lock_time: LockTime::ZERO,
         input: vec![
             TxIn {
-                previous_output: OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0xab; 32]),
+                    vout: 0,
+                },
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
@@ -501,7 +546,10 @@ fn case_non_coinbase_null_input() -> Satd {
                 witness: Witness::default(),
             },
         ],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: bitcoin::ScriptBuf::new() }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
     })
 }
 
@@ -509,28 +557,43 @@ fn case_non_coinbase_null_input() -> Satd {
 
 fn case_spend_nonexistent() -> Satd {
     let store = differential_store();
-    let fake = OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 };
-    let block = block_of(vec![coinbase(1, 50_0000_0000), spending_tx(fake, 50_000_000, 2, 0xffff_ffff, 0)]);
+    let fake = OutPoint {
+        txid: Txid::from_byte_array([0xab; 32]),
+        vout: 0,
+    };
+    let block = block_of(vec![
+        coinbase(1, 50_0000_0000),
+        spending_tx(fake, 50_000_000, 2, 0xffff_ffff, 0),
+    ]);
     connect(&store, &block, 1, 0)
 }
 
 fn case_immature_coinbase_spend() -> Satd {
     // coinbase coin at height 50, spent at height 149 (only 99 confirmations).
     let (store, op) = store_with_coin(50_000_000, 50, true);
-    let block = block_of(vec![coinbase(149, block_subsidy(Network::Regtest, 149)), spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0)]);
+    let block = block_of(vec![
+        coinbase(149, block_subsidy(Network::Regtest, 149)),
+        spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0),
+    ]);
     connect(&store, &block, 149, 0)
 }
 
 fn case_mature_coinbase_spend_ok() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 50, true);
-    let block = block_of(vec![coinbase(150, block_subsidy(Network::Regtest, 150)), spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0)]);
+    let block = block_of(vec![
+        coinbase(150, block_subsidy(Network::Regtest, 150)),
+        spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0),
+    ]);
     connect(&store, &block, 150, 0)
 }
 
 fn case_inputs_below_outputs() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 10, false);
     // Spend 50_000_000 but pay out 60_000_000.
-    let block = block_of(vec![coinbase(60, block_subsidy(Network::Regtest, 60)), spending_tx(op, 60_000_000, 2, 0xffff_ffff, 0)]);
+    let block = block_of(vec![
+        coinbase(60, block_subsidy(Network::Regtest, 60)),
+        spending_tx(op, 60_000_000, 2, 0xffff_ffff, 0),
+    ]);
     connect(&store, &block, 60, 0)
 }
 
@@ -551,14 +614,20 @@ fn case_bad_coinbase_height_bip34() -> Satd {
 fn case_locktime_not_final() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 10, false);
     // Height-based locktime 50, block at height 49, non-final sequence.
-    let block = block_of(vec![coinbase(49, block_subsidy(Network::Regtest, 49)), spending_tx(op, 50_000_000, 2, 0, 50)]);
+    let block = block_of(vec![
+        coinbase(49, block_subsidy(Network::Regtest, 49)),
+        spending_tx(op, 50_000_000, 2, 0, 50),
+    ]);
     connect(&store, &block, 49, 0)
 }
 
 fn case_bip68_sequence_not_met() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 50, false);
     // tx v2, sequence requires 10 blocks, coin at 50, block at 55.
-    let block = block_of(vec![coinbase(55, block_subsidy(Network::Regtest, 55)), spending_tx(op, 50_000_000, 2, 10, 0)]);
+    let block = block_of(vec![
+        coinbase(55, block_subsidy(Network::Regtest, 55)),
+        spending_tx(op, 50_000_000, 2, 10, 0),
+    ]);
     connect(&store, &block, 55, 0)
 }
 
@@ -573,9 +642,22 @@ fn case_intra_block_spend_ok() -> Satd {
     let (store2, op) = store_with_coin(50_000_000, 0, false);
     let mid = spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0);
     let mid_txid = mid.compute_txid();
-    let child = spending_tx(OutPoint { txid: mid_txid, vout: 0 }, 50_000_000, 2, 0xffff_ffff, 0);
+    let child = spending_tx(
+        OutPoint {
+            txid: mid_txid,
+            vout: 0,
+        },
+        50_000_000,
+        2,
+        0xffff_ffff,
+        0,
+    );
     let _ = (store, cbtx, cb_txid);
-    let block = block_of(vec![coinbase(1, block_subsidy(Network::Regtest, 1)), mid, child]);
+    let block = block_of(vec![
+        coinbase(1, block_subsidy(Network::Regtest, 1)),
+        mid,
+        child,
+    ]);
     connect(&store2, &block, 1, 0)
 }
 
@@ -585,9 +667,22 @@ fn case_intra_block_child_before_parent() -> Satd {
     let (store, op) = store_with_coin(50_000_000, 0, false);
     let mid = spending_tx(op, 50_000_000, 2, 0xffff_ffff, 0);
     let mid_txid = mid.compute_txid();
-    let child = spending_tx(OutPoint { txid: mid_txid, vout: 0 }, 50_000_000, 2, 0xffff_ffff, 0);
+    let child = spending_tx(
+        OutPoint {
+            txid: mid_txid,
+            vout: 0,
+        },
+        50_000_000,
+        2,
+        0xffff_ffff,
+        0,
+    );
     // child placed before its parent `mid`.
-    let block = block_of(vec![coinbase(1, block_subsidy(Network::Regtest, 1)), child, mid]);
+    let block = block_of(vec![
+        coinbase(1, block_subsidy(Network::Regtest, 1)),
+        child,
+        mid,
+    ]);
     connect(&store, &block, 1, 0)
 }
 
@@ -620,8 +715,10 @@ fn case_time_too_old_mtp() -> Satd {
         }
         ancestors.push(e);
     }
-    let by_hash: std::collections::HashMap<BlockHash, BlockIndexEntry> =
-        ancestors.iter().map(|e| (e.header.block_hash(), e.clone())).collect();
+    let by_hash: std::collections::HashMap<BlockHash, BlockIndexEntry> = ancestors
+        .iter()
+        .map(|e| (e.header.block_hash(), e.clone()))
+        .collect();
     let prev = ancestors.last().unwrap().clone();
     let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
     header.prev_blockhash = prev.header.block_hash();
@@ -636,13 +733,14 @@ fn case_gap_block_sigops() -> Satd {
     // each). 4001 ops → 80_020 sigop cost > MAX_BLOCK_SIGOPS_COST (80_000),
     // while staying far under MAX_BLOCK_WEIGHT. Core: `bad-blk-sigops`.
     let store = differential_store();
-    let script = bitcoin::ScriptBuf::from(vec![
-        bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8();
-        4001
-    ]);
+    let script =
+        bitcoin::ScriptBuf::from(vec![bitcoin::opcodes::all::OP_CHECKMULTISIG.to_u8(); 4001]);
     let cbtx = coinbase_with_outputs(
         1,
-        vec![TxOut { value: Amount::from_sat(0), script_pubkey: script }],
+        vec![TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: script,
+        }],
     );
     connect(&store, &block_of(vec![cbtx]), 1, 0)
 }
@@ -656,7 +754,10 @@ fn case_gap_bip30() -> Satd {
     // Pre-seed an unspent coin at the soon-to-be-created outpoint.
     let mut batch = StoreBatch::default();
     batch.coin_puts.push((
-        OutPoint { txid: dup_txid, vout: 0 },
+        OutPoint {
+            txid: dup_txid,
+            vout: 0,
+        },
         Coin {
             amount: 1_000,
             script_pubkey: bitcoin::ScriptBuf::new(),
@@ -666,7 +767,10 @@ fn case_gap_bip30() -> Satd {
         },
     ));
     store.write_batch(batch).unwrap();
-    let block = block_of(vec![coinbase(200, block_subsidy(Network::Regtest, 200)), spend]);
+    let block = block_of(vec![
+        coinbase(200, block_subsidy(Network::Regtest, 200)),
+        spend,
+    ]);
     connect(&store, &block, 200, 0)
 }
 
@@ -697,8 +801,26 @@ fn case_merkle_mutation_cve_2012_2459() -> Satd {
     // flag and rejects `bad-txns-duplicate`. Now enforced by check_block's
     // merkle_tree_mutated detector → exact match (was a Gap; satd previously
     // only caught the duplicate later in connect_block as a double-spend).
-    let t1 = spending_tx(OutPoint { txid: Txid::from_byte_array([0x11; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0);
-    let t2 = spending_tx(OutPoint { txid: Txid::from_byte_array([0x22; 32]), vout: 0 }, 1_000, 1, 0xffff_ffff, 0);
+    let t1 = spending_tx(
+        OutPoint {
+            txid: Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        },
+        1_000,
+        1,
+        0xffff_ffff,
+        0,
+    );
+    let t2 = spending_tx(
+        OutPoint {
+            txid: Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        },
+        1_000,
+        1,
+        0xffff_ffff,
+        0,
+    );
     let b = block_of(vec![coinbase(1, 50_0000_0000), t1, t2.clone(), t2]);
     cb(&b)
 }
@@ -714,12 +836,18 @@ fn case_tx_oversize() -> Satd {
         version: Version::ONE,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::from_byte_array([0xab; 32]), vout: 0 },
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([0xab; 32]),
+                vout: 0,
+            },
             script_sig: bitcoin::ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::default(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: big }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: big,
+        }],
     };
     tx(&t)
 }
@@ -731,52 +859,242 @@ fn cases() -> Vec<Case> {
     use Expect::*;
     vec![
         // context-free block structure
-        Case { name: "accept_genesis", core: Accept, expect: Match, run: case_accept_genesis },
-        Case { name: "empty_block", core: Reject("bad-blk-length"), expect: Match, run: case_empty_block },
-        Case { name: "empty_block_under_real_merkle_root", core: Reject("bad-txnmrklroot"), expect: Match, run: case_empty_block_under_real_merkle_root },
-        Case { name: "first_tx_not_coinbase", core: Reject("bad-cb-missing"), expect: Match, run: case_first_tx_not_coinbase },
-        Case { name: "multiple_coinbase", core: Reject("bad-cb-multiple"), expect: Match, run: case_multiple_coinbase },
-        Case { name: "bad_merkle_root", core: Reject("bad-txnmrklroot"), expect: Match, run: case_bad_merkle_root },
-        Case { name: "oversize_block", core: Reject("bad-blk-length"), expect: Match, run: case_oversize_block },
-        Case { name: "oversize_and_bad_merkle", core: Reject("bad-txnmrklroot"), expect: Match, run: case_oversize_and_bad_merkle },
-        Case { name: "legacy_sigops_over_limit", core: Reject("bad-blk-sigops"), expect: Match, run: case_legacy_sigops_over_limit },
-        Case { name: "legacy_sigops_at_limit", core: Accept, expect: Match, run: case_legacy_sigops_at_limit },
-        Case { name: "witness_commitment_missing", core: Reject("unexpected-witness"), expect: Match, run: case_witness_commitment_missing },
+        Case {
+            name: "accept_genesis",
+            core: Accept,
+            expect: Match,
+            run: case_accept_genesis,
+        },
+        Case {
+            name: "empty_block",
+            core: Reject("bad-blk-length"),
+            expect: Match,
+            run: case_empty_block,
+        },
+        Case {
+            name: "empty_block_under_real_merkle_root",
+            core: Reject("bad-txnmrklroot"),
+            expect: Match,
+            run: case_empty_block_under_real_merkle_root,
+        },
+        Case {
+            name: "first_tx_not_coinbase",
+            core: Reject("bad-cb-missing"),
+            expect: Match,
+            run: case_first_tx_not_coinbase,
+        },
+        Case {
+            name: "multiple_coinbase",
+            core: Reject("bad-cb-multiple"),
+            expect: Match,
+            run: case_multiple_coinbase,
+        },
+        Case {
+            name: "bad_merkle_root",
+            core: Reject("bad-txnmrklroot"),
+            expect: Match,
+            run: case_bad_merkle_root,
+        },
+        Case {
+            name: "oversize_block",
+            core: Reject("bad-blk-length"),
+            expect: Match,
+            run: case_oversize_block,
+        },
+        Case {
+            name: "oversize_and_bad_merkle",
+            core: Reject("bad-txnmrklroot"),
+            expect: Match,
+            run: case_oversize_and_bad_merkle,
+        },
+        Case {
+            name: "legacy_sigops_over_limit",
+            core: Reject("bad-blk-sigops"),
+            expect: Match,
+            run: case_legacy_sigops_over_limit,
+        },
+        Case {
+            name: "legacy_sigops_at_limit",
+            core: Accept,
+            expect: Match,
+            run: case_legacy_sigops_at_limit,
+        },
+        Case {
+            name: "witness_commitment_missing",
+            core: Reject("unexpected-witness"),
+            expect: Match,
+            run: case_witness_commitment_missing,
+        },
         // context-free transaction
-        Case { name: "tx_no_inputs", core: Reject("bad-txns-vin-empty"), expect: Match, run: case_tx_no_inputs },
-        Case { name: "tx_no_outputs", core: Reject("bad-txns-vout-empty"), expect: Match, run: case_tx_no_outputs },
-        Case { name: "tx_output_over_max", core: Reject("bad-txns-vout-toolarge"), expect: Match, run: case_tx_output_over_max },
-        Case { name: "tx_output_negative", core: Reject("bad-txns-vout-negative"), expect: Match, run: case_tx_output_negative },
-        Case { name: "tx_duplicate_inputs", core: Reject("bad-txns-inputs-duplicate"), expect: Match, run: case_tx_duplicate_inputs },
-        Case { name: "coinbase_scriptsig_too_short", core: Reject("bad-cb-length"), expect: Match, run: case_coinbase_scriptsig_too_short },
-        Case { name: "coinbase_scriptsig_too_long", core: Reject("bad-cb-length"), expect: Match, run: case_coinbase_scriptsig_too_long },
-        Case { name: "non_coinbase_null_input", core: Reject("bad-txns-prevout-null"), expect: Match, run: case_non_coinbase_null_input },
+        Case {
+            name: "tx_no_inputs",
+            core: Reject("bad-txns-vin-empty"),
+            expect: Match,
+            run: case_tx_no_inputs,
+        },
+        Case {
+            name: "tx_no_outputs",
+            core: Reject("bad-txns-vout-empty"),
+            expect: Match,
+            run: case_tx_no_outputs,
+        },
+        Case {
+            name: "tx_output_over_max",
+            core: Reject("bad-txns-vout-toolarge"),
+            expect: Match,
+            run: case_tx_output_over_max,
+        },
+        Case {
+            name: "tx_output_negative",
+            core: Reject("bad-txns-vout-negative"),
+            expect: Match,
+            run: case_tx_output_negative,
+        },
+        Case {
+            name: "tx_duplicate_inputs",
+            core: Reject("bad-txns-inputs-duplicate"),
+            expect: Match,
+            run: case_tx_duplicate_inputs,
+        },
+        Case {
+            name: "coinbase_scriptsig_too_short",
+            core: Reject("bad-cb-length"),
+            expect: Match,
+            run: case_coinbase_scriptsig_too_short,
+        },
+        Case {
+            name: "coinbase_scriptsig_too_long",
+            core: Reject("bad-cb-length"),
+            expect: Match,
+            run: case_coinbase_scriptsig_too_long,
+        },
+        Case {
+            name: "non_coinbase_null_input",
+            core: Reject("bad-txns-prevout-null"),
+            expect: Match,
+            run: case_non_coinbase_null_input,
+        },
         // contextual / chain-level
-        Case { name: "spend_nonexistent", core: Reject("bad-txns-inputs-missingorspent"), expect: Match, run: case_spend_nonexistent },
-        Case { name: "immature_coinbase_spend", core: Reject("bad-txns-premature-spend-of-coinbase"), expect: Match, run: case_immature_coinbase_spend },
-        Case { name: "mature_coinbase_spend_ok", core: Accept, expect: Match, run: case_mature_coinbase_spend_ok },
-        Case { name: "inputs_below_outputs", core: Reject("bad-txns-in-belowout"), expect: Match, run: case_inputs_below_outputs },
-        Case { name: "coinbase_value_too_high", core: Reject("bad-cb-amount"), expect: Match, run: case_coinbase_value_too_high },
-        Case { name: "bad_coinbase_height_bip34", core: Reject("bad-cb-height"), expect: Match, run: case_bad_coinbase_height_bip34 },
-        Case { name: "locktime_not_final", core: Reject("bad-txns-nonfinal"), expect: Match, run: case_locktime_not_final },
-        Case { name: "bip68_sequence_not_met", core: Reject("bad-txns-nonBIP68-final"), expect: Match, run: case_bip68_sequence_not_met },
-        Case { name: "intra_block_spend_ok", core: Accept, expect: Match, run: case_intra_block_spend_ok },
-        Case { name: "intra_block_child_before_parent", core: Reject("bad-txns-inputs-missingorspent"), expect: Match, run: case_intra_block_child_before_parent },
+        Case {
+            name: "spend_nonexistent",
+            core: Reject("bad-txns-inputs-missingorspent"),
+            expect: Match,
+            run: case_spend_nonexistent,
+        },
+        Case {
+            name: "immature_coinbase_spend",
+            core: Reject("bad-txns-premature-spend-of-coinbase"),
+            expect: Match,
+            run: case_immature_coinbase_spend,
+        },
+        Case {
+            name: "mature_coinbase_spend_ok",
+            core: Accept,
+            expect: Match,
+            run: case_mature_coinbase_spend_ok,
+        },
+        Case {
+            name: "inputs_below_outputs",
+            core: Reject("bad-txns-in-belowout"),
+            expect: Match,
+            run: case_inputs_below_outputs,
+        },
+        Case {
+            name: "coinbase_value_too_high",
+            core: Reject("bad-cb-amount"),
+            expect: Match,
+            run: case_coinbase_value_too_high,
+        },
+        Case {
+            name: "bad_coinbase_height_bip34",
+            core: Reject("bad-cb-height"),
+            expect: Match,
+            run: case_bad_coinbase_height_bip34,
+        },
+        Case {
+            name: "locktime_not_final",
+            core: Reject("bad-txns-nonfinal"),
+            expect: Match,
+            run: case_locktime_not_final,
+        },
+        Case {
+            name: "bip68_sequence_not_met",
+            core: Reject("bad-txns-nonBIP68-final"),
+            expect: Match,
+            run: case_bip68_sequence_not_met,
+        },
+        Case {
+            name: "intra_block_spend_ok",
+            core: Accept,
+            expect: Match,
+            run: case_intra_block_spend_ok,
+        },
+        Case {
+            name: "intra_block_child_before_parent",
+            core: Reject("bad-txns-inputs-missingorspent"),
+            expect: Match,
+            run: case_intra_block_child_before_parent,
+        },
         // proof-of-work / difficulty / timestamp
-        Case { name: "high_hash_bad_pow", core: Reject("high-hash"), expect: Match, run: case_high_hash_bad_pow },
-        Case { name: "bad_diffbits", core: Reject("bad-diffbits"), expect: Match, run: case_bad_diffbits },
-        Case { name: "time_too_old_mtp", core: Reject("time-too-old"), expect: Match, run: case_time_too_old_mtp },
+        Case {
+            name: "high_hash_bad_pow",
+            core: Reject("high-hash"),
+            expect: Match,
+            run: case_high_hash_bad_pow,
+        },
+        Case {
+            name: "bad_diffbits",
+            core: Reject("bad-diffbits"),
+            expect: Match,
+            run: case_bad_diffbits,
+        },
+        Case {
+            name: "time_too_old_mtp",
+            core: Reject("time-too-old"),
+            expect: Match,
+            run: case_time_too_old_mtp,
+        },
         // Formerly gaps (Core rejects, satd accepted) — now enforced and
         // promoted to exact matches by the consensus fixes in this PR.
-        Case { name: "block_sigops", core: Reject("bad-blk-sigops"), expect: Match, run: case_gap_block_sigops },
-        Case { name: "bip30_duplicate_txid", core: Reject("bad-txns-BIP30"), expect: Match, run: case_gap_bip30 },
-        Case { name: "time_too_new", core: Reject("time-too-new"), expect: Match, run: case_gap_time_too_new },
-        Case { name: "block_version", core: Reject("bad-version(0x00000001)"), expect: Match, run: case_gap_block_version },
+        Case {
+            name: "block_sigops",
+            core: Reject("bad-blk-sigops"),
+            expect: Match,
+            run: case_gap_block_sigops,
+        },
+        Case {
+            name: "bip30_duplicate_txid",
+            core: Reject("bad-txns-BIP30"),
+            expect: Match,
+            run: case_gap_bip30,
+        },
+        Case {
+            name: "time_too_new",
+            core: Reject("time-too-new"),
+            expect: Match,
+            run: case_gap_time_too_new,
+        },
+        Case {
+            name: "block_version",
+            core: Reject("bad-version(0x00000001)"),
+            expect: Match,
+            run: case_gap_block_version,
+        },
         // Audit-discovered gaps (block-handling equivalence audit, findings A
         // and F) — now enforced and promoted to exact matches: merkle-mutation
         // detection in check_block and a per-tx weight cap in check_transaction.
-        Case { name: "merkle_mutation_cve_2012_2459", core: Reject("bad-txns-duplicate"), expect: Match, run: case_merkle_mutation_cve_2012_2459 },
-        Case { name: "tx_oversize", core: Reject("bad-txns-oversize"), expect: Match, run: case_tx_oversize },
+        Case {
+            name: "merkle_mutation_cve_2012_2459",
+            core: Reject("bad-txns-duplicate"),
+            expect: Match,
+            run: case_merkle_mutation_cve_2012_2459,
+        },
+        Case {
+            name: "tx_oversize",
+            core: Reject("bad-txns-oversize"),
+            expect: Match,
+            run: case_tx_oversize,
+        },
     ]
 }
 
@@ -804,9 +1122,10 @@ fn classify(case: &Case, satd: &Satd) -> Result<String, String> {
             "REGRESSION {}: Core rejects `{r}` but satd ACCEPTED",
             case.name
         )),
-        (Expect::Match, None, Err(e)) => {
-            Err(format!("REGRESSION {}: Core accepts but satd rejected `{e}`", case.name))
-        }
+        (Expect::Match, None, Err(e)) => Err(format!(
+            "REGRESSION {}: Core accepts but satd rejected `{e}`",
+            case.name
+        )),
 
         // both reject, satd uses a different reason label.
         (Expect::ReasonDiffers(s), Some(r), Err(e)) if e == s => {
@@ -820,14 +1139,16 @@ fn classify(case: &Case, satd: &Satd) -> Result<String, String> {
             "GAP OPENED {}: satd used to reject `{s}`, now ACCEPTS — regression",
             case.name
         )),
-        (Expect::ReasonDiffers(_), None, _) => {
-            Err(format!("BAD CASE {}: ReasonDiffers requires Core::Reject", case.name))
-        }
+        (Expect::ReasonDiffers(_), None, _) => Err(format!(
+            "BAD CASE {}: ReasonDiffers requires Core::Reject",
+            case.name
+        )),
 
         // known gap: Core rejects, satd accepts.
-        (Expect::Gap, Some(r), Ok(())) => {
-            Ok(format!("⚠ {:<32} GAP open (Core: {r}, satd accepts)", case.name))
-        }
+        (Expect::Gap, Some(r), Ok(())) => Ok(format!(
+            "⚠ {:<32} GAP open (Core: {r}, satd accepts)",
+            case.name
+        )),
         (Expect::Gap, Some(r), Err(e)) => Err(format!(
             "GAP CLOSED {}: satd now rejects with `{e}` (Core: {r}). \
              Promote this case to Expect::Match (or ReasonDiffers) and remove it from the gap list.",
@@ -840,7 +1161,8 @@ fn classify(case: &Case, satd: &Satd) -> Result<String, String> {
 #[test]
 fn feature_block_consensus_matrix() {
     let cases = cases();
-    let mut report = String::from("\nfeature_block.py differential matrix (satd vs Bitcoin Core)\n");
+    let mut report =
+        String::from("\nfeature_block.py differential matrix (satd vs Bitcoin Core)\n");
     let mut failures = Vec::new();
     let (mut matched, mut reason_diff, mut gaps) = (0u32, 0u32, 0u32);
 

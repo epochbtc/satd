@@ -33,7 +33,11 @@ pub const MSG_TYPE_OTHER: &str = "*other*";
 /// never make satd allocate a new map key, which is the memory-DoS Core
 /// guards against by only counting message types it knows.
 fn msg_key(cmd: &'static str) -> &'static str {
-    if cmd == "unknown" { MSG_TYPE_OTHER } else { cmd }
+    if cmd == "unknown" {
+        MSG_TYPE_OTHER
+    } else {
+        cmd
+    }
 }
 
 /// Current wall-clock time as unix seconds (0 on a pre-epoch clock).
@@ -165,8 +169,13 @@ impl PeerStats {
     pub fn discount_recv(&self, n: usize) {
         let n = n as u64;
         let sub = |v: u64| Some(v.saturating_sub(n));
-        let _ = self.bytes_recv.fetch_update(Ordering::Relaxed, Ordering::Relaxed, sub);
-        let _ = self.totals.bytes_recv.fetch_update(Ordering::Relaxed, Ordering::Relaxed, sub);
+        let _ = self
+            .bytes_recv
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, sub);
+        let _ = self
+            .totals
+            .bytes_recv
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, sub);
     }
 
     pub fn bytes_sent(&self) -> u64 {
@@ -233,12 +242,18 @@ impl PeerStats {
 
     /// Snapshot of `bytessent_per_msg`.
     pub fn bytes_sent_per_msg(&self) -> BTreeMap<&'static str, u64> {
-        self.per_msg_sent.lock().map(|m| m.clone()).unwrap_or_default()
+        self.per_msg_sent
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 
     /// Snapshot of `bytesrecv_per_msg`.
     pub fn bytes_recv_per_msg(&self) -> BTreeMap<&'static str, u64> {
-        self.per_msg_recv.lock().map(|m| m.clone()).unwrap_or_default()
+        self.per_msg_recv
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 
     /// Note that a keepalive ping carrying `nonce` has just gone out.
@@ -312,7 +327,10 @@ impl PeerStats {
     pub fn ping_due(&self, interval: std::time::Duration) -> bool {
         !self.ping_outstanding()
             && now_micros()
-                > self.ping_sent_us.load(Ordering::Relaxed).saturating_add(interval.as_micros() as u64)
+                > self
+                    .ping_sent_us
+                    .load(Ordering::Relaxed)
+                    .saturating_add(interval.as_micros() as u64)
     }
 
     /// Whether a ping is still awaiting its pong.
@@ -377,7 +395,9 @@ mod tests {
     #[test]
     fn a_matching_pong_records_a_round_trip() {
         // Timed on the node clock, which another test may mock meanwhile.
-        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = crate::time::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let s = PeerStats::new(NetTotals::new());
         assert_eq!(s.ping_time_secs(), None, "nothing measured yet");
         assert_eq!(s.min_ping_secs(), None);
@@ -403,7 +423,9 @@ mod tests {
     #[test]
     fn a_wrong_or_repeated_nonce_cannot_write_a_ping_time() {
         // Timed on the node clock, which another test may mock meanwhile.
-        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = crate::time::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let s = PeerStats::new(NetTotals::new());
         // Unsolicited pong, before any ping went out.
         assert!(!s.pong_received(7));
@@ -425,7 +447,9 @@ mod tests {
     #[test]
     fn a_pong_carrying_nonce_zero_finishes_the_ping_without_timing_it() {
         // Timed on the node clock, which another test may mock meanwhile.
-        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = crate::time::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::time::Duration;
         let s = PeerStats::new(NetTotals::new());
 
@@ -449,7 +473,9 @@ mod tests {
     #[test]
     fn only_an_unanswered_ping_can_time_out() {
         // Timed on the node clock, which another test may mock meanwhile.
-        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = crate::time::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::time::Duration;
         let s = PeerStats::new(NetTotals::new());
 
@@ -482,7 +508,9 @@ mod tests {
     #[test]
     fn minping_keeps_the_best_round_trip_not_the_last() {
         // Timed on the node clock, which another test may mock meanwhile.
-        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = crate::time::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let s = PeerStats::new(NetTotals::new());
         s.ping_sent(1);
         assert!(s.pong_received(1));
@@ -557,15 +585,25 @@ mod tests {
         a.attribute_recv(MSG_TYPE_OTHER, 5);
         a.attribute_recv("ping", 32);
         let recv = a.bytes_recv_per_msg();
-        assert_eq!(recv.get(MSG_TYPE_OTHER), Some(&105), "both fold into one key");
-        assert_eq!(recv.get("unknown"), None, "\"unknown\" is not a key Core emits");
+        assert_eq!(
+            recv.get(MSG_TYPE_OTHER),
+            Some(&105),
+            "both fold into one key"
+        );
+        assert_eq!(
+            recv.get("unknown"),
+            None,
+            "\"unknown\" is not a key Core emits"
+        );
         assert_eq!(recv.len(), 2);
     }
 
     #[test]
     fn records_stamp_last_activity() {
         // Timed on the node clock, which another test may mock meanwhile.
-        let _clock = crate::time::CLOCK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = crate::time::CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let a = PeerStats::new(NetTotals::new());
         assert_eq!(a.last_send(), 0);
         assert_eq!(a.last_recv(), 0);

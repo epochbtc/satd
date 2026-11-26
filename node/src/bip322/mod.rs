@@ -116,7 +116,11 @@ pub enum DecodeError {
 pub enum Verification {
     /// Valid at time `lock_time` and age `sequence` (input 0's), as `to_sign`
     /// carries them. A simple proof has all three fields zero.
-    Valid { version: i32, lock_time: u32, sequence: u32 },
+    Valid {
+        version: i32,
+        lock_time: u32,
+        sequence: u32,
+    },
     /// Valid only under rules this verifier treats as upgradeable.
     Inconclusive(String),
     Invalid(String),
@@ -140,12 +144,18 @@ pub fn to_spend(challenge: &Script, message: &[u8]) -> Transaction {
         version: Version(0),
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0xFFFF_FFFF },
+            previous_output: OutPoint {
+                txid: Txid::all_zeros(),
+                vout: 0xFFFF_FFFF,
+            },
             script_sig: ScriptBuf::from_bytes(script_sig),
             sequence: Sequence(0),
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::ZERO, script_pubkey: challenge.to_owned() }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: challenge.to_owned(),
+        }],
     }
 }
 
@@ -156,7 +166,10 @@ pub fn to_sign(to_spend_txid: Txid, witness: Witness) -> Transaction {
         version: Version(0),
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: to_spend_txid, vout: 0 },
+            previous_output: OutPoint {
+                txid: to_spend_txid,
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence(0),
             witness,
@@ -303,7 +316,12 @@ fn check_full_structure(tx: &Transaction, to_spend_txid: Txid) -> Result<(), &'s
     if tx.input.len() != 1 {
         return Err("a full signature's to_sign must have exactly one input");
     }
-    if tx.input[0].previous_output != (OutPoint { txid: to_spend_txid, vout: 0 }) {
+    if tx.input[0].previous_output
+        != (OutPoint {
+            txid: to_spend_txid,
+            vout: 0,
+        })
+    {
         return Err("to_sign does not spend to_spend for this message and address");
     }
     if tx.output.len() != 1 || tx.output[0] != op_return_output() {
@@ -387,7 +405,8 @@ impl SignatureChecker for Bip322Checker<'_> {
             self.bad_sighash.set(true);
             return false;
         }
-        self.inner.check_ecdsa_signature(sig, pubkey, script_code, sig_version)
+        self.inner
+            .check_ecdsa_signature(sig, pubkey, script_code, sig_version)
     }
 
     fn check_schnorr_signature(
@@ -403,7 +422,8 @@ impl SignatureChecker for Bip322Checker<'_> {
             self.bad_sighash.set(true);
             return Ok(false);
         }
-        self.inner.check_schnorr_signature(sig, pubkey, sig_version, exec_data)
+        self.inner
+            .check_schnorr_signature(sig, pubkey, sig_version, exec_data)
     }
 
     fn check_lock_time(&self, lock_time: &ScriptNum) -> bool {

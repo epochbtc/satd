@@ -71,12 +71,19 @@ pub(crate) fn single_truc_checks(
 ) -> Option<SingleTrucFailure> {
     let txid = tx.compute_txid();
     let wtxid = crate::validation::decode::wtxid(tx);
-    let fail = |detail: String| Some(SingleTrucFailure { detail, sibling: None });
+    let fail = |detail: String| {
+        Some(SingleTrucFailure {
+            detail,
+            sibling: None,
+        })
+    };
 
     // Inheritance: a TRUC transaction spends only TRUC parents, and the
     // reverse.
     for parent_txid in mempool_parents {
-        let Some(parent) = view.mempool_tx(parent_txid) else { continue };
+        let Some(parent) = view.mempool_tx(parent_txid) else {
+            continue;
+        };
         if is_truc(tx) != is_truc(parent) {
             let (child, parent_kind) = if is_truc(tx) {
                 ("version=3", "non-version=3")
@@ -101,13 +108,17 @@ pub(crate) fn single_truc_checks(
     }
 
     if mempool_parents.len() + 1 > TRUC_ANCESTOR_LIMIT {
-        return fail(format!("tx {txid} (wtxid={wtxid}) would have too many ancestors"));
+        return fail(format!(
+            "tx {txid} (wtxid={wtxid}) would have too many ancestors"
+        ));
     }
 
     let parent_txid = mempool_parents.first()?;
     // The parent may not have unconfirmed ancestors of its own.
     if view.ancestor_count(parent_txid, TRUC_ANCESTOR_LIMIT + 1) + 1 > TRUC_ANCESTOR_LIMIT {
-        return fail(format!("tx {txid} (wtxid={wtxid}) would have too many ancestors"));
+        return fail(format!(
+            "tx {txid} (wtxid={wtxid}) would have too many ancestors"
+        ));
     }
     if vsize > TRUC_CHILD_MAX_VSIZE {
         return fail(format!(
@@ -121,7 +132,9 @@ pub(crate) fn single_truc_checks(
     // conflicts rather than of the descendants, which are counted only as
     // far as the limit needs: a reorg can leave any number.
     let descendants = view.descendants(parent_txid, TRUC_DESCENDANT_LIMIT + 1);
-    let child_will_be_replaced = direct_conflicts.iter().any(|c| view.descends_from(c, parent_txid));
+    let child_will_be_replaced = direct_conflicts
+        .iter()
+        .any(|c| view.descends_from(c, parent_txid));
     if descendants.len() + 2 > TRUC_DESCENDANT_LIMIT && !child_will_be_replaced {
         // Sibling eviction is on offer only when the parent has exactly one
         // child and that child has no other ancestors, so there is no choice
@@ -190,7 +203,11 @@ pub(crate) fn package_truc_checks(
         ));
     }
 
-    let too_many_ancestors = || Some(format!("tx {txid} (wtxid={wtxid}) would have too many ancestors"));
+    let too_many_ancestors = || {
+        Some(format!(
+            "tx {txid} (wtxid={wtxid}) would have too many ancestors"
+        ))
+    };
     if mempool_parents.len() + in_package_parents.len() + 1 > TRUC_ANCESTOR_LIMIT {
         return too_many_ancestors();
     }
@@ -202,7 +219,8 @@ pub(crate) fn package_truc_checks(
     }
 
     // Exactly one parent, in the mempool or in the package.
-    let (parent, parent_has_mempool_descendant) = if let Some(parent_txid) = mempool_parents.first() {
+    let (parent, parent_has_mempool_descendant) = if let Some(parent_txid) = mempool_parents.first()
+    {
         let parent = view.mempool_tx(parent_txid)?;
         (parent, !view.descendants(parent_txid, 1).is_empty())
     } else if let Some(parent) = in_package_parents.first() {
@@ -225,8 +243,11 @@ pub(crate) fn package_truc_checks(
         ));
     }
 
-    let exceeds_descendants =
-        || Some(format!("tx {parent_txid} (wtxid={parent_wtxid}) would exceed descendant count limit"));
+    let exceeds_descendants = || {
+        Some(format!(
+            "tx {parent_txid} (wtxid={parent_wtxid}) would exceed descendant count limit"
+        ))
+    };
     for other in package.iter().filter(|p| p.compute_txid() != txid) {
         for input in &other.input {
             // Another member with the same parent. Whether it replaces

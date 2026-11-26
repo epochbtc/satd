@@ -58,7 +58,12 @@ pub struct HeadersJob {
 impl HeadersJob {
     pub fn new(peer: PeerId, msg: NetworkMessage, in_flight: InFlight) -> Self {
         let size = approx_size(&msg);
-        Self { peer, msg, in_flight, size }
+        Self {
+            peer,
+            msg,
+            in_flight,
+            size,
+        }
     }
 }
 
@@ -71,9 +76,18 @@ fn approx_size(msg: &NetworkMessage) -> usize {
         NetworkMessage::Inv(inv) => inv.len() * 36,
         NetworkMessage::CmpctBlock(c) => {
             80 + c.compact_block.short_ids.len() * 6
-                + c.compact_block.prefilled_txs.iter().map(|p| p.tx.total_size()).sum::<usize>()
+                + c.compact_block
+                    .prefilled_txs
+                    .iter()
+                    .map(|p| p.tx.total_size())
+                    .sum::<usize>()
         }
-        NetworkMessage::BlockTxn(b) => b.transactions.transactions.iter().map(|t| t.total_size()).sum(),
+        NetworkMessage::BlockTxn(b) => b
+            .transactions
+            .transactions
+            .iter()
+            .map(|t| t.total_size())
+            .sum(),
         _ => 1024,
     }
 }
@@ -104,7 +118,11 @@ impl Default for HeadersQueue {
 
 impl HeadersQueue {
     pub fn new(max_bytes: usize) -> Self {
-        Self { state: Mutex::new(State::default()), cvar: Condvar::new(), max_bytes }
+        Self {
+            state: Mutex::new(State::default()),
+            cvar: Condvar::new(),
+            max_bytes,
+        }
     }
 
     /// Queue `job` for the headers thread, waiting for room while the queue
@@ -203,7 +221,12 @@ mod tests {
     use super::*;
 
     fn job(peer: PeerId, size: usize) -> HeadersJob {
-        HeadersJob { peer, msg: NetworkMessage::Headers(Vec::new()), in_flight: InFlight::adopt(None), size }
+        HeadersJob {
+            peer,
+            msg: NetworkMessage::Headers(Vec::new()),
+            in_flight: InFlight::adopt(None),
+            size,
+        }
     }
 
     /// Jobs come out in the order they went in, which is what keeps the
@@ -243,18 +266,27 @@ mod tests {
     #[test]
     fn a_push_past_the_bound_waits_for_room() {
         let q = std::sync::Arc::new(HeadersQueue::new(100));
-        assert!(q.push(job(1, 150)).is_ok(), "an empty queue takes an oversized message");
+        assert!(
+            q.push(job(1, 150)).is_ok(),
+            "an empty queue takes an oversized message"
+        );
         let pusher = {
             let q = q.clone();
             std::thread::spawn(move || q.push(job(2, 10)).is_ok())
         };
         std::thread::sleep(Duration::from_millis(150));
-        assert!(!pusher.is_finished(), "the push waits while the queue is past its bound");
+        assert!(
+            !pusher.is_finished(),
+            "the push waits while the queue is past its bound"
+        );
         assert_eq!(q.queued_bytes(), 150);
         let first = q.pop(Duration::ZERO).unwrap();
         assert_eq!(first.peer, 1);
         q.done();
-        assert!(pusher.join().unwrap(), "the push goes in once there is room");
+        assert!(
+            pusher.join().unwrap(),
+            "the push goes in once there is room"
+        );
         assert_eq!(q.queued_bytes(), 10);
     }
 
@@ -267,9 +299,17 @@ mod tests {
         assert!(q.push(job(1, 10)).is_ok());
         assert!(q.push(job(2, 10)).is_ok());
         q.close();
-        assert!(q.pop(Duration::ZERO).is_none(), "a closed queue gives the thread nothing");
-        let back = q.push(job(3, 10)).expect_err("a closed queue hands jobs back");
-        assert_eq!(back.iter().map(|j| j.peer).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(
+            q.pop(Duration::ZERO).is_none(),
+            "a closed queue gives the thread nothing"
+        );
+        let back = q
+            .push(job(3, 10))
+            .expect_err("a closed queue hands jobs back");
+        assert_eq!(
+            back.iter().map(|j| j.peer).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert!(q.is_idle());
         assert_eq!(q.queued_bytes(), 0);
     }
@@ -283,7 +323,10 @@ mod tests {
         assert!(q.take_stranded().is_empty(), "the thread still owns them");
         assert!(q.push(job(2, 10)).is_ok());
         q.close();
-        assert_eq!(q.take_stranded().iter().map(|j| j.peer).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            q.take_stranded().iter().map(|j| j.peer).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert!(q.take_stranded().is_empty());
         assert!(q.is_idle());
         assert_eq!(q.queued_bytes(), 0);
@@ -301,6 +344,10 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(50));
         q.close();
-        assert_eq!(pusher.join().unwrap(), Some(2), "the queued job and its own");
+        assert_eq!(
+            pusher.join().unwrap(),
+            Some(2),
+            "the queued job and its own"
+        );
     }
 }

@@ -50,8 +50,10 @@ fn sats(btc: &serde_json::Value) -> u64 {
 /// The coinbase of the block at `height`, as `getblock` verbosity 2 gives it.
 fn coinbase_at(e2e: &E2eNode, height: u64) -> serde_json::Value {
     let hash = block_hash_at(e2e, height);
-    e2e.node
-        .rpc_ok("getblock", vec![serde_json::json!(hash), serde_json::json!(2)])["tx"][0]
+    e2e.node.rpc_ok(
+        "getblock",
+        vec![serde_json::json!(hash), serde_json::json!(2)],
+    )["tx"][0]
         .clone()
 }
 
@@ -84,19 +86,34 @@ fn test_e2e_esplora_block_txs_summary() {
         let tx: bitcoin::Transaction =
             bitcoin::consensus::encode::deserialize_hex(&raw).expect("the signed spend decodes");
         assert_eq!(tx.input.len(), 1);
-        let spent = sats(&coinbase_at(&e2e, height)["vout"][tx.input[0].previous_output.vout as usize]["value"]);
+        let spent = sats(
+            &coinbase_at(&e2e, height)["vout"][tx.input[0].previous_output.vout as usize]["value"],
+        );
         let paid: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-        assert_eq!(spent - paid, fee, "the helper pays the fee it was asked for");
+        assert_eq!(
+            spent - paid,
+            fee,
+            "the helper pays the fee it was asked for"
+        );
         expected.insert(txid, (spent - paid, tx.weight().to_wu(), paid));
         let r = esplora.post_tx(&raw);
-        assert_eq!(r.status(), 200, "broadcast: {}", r.text().unwrap_or_default());
+        assert_eq!(
+            r.status(),
+            200,
+            "broadcast: {}",
+            r.text().unwrap_or_default()
+        );
     }
     mine(&e2e, 1, &w);
     let h102 = block_hash_at(&e2e, 102);
 
     let (status, tip, body) = get(&esplora, &format!("/block/{h102}/txs/summary"));
     assert_eq!(status, 200, "{body}");
-    assert_eq!(tip.as_deref(), Some(h102.as_str()), "stamped with the tip it was read at");
+    assert_eq!(
+        tip.as_deref(),
+        Some(h102.as_str()),
+        "stamped with the tip it was read at"
+    );
     let rows: serde_json::Value = serde_json::from_str(&body).expect("JSON");
     let rows = rows.as_array().expect("an array of rows");
     assert_eq!(rows.len(), 3, "{body}");
@@ -104,7 +121,10 @@ fn test_e2e_esplora_block_txs_summary() {
     // Block order: the rows' txids are `/block/:hash/txids`.
     let txids = esplora_get_json(&esplora, &format!("/block/{h102}/txids"));
     let row_txids: Vec<&serde_json::Value> = rows.iter().map(|row| &row[0]).collect();
-    assert_eq!(row_txids, txids.as_array().expect("txids").iter().collect::<Vec<_>>());
+    assert_eq!(
+        row_txids,
+        txids.as_array().expect("txids").iter().collect::<Vec<_>>()
+    );
 
     // The coinbase first: fee 0, and it pays out the subsidy and both fees.
     let coinbase = coinbase_at(&e2e, 102);
@@ -115,14 +135,19 @@ fn test_e2e_esplora_block_txs_summary() {
         serde_json::json!([coinbase["txid"], 0, coinbase["weight"], claimed]),
         "the coinbase row"
     );
-    assert_eq!(rows[0][0], serde_json::json!(common::coinbase_txid_at(&e2e.node, 102)));
+    assert_eq!(
+        rows[0][0],
+        serde_json::json!(common::coinbase_txid_at(&e2e.node, 102))
+    );
 
     // The two spends, in whichever order the block holds them.
     for row in &rows[1..] {
         let row = row.as_array().expect("a row is an array");
         assert_eq!(row.len(), 4, "[txid, fee, weight, value]");
         let txid = row[0].as_str().expect("txid");
-        let (fee, weight, value) = expected.remove(txid).unwrap_or_else(|| panic!("unexpected {txid}"));
+        let (fee, weight, value) = expected
+            .remove(txid)
+            .unwrap_or_else(|| panic!("unexpected {txid}"));
         assert_eq!(
             (row[1].as_u64(), row[2].as_u64(), row[3].as_u64()),
             (Some(fee), Some(weight), Some(value)),
@@ -149,7 +174,8 @@ fn test_e2e_esplora_block_txs_summary() {
 
     // Once block 102 leaves the best chain it is 404, though the node still
     // holds it and `/txids` still lists it.
-    e2e.node.rpc_ok("invalidateblock", vec![serde_json::json!(h102)]);
+    e2e.node
+        .rpc_ok("invalidateblock", vec![serde_json::json!(h102)]);
     let (status, _, body) = get(&esplora, &format!("/block/{h102}/txs/summary"));
     assert_eq!((status, body.as_str()), (404, "not found"));
     let (status, _, _) = get(&esplora, &format!("/block/{h102}/txids"));

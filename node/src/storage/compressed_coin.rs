@@ -397,8 +397,7 @@ pub fn decompress_special_script(ns: u32, payload: &[u8]) -> Result<ScriptBuf, C
             let mut compressed = [0u8; 33];
             compressed[0] = (ns - 2) as u8;
             compressed[1..].copy_from_slice(payload);
-            let pk =
-                PublicKey::from_slice(&compressed).map_err(|_| CodecError::InvalidPubkey)?;
+            let pk = PublicKey::from_slice(&compressed).map_err(|_| CodecError::InvalidPubkey)?;
             let uncomp = pk.serialize_uncompressed();
             let mut s = Vec::with_capacity(67);
             s.push(65);
@@ -530,11 +529,7 @@ pub fn serialize_coin<W: Write>(w: &mut W, coin: &Coin) -> io::Result<()> {
 /// [`serialize_coin`] — same input, different bytes, different
 /// purpose. The snapshot **file** uses `serialize_coin`; the
 /// snapshot **hash** uses `write_txout_ser`.
-pub fn write_txout_ser<W: Write>(
-    w: &mut W,
-    outpoint: &OutPoint,
-    coin: &Coin,
-) -> io::Result<()> {
+pub fn write_txout_ser<W: Write>(w: &mut W, outpoint: &OutPoint, coin: &Coin) -> io::Result<()> {
     write_outpoint(w, outpoint)?;
     let code = (coin.height << 1) | (u32::from(coin.coinbase));
     w.write_all(&code.to_le_bytes())?;
@@ -679,7 +674,11 @@ mod tests {
         let mut cursor = &buf[..];
         let decoded = read_varint(&mut cursor).unwrap();
         assert_eq!(decoded, n, "varint round-trip failed for {n}");
-        assert!(cursor.is_empty(), "varint decoder left {} trailing bytes", cursor.len());
+        assert!(
+            cursor.is_empty(),
+            "varint decoder left {} trailing bytes",
+            cursor.len()
+        );
     }
 
     #[test]
@@ -828,9 +827,9 @@ mod tests {
         let vectors: &[(u64, u64)] = &[
             (0, 0x0),
             (1, 0x1),
-            (1_000_000, 0x7),       // CENT
-            (100_000_000, 0x9),     // COIN
-            (5_000_000_000, 0x32),  // 50 * COIN
+            (1_000_000, 0x7),                   // CENT
+            (100_000_000, 0x9),                 // COIN
+            (5_000_000_000, 0x32),              // 50 * COIN
             (2_100_000_000_000_000, 0x1406F40), // 21_000_000 * COIN
         ];
         for &(dec, enc) in vectors {
@@ -935,10 +934,9 @@ mod tests {
     fn p2pk_uncompressed_script() -> (ScriptBuf, u8) {
         // secp256k1 generator point in uncompressed form
         let g_compressed: [u8; 33] = [
-            0x02,
-            0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
-            0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B,
-            0x16, 0xF8, 0x17, 0x98,
+            0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE,
+            0x87, 0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81,
+            0x5B, 0x16, 0xF8, 0x17, 0x98,
         ];
         let pk = PublicKey::from_slice(&g_compressed).unwrap();
         let uncomp = pk.serialize_uncompressed();
@@ -1151,9 +1149,9 @@ mod tests {
     #[test]
     fn outpoint_roundtrip() {
         let op = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0x42; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0x42; 32],
+            )),
             vout: 0x12345678,
         };
         let mut buf = Vec::new();
@@ -1182,9 +1180,9 @@ mod tests {
         //   txid(32) + vout_le(4) + code_le_u32(4) + amount_le_i64(8) +
         //   cs(3=0x03) + script(3) = 52 bytes.
         let op = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xaa; 32],
+            )),
             vout: 0x00000001,
         };
         let coin = Coin {
@@ -1210,9 +1208,9 @@ mod tests {
     fn txout_ser_coinbase_packs_correctly() {
         // height=10, coinbase=true → code = 10 << 1 | 1 = 21
         let op = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0xff; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0xff; 32],
+            )),
             vout: 0,
         };
         let coin = Coin {
@@ -1242,9 +1240,9 @@ mod tests {
         // entry has amount > i64::MAX, the bytes should match what a
         // C++ reinterpret would produce.
         let op = OutPoint {
-            txid: bitcoin::Txid::from_raw_hash(
-                bitcoin::hashes::sha256d::Hash::from_byte_array([0; 32]),
-            ),
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
+                [0; 32],
+            )),
             vout: 0,
         };
         let coin = Coin {

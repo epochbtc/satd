@@ -135,7 +135,11 @@ impl SubscriptionRegistry {
     /// live channels only: an abandoned one stays in the map until the next
     /// sweep (at the cap, or [`prune_empty`](Self::prune_empty)).
     pub fn active_count(&self) -> usize {
-        self.channels.lock().values().filter(|tx| tx.receiver_count() > 0).count()
+        self.channels
+            .lock()
+            .values()
+            .filter(|tx| tx.receiver_count() > 0)
+            .count()
     }
 
     /// Forget all per-scripthash channels with zero remaining
@@ -164,7 +168,6 @@ impl SubscriptionRegistry {
     pub fn active_scripthashes(&self) -> Vec<Scripthash> {
         self.channels
             .lock()
-            
             .iter()
             .filter_map(|(sh, tx)| {
                 if tx.receiver_count() > 0 {
@@ -386,7 +389,10 @@ mod tests {
         // (re-subscribing an already-open scripthash still works), but a brand
         // new scripthash is rejected.
         reg.set_max_subs(1);
-        assert!(reg.subscribe([0xaa; 32]).is_ok(), "existing sub still served");
+        assert!(
+            reg.subscribe([0xaa; 32]).is_ok(),
+            "existing sub still served"
+        );
         assert!(matches!(
             reg.subscribe([0xee; 32]),
             Err(SubscribeError::CapReached(1))
@@ -482,7 +488,9 @@ mod tests {
         assert_eq!(reg.active_count(), 1, "the gauge counts live channels only");
         // At the cap, the sweep reclaims the abandoned slot.
         let _c = reg.subscribe([0x03; 32]).unwrap();
-        let _d = reg.subscribe([0x04; 32]).expect("the abandoned slot is reclaimed at the cap");
+        let _d = reg
+            .subscribe([0x04; 32])
+            .expect("the abandoned slot is reclaimed at the cap");
         assert_eq!(reg.channels.lock().len(), 3);
         reg.prune_empty();
         assert_eq!(reg.channels.lock().len(), 3);

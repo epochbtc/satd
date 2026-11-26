@@ -31,9 +31,7 @@ use parking_lot::Mutex;
 use super::ChainState;
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::flatfile::FlatFilePos;
-use crate::storage::opreturn_strip::{
-    self, StoredBlock, StrippedOutput, StrippedTx, StripRecord,
-};
+use crate::storage::opreturn_strip::{self, StoredBlock, StripRecord, StrippedOutput, StrippedTx};
 use crate::storage::punch::{self, PunchCaps, PunchError};
 use crate::storage::{Store, StoreBatch, StoreError};
 use crate::validation;
@@ -87,7 +85,10 @@ pub enum StripError {
     #[error("block {0} is not on the active chain")]
     NotActive(BlockHash),
     #[error("block {hash} is {status:?}, not Valid")]
-    NotValid { hash: BlockHash, status: BlockStatus },
+    NotValid {
+        hash: BlockHash,
+        status: BlockStatus,
+    },
     /// The stored copy fails a check. Raised as a `blockdata.corrupt.*`
     /// warning as well; a copy that does not verify is never stripped.
     #[error("block {hash} is not stripped, its stored copy is unusable: {detail}")]
@@ -202,14 +203,23 @@ impl ChainState {
     /// background chainstate, normal write mode), the block is `Valid` and
     /// on the active chain, and its stored copy passes `check_block`. Its
     /// depth is not checked: that is the caller's to judge.
-    pub fn strip_block(&self, hash: &BlockHash, threshold: u64) -> Result<StripOutcome, StripError> {
+    pub fn strip_block(
+        &self,
+        hash: &BlockHash,
+        threshold: u64,
+    ) -> Result<StripOutcome, StripError> {
         self.strip_block_inner(hash, threshold, false)
     }
 
     /// [`Self::strip_block`]. `flushed`: the caller made the store durable
     /// after the block connected (the worker does once per pass, and every
     /// block it strips connected long before), so the first flush is skipped.
-    fn strip_block_inner(&self, hash: &BlockHash, threshold: u64, flushed: bool) -> Result<StripOutcome, StripError> {
+    fn strip_block_inner(
+        &self,
+        hash: &BlockHash,
+        threshold: u64,
+        flushed: bool,
+    ) -> Result<StripOutcome, StripError> {
         let _strip = self.strip.lock.lock();
         self.check_quiet()?;
         let caps = self.punch_caps()?;
@@ -263,7 +273,10 @@ impl ChainState {
                 // the entry no longer names. A block that left the active
                 // chain in place keeps whatever was punched before this
                 // call, so it keeps the record it had.
-                let in_place = unmoved && now.as_ref().is_some_and(|e| e.status != BlockStatus::Pruned);
+                let in_place = unmoved
+                    && now
+                        .as_ref()
+                        .is_some_and(|e| e.status != BlockStatus::Pruned);
                 let restore = if in_place { plan.prior } else { None };
                 if plan.commit.is_some() {
                     let mut batch = StoreBatch::default();
@@ -276,7 +289,9 @@ impl ChainState {
                 }
                 return Ok(StripOutcome::Raced);
             }
-            let path = flat_files.blocks_dir().join(format!("blk{:05}.dat", pos.file_number));
+            let path = flat_files
+                .blocks_dir()
+                .join(format!("blk{:05}.dat", pos.file_number));
             // The cached read handles are read-only; punch through a handle
             // of its own.
             let file = OpenOptions::new().write(true).open(&path)?;
@@ -290,7 +305,8 @@ impl ChainState {
                     continue;
                 }
                 let len = range.len() as u64;
-                stats.freed_bytes += punch::zero_and_punch(&file, base + range.start as u64, len, &caps)?;
+                stats.freed_bytes +=
+                    punch::zero_and_punch(&file, base + range.start as u64, len, &caps)?;
                 stats.outputs += 1;
                 stats.span_bytes += len;
             }
@@ -312,12 +328,16 @@ impl ChainState {
         }
         if self.has_background() {
             // Background validation reads the blocks below the snapshot.
-            return Err(StripError::NotQuiet("an AssumeUTXO background chainstate is validating"));
+            return Err(StripError::NotQuiet(
+                "an AssumeUTXO background chainstate is validating",
+            ));
         }
         if self.bulk_load.load(Ordering::Acquire) {
             // IBD and the startup replays (-reindex, -reindex-chainstate,
             // -upgradechainstate) run in BulkLoad.
-            return Err(StripError::NotQuiet("the chainstate is in bulk-load write mode"));
+            return Err(StripError::NotQuiet(
+                "the chainstate is in bulk-load write mode",
+            ));
         }
         Ok(())
     }
@@ -338,7 +358,9 @@ impl ChainState {
         if self.network == Network::Regtest
             && std::env::var(FAILPOINT_ENV).is_ok_and(|v| v == FAILPOINT_AFTER_RECORD)
         {
-            tracing::error!("{FAILPOINT_ENV}={FAILPOINT_AFTER_RECORD}: aborting with a durable strip record");
+            tracing::error!(
+                "{FAILPOINT_ENV}={FAILPOINT_AFTER_RECORD}: aborting with a durable strip record"
+            );
             std::process::abort();
         }
     }
@@ -346,7 +368,10 @@ impl ChainState {
     /// Steps 1 and 4 of the strip: read and check the block, and work out
     /// what to commit and punch.
     fn plan_strip(&self, hash: &BlockHash, threshold: u64) -> Result<Planned, StripError> {
-        let entry = self.store.get_block_index(hash).ok_or(StripError::UnknownBlock(*hash))?;
+        let entry = self
+            .store
+            .get_block_index(hash)
+            .ok_or(StripError::UnknownBlock(*hash))?;
         if entry.status != BlockStatus::Valid {
             return Err(StripError::NotValid {
                 hash: *hash,
@@ -385,13 +410,21 @@ impl ChainState {
     /// [`Self::plan_strip`] once the entry passes its checks. A
     /// [`StripError::Corrupt`] here is not reported yet: the caller first
     /// rules out a race.
-    fn plan_from(&self, hash: &BlockHash, threshold: u64, entry: &BlockIndexEntry) -> Result<Planned, StripError> {
+    fn plan_from(
+        &self,
+        hash: &BlockHash,
+        threshold: u64,
+        entry: &BlockIndexEntry,
+    ) -> Result<Planned, StripError> {
         let entry = entry.clone();
         let pos = FlatFilePos {
             file_number: entry.file_number,
             data_pos: entry.data_pos,
         };
-        let corrupt = |detail: String| StripError::Corrupt { hash: *hash, detail };
+        let corrupt = |detail: String| StripError::Corrupt {
+            hash: *hash,
+            detail,
+        };
         #[cfg(test)]
         if let Some(hook) = self.strip.before_read_hook.lock().take() {
             hook(self);
@@ -401,7 +434,8 @@ impl ChainState {
             .lock()
             .read_block(&pos)
             .map_err(|e| corrupt(format!("read failed: {e}")))?;
-        let spans = opreturn_strip::tx_spans(&bytes).map_err(|e| corrupt(format!("block bytes do not parse: {e}")))?;
+        let spans = opreturn_strip::tx_spans(&bytes)
+            .map_err(|e| corrupt(format!("block bytes do not parse: {e}")))?;
         let prior = self.store.get_opreturn_strip(hash)?;
         match &prior {
             None => {
@@ -421,7 +455,11 @@ impl ChainState {
                 // Never strip a copy that does not verify: the record's
                 // txids would come from bytes that do not match the header.
                 // This also refuses punched bytes whose record was lost.
-                crate::chain::connect::debug_assert_block_height(&*self.store, &block, entry.height);
+                crate::chain::connect::debug_assert_block_height(
+                    &*self.store,
+                    &block,
+                    entry.height,
+                );
                 validation::block::check_block(&block, self.network, entry.height)
                     .map_err(|e| corrupt(format!("the stored copy fails check_block: {e:?}")))?;
                 let Some((record, _filled)) = StripRecord::build(&bytes, &block, threshold)
@@ -444,7 +482,9 @@ impl ChainState {
                 let record = StripRecord::decode(prior_bytes)
                     .map_err(|e| corrupt(format!("strip record does not decode: {e}")))?;
                 let stored = StoredBlock::from_bytes(bytes.clone(), Some(record.clone()), hash)
-                    .map_err(|e| corrupt(format!("strip record does not match the stored bytes: {e}")))?;
+                    .map_err(|e| {
+                        corrupt(format!("strip record does not match the stored bytes: {e}"))
+                    })?;
                 let extended = extend_record(&stored, &record, threshold);
                 if extended == record {
                     let ranges = opreturn_strip::strip_ranges(&bytes, &record, &spans)
@@ -528,7 +568,9 @@ impl WorkerStatus {
             Self::WaitingForTip => "waiting_for_tip",
             Self::Restored => "restored",
             Self::Paused("initial block download") => "ibd",
-            Self::Paused("an AssumeUTXO background chainstate is validating") => "background_validation",
+            Self::Paused("an AssumeUTXO background chainstate is validating") => {
+                "background_validation"
+            }
             Self::Paused(_) => "reindex",
         }
     }
@@ -614,7 +656,8 @@ impl ChainState {
         if let Err(StripError::NotQuiet(why)) = self.check_quiet() {
             return Some(why);
         }
-        (self.headers_tip_height() > self.tip_height()).then_some("the tip is behind the best header")
+        (self.headers_tip_height() > self.tip_height())
+            .then_some("the tip is behind the best header")
     }
 
     /// The stripped blocks, in height order (descending with `descending`),
@@ -622,7 +665,8 @@ impl ChainState {
     /// whose block is no longer stored (pruned meanwhile) is left out.
     pub fn opreturn_restore_work(&self, descending: bool) -> Result<Vec<RestoreItem>, StoreError> {
         let mut hashes = Vec::new();
-        self.store.for_each_opreturn_strip(&mut |hash, _| hashes.push(*hash))?;
+        self.store
+            .for_each_opreturn_strip(&mut |hash, _| hashes.push(*hash))?;
         let mut work = Vec::with_capacity(hashes.len());
         for hash in hashes {
             let Some(entry) = self.store.get_block_index(&hash) else {
@@ -653,7 +697,11 @@ impl ChainState {
     }
 
     /// The downloader's report of what the restore is doing.
-    pub fn set_opreturn_restore_status(&self, status: WorkerStatus, progress: Option<RestoreProgress>) {
+    pub fn set_opreturn_restore_status(
+        &self,
+        status: WorkerStatus,
+        progress: Option<RestoreProgress>,
+    ) {
         *self.strip.restore_status.lock() = status;
         if progress.is_some() {
             *self.strip.restore_progress.lock() = progress;
@@ -804,7 +852,8 @@ impl ChainState {
     /// write when so. One point read, and none on a node that has never
     /// stripped.
     pub(super) fn holds_strip_record(&self, hash: &BlockHash) -> bool {
-        self.strip.has_records.load(Ordering::Acquire) && matches!(self.store.get_opreturn_strip(hash), Ok(Some(_)))
+        self.strip.has_records.load(Ordering::Acquire)
+            && matches!(self.store.get_opreturn_strip(hash), Ok(Some(_)))
     }
 
     /// Drop the cached totals and the blocks directory's stat: a record was
@@ -852,7 +901,11 @@ impl ChainState {
     /// cursor. A lowered size threshold starts the scan over, since outputs
     /// between the two sizes are newly eligible in blocks already examined; a
     /// raised one keeps it, and what is stripped stays stripped.
-    pub fn strip_pass(&self, max_blocks: u32, stop: &std::sync::atomic::AtomicBool) -> Result<PassReport, StripError> {
+    pub fn strip_pass(
+        &self,
+        max_blocks: u32,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<PassReport, StripError> {
         let Some(config) = self.opreturn_prune_config() else {
             // The option is off on a node that holds stripped blocks: nothing
             // to strip, but records go (`-prune`, `getblockfrompeer`, a fresh
@@ -887,7 +940,10 @@ impl ChainState {
 
         // A store error ends the pass rather than reading as "no cursor",
         // which would start the scan over from genesis.
-        let stored = self.store.opreturn_strip_meta()?.and_then(|b| opreturn_strip::StripMeta::decode(&b));
+        let stored = self
+            .store
+            .opreturn_strip_meta()?
+            .and_then(|b| opreturn_strip::StripMeta::decode(&b));
         let mut meta = stored.unwrap_or(opreturn_strip::StripMeta {
             next_height: 0,
             size_threshold: config.size_threshold,
@@ -905,7 +961,9 @@ impl ChainState {
         let mut report = PassReport::default();
         // Strip only below `tip - N - 2` (plan §2.4): never a block a limited
         // peer may still ask for.
-        let last = self.tip_height().checked_sub(config.depth.saturating_add(3));
+        let last = self
+            .tip_height()
+            .checked_sub(config.depth.saturating_add(3));
         let result = (|| {
             let Some(last) = last else {
                 return Ok(());
@@ -925,7 +983,9 @@ impl ChainState {
                     return Ok(());
                 };
                 match self.strip_block_inner(&hash, config.size_threshold, true) {
-                    Ok(StripOutcome::Stripped(_) | StripOutcome::Extended(_)) => report.stripped += 1,
+                    Ok(StripOutcome::Stripped(_) | StripOutcome::Extended(_)) => {
+                        report.stripped += 1
+                    }
                     Ok(_) => {}
                     Err(StripError::NotQuiet(why)) => {
                         *self.strip.worker.lock() = WorkerStatus::Paused(why);
@@ -934,10 +994,12 @@ impl ChainState {
                     // Not a block to strip (yet), or a stored copy that
                     // does not verify, which has raised its warning: move
                     // on rather than wedge the scan on it.
-                    Err(e @ (StripError::UnknownBlock(_)
-                    | StripError::NotActive(_)
-                    | StripError::NotValid { .. }
-                    | StripError::Corrupt { .. })) => {
+                    Err(
+                        e @ (StripError::UnknownBlock(_)
+                        | StripError::NotActive(_)
+                        | StripError::NotValid { .. }
+                        | StripError::Corrupt { .. }),
+                    ) => {
                         tracing::debug!(height = h, error = %e, "OP_RETURN strip: skipping block");
                     }
                     Err(e) => return Err(e),
@@ -1040,7 +1102,11 @@ impl ChainState {
         // spans.
         if StoredBlock::from_bytes(body.clone(), Some(record.clone()), &hash).is_err()
             || record.txs.iter().any(|t| {
-                block.txdata.get(t.tx_index as usize).map(|tx| tx.compute_txid()) != Some(t.txid)
+                block
+                    .txdata
+                    .get(t.tx_index as usize)
+                    .map(|tx| tx.compute_txid())
+                    != Some(t.txid)
             })
         {
             return Ok(None);
@@ -1070,10 +1136,14 @@ impl ChainState {
         let offset = u64::from(pos.data_pos) + 8;
         let mut encoded = body;
         crate::storage::flatfile::xor_in_place(&mut encoded, &flat_files.xor_key(), offset);
-        let path = flat_files.blocks_dir().join(format!("blk{:05}.dat", pos.file_number));
+        let path = flat_files
+            .blocks_dir()
+            .join(format!("blk{:05}.dat", pos.file_number));
         // A write that fails part way leaves the same block's bytes, partly
         // intact, under the record: readers still zero-fill the spans.
-        let io = |e: std::io::Error| super::ChainError::FlatFile(format!("restoring {hash} in place: {e}"));
+        let io = |e: std::io::Error| {
+            super::ChainError::FlatFile(format!("restoring {hash} in place: {e}"))
+        };
         let file = OpenOptions::new().write(true).open(&path).map_err(io)?;
         std::os::unix::fs::FileExt::write_all_at(&file, &encoded, offset).map_err(io)?;
         // The bytes are durable before the record goes. A crash between the
@@ -1157,7 +1227,9 @@ fn extend_record(stored: &StoredBlock, record: &StripRecord, threshold: u64) -> 
 fn output_of(stored: &StoredBlock, tx_index: usize, vout: u32) -> StrippedOutput {
     StrippedOutput {
         vout,
-        script_len: stored.block.txdata[tx_index].output[vout as usize].script_pubkey.len() as u64,
+        script_len: stored.block.txdata[tx_index].output[vout as usize]
+            .script_pubkey
+            .len() as u64,
     }
 }
 
@@ -1195,7 +1267,10 @@ mod tests;
 /// last stopped at its block limit, else a wait of up to a minute that ends
 /// early when the tip moves. Runs until `stop`. Spawn it on a thread of its
 /// own; every pass is blocking I/O.
-pub fn run_strip_worker(chain: std::sync::Arc<ChainState>, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+pub fn run_strip_worker(
+    chain: std::sync::Arc<ChainState>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     const PASS_BLOCKS: u32 = 1000;
     const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
     const POLL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1226,7 +1301,8 @@ pub fn run_strip_worker(chain: std::sync::Arc<ChainState>, stop: std::sync::Arc<
         }
         let tip = chain.tip_height();
         let started = std::time::Instant::now();
-        while started.elapsed() < IDLE && !stop.load(Ordering::Relaxed) && chain.tip_height() == tip {
+        while started.elapsed() < IDLE && !stop.load(Ordering::Relaxed) && chain.tip_height() == tip
+        {
             std::thread::sleep(POLL);
         }
     }

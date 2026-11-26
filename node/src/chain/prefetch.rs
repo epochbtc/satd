@@ -4,17 +4,19 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
+use crate::chain::replay_plan::ReplayPlan;
+use crate::storage::Store;
 use crate::storage::blockindex::{BlockIndexEntry, BlockStatus};
 use crate::storage::coinview::Coin;
 use crate::storage::flatfile::FlatFilePos;
 use crate::storage::opreturn_strip::{self, StoredBlock};
-use crate::chain::replay_plan::ReplayPlan;
-use crate::storage::Store;
-use crate::validation::script::{ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptContext, ScriptVerifier};
+use crate::validation::script::{
+    ConsensusVerifier, PrimaryEngine, RustVerifier, ScriptContext, ScriptVerifier,
+};
 use crate::validation::tx::check_transaction;
 
 /// A block that has been pre-read, deserialized, and partially validated
@@ -53,7 +55,11 @@ fn read_block_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8])
 }
 
 /// The raw, xor-decoded bytes of the block record at `pos`.
-fn read_bytes_from_file(blocks_dir: &Path, pos: &FlatFilePos, xor_key: &[u8; 8]) -> Option<Vec<u8>> {
+fn read_bytes_from_file(
+    blocks_dir: &Path,
+    pos: &FlatFilePos,
+    xor_key: &[u8; 8],
+) -> Option<Vec<u8>> {
     let path = blocks_dir.join(format!("blk{:05}.dat", pos.file_number));
     let mut file = File::open(&path).ok()?;
     // Flat file layout: [magic:4][size:4][block_data:size]
@@ -140,9 +146,22 @@ pub fn prefetch_block(
         StoredBlock::intact(read_block_from_file(blocks_dir, &flat_pos, blocks_xor_key)?)
     };
     let (txids, wtxids, script_skip_txs) = if stored.is_stripped() {
-        (stored.txids(), Some(stored.wtxids()), stored.stripped_tx_indices())
+        (
+            stored.txids(),
+            Some(stored.wtxids()),
+            stored.stripped_tx_indices(),
+        )
     } else {
-        (stored.block.txdata.iter().map(|tx| tx.compute_txid()).collect(), None, HashSet::new())
+        (
+            stored
+                .block
+                .txdata
+                .iter()
+                .map(|tx| tx.compute_txid())
+                .collect(),
+            None,
+            HashSet::new(),
+        )
     };
     let block = stored.block;
 
@@ -201,8 +220,12 @@ pub fn prefetch_block(
         .iter()
         .enumerate()
         .flat_map(|(tx_idx, tx)| {
-            if tx.is_coinbase() { return Vec::new(); }
-            tx.input.iter().enumerate()
+            if tx.is_coinbase() {
+                return Vec::new();
+            }
+            tx.input
+                .iter()
+                .enumerate()
                 .map(|(input_idx, input)| (tx_idx, input_idx, input.previous_output))
                 .collect::<Vec<_>>()
         })
@@ -228,12 +251,16 @@ pub fn prefetch_block(
             }
         }
 
-        let verifiable: Vec<(usize, &Transaction, Vec<TxOut>)> = block.txdata.iter()
+        let verifiable: Vec<(usize, &Transaction, Vec<TxOut>)> = block
+            .txdata
+            .iter()
             .enumerate()
             .filter_map(|(tx_idx, tx)| {
                 // A stripped transaction's signatures commit to bytes
                 // that are gone: connect_block skips its scripts.
-                if tx.is_coinbase() || script_skip_txs.contains(&tx_idx) { return None; }
+                if tx.is_coinbase() || script_skip_txs.contains(&tx_idx) {
+                    return None;
+                }
                 let mut prev_outputs = Vec::with_capacity(tx.input.len());
                 for (input_idx, _) in tx.input.iter().enumerate() {
                     let coin = spec_coins.get(&(tx_idx, input_idx))?;
@@ -246,7 +273,13 @@ pub fn prefetch_block(
             })
             .collect();
 
-        verify_speculatively(&verifiable, primary_engine, network, ScriptContext::block(height, hash), cancel)
+        verify_speculatively(
+            &verifiable,
+            primary_engine,
+            network,
+            ScriptContext::block(height, hash),
+            cancel,
+        )
     };
 
     Some(PreprocessedBlock {
@@ -290,10 +323,12 @@ fn verify_speculatively(
     // authoritative choice — otherwise we'd covertly promote the
     // other engine to authoritative for pre-verified txs.
     std::thread::scope(|s| {
-        let handles: Vec<_> = verifiable.chunks(chunk_size)
+        let handles: Vec<_> = verifiable
+            .chunks(chunk_size)
             .map(|chunk| {
                 s.spawn(move || {
-                    chunk.iter()
+                    chunk
+                        .iter()
                         .filter(|(_, tx, prev_outputs)| {
                             !cancel.load(Ordering::Relaxed)
                                 && match primary_engine {
@@ -444,42 +479,39 @@ pub fn start_prefetcher(
         thread::Builder::new()
             .name("prefetch-dispatch".into())
             .spawn(move || {
-        let mut next_to_assign = disp_cursor.load(Ordering::Relaxed);
+                let mut next_to_assign = disp_cursor.load(Ordering::Relaxed);
 
-        while !disp_shutdown.load(Ordering::Relaxed) {
-            let current_cursor = disp_cursor.load(Ordering::Relaxed);
-            if current_cursor > next_to_assign {
-                next_to_assign = current_cursor;
-            }
+                while !disp_shutdown.load(Ordering::Relaxed) {
+                    let current_cursor = disp_cursor.load(Ordering::Relaxed);
+                    if current_cursor > next_to_assign {
+                        next_to_assign = current_cursor;
+                    }
 
-            // Evict stale entries below cursor
-            {
-                let mut buf = disp_buffer.lock();
-                buf.retain(|h, _| *h >= current_cursor);
-            }
+                    // Evict stale entries below cursor
+                    {
+                        let mut buf = disp_buffer.lock();
+                        buf.retain(|h, _| *h >= current_cursor);
+                    }
 
-            // Assign work up to lookahead ahead of cursor
-            while next_to_assign < current_cursor + lookahead as u32 {
-                let next_hash = match &disp_plan {
-                    Some(p) => p.hash_at(next_to_assign),
-                    None => disp_store.get_block_hash_by_height(next_to_assign),
-                };
-                let has_data = next_hash
-                    .and_then(|hash| disp_store.get_block_index(&hash))
-                    .is_some_and(|entry| {
-                        matches!(
-                            entry.status,
-                            BlockStatus::DataStored | BlockStatus::Valid
-                        )
-                    });
-                if has_data {
-                    let _ = work_tx.try_send(next_to_assign);
+                    // Assign work up to lookahead ahead of cursor
+                    while next_to_assign < current_cursor + lookahead as u32 {
+                        let next_hash = match &disp_plan {
+                            Some(p) => p.hash_at(next_to_assign),
+                            None => disp_store.get_block_hash_by_height(next_to_assign),
+                        };
+                        let has_data = next_hash
+                            .and_then(|hash| disp_store.get_block_index(&hash))
+                            .is_some_and(|entry| {
+                                matches!(entry.status, BlockStatus::DataStored | BlockStatus::Valid)
+                            });
+                        if has_data {
+                            let _ = work_tx.try_send(next_to_assign);
+                        }
+                        next_to_assign += 1;
+                    }
+
+                    thread::sleep(std::time::Duration::from_millis(10));
                 }
-                next_to_assign += 1;
-            }
-
-            thread::sleep(std::time::Duration::from_millis(10));
-        }
             })
             .expect("failed to spawn prefetch-dispatch thread"),
     );
@@ -526,10 +558,15 @@ mod tests {
             handle.abandon();
             let _ = done_tx.send(());
         });
-        let returned = done_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let returned = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
         let _ = release_tx.send(());
         assert!(returned, "abandon must not wait for a busy worker");
-        assert!(shutdown.load(Ordering::Relaxed), "abandon must signal the workers");
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "abandon must signal the workers"
+        );
     }
 
     #[test]
@@ -560,13 +597,26 @@ mod tests {
 
         let running = AtomicBool::new(false);
         assert_eq!(
-            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, ScriptContext::unmined(1), &running),
+            verify_speculatively(
+                &verifiable,
+                PrimaryEngine::Rust,
+                network,
+                ScriptContext::unmined(1),
+                &running
+            ),
             HashSet::from([1]),
             "fixture: the transaction must verify when not cancelled"
         );
         let stopped = AtomicBool::new(true);
         assert!(
-            verify_speculatively(&verifiable, PrimaryEngine::Rust, network, ScriptContext::unmined(1), &stopped).is_empty(),
+            verify_speculatively(
+                &verifiable,
+                PrimaryEngine::Rust,
+                network,
+                ScriptContext::unmined(1),
+                &stopped
+            )
+            .is_empty(),
             "a cancelled verification must verify nothing"
         );
     }

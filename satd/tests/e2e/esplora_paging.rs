@@ -11,8 +11,10 @@
 
 use std::str::FromStr;
 
-use super::{E2eNode, EsploraClient, esplora_e2e_args, esplora_for, esplora_get_json,
-    esplora_scripthash_of_spk};
+use super::{
+    E2eNode, EsploraClient, esplora_e2e_args, esplora_for, esplora_get_json,
+    esplora_scripthash_of_spk,
+};
 use crate::common::{self, DeterministicWallet, build_signed_p2wpkh_spend_of_coinbase};
 
 fn mine(e2e: &E2eNode, n: u64, wallet: &DeterministicWallet) {
@@ -80,7 +82,10 @@ fn test_e2e_esplora_txs_after_txid_continues_the_history() {
     assert_eq!(heights(&page1), (6..=30).rev().collect::<Vec<u64>>());
     let cursor = txids(&page1)[24].clone();
 
-    let page2 = esplora_get_json(&esplora, &format!("/address/{a_str}/txs?after_txid={cursor}"));
+    let page2 = esplora_get_json(
+        &esplora,
+        &format!("/address/{a_str}/txs?after_txid={cursor}"),
+    );
     assert_eq!(
         heights(&page2),
         vec![5, 4, 3, 2, 1],
@@ -89,7 +94,10 @@ fn test_e2e_esplora_txs_after_txid_continues_the_history() {
     // The path form answers the same page, and so does the scripthash family.
     let chain_page2 = esplora_get_json(&esplora, &format!("/address/{a_str}/txs/chain/{cursor}"));
     assert_eq!(txids(&page2), txids(&chain_page2));
-    let sh_page2 = esplora_get_json(&esplora, &format!("/scripthash/{a_sh}/txs?after_txid={cursor}"));
+    let sh_page2 = esplora_get_json(
+        &esplora,
+        &format!("/scripthash/{a_sh}/txs?after_txid={cursor}"),
+    );
     assert_eq!(txids(&page2), txids(&sh_page2));
 
     // After the oldest transaction there is nothing more.
@@ -106,11 +114,15 @@ fn test_e2e_esplora_txs_after_txid_continues_the_history() {
     let not_a_tx = common::coinbase_txid_at(&e2e.node, 31);
     let zero = "0000000000000000000000000000000000000000000000000000000000000000";
     for unknown in [not_a_tx.as_str(), zero] {
-        let (status, body) =
-            get_text(&esplora, &format!("/address/{a_str}/txs?after_txid={unknown}"));
+        let (status, body) = get_text(
+            &esplora,
+            &format!("/address/{a_str}/txs?after_txid={unknown}"),
+        );
         assert_eq!((status, body.as_str()), (422, "after_txid not found"));
-        let (status, body) =
-            get_text(&esplora, &format!("/scripthash/{a_sh}/txs?after_txid={unknown}"));
+        let (status, body) = get_text(
+            &esplora,
+            &format!("/scripthash/{a_sh}/txs?after_txid={unknown}"),
+        );
         assert_eq!((status, body.as_str()), (422, "after_txid not found"));
     }
     let (status, _) = get_text(&esplora, &format!("/address/{a_str}/txs?after_txid=nothex"));
@@ -119,10 +131,20 @@ fn test_e2e_esplora_txs_after_txid_continues_the_history() {
     // Mempool cursor: `b` has two unconfirmed transactions and no confirmed
     // history. After the first comes the second; after the second, nothing.
     for height in [31u64, 32] {
-        let (raw, _) =
-            build_signed_p2wpkh_spend_of_coinbase(&e2e.node, &w, height, b.address.script_pubkey(), 1000);
+        let (raw, _) = build_signed_p2wpkh_spend_of_coinbase(
+            &e2e.node,
+            &w,
+            height,
+            b.address.script_pubkey(),
+            1000,
+        );
         let r = esplora.post_tx(&raw);
-        assert_eq!(r.status(), 200, "broadcast: {}", r.text().unwrap_or_default());
+        assert_eq!(
+            r.status(),
+            200,
+            "broadcast: {}",
+            r.text().unwrap_or_default()
+        );
     }
     let b_str = b.address.to_string();
     let b_path = format!("/address/{b_str}/txs");
@@ -140,11 +162,9 @@ fn test_e2e_esplora_txs_after_txid_continues_the_history() {
         "both of b's transactions are unconfirmed: {b_page1}"
     );
     let b_txids = txids(&b_page1);
-    let after_first =
-        esplora_get_json(&esplora, &format!("{b_path}?after_txid={}", b_txids[0]));
+    let after_first = esplora_get_json(&esplora, &format!("{b_path}?after_txid={}", b_txids[0]));
     assert_eq!(txids(&after_first), vec![b_txids[1].clone()]);
-    let after_second =
-        esplora_get_json(&esplora, &format!("{b_path}?after_txid={}", b_txids[1]));
+    let after_second = esplora_get_json(&esplora, &format!("{b_path}?after_txid={}", b_txids[1]));
     assert_eq!(txids(&after_second), Vec::<String>::new());
 
     e2e.node.stop();

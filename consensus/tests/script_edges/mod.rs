@@ -10,8 +10,10 @@
 
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;
-use bitcoin::hashes::{hash160, sha256, sha256d, Hash, HashEngine};
-use bitcoin::secp256k1::{Keypair, Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
+use bitcoin::hashes::{Hash, HashEngine, hash160, sha256, sha256d};
+use bitcoin::secp256k1::{
+    Keypair, Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey,
+};
 use bitcoin::sighash::SighashCache;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
@@ -59,7 +61,10 @@ impl Case {
                 sequence: Sequence::MAX,
                 witness: Witness::from_slice(witness),
             }],
-            output: vec![TxOut { value: spent.value, script_pubkey: ScriptBuf::new() }],
+            output: vec![TxOut {
+                value: spent.value,
+                script_pubkey: ScriptBuf::new(),
+            }],
         };
         Case { tx, spent, flags }
     }
@@ -73,14 +78,24 @@ impl Case {
     }
 
     pub fn witness(&self) -> Vec<Vec<u8>> {
-        self.tx.input[0].witness.iter().map(|w| w.to_vec()).collect()
+        self.tx.input[0]
+            .witness
+            .iter()
+            .map(|w| w.to_vec())
+            .collect()
     }
 
     /// Verify input 0 with the Rust interpreter.
     pub fn verify(&self) -> Result<(), ScriptError> {
         let prev = [self.spent.clone()];
         let checker = TxSignatureChecker::new(&self.tx, 0, self.spent.value, &prev);
-        verify_script(self.script_sig(), self.script_pubkey(), &self.witness(), self.flags, &checker)
+        verify_script(
+            self.script_sig(),
+            self.script_pubkey(),
+            &self.witness(),
+            self.flags,
+            &checker,
+        )
     }
 }
 
@@ -100,7 +115,12 @@ pub fn pushdata2_missing_a_length_byte() -> Case {
 /// PUSHDATA2 and all, before the signature is looked at.
 pub fn pushdata2_missing_a_length_byte_after_checksig() -> Case {
     // Push sig [07], pubkey [01].
-    Case::new(&[0x01, 0x07, 0x01, 0x01], &[0xac, 0x4d, 0x01], &[], flags::VERIFY_NONE)
+    Case::new(
+        &[0x01, 0x07, 0x01, 0x01],
+        &[0xac, 0x4d, 0x01],
+        &[],
+        flags::VERIFY_NONE,
+    )
 }
 
 /// The same scriptCode as a P2SH redeemScript, under every flag: what a
@@ -116,12 +136,22 @@ pub fn p2sh_redeem_script_with_a_truncated_pushdata2() -> Case {
 
 /// PUSHDATA4 with length 0x00010001 (byte 2 set) and one byte of data.
 pub fn pushdata4_length_with_byte_2_set() -> Case {
-    Case::new(&[], &[0x4e, 0x01, 0x00, 0x01, 0x00, 0x51], &[], flags::VERIFY_NONE)
+    Case::new(
+        &[],
+        &[0x4e, 0x01, 0x00, 0x01, 0x00, 0x51],
+        &[],
+        flags::VERIFY_NONE,
+    )
 }
 
 /// PUSHDATA4 with length 1 and one byte of data, which is true.
 pub fn pushdata4_length_of_one() -> Case {
-    Case::new(&[], &[0x4e, 0x01, 0x00, 0x00, 0x00, 0x51], &[], flags::VERIFY_NONE)
+    Case::new(
+        &[],
+        &[0x4e, 0x01, 0x00, 0x00, 0x00, 0x51],
+        &[],
+        flags::VERIFY_NONE,
+    )
 }
 
 /// A 257-byte redeemScript, `PUSHDATA1 <253 zero bytes> OP_DROP OP_1`, pushed
@@ -212,7 +242,9 @@ pub fn taproot_script_path_with_nodes(nodes: usize) -> Case {
     let (internal, _) = XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(&secp, &sk));
     let leaf = [0x51u8]; // OP_1
     let mut root = tagged_hash(b"TapLeaf", &[&[0xc0, leaf.len() as u8], &leaf]);
-    let path: Vec<[u8; 32]> = (0..nodes as u32).map(|i| sha256::Hash::hash(&i.to_le_bytes()).to_byte_array()).collect();
+    let path: Vec<[u8; 32]> = (0..nodes as u32)
+        .map(|i| sha256::Hash::hash(&i.to_le_bytes()).to_byte_array())
+        .collect();
     for node in &path {
         root = if root < *node {
             tagged_hash(b"TapBranch", &[&root, node])
@@ -221,7 +253,9 @@ pub fn taproot_script_path_with_nodes(nodes: usize) -> Case {
         };
     }
     let tweak = tagged_hash(b"TapTweak", &[&internal.serialize(), &root]);
-    let (output, parity) = internal.add_tweak(&secp, &Scalar::from_be_bytes(tweak).unwrap()).unwrap();
+    let (output, parity) = internal
+        .add_tweak(&secp, &Scalar::from_be_bytes(tweak).unwrap())
+        .unwrap();
     let mut spk = vec![0x51, 0x20];
     spk.extend_from_slice(&output.serialize());
     let mut control = vec![0xc0 | u8::from(parity == Parity::Odd)];

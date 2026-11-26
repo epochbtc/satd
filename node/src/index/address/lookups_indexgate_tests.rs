@@ -27,8 +27,8 @@ fn indexes_with_cursor(
     state: BackfillState,
 ) -> (RocksAddressIndex, RocksSpendIndex, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap())
-        as Arc<dyn Store>;
+    let store =
+        Arc::new(RocksDbStore::open(dir.path(), false, 16, false, -1).unwrap()) as Arc<dyn Store>;
     let batch = StoreBatch {
         backfill_cursor_advance: Some(BackfillCursorWrite {
             state,

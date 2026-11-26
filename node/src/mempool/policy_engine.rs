@@ -430,22 +430,37 @@ mod tests {
         assert_eq!(classify_script(&spk(p2tr)), ScriptType::P2tr);
 
         // OP_RETURN
-        assert_eq!(classify_script(&spk(vec![0x6a, 0x01, 0x00])), ScriptType::OpReturn);
+        assert_eq!(
+            classify_script(&spk(vec![0x6a, 0x01, 0x00])),
+            ScriptType::OpReturn
+        );
 
         // P2A anchor
-        assert_eq!(classify_script(&spk(vec![0x51, 0x02, 0x4e, 0x73])), ScriptType::P2a);
+        assert_eq!(
+            classify_script(&spk(vec![0x51, 0x02, 0x4e, 0x73])),
+            ScriptType::P2a
+        );
 
         // Garbage ⇒ nonstandard
-        assert_eq!(classify_script(&spk(vec![0xff, 0xff])), ScriptType::Nonstandard);
+        assert_eq!(
+            classify_script(&spk(vec![0xff, 0xff])),
+            ScriptType::Nonstandard
+        );
     }
 
     #[test]
     fn p2a_is_not_a_generic_witness_unknown() {
         // The anchor must classify as P2a, never as the witness-unknown catch-all
         // (a dust filter that carved out P2a depends on this — design §17.3 E1).
-        assert_eq!(classify_script(&spk(vec![0x51, 0x02, 0x4e, 0x73])), ScriptType::P2a);
+        assert_eq!(
+            classify_script(&spk(vec![0x51, 0x02, 0x4e, 0x73])),
+            ScriptType::P2a
+        );
         // A different 2-byte v1 program is witness_unknown, not P2a.
-        assert_eq!(classify_script(&spk(vec![0x51, 0x02, 0x00, 0x00])), ScriptType::WitnessUnknown);
+        assert_eq!(
+            classify_script(&spk(vec![0x51, 0x02, 0x00, 0x00])),
+            ScriptType::WitnessUnknown
+        );
     }
 
     /// `out.is_dust` judges at `-dustrelayfee`, and at the default rate when
@@ -456,16 +471,34 @@ mod tests {
         p2wpkh.extend_from_slice(&[0u8; 20]);
         let p2wpkh = spk(p2wpkh);
         let at = |rate: u64| policy::dust_threshold_with_rate(&p2wpkh, rate);
-        let output = |value: u64| TxOut { value: bitcoin::Amount::from_sat(value), script_pubkey: p2wpkh.clone() };
-        let mut cfg = MempoolConfig { dust_relay_fee: 0, ..Default::default() };
-        assert!(output_is_dust(&output(at(policy::DUST_RELAY_FEE_RATE) - 1), &cfg));
-        assert!(!output_is_dust(&output(at(policy::DUST_RELAY_FEE_RATE)), &cfg));
+        let output = |value: u64| TxOut {
+            value: bitcoin::Amount::from_sat(value),
+            script_pubkey: p2wpkh.clone(),
+        };
+        let mut cfg = MempoolConfig {
+            dust_relay_fee: 0,
+            ..Default::default()
+        };
+        assert!(output_is_dust(
+            &output(at(policy::DUST_RELAY_FEE_RATE) - 1),
+            &cfg
+        ));
+        assert!(!output_is_dust(
+            &output(at(policy::DUST_RELAY_FEE_RATE)),
+            &cfg
+        ));
 
         // Set, the configured rate is the one used.
         cfg.dust_relay_fee = 2 * policy::DUST_RELAY_FEE_RATE;
         assert!(at(2 * policy::DUST_RELAY_FEE_RATE) > at(policy::DUST_RELAY_FEE_RATE));
-        assert!(output_is_dust(&output(at(policy::DUST_RELAY_FEE_RATE)), &cfg));
-        assert!(!output_is_dust(&output(at(2 * policy::DUST_RELAY_FEE_RATE)), &cfg));
+        assert!(output_is_dust(
+            &output(at(policy::DUST_RELAY_FEE_RATE)),
+            &cfg
+        ));
+        assert!(!output_is_dust(
+            &output(at(2 * policy::DUST_RELAY_FEE_RATE)),
+            &cfg
+        ));
     }
 
     #[test]
@@ -623,7 +656,10 @@ mod tests {
         assert_eq!(traces[1].name, "bulk");
         assert!(traces[1].evaluated && traces[1].matched && traces[1].decisive);
         assert_eq!(traces[2].name, "later");
-        assert!(!traces[2].evaluated, "later rule is never reached (first-match-wins)");
+        assert!(
+            !traces[2].evaluated,
+            "later rule is never reached (first-match-wins)"
+        );
         assert!(matches!(verdict, satd_policy::Verdict::Quarantine { .. }));
         assert_eq!(verdict.rule(), Some("bulk"));
     }
@@ -636,11 +672,23 @@ mod tests {
         use bitcoin::blockdata::locktime::absolute::LockTime;
         use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness, transaction};
 
-        let ruleset = satd_policy::parse_ruleset("version 1\nquarantine rbf when tx.signals_rbf").unwrap();
+        let ruleset =
+            satd_policy::parse_ruleset("version 1\nquarantine rbf when tx.signals_rbf").unwrap();
         let cfg = MempoolConfig::default();
-        let ctx = PolicyCtx { network: BNetwork::Regtest, height: 1, mempool_bytes: 0 };
-        let prev = vec![TxOut { value: Amount::from_sat(10_000), script_pubkey: spk(vec![0x51]) }];
-        for (sequence, signals) in [(0xffff_fffd, true), (0xffff_fffe, false), (0xffff_ffff, false)] {
+        let ctx = PolicyCtx {
+            network: BNetwork::Regtest,
+            height: 1,
+            mempool_bytes: 0,
+        };
+        let prev = vec![TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: spk(vec![0x51]),
+        }];
+        for (sequence, signals) in [
+            (0xffff_fffd, true),
+            (0xffff_fffe, false),
+            (0xffff_ffff, false),
+        ] {
             let tx = Transaction {
                 version: transaction::Version(2),
                 lock_time: LockTime::ZERO,
@@ -650,7 +698,10 @@ mod tests {
                     sequence: Sequence(sequence),
                     witness: Witness::new(),
                 }],
-                output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: spk(vec![0x51]) }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: spk(vec![0x51]),
+                }],
             };
             let verdict = evaluate(
                 &ruleset,
@@ -666,7 +717,11 @@ mod tests {
                 TxSource::P2p,
                 false,
             );
-            assert_eq!(verdict.rule() == Some("rbf"), signals, "nSequence {sequence:#x}");
+            assert_eq!(
+                verdict.rule() == Some("rbf"),
+                signals,
+                "nSequence {sequence:#x}"
+            );
         }
     }
 }

@@ -34,7 +34,10 @@ fn light_script() -> Vec<u8> {
 }
 
 fn prev(tag: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
+    OutPoint {
+        txid: Txid::from_byte_array([tag; 32]),
+        vout: 0,
+    }
 }
 
 fn p2wsh_coin(script: &[u8]) -> Coin {
@@ -59,7 +62,9 @@ fn spend(prevout: OutPoint, script: &[u8], fee: u64) -> Transaction {
         }],
         output: vec![TxOut {
             value: Amount::from_sat(COIN_VALUE - fee),
-            script_pubkey: ScriptBuf::from_bytes([&[0x00, 0x14][..], &[prevout.txid[0]; 20]].concat()),
+            script_pubkey: ScriptBuf::from_bytes(
+                [&[0x00, 0x14][..], &[prevout.txid[0]; 20]].concat(),
+            ),
         }],
     }
 }
@@ -70,7 +75,10 @@ fn the_adjusted_weight_is_the_larger_of_weight_and_sigops_times_twenty() {
     assert_eq!(policy::sigops_adjusted_weight(1_000, 10), 1_000);
     assert_eq!(policy::sigops_adjusted_weight(1_000, 50), 1_000);
     assert_eq!(policy::sigops_adjusted_weight(1_000, 51), 1_020);
-    assert_eq!(policy::sigops_adjusted_weight(400, HEAVY_SIGOPS), 4 * HEAVY_VSIZE);
+    assert_eq!(
+        policy::sigops_adjusted_weight(400, HEAVY_SIGOPS),
+        4 * HEAVY_VSIZE
+    );
 }
 
 /// The relay floor, `testmempoolaccept`'s `vsize` and `getmempoolentry`'s
@@ -85,16 +93,25 @@ fn a_sigop_dense_transaction_pays_for_its_adjusted_size() {
     // 1000 sat covers its weight many times over, and 19705 vbytes not.
     let cheap = spend(prev(1), &ws, 1_000);
     assert!(cheap.weight().to_wu() < 1_000, "{}", cheap.weight());
-    let err = mp.accept_transaction(cheap.clone(), &cs, &NoopVerifier, TxSource::Rpc, false).expect_err("refused");
-    assert_eq!(err.state_string(), format!("min relay fee not met, 1000 < {HEAVY_VSIZE}"));
-    let err = mp.test_accept(&cheap, &cs, &NoopVerifier).expect_err("refused");
+    let err = mp
+        .accept_transaction(cheap.clone(), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect_err("refused");
+    assert_eq!(
+        err.state_string(),
+        format!("min relay fee not met, 1000 < {HEAVY_VSIZE}")
+    );
+    let err = mp
+        .test_accept(&cheap, &cs, &NoopVerifier)
+        .expect_err("refused");
     assert_eq!(err.reject_reason(), "min relay fee not met");
 
     let paid = spend(prev(2), &ws, HEAVY_VSIZE);
     let (_, vsize, _) = mp.test_accept(&paid, &cs, &NoopVerifier).expect("accepted");
     assert_eq!(vsize as u64, HEAVY_VSIZE);
     let weight = paid.weight().to_wu();
-    let txid = mp.accept_transaction(paid, &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+    let txid = mp
+        .accept_transaction(paid, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("admitted");
     let entry = mp.get_entry_verbose(&txid).expect("resident");
     assert_eq!(entry["vsize"], serde_json::json!(HEAVY_VSIZE));
     assert_eq!(entry["weight"], serde_json::json!(weight));
@@ -111,17 +128,38 @@ fn the_template_ranks_by_the_adjusted_feerate() {
     let coins = vec![(prev(1), p2wsh_coin(&heavy)), (prev(2), p2wsh_coin(&light))];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     let heavy_tx = mp
-        .accept_transaction(spend(prev(1), &heavy, 15_000), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .accept_transaction(
+            spend(prev(1), &heavy, 15_000),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
         .expect("admitted");
     let light_tx = mp
-        .accept_transaction(spend(prev(2), &light, 1_000), &cs, &NoopVerifier, TxSource::Rpc, false)
+        .accept_transaction(
+            spend(prev(2), &light, 1_000),
+            &cs,
+            &NoopVerifier,
+            TxSource::Rpc,
+            false,
+        )
         .expect("admitted");
 
     let template = crate::mining::template::create_template(&cs, &mp);
-    let order: Vec<Txid> = template.transactions.iter().map(|t| t.tx.compute_txid()).collect();
+    let order: Vec<Txid> = template
+        .transactions
+        .iter()
+        .map(|t| t.tx.compute_txid())
+        .collect();
     assert_eq!(order, vec![light_tx, heavy_tx]);
     // A template transaction's `weight` is its own.
-    assert!(template.transactions.iter().all(|t| t.weight == t.tx.weight().to_wu() as usize));
+    assert!(
+        template
+            .transactions
+            .iter()
+            .all(|t| t.weight == t.tx.weight().to_wu() as usize)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -134,17 +172,34 @@ fn a_replacement_pays_relay_for_its_adjusted_size() {
     let coins = vec![(prev(1), p2wsh_coin(&ws))];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     mp.config.write().incremental_relay_fee = 100;
-    mp.accept_transaction(spend(prev(1), &ws, 20_000), &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+    mp.accept_transaction(
+        spend(prev(1), &ws, 20_000),
+        &cs,
+        &NoopVerifier,
+        TxSource::Rpc,
+        false,
+    )
+    .expect("admitted");
 
     let mut short = spend(prev(1), &ws, 20_500);
-    short.output[0].script_pubkey = ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x77; 20]].concat());
-    let err = mp.accept_transaction(short, &cs, &NoopVerifier, TxSource::Rpc, false).expect_err("refused");
+    short.output[0].script_pubkey =
+        ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x77; 20]].concat());
+    let err = mp
+        .accept_transaction(short, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect_err("refused");
     assert_eq!(err.reject_reason(), "insufficient fee", "{err:?}");
-    assert!(err.state_string().contains("not enough additional fees to relay"), "{}", err.state_string());
+    assert!(
+        err.state_string()
+            .contains("not enough additional fees to relay"),
+        "{}",
+        err.state_string()
+    );
 
     let mut enough = spend(prev(1), &ws, 20_000 + 1_971);
-    enough.output[0].script_pubkey = ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x78; 20]].concat());
-    mp.accept_transaction(enough, &cs, &NoopVerifier, TxSource::Rpc, false).expect("pays its relay");
+    enough.output[0].script_pubkey =
+        ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x78; 20]].concat());
+    mp.accept_transaction(enough, &cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("pays its relay");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -153,9 +208,9 @@ fn a_replacement_pays_relay_for_its_adjusted_size() {
 /// transaction.
 const CORE_FUNDING_TXID: &str = "ab907b3945981a9c4b2b8a9e70ef4fa5720f49acdc3c321e0387f6956487cd71";
 const CORE_PLAIN_SPEND: &str = concat!(
-        "0200000000010171cd876495f687031e323cdcac490f72a54fef709e8a2b4b9c1a9845397b90ab0100000000fdffffff",
-        "01c0030d24010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
-        "000000",
+    "0200000000010171cd876495f687031e323cdcac490f72a54fef709e8a2b4b9c1a9845397b90ab0100000000fdffffff",
+    "01c0030d24010000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326001015100",
+    "000000",
 );
 
 fn core_heavy_spend() -> String {
@@ -186,8 +241,20 @@ fn mempool_entries_carry_core_v32_1_vsize_bip141_and_vsize_adjusted() {
         txseq: node_index::TXSEQ_UNKNOWN,
     };
     let coins = vec![
-        (OutPoint { txid: funding, vout: 0 }, coin(&heavy_script(), 100_000_000)),
-        (OutPoint { txid: funding, vout: 1 }, coin(&[0x51], 4_899_900_000)),
+        (
+            OutPoint {
+                txid: funding,
+                vout: 0,
+            },
+            coin(&heavy_script(), 100_000_000),
+        ),
+        (
+            OutPoint {
+                txid: funding,
+                vout: 1,
+            },
+            coin(&[0x51], 4_899_900_000),
+        ),
     ];
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
     for (hex, want) in [
@@ -195,10 +262,22 @@ fn mempool_entries_carry_core_v32_1_vsize_bip141_and_vsize_adjusted() {
         (core_heavy_spend(), (19_705, 19_705, 146, 583)),
     ] {
         let tx: Transaction = bitcoin::consensus::encode::deserialize_hex(&hex).unwrap();
-        let txid = mp.accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted");
+        let txid = mp
+            .accept_transaction(tx, &cs, &NoopVerifier, TxSource::Rpc, false)
+            .expect("admitted");
         let e = mp.get_entry_verbose(&txid).expect("resident");
-        let got = (&e["vsize"], &e["vsize_adjusted"], &e["vsize_bip141"], &e["weight"]);
-        let want = (&serde_json::json!(want.0), &serde_json::json!(want.1), &serde_json::json!(want.2), &serde_json::json!(want.3));
+        let got = (
+            &e["vsize"],
+            &e["vsize_adjusted"],
+            &e["vsize_bip141"],
+            &e["weight"],
+        );
+        let want = (
+            &serde_json::json!(want.0),
+            &serde_json::json!(want.1),
+            &serde_json::json!(want.2),
+            &serde_json::json!(want.3),
+        );
         assert_eq!(got, want, "{e}");
     }
     let _ = std::fs::remove_dir_all(&dir);

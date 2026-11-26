@@ -421,7 +421,10 @@ mod tests {
             .stint
             .begin_backdated(0.05, std::time::Duration::from_secs(3600));
         let eta = render_status(Some(&h), true, false).estimated_remaining_seconds;
-        assert!((13_300..=13_700).contains(&eta), "expected ~13500s, got {eta}");
+        assert!(
+            (13_300..=13_700).contains(&eta),
+            "expected ~13500s, got {eta}"
+        );
     }
 
     /// The #532 guard: a backfill that is not running reports no ETA even
@@ -459,7 +462,10 @@ mod tests {
         h.inner
             .stint
             .begin_backdated(0.05, std::time::Duration::from_secs(3600));
-        assert_eq!(render_status(Some(&h), false, false).estimated_remaining_seconds, 0);
+        assert_eq!(
+            render_status(Some(&h), false, false).estimated_remaining_seconds,
+            0
+        );
     }
 
     #[test]

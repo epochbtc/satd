@@ -1,10 +1,9 @@
 use bitcoin::block::{Header, Version};
-use bitcoin::hashes::Hash;
-use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::opcodes;
+use bitcoin::blockdata::script::Builder;
+use bitcoin::hashes::Hash;
 use bitcoin::{
-    Address, Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-    Witness,
+    Address, Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 
 use crate::chain::state::ChainState;
@@ -80,7 +79,11 @@ pub fn mine_block(
     mempool: &Mempool,
     address: &str,
 ) -> Result<Block, MineError> {
-    mine_block_to_script(chain_state, mempool, address_to_script(chain_state, address)?)
+    mine_block_to_script(
+        chain_state,
+        mempool,
+        address_to_script(chain_state, address)?,
+    )
 }
 
 /// [`build_block_to_script_within`] on a fresh default budget, for the callers
@@ -135,7 +138,13 @@ pub fn build_block_to_script_within(
         ),
     };
 
-    let mut block = unsolved_block(chain_state, &template, &coinbase_script, coinbase_value, other_txs);
+    let mut block = unsolved_block(
+        chain_state,
+        &template,
+        &coinbase_script,
+        coinbase_value,
+        other_txs,
+    );
     check_before_solving(chain_state, &block, template.height, from_mempool)?;
 
     if !solve(&mut block.header, budget) {
@@ -203,10 +212,14 @@ pub fn mine_block_only(
 
     let coinbase_script = resolve_output_descriptor(output, chain_state.network)?;
 
-    let other_txs: Vec<Transaction> =
-        template.transactions.iter().map(|t| t.tx.clone()).collect();
-    let mut block =
-        unsolved_block(chain_state, &template, &coinbase_script, template.coinbase_value, other_txs);
+    let other_txs: Vec<Transaction> = template.transactions.iter().map(|t| t.tx.clone()).collect();
+    let mut block = unsolved_block(
+        chain_state,
+        &template,
+        &coinbase_script,
+        template.coinbase_value,
+        other_txs,
+    );
     check_before_solving(chain_state, &block, template.height, true)?;
 
     let mut budget = DEFAULT_MAX_TRIES;
@@ -259,29 +272,35 @@ pub fn build_solved_block(
         if explicit_txs.is_empty() {
             subsidy
         } else {
-        // Sum up fees: look up each input's value from the UTXO set,
-        // then subtract the output total. For regtest mining this is the
-        // straightforward path.
-        let mut total_fees = 0u64;
-        for tx in &explicit_txs {
-            let mut input_sum = 0u64;
-            for input in &tx.input {
-                if let Some(coin) = chain_state.get_coin(&input.previous_output) {
-                    input_sum += coin.amount;
-                } else if let Some(entry) = mempool.get(&input.previous_output.txid)
-                    && let Some(out) = entry.tx.output.get(input.previous_output.vout as usize)
-                {
-                    input_sum += out.value.to_sat();
+            // Sum up fees: look up each input's value from the UTXO set,
+            // then subtract the output total. For regtest mining this is the
+            // straightforward path.
+            let mut total_fees = 0u64;
+            for tx in &explicit_txs {
+                let mut input_sum = 0u64;
+                for input in &tx.input {
+                    if let Some(coin) = chain_state.get_coin(&input.previous_output) {
+                        input_sum += coin.amount;
+                    } else if let Some(entry) = mempool.get(&input.previous_output.txid)
+                        && let Some(out) = entry.tx.output.get(input.previous_output.vout as usize)
+                    {
+                        input_sum += out.value.to_sat();
+                    }
                 }
+                let output_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+                total_fees += input_sum.saturating_sub(output_sum);
             }
-            let output_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-            total_fees += input_sum.saturating_sub(output_sum);
-        }
             subsidy + total_fees
         }
     };
 
-    let mut block = unsolved_block(chain_state, &template, &coinbase_script, coinbase_value, explicit_txs);
+    let mut block = unsolved_block(
+        chain_state,
+        &template,
+        &coinbase_script,
+        coinbase_value,
+        explicit_txs,
+    );
     check_before_solving(chain_state, &block, template.height, false)?;
 
     let mut budget = DEFAULT_MAX_TRIES;
@@ -375,8 +394,8 @@ fn resolve_output_descriptor(
     network: bitcoin::Network,
 ) -> Result<ScriptBuf, MineError> {
     if let Some(inner) = desc.strip_prefix("raw(").and_then(|s| s.strip_suffix(')')) {
-        let bytes = hex::decode(inner)
-            .map_err(|e| MineError::BadAddress(format!("bad raw() hex: {e}")))?;
+        let bytes =
+            hex::decode(inner).map_err(|e| MineError::BadAddress(format!("bad raw() hex: {e}")))?;
         return Ok(ScriptBuf::from_bytes(bytes));
     }
     let addr_str = desc
@@ -448,19 +467,26 @@ fn check_before_solving(
     from_mempool: bool,
 ) -> Result<(), MineError> {
     use crate::mining::validity::{Check, CheckOrigin};
-    let outcome = crate::mining::validity::check_block(chain_state, block, height, Check::Structural);
+    let outcome =
+        crate::mining::validity::check_block(chain_state, block, height, Check::Structural);
     if from_mempool {
-        chain_state.template_validity().record(Check::Structural, &outcome, CheckOrigin::Generate);
+        chain_state
+            .template_validity()
+            .record(Check::Structural, &outcome, CheckOrigin::Generate);
     }
     match outcome.verdict {
-        crate::chain::state::TemplateVerdict::Invalid(reason) => Err(MineError::TemplateInvalid(reason)),
+        crate::chain::state::TemplateVerdict::Invalid(reason) => {
+            Err(MineError::TemplateInvalid(reason))
+        }
         _ => Ok(()),
     }
 }
 
 fn needs_witness_commitment(chain_state: &ChainState, height: u32, txs: &[Transaction]) -> bool {
     crate::validation::block::segwit_active_at(chain_state.network, height)
-        || txs.iter().any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
+        || txs
+            .iter()
+            .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
 }
 
 fn build_coinbase(height: u32, value: u64, output_script: &ScriptBuf) -> Transaction {
@@ -501,7 +527,10 @@ fn compute_merkle_root(txdata: &[Transaction]) -> bitcoin::TxMerkleNode {
         );
     }
 
-    let mut current: Vec<[u8; 32]> = hashes.iter().map(|h| h.to_raw_hash().to_byte_array()).collect();
+    let mut current: Vec<[u8; 32]> = hashes
+        .iter()
+        .map(|h| h.to_raw_hash().to_byte_array())
+        .collect();
 
     while current.len() > 1 {
         if !current.len().is_multiple_of(2) {
@@ -535,7 +564,11 @@ fn compute_witness_root(_coinbase: &Transaction, others: &[Transaction]) -> [u8;
     // Other transactions use their wtxid, as Core's `GetWitnessHash` gives it
     // (`generateblock` can be handed one with no inputs).
     for tx in others {
-        hashes.push(crate::validation::decode::wtxid(tx).to_raw_hash().to_byte_array());
+        hashes.push(
+            crate::validation::decode::wtxid(tx)
+                .to_raw_hash()
+                .to_byte_array(),
+        );
     }
 
     // Compute merkle root from these hashes
@@ -613,8 +646,7 @@ mod tests {
     /// half fails — the transaction leaves the pool as if it had confirmed.
     #[test]
     fn a_block_that_only_stored_does_not_purge_the_mempool() {
-        let dir = std::env::temp_dir()
-            .join(format!("satd-miner-stored-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("satd-miner-stored-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
         let cs = ChainState::new(
@@ -640,7 +672,12 @@ mod tests {
         let tx = block.txdata[0].clone();
 
         let txid = mp.insert_tx_scoped_for_test(tx.clone(), QuarantineScope::acting());
-        confirm_if_connected(&cs, &mp, &block, &BlockAcceptance::Stored(block.block_hash()));
+        confirm_if_connected(
+            &cs,
+            &mp,
+            &block,
+            &BlockAcceptance::Stored(block.block_hash()),
+        );
         assert!(
             mp.get(&txid).is_some(),
             "a stored-but-not-connected block confirms nothing; the pool must be untouched"
@@ -648,7 +685,12 @@ mod tests {
 
         // The same block on the connected outcome does purge it — otherwise
         // the assertion above would hold for the wrong reason.
-        confirm_if_connected(&cs, &mp, &block, &BlockAcceptance::Connected(block.block_hash()));
+        confirm_if_connected(
+            &cs,
+            &mp,
+            &block,
+            &BlockAcceptance::Connected(block.block_hash()),
+        );
         assert!(
             mp.get(&txid).is_none(),
             "a connected block must still purge what it confirmed"
@@ -656,9 +698,9 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    use crate::chain::state::AssumeValid;
     use crate::storage::db::InMemoryStore;
     use crate::storage::flatfile::FlatFileManager;
-    use crate::chain::state::AssumeValid;
     use crate::validation::script::NoopVerifier;
 
     #[test]
@@ -673,10 +715,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
 
@@ -691,7 +734,11 @@ mod tests {
         // Core commits to the witness root even in an empty block, and a
         // signet solution needs that output: without it an OP_TRUE
         // challenge rejects the block.
-        assert_eq!(block.txdata[0].output.len(), 2, "coinbase carries the commitment");
+        assert_eq!(
+            block.txdata[0].output.len(),
+            2,
+            "coinbase carries the commitment"
+        );
         assert!(block.check_witness_commitment());
         crate::validation::signet::check_signet_block_solution(
             &block,
@@ -705,10 +752,8 @@ mod tests {
 
     #[test]
     fn test_mine_multiple_blocks() {
-        let dir = std::env::temp_dir().join(format!(
-            "satd-miner-multi-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("satd-miner-multi-test-{}", std::process::id()));
         let store = Box::new(InMemoryStore::new());
         let flat_files = FlatFileManager::new(&dir.join("blocks")).unwrap();
         let cs = ChainState::new(
@@ -718,10 +763,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
 
@@ -752,10 +798,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
 
@@ -784,10 +831,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
 
@@ -820,10 +868,11 @@ mod tests {
             Box::new(NoopVerifier),
             AssumeValid::Disabled,
             450,
-        4,
-        Default::default(),
-        Default::default(),
-            Default::default(),)
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
         .unwrap();
         let mp = Mempool::new(1_000_000, 0);
 

@@ -31,7 +31,9 @@ impl Peer {
         let stream = loop {
             match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
                 Ok(s) => break s,
-                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
                 Err(e) => panic!("connect to {addr}: {e}"),
             }
         };
@@ -57,7 +59,9 @@ impl Peer {
 
     fn handshake(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
         let mut peer = Peer { stream };
         peer.send(NetworkMessage::Version(version()));
         let (mut got_version, mut got_verack) = (false, false);
@@ -75,7 +79,9 @@ impl Peer {
     }
 
     fn send(&mut self, msg: NetworkMessage) {
-        let _ = self.stream.write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
+        let _ = self
+            .stream
+            .write_all(&serialize(&RawNetworkMessage::new(Magic::REGTEST, msg)));
     }
 
     fn recv(&mut self, timeout: Duration) -> io::Result<NetworkMessage> {
@@ -86,16 +92,22 @@ impl Peer {
         let mut buf = header.to_vec();
         buf.resize(24 + len, 0);
         self.stream.read_exact(&mut buf[24..])?;
-        let raw: RawNetworkMessage =
-            deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let raw: RawNetworkMessage = deserialize(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(raw.into_payload())
     }
 
     /// Answer pings until the node sends a message `pred` accepts.
-    fn recv_until(&mut self, timeout: Duration, pred: impl Fn(&NetworkMessage) -> bool) -> Option<NetworkMessage> {
+    fn recv_until(
+        &mut self,
+        timeout: Duration,
+        pred: impl Fn(&NetworkMessage) -> bool,
+    ) -> Option<NetworkMessage> {
         let deadline = Instant::now() + timeout;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
             match self.recv(left) {
                 Ok(NetworkMessage::Ping(n)) => self.send(NetworkMessage::Pong(n)),
                 Ok(m) if pred(&m) => return Some(m),
@@ -113,8 +125,11 @@ impl Peer {
         let nonce = rand_nonce();
         self.send(NetworkMessage::Ping(nonce));
         assert!(
-            self.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::Pong(n) if *n == nonce))
-                .is_some(),
+            self.recv_until(
+                test_timeout(30),
+                |m| matches!(m, NetworkMessage::Pong(n) if *n == nonce)
+            )
+            .is_some(),
             "the node answers the ping"
         );
     }
@@ -177,7 +192,10 @@ fn peer_on(node: &TestNode, port: u16) -> serde_json::Value {
 
 fn addr_counts(node: &TestNode, port: u16) -> (u64, u64) {
     let p = peer_on(node, port);
-    (p["addr_processed"].as_u64().unwrap(), p["addr_rate_limited"].as_u64().unwrap())
+    (
+        p["addr_processed"].as_u64().unwrap(),
+        p["addr_rate_limited"].as_u64().unwrap(),
+    )
 }
 
 /// The addresses `addr_msg` announced that the address book holds (the
@@ -228,7 +246,11 @@ fn a_peers_addresses_are_rate_limited_unless_it_has_the_addr_permission() {
 
     let mut exempt = Peer::connect(exempt_port);
     exempt.send_and_sync(addr_msg(40, 1000));
-    assert_eq!(addr_counts(&node, exempt_port), (1000, 0), "the addr permission takes them all");
+    assert_eq!(
+        addr_counts(&node, exempt_port),
+        (1000, 0),
+        "the addr permission takes them all"
+    );
     assert_eq!(book_size(&node), 1011);
 }
 
@@ -239,14 +261,23 @@ fn an_addr_fetch_peers_answer_is_taken_whole() {
     let node = TestNode::start(&["--v2transport=0"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let target = listener.local_addr().unwrap().to_string();
-    node.rpc_ok("addconnection", vec![json!(target), json!("addr-fetch"), json!(false)]);
-    let mut peer = Peer::accept(&listener, test_timeout(30)).expect("the node dials the addr-fetch peer");
+    node.rpc_ok(
+        "addconnection",
+        vec![json!(target), json!("addr-fetch"), json!(false)],
+    );
+    let mut peer =
+        Peer::accept(&listener, test_timeout(30)).expect("the node dials the addr-fetch peer");
     assert!(
-        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr)).is_some(),
+        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr))
+            .is_some(),
         "the node asks for addresses"
     );
     peer.send(addr_msg(1, 600));
-    poll_until(|| book_size(&node) == 600, test_timeout(30), "all 600 addresses are learned");
+    poll_until(
+        || book_size(&node) == 600,
+        test_timeout(30),
+        "all 600 addresses are learned",
+    );
 }
 
 /// Core sends `getaddr` to every outbound peer that relays addresses, as
@@ -261,20 +292,33 @@ fn outbound_full_relay_peers_are_asked_for_addresses() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let target = listener.local_addr().unwrap().to_string();
 
-    node.rpc_ok("addconnection", vec![json!(target), json!("outbound-full-relay"), json!(false)]);
-    let mut peer = Peer::accept(&listener, test_timeout(30)).expect("the node dials the full-relay peer");
+    node.rpc_ok(
+        "addconnection",
+        vec![json!(target), json!("outbound-full-relay"), json!(false)],
+    );
+    let mut peer =
+        Peer::accept(&listener, test_timeout(30)).expect("the node dials the full-relay peer");
     assert!(
-        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr)).is_some(),
+        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr))
+            .is_some(),
         "the node asks its full-relay peer for addresses"
     );
     // Room for the whole answer, past the rate limit.
     peer.send(addr_msg(1, 600));
-    poll_until(|| book_size(&node) == 600, test_timeout(30), "all 600 addresses are learned");
+    poll_until(
+        || book_size(&node) == 600,
+        test_timeout(30),
+        "all 600 addresses are learned",
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let target = listener.local_addr().unwrap().to_string();
-    node.rpc_ok("addconnection", vec![json!(target), json!("block-relay-only"), json!(false)]);
-    let mut peer = Peer::accept(&listener, test_timeout(30)).expect("the node dials the block-relay peer");
+    node.rpc_ok(
+        "addconnection",
+        vec![json!(target), json!("block-relay-only"), json!(false)],
+    );
+    let mut peer =
+        Peer::accept(&listener, test_timeout(30)).expect("the node dials the block-relay peer");
     // The session setup goes out before the node reads anything, so by the
     // `pong` a `getaddr` would have come.
     let nonce = rand_nonce();
@@ -317,14 +361,23 @@ fn a_getaddr_answer_listing_a_high_service_bit_is_learned() {
     let node = TestNode::start(&["--v2transport=0"]);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let target = listener.local_addr().unwrap().to_string();
-    node.rpc_ok("addconnection", vec![json!(target), json!("outbound-full-relay"), json!(false)]);
-    let mut peer = Peer::accept(&listener, test_timeout(30)).expect("the node dials the full-relay peer");
+    node.rpc_ok(
+        "addconnection",
+        vec![json!(target), json!("outbound-full-relay"), json!(false)],
+    );
+    let mut peer =
+        Peer::accept(&listener, test_timeout(30)).expect("the node dials the full-relay peer");
     assert!(
-        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr)).is_some(),
+        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr))
+            .is_some(),
         "the node asks for addresses"
     );
     peer.send_and_sync(addrv2_with_service_bit_26(1, 600));
-    poll_until(|| book_size(&node) == 600, test_timeout(30), "all 600 addresses are learned");
+    poll_until(
+        || book_size(&node) == 600,
+        test_timeout(30),
+        "all 600 addresses are learned",
+    );
     let bit26 = node
         .rpc_ok("getnodeaddresses", vec![json!(0)])
         .as_array()
@@ -355,7 +408,10 @@ fn manual_connections_are_outside_the_automatic_outbound_target() {
     for _ in 0..3 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap().to_string();
-        node.rpc_ok("addconnection", vec![json!(target), json!("outbound-full-relay"), json!(false)]);
+        node.rpc_ok(
+            "addconnection",
+            vec![json!(target), json!("outbound-full-relay"), json!(false)],
+        );
         automatic.push(Peer::accept(&listener, test_timeout(30)).expect("an automatic peer"));
     }
     let outbound = |node: &TestNode| {
@@ -364,16 +420,30 @@ fn manual_connections_are_outside_the_automatic_outbound_target() {
             .unwrap()
             .iter()
             .filter(|p| p["inbound"] == json!(false))
-            .map(|p| (p["addr"].as_str().unwrap().to_string(), p["connection_type"].as_str().unwrap().to_string()))
+            .map(|p| {
+                (
+                    p["addr"].as_str().unwrap().to_string(),
+                    p["connection_type"].as_str().unwrap().to_string(),
+                )
+            })
             .collect::<Vec<_>>()
     };
-    poll_until(|| outbound(&node).len() == 3, test_timeout(20), "three automatic peers");
+    poll_until(
+        || outbound(&node).len() == 3,
+        test_timeout(20),
+        "three automatic peers",
+    );
 
     // `onetry`, with the automatic slots full.
     let one = TcpListener::bind("127.0.0.1:0").unwrap();
     let one_addr = one.local_addr().unwrap().to_string();
-    let out = node.rpc_call_with_params("addnode", vec![json!(one_addr), json!("onetry")]).unwrap();
-    assert!(out["error"].is_null(), "onetry is outside the automatic target: {out}");
+    let out = node
+        .rpc_call_with_params("addnode", vec![json!(one_addr), json!("onetry")])
+        .unwrap();
+    assert!(
+        out["error"].is_null(),
+        "onetry is outside the automatic target: {out}"
+    );
     let _one = Peer::accept(&one, test_timeout(30)).expect("the onetry dial");
     poll_until(
         || outbound(&node).contains(&(one_addr.clone(), "manual".to_string())),
@@ -381,8 +451,13 @@ fn manual_connections_are_outside_the_automatic_outbound_target() {
         "the onetry peer is a manual connection",
     );
     // And again, to the connected peer: null, as in Core.
-    let out = node.rpc_call_with_params("addnode", vec![json!(one_addr), json!("onetry")]).unwrap();
-    assert!(out["error"].is_null(), "onetry to a connected peer answers null: {out}");
+    let out = node
+        .rpc_call_with_params("addnode", vec![json!(one_addr), json!("onetry")])
+        .unwrap();
+    assert!(
+        out["error"].is_null(),
+        "onetry to a connected peer answers null: {out}"
+    );
     assert_eq!(out["result"], json!(null));
 
     // An added node whose first dial fails is dialled again.
@@ -391,13 +466,18 @@ fn manual_connections_are_outside_the_automatic_outbound_target() {
     node.rpc_ok("addnode", vec![json!(added), json!("add")]);
     std::thread::sleep(Duration::from_secs(1));
     let listener = TcpListener::bind(&added).unwrap();
-    let _added = Peer::accept(&listener, test_timeout(40)).expect("the added node is dialled again");
+    let _added =
+        Peer::accept(&listener, test_timeout(40)).expect("the added node is dialled again");
     poll_until(
         || outbound(&node).contains(&(added.clone(), "manual".to_string())),
         test_timeout(20),
         "the added node is a manual connection",
     );
-    assert_eq!(outbound(&node).len(), 5, "three automatic peers and two manual ones");
+    assert_eq!(
+        outbound(&node).len(),
+        5,
+        "three automatic peers and two manual ones"
+    );
     node.stop();
 }
 
@@ -484,11 +564,16 @@ fn a_seednode_name_under_a_proxy_is_fetched_by_name_through_it() {
 
     let (stream, atyp, host, port) = socks5_accept(&proxy, test_timeout(60));
     assert_eq!(atyp, 3, "the name goes to the proxy unresolved");
-    assert_eq!((host.as_str(), port), ("seed.invalid", 18444), "at the network's default port");
+    assert_eq!(
+        (host.as_str(), port),
+        ("seed.invalid", 18444),
+        "at the network's default port"
+    );
 
     let mut peer = Peer::handshake(stream).expect("handshake through the proxy");
     assert!(
-        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr)).is_some(),
+        peer.recv_until(test_timeout(30), |m| matches!(m, NetworkMessage::GetAddr))
+            .is_some(),
         "an addr-fetch connection asks for addresses"
     );
     let peers = node.rpc_ok("getpeerinfo", vec![]);
@@ -499,10 +584,17 @@ fn a_seednode_name_under_a_proxy_is_fetched_by_name_through_it() {
         .filter(|p| p["connection_type"] == "addr-fetch")
         .collect();
     assert_eq!(fetch.len(), 1, "one addr-fetch peer: {peers}");
-    assert_eq!(fetch[0]["addr"], "seed.invalid:18444", "named by the name it was opened to");
+    assert_eq!(
+        fetch[0]["addr"], "seed.invalid:18444",
+        "named by the name it was opened to"
+    );
 
     peer.send(addr_msg(30, 5));
-    poll_until(|| book_size(&node) == 5, test_timeout(30), "the seed's answer is kept");
+    poll_until(
+        || book_size(&node) == 5,
+        test_timeout(30),
+        "the seed's answer is kept",
+    );
     assert!(
         peer.recv_until(test_timeout(30), |_| false).is_none(),
         "the connection is dropped once it has answered"

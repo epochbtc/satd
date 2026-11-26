@@ -132,7 +132,10 @@ impl JsonRpcError {
             cap,
             "batch too large — rejecting (raise electrummaxbatchrequests if a wallet client needs it)"
         );
-        Self::new(1, format!("batch too large: {requests} requests (cap = {cap})"))
+        Self::new(
+            1,
+            format!("batch too large: {requests} requests (cap = {cap})"),
+        )
     }
 
     /// The scripthash's history is over the per-request cap
@@ -143,14 +146,22 @@ impl JsonRpcError {
     /// semantic limit, dynamic message). Logged at warn
     /// (operator-actionable cap).
     pub fn history_too_large(limit: usize) -> Self {
-        tracing::warn!(target = "electrum::rpc", limit, "history too large — rejecting");
+        tracing::warn!(
+            target = "electrum::rpc",
+            limit,
+            "history too large — rejecting"
+        );
         Self::new(2, format!("history too large (cap = {limit} entries)"))
     }
 
     /// Subscription cap reached for the connection or server. Logged at
     /// warn (operator-actionable cap — raise `electrummaxsubsperconn`).
     pub fn subscription_cap(limit: usize) -> Self {
-        tracing::warn!(target = "electrum::rpc", limit, "subscription cap reached — rejecting subscribe");
+        tracing::warn!(
+            target = "electrum::rpc",
+            limit,
+            "subscription cap reached — rejecting subscribe"
+        );
         Self::new(3, format!("subscription cap reached ({limit})"))
     }
 

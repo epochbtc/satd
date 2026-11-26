@@ -19,7 +19,11 @@ const REQUIRED: u64 = 151 + 100 + 8 + 1 + 2 * 101;
 const FIXED: &[&str] = &["--esplora=0", "--maxopenfiles=100"];
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// Start satd with the soft and hard `RLIMIT_NOFILE` set to `soft` / `hard`
@@ -52,7 +56,10 @@ fn start_with(soft: u64, hard: u64, args: &[&str]) -> (Option<i32>, String) {
     // SAFETY: setrlimit is async-signal-safe and touches only the child.
     unsafe {
         cmd.pre_exec(move || {
-            let lim = libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
+            let lim = libc::rlimit {
+                rlim_cur: soft as libc::rlim_t,
+                rlim_max: hard as libc::rlim_t,
+            };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -64,7 +71,10 @@ fn start_with(soft: u64, hard: u64, args: &[&str]) -> (Option<i32>, String) {
     let mut text = String::new();
     let status = loop {
         text.clear();
-        std::fs::File::open(&log).unwrap().read_to_string(&mut text).unwrap();
+        std::fs::File::open(&log)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
         if let Some(status) = child.try_wait().unwrap() {
             break status.code();
         }
@@ -76,7 +86,10 @@ fn start_with(soft: u64, hard: u64, args: &[&str]) -> (Option<i32>, String) {
         std::thread::sleep(Duration::from_millis(100));
     };
     text.clear();
-    std::fs::File::open(&log).unwrap().read_to_string(&mut text).unwrap();
+    std::fs::File::open(&log)
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
     let _ = std::fs::remove_dir_all(&datadir);
     (status, text)
 }
@@ -94,7 +107,9 @@ fn a_low_limit_lowers_maxconnections() {
         "no reduction warning:\n{out}"
     );
     assert!(
-        out.contains(&format!("Using at most 50 automatic connections ({hard} file descriptors available)")),
+        out.contains(&format!(
+            "Using at most 50 automatic connections ({hard} file descriptors available)"
+        )),
         "no budget line:\n{out}"
     );
 }
@@ -106,10 +121,15 @@ fn a_low_limit_lowers_maxconnections() {
 fn enough_descriptors_keep_maxconnections() {
     let (status, out) = start_under(256, REQUIRED + 500, &[]);
     assert_eq!(status, None, "satd exited early:\n{out}");
-    assert!(!out.contains("Reducing -maxconnections"), "unexpected reduction:\n{out}");
+    assert!(
+        !out.contains("Reducing -maxconnections"),
+        "unexpected reduction:\n{out}"
+    );
     let asked = REQUIRED + 200;
     assert!(
-        out.contains(&format!("Using at most 200 automatic connections ({asked} file descriptors available)")),
+        out.contains(&format!(
+            "Using at most 200 automatic connections ({asked} file descriptors available)"
+        )),
         "no budget line:\n{out}"
     );
 }
@@ -121,7 +141,9 @@ fn below_the_minimum_refuses_to_start() {
     let (status, out) = start_under(hard, hard, &[]);
     assert_eq!(status, Some(1), "satd did not refuse:\n{out}");
     assert!(
-        out.contains(&format!("Error: Not enough file descriptors available. {hard} available, {REQUIRED} required.")),
+        out.contains(&format!(
+            "Error: Not enough file descriptors available. {hard} available, {REQUIRED} required."
+        )),
         "no refusal message:\n{out}"
     );
 }
@@ -154,7 +176,9 @@ fn an_explicit_cap_still_refuses_under_1024() {
     assert_eq!(status, Some(1), "satd did not refuse:\n{out}");
     let required = 151 + 8 + 1 + 2 * 101 + 1 + 64 + 1024;
     assert!(
-        out.contains(&format!("Error: Not enough file descriptors available. 1024 available, {required} required.")),
+        out.contains(&format!(
+            "Error: Not enough file descriptors available. 1024 available, {required} required."
+        )),
         "no refusal message:\n{out}"
     );
 }

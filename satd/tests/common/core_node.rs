@@ -118,7 +118,11 @@ impl CoreNode {
         let rpc = Client::new(&url, Auth::UserPass(user.to_string(), pass.to_string()))
             .expect("construct Bitcoin Core RPC client");
 
-        let node = CoreNode { container, rpc, rpc_port };
+        let node = CoreNode {
+            container,
+            rpc,
+            rpc_port,
+        };
 
         // Wait for the RPC to answer. Scaled by SATD_TEST_TIMEOUT_MULT for CI.
         let deadline = Instant::now() + test_timeout(90);
@@ -161,7 +165,10 @@ impl CoreNode {
     /// `Accept` when Core reports `allowed: true`, else `Reject(reject-reason)`.
     pub fn test_mempool_accept(&self, tx_hex: &str) -> Outcome {
         let arg = serde_json::json!([tx_hex]);
-        match self.rpc.call::<Vec<serde_json::Value>>("testmempoolaccept", &[arg]) {
+        match self
+            .rpc
+            .call::<Vec<serde_json::Value>>("testmempoolaccept", &[arg])
+        {
             Ok(results) => {
                 let r = results.first().cloned().unwrap_or(serde_json::Value::Null);
                 if r.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -186,7 +193,9 @@ impl CoreNode {
     }
 
     pub fn block_count(&self) -> u64 {
-        self.rpc.call::<u64>("getblockcount", &[]).expect("Core getblockcount")
+        self.rpc
+            .call::<u64>("getblockcount", &[])
+            .expect("Core getblockcount")
     }
 
     /// Mark a block invalid (used to roll the chain back to a shared tip

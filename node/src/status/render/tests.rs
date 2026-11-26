@@ -55,7 +55,11 @@ fn snapshot() -> StatusSnapshot {
                 user_agent: "/Satoshi:29.0.0/".to_string(),
                 count: 10,
             }],
-            flagged: vec![FlagCount { code: 'C', name: "crawler", count: 3 }],
+            flagged: vec![FlagCount {
+                code: 'C',
+                name: "crawler",
+                count: 3,
+            }],
         },
         crawl: Some(CrawlStatus {
             state: "held",
@@ -130,9 +134,16 @@ fn status_json_and_html_render_the_same_snapshot() {
     let v = view(&s, 1_780_000_300);
     let page = html(&v);
     let texts = page_texts(&page);
-    assert!(texts.len() > 20, "found only {} marked elements", texts.len());
+    assert!(
+        texts.len() > 20,
+        "found only {} marked elements",
+        texts.len()
+    );
     for (key, text) in &texts {
-        let want = v.text.get(key.as_str()).unwrap_or_else(|| panic!("the page marks `{key}`, which the view does not carry"));
+        let want = v
+            .text
+            .get(key.as_str())
+            .unwrap_or_else(|| panic!("the page marks `{key}`, which the view does not carry"));
         assert_eq!(text, want, "`{key}`");
     }
     // And the JSON carries that same view.
@@ -148,7 +159,10 @@ fn status_json_and_html_render_the_same_snapshot() {
     ] {
         for part in page.split(attr).skip(1) {
             let key = &part[..part.find('"').unwrap()];
-            assert!(keys.contains(&key), "the page marks {attr}{key}\" but the view has no such key");
+            assert!(
+                keys.contains(&key),
+                "the page marks {attr}{key}\" but the view has no such key"
+            );
         }
     }
 }
@@ -182,7 +196,10 @@ fn status_escapes_peer_user_agent() {
     let v = view(&s, 1_780_000_300);
 
     let page = html(&v);
-    assert!(!page.contains("<script>alert"), "raw script tag in the page");
+    assert!(
+        !page.contains("<script>alert"),
+        "raw script tag in the page"
+    );
     assert!(!page.contains("<img"), "raw img tag in the page");
     assert!(page.contains("&lt;/code&gt;&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;"));
     // Exactly one <script>: the page's own.
@@ -191,8 +208,14 @@ fn status_escapes_peer_user_agent() {
     let body = json(&s, &v);
     assert!(!body.contains('<') && !body.contains('>'), "{body}");
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(parsed["view"]["lists"]["peers.clients"][0]["label"], hostile);
-    assert_eq!(parsed["snapshot"]["peers"]["clients"][0]["user_agent"], hostile);
+    assert_eq!(
+        parsed["view"]["lists"]["peers.clients"][0]["label"],
+        hostile
+    );
+    assert_eq!(
+        parsed["snapshot"]["peers"]["clients"][0]["user_agent"],
+        hostile
+    );
 }
 
 /// The peers card counts the flags some peer carries, by name and code,
@@ -203,12 +226,25 @@ fn status_shows_flag_counts_only() {
     let v = view(&s, 1_780_000_300);
     let flags = &v.lists["peers.flags"];
     assert_eq!(flags.len(), 1);
-    assert_eq!((flags[0].label.as_str(), flags[0].value.as_str()), ("Flagged crawler (C)", "3"));
+    assert_eq!(
+        (flags[0].label.as_str(), flags[0].value.as_str()),
+        ("Flagged crawler (C)", "3")
+    );
     assert!(html(&v).contains("<span>Flagged crawler (C)</span><code>3</code>"));
 
-    let counts = crate::net::flags::FlagCounts { flagged: [0, 2, 0, 0, 0, 0, 1], ..Default::default() };
-    let shown: Vec<(char, usize)> = flag_counts(&counts).iter().map(|f| (f.code, f.count)).collect();
-    assert_eq!(shown, [('S', 2), ('T', 1)], "only the flags some peer carries");
+    let counts = crate::net::flags::FlagCounts {
+        flagged: [0, 2, 0, 0, 0, 0, 1],
+        ..Default::default()
+    };
+    let shown: Vec<(char, usize)> = flag_counts(&counts)
+        .iter()
+        .map(|f| (f.code, f.count))
+        .collect();
+    assert_eq!(
+        shown,
+        [('S', 2), ('T', 1)],
+        "only the flags some peer carries"
+    );
 }
 
 /// The crawl card shows the crawl's counts and its state, and nothing
@@ -219,8 +255,16 @@ fn status_shows_crawl_counts_only() {
     let v = view(&s, 1_780_000_300);
     assert!(v.show["crawl"]);
     let rows = &v.lists["crawl"];
-    let get = |label: &str| rows.iter().find(|i| i.label == label).unwrap_or_else(|| panic!("{label}")).clone();
-    assert_eq!((get("State").value.as_str(), get("State").state), ("held", WAIT));
+    let get = |label: &str| {
+        rows.iter()
+            .find(|i| i.label == label)
+            .unwrap_or_else(|| panic!("{label}"))
+            .clone()
+    };
+    assert_eq!(
+        (get("State").value.as_str(), get("State").state),
+        ("held", WAIT)
+    );
     assert_eq!(get("Addresses in the book").value, "12,345");
     assert_eq!(get("Reachable over IPv4").value, "7");
     assert_eq!(get("I2P learned (never dialled)").value, "4");
@@ -229,7 +273,10 @@ fn status_shows_crawl_counts_only() {
     assert_eq!(get("v1, BIP 324 not advertised").value, "2");
     // Every value is a count, bar the state.
     for i in rows.iter().filter(|i| i.label != "State") {
-        assert!(i.value.chars().all(|c| c.is_ascii_digit() || c == ','), "{i:?}");
+        assert!(
+            i.value.chars().all(|c| c.is_ascii_digit() || c == ','),
+            "{i:?}"
+        );
     }
     let page = html(&v);
     assert!(page.contains("<h2>Crawl</h2>"));
@@ -247,7 +294,13 @@ fn status_shows_crawl_counts_only() {
 
 #[test]
 fn the_script_never_writes_html() {
-    for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("] {
+    for banned in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+    ] {
         assert!(!SCRIPT.contains(banned), "status.js uses {banned}");
     }
     assert!(SCRIPT.contains("textContent"));
@@ -265,7 +318,10 @@ fn a_syncing_view_hides_the_synced_panels() {
     assert_eq!(v.text["sync.eta"], "about 1d 01h left");
     assert_eq!(v.text["phase.label"], "syncing blocks");
     let page = html(&v);
-    assert!(page.contains("data-s=\"synced\" hidden"), "server render hides it too");
+    assert!(
+        page.contains("data-s=\"synced\" hidden"),
+        "server render hides it too"
+    );
 }
 
 /// Every card on the page carries `data-s`, so a view can hide it. The
@@ -278,7 +334,10 @@ fn every_card_on_the_page_can_be_hidden() {
     assert!(cards.len() >= 6, "found only {} cards", cards.len());
     for card in cards {
         let open = &card[..card.find('>').unwrap()];
-        assert!(open.contains("data-s=\""), "a card that no view can hide: <section {open}>");
+        assert!(
+            open.contains("data-s=\""),
+            "a card that no view can hide: <section {open}>"
+        );
     }
 
     let startup = crate::status::startup::view(
@@ -294,7 +353,11 @@ fn every_card_on_the_page_can_be_hidden() {
     for card in page.split("<section ").skip(1) {
         let open = &card[..card.find('>').unwrap()];
         let shown = !open.ends_with(" hidden");
-        assert_eq!(shown, open.contains("data-s=\"startup\""), "during startup: <section {open}>");
+        assert_eq!(
+            shown,
+            open.contains("data-s=\"startup\""),
+            "during startup: <section {open}>"
+        );
     }
 }
 
@@ -313,7 +376,10 @@ fn the_real_view_shows_every_card() {
     assert!(!v.show["startup"]);
     let page = html(&v);
     for card in ["chain", "wallets", "peers", "warnings", "connect"] {
-        assert!(page.contains(&format!("data-s=\"{card}\">")), "{card} is hidden in the first paint");
+        assert!(
+            page.contains(&format!("data-s=\"{card}\">")),
+            "{card} is hidden in the first paint"
+        );
     }
     assert!(page.contains("data-s=\"startup\" hidden"));
 }

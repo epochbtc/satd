@@ -10,8 +10,8 @@ use crate::storage::db::InMemoryStore;
 use crate::validation::script::NoopVerifier;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
-use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHNUM_1};
 use bitcoin::opcodes::OP_0;
+use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHNUM_1};
 use bitcoin::pow::CompactTarget;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, Witness};
@@ -116,7 +116,10 @@ fn connect_at_height_1(store: &InMemoryStore, block: &Block) -> Result<StoreBatc
         block,
         height: 1,
         parent_chainwork: &[0u8; 32],
-        flat_pos: FlatFilePos { file_number: 0, data_pos: 0 },
+        flat_pos: FlatFilePos {
+            file_number: 0,
+            data_pos: 0,
+        },
         script_verifier: &NoopVerifier,
         median_time_past: 0,
         network: Network::Regtest,
@@ -153,7 +156,10 @@ fn a_block_one_sigop_over_the_limit_by_cores_count_is_refused() {
     *scripts.last_mut().unwrap() = checksig_script(80_000 - 20 * 3_941 + 1);
     let (store, over) = block_spending_p2wsh(&scripts);
     assert!(
-        matches!(connect_at_height_1(&store, &over), Err(ConnectError::BadBlockSigops)),
+        matches!(
+            connect_at_height_1(&store, &over),
+            Err(ConnectError::BadBlockSigops)
+        ),
         "a block at 80,001 sigop cost is bad-blk-sigops"
     );
 }
@@ -170,10 +176,16 @@ fn the_block_sigop_cost_of_a_p2wsh_spend_follows_cores_count() {
         script_pubkey: ScriptBuf::new_p2wsh(&ws.wscript_hash()),
     }];
     let flags = |net| crate::validation::script::script_verify_flags(net, 1);
-    assert_eq!(transaction_sigop_cost(&block.txdata[1], flags(Network::Regtest), &prevouts), 21);
+    assert_eq!(
+        transaction_sigop_cost(&block.txdata[1], flags(Network::Regtest), &prevouts),
+        21
+    );
     // Mainnet counts it the same at height 1: Core's flags have P2SH and
     // WITNESS on every block (#1244). Only an exception block's flags,
     // none at all here, leave legacy sigops alone, and this transaction has none.
-    assert_eq!(transaction_sigop_cost(&block.txdata[1], flags(Network::Bitcoin), &prevouts), 21);
+    assert_eq!(
+        transaction_sigop_cost(&block.txdata[1], flags(Network::Bitcoin), &prevouts),
+        21
+    );
     assert_eq!(transaction_sigop_cost(&block.txdata[1], 0, &prevouts), 0);
 }

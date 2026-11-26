@@ -20,7 +20,9 @@
 
 use std::future::Future;
 
-use jsonrpsee::server::middleware::rpc::{Batch, BatchEntry, BatchEntryErr, Notification, RpcServiceT};
+use jsonrpsee::server::middleware::rpc::{
+    Batch, BatchEntry, BatchEntryErr, Notification, RpcServiceT,
+};
 use jsonrpsee::server::{BatchResponseBuilder, MethodResponse};
 use jsonrpsee::types::{ErrorObjectOwned, Request};
 use satd_auth::{Capability, Principal};
@@ -356,19 +358,19 @@ where
             for entry in batch.into_iter() {
                 let entry = match entry {
                     Ok(mut e) => {
-                        let v = verdict.get_or_insert_with(|| recheck(e.extensions())).clone();
+                        let v = verdict
+                            .get_or_insert_with(|| recheck(e.extensions()))
+                            .clone();
                         match (v, &mut e) {
                             (Ok(None), _) => Ok(e),
                             (Ok(Some(p)), _) => {
                                 e.extensions_mut().insert(p);
                                 Ok(e)
                             }
-                            (Err(()), BatchEntry::Call(req)) => Err(
-                                BatchEntryErr::new(
-                                    req.id.clone().into_owned(),
-                                    token_revoked_error(),
-                                ),
-                            ),
+                            (Err(()), BatchEntry::Call(req)) => Err(BatchEntryErr::new(
+                                req.id.clone().into_owned(),
+                                token_revoked_error(),
+                            )),
                             // A notification gets no reply; one on a revoked
                             // token is dropped.
                             (Err(()), BatchEntry::Notification(_)) => {
@@ -582,10 +584,7 @@ mod tests {
         type BatchResponse = MethodResponse;
         type NotificationResponse = MethodResponse;
 
-        fn call<'a>(
-            &self,
-            req: Request<'a>,
-        ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
             self.dispatched.fetch_add(1, Ordering::SeqCst);
             let id = req.id.clone();
             async move { MethodResponse::response(id, ResponsePayload::success(true), 1024) }
@@ -668,14 +667,28 @@ mod tests {
     #[tokio::test]
     async fn read_token_gets_the_crawl_counts_and_not_its_addresses() {
         let (svc, dispatched) = filter();
-        let rp = svc.call(req_with("getcrawlinfo", Some(read_only_token()))).await;
+        let rp = svc
+            .call(req_with("getcrawlinfo", Some(read_only_token())))
+            .await;
         assert!(rp.is_success());
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
-        let rp = svc.call(req_with("getcrawlnodes", Some(read_only_token()))).await;
+        let rp = svc
+            .call(req_with("getcrawlnodes", Some(read_only_token())))
+            .await;
         assert!(rp.is_error());
-        assert_eq!(dispatched.load(Ordering::SeqCst), 1, "getcrawlnodes never reached the handler");
-        assert!(rp.as_json().get().contains("rpc:write"), "{}", rp.as_json().get());
-        let rp = svc.call(req_with("getcrawlnodes", Some(Principal::operator()))).await;
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            1,
+            "getcrawlnodes never reached the handler"
+        );
+        assert!(
+            rp.as_json().get().contains("rpc:write"),
+            "{}",
+            rp.as_json().get()
+        );
+        let rp = svc
+            .call(req_with("getcrawlnodes", Some(Principal::operator())))
+            .await;
         assert!(rp.is_success());
         assert_eq!(dispatched.load(Ordering::SeqCst), 2);
     }
@@ -685,11 +698,23 @@ mod tests {
     #[tokio::test]
     async fn read_token_cannot_export_the_crawl() {
         let (svc, dispatched) = filter();
-        let rp = svc.call(req_with("dumpcrawlsnapshot", Some(read_only_token()))).await;
+        let rp = svc
+            .call(req_with("dumpcrawlsnapshot", Some(read_only_token())))
+            .await;
         assert!(rp.is_error());
-        assert!(rp.as_json().get().contains("rpc:write"), "{}", rp.as_json().get());
-        assert_eq!(dispatched.load(Ordering::SeqCst), 0, "dumpcrawlsnapshot never reached the handler");
-        let rp = svc.call(req_with("dumpcrawlsnapshot", Some(Principal::operator()))).await;
+        assert!(
+            rp.as_json().get().contains("rpc:write"),
+            "{}",
+            rp.as_json().get()
+        );
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            0,
+            "dumpcrawlsnapshot never reached the handler"
+        );
+        let rp = svc
+            .call(req_with("dumpcrawlsnapshot", Some(Principal::operator())))
+            .await;
         assert!(rp.is_success());
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
@@ -703,7 +728,11 @@ mod tests {
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
         // The denial names the capability that would have admitted the call.
-        assert!(rp.as_json().get().contains("rpc:submit"), "{}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("rpc:submit"),
+            "{}",
+            rp.as_json().get()
+        );
     }
 
     fn submit_token() -> Principal {
@@ -723,7 +752,11 @@ mod tests {
     #[tokio::test]
     async fn submit_token_broadcasts_but_cannot_control() {
         for method in ["sendrawtransaction", "submitpackage"] {
-            assert_eq!(required_capability(method), Capability::RpcSubmit, "{method}");
+            assert_eq!(
+                required_capability(method),
+                Capability::RpcSubmit,
+                "{method}"
+            );
             let (svc, dispatched) = filter();
             let rp = svc.call(req_with(method, Some(submit_token()))).await;
             assert!(rp.is_success(), "{method}: {}", rp.as_json().get());
@@ -734,7 +767,11 @@ mod tests {
             let rp = svc.call(req_with(method, Some(submit_token()))).await;
             assert!(rp.is_error(), "{method} must be denied to a submit token");
             assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-            assert!(rp.as_json().get().contains("rpc:write"), "{}", rp.as_json().get());
+            assert!(
+                rp.as_json().get().contains("rpc:write"),
+                "{}",
+                rp.as_json().get()
+            );
         }
 
         let write_token = Principal::token(
@@ -811,10 +848,16 @@ mod tests {
             Principal::operator().accounting().clone(),
         );
         let (svc, dispatched) = filter();
-        let rp = svc.call(req_with("addpeeraddress", Some(write_token))).await;
+        let rp = svc
+            .call(req_with("addpeeraddress", Some(write_token)))
+            .await;
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-        assert!(rp.as_json().get().contains("test:net"), "{}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("test:net"),
+            "{}",
+            rp.as_json().get()
+        );
 
         let net_token = Principal::token(
             Arc::from("net"),
@@ -841,12 +884,14 @@ mod tests {
             Principal::operator().accounting().clone(),
         );
         let (svc, dispatched) = filter();
-        let rp = svc
-            .call(req_with("addconnection", Some(write_token)))
-            .await;
+        let rp = svc.call(req_with("addconnection", Some(write_token))).await;
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-        assert!(rp.as_json().get().contains("test:net"), "{}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("test:net"),
+            "{}",
+            rp.as_json().get()
+        );
 
         // The operator principal still reaches it.
         let (svc, dispatched) = filter();
@@ -878,15 +923,25 @@ mod tests {
             assert_eq!(dispatched.load(Ordering::SeqCst), 1);
         }
         let (svc, dispatched) = filter();
-        let rp = svc.call(req_with("getblockcount", Some(submit_only()))).await;
+        let rp = svc
+            .call(req_with("getblockcount", Some(submit_only())))
+            .await;
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-        assert!(rp.as_json().get().contains("rpc:read"), "{}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("rpc:read"),
+            "{}",
+            rp.as_json().get()
+        );
         let (svc, dispatched) = filter();
         let rp = svc.call(req_with("stop", Some(submit_only()))).await;
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-        assert!(rp.as_json().get().contains("rpc:write"), "{}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("rpc:write"),
+            "{}",
+            rp.as_json().get()
+        );
     }
 
     /// `rpc:write` implies `rpc:submit` and nothing else: a write-only token
@@ -904,7 +959,11 @@ mod tests {
         let rp = svc.call(req_with("getblockcount", Some(write_only))).await;
         assert!(rp.is_error());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
-        assert!(rp.as_json().get().contains("rpc:read"), "{}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("rpc:read"),
+            "{}",
+            rp.as_json().get()
+        );
     }
 
     /// A call as parsed from an HTTP body, whose unit the HTTP layer took.
@@ -938,7 +997,11 @@ mod tests {
         assert_eq!(replies.len(), 3, "{}", rp.as_json().get());
         assert!(replies[0].get("result").is_some(), "{}", replies[0]);
         assert!(replies[1].get("result").is_some(), "{}", replies[1]);
-        assert_eq!(replies[2]["error"]["code"], CAPABILITY_DENIED_CODE, "{}", replies[2]);
+        assert_eq!(
+            replies[2]["error"]["code"], CAPABILITY_DENIED_CODE,
+            "{}",
+            replies[2]
+        );
         assert!(
             replies[2]["error"]["message"]
                 .as_str()
@@ -990,10 +1053,26 @@ mod tests {
             .await;
         let replies = batch_replies(&rp);
         assert_eq!(replies.len(), 4, "{}", rp.as_json().get());
-        assert!(replies[0].get("result").is_some(), "entry 0 is free: {}", replies[0]);
-        assert!(replies[1].get("result").is_some(), "entry 1 costs one: {}", replies[1]);
-        assert!(replies[2].get("result").is_some(), "entry 2 costs one: {}", replies[2]);
-        assert_eq!(replies[3]["error"]["code"], RATE_LIMITED_CODE, "{}", replies[3]);
+        assert!(
+            replies[0].get("result").is_some(),
+            "entry 0 is free: {}",
+            replies[0]
+        );
+        assert!(
+            replies[1].get("result").is_some(),
+            "entry 1 costs one: {}",
+            replies[1]
+        );
+        assert!(
+            replies[2].get("result").is_some(),
+            "entry 2 costs one: {}",
+            replies[2]
+        );
+        assert_eq!(
+            replies[3]["error"]["code"], RATE_LIMITED_CODE,
+            "{}",
+            replies[3]
+        );
         assert!(
             replies[3]["error"]["data"]["retry_after_secs"].is_u64(),
             "{}",
@@ -1063,9 +1142,14 @@ mod tests {
         // Entry 0 is free and the bucket (2) covers entries 1 and 2; the
         // other seven are over budget.
         let rp = svc
-            .batch(Batch::from((0..10).map(|_| notif(rl())).collect::<Vec<_>>()))
+            .batch(Batch::from(
+                (0..10).map(|_| notif(rl())).collect::<Vec<_>>(),
+            ))
             .await;
-        assert!(rp.is_notification(), "an all-notification batch has no reply");
+        assert!(
+            rp.is_notification(),
+            "an all-notification batch has no reply"
+        );
         assert_eq!(dispatched.load(Ordering::SeqCst), 3);
     }
 
@@ -1088,8 +1172,7 @@ mod tests {
     /// included -- costs one.
     #[tokio::test]
     async fn websocket_frames_are_charged_against_the_rate_limit() {
-        let acct: Arc<dyn satd_auth::Accounting> =
-            Arc::new(satd_auth::LocalAccounting::new());
+        let acct: Arc<dyn satd_auth::Accounting> = Arc::new(satd_auth::LocalAccounting::new());
         let dispatched = Arc::new(AtomicUsize::new(0));
         let svc = BatchRateFilter {
             inner: Recorder {
@@ -1099,14 +1182,20 @@ mod tests {
 
         let mut shed = 0;
         for _ in 0..5 {
-            let rp = svc.call(req_with("sendrawtransaction", Some(rate_limited(&acct)))).await;
+            let rp = svc
+                .call(req_with("sendrawtransaction", Some(rate_limited(&acct))))
+                .await;
             if !rp.is_success() {
                 let reply: serde_json::Value = serde_json::from_str(rp.as_json().get()).unwrap();
                 assert_eq!(reply["error"]["code"], RATE_LIMITED_CODE, "{reply}");
                 shed += 1;
             }
         }
-        assert_eq!(dispatched.load(Ordering::SeqCst), 2, "burst 2 admits two frames");
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            2,
+            "burst 2 admits two frames"
+        );
         assert_eq!(shed, 3);
 
         // The bucket is empty: a notification frame is dropped, and a batch
@@ -1115,7 +1204,10 @@ mod tests {
         n.extensions.insert(rate_limited(&acct));
         svc.notification(n).await;
         let rp = svc
-            .batch(batch_of(vec![req_with("sendrawtransaction", Some(rate_limited(&acct)))]))
+            .batch(batch_of(vec![req_with(
+                "sendrawtransaction",
+                Some(rate_limited(&acct)),
+            )]))
             .await;
         assert_eq!(batch_replies(&rp)[0]["error"]["code"], RATE_LIMITED_CODE);
         assert_eq!(dispatched.load(Ordering::SeqCst), 2);
@@ -1127,8 +1219,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_first_entry_does_not_spend_the_http_unit() {
         use jsonrpsee::server::middleware::rpc::BatchEntryErr;
-        let acct: Arc<dyn satd_auth::Accounting> =
-            Arc::new(satd_auth::LocalAccounting::new());
+        let acct: Arc<dyn satd_auth::Accounting> = Arc::new(satd_auth::LocalAccounting::new());
         // Drain the bucket so any charge at all would shed the call.
         let p = rate_limited(&acct);
         while matches!(p.check_rate(), satd_auth::RateDecision::Allow) {}
@@ -1146,12 +1237,19 @@ mod tests {
         let rp = svc
             .batch(Batch::from(vec![
                 Err(junk),
-                Ok(BatchEntry::Call(http(req_with("getblockcount", Some(rate_limited(&acct)))))),
+                Ok(BatchEntry::Call(http(req_with(
+                    "getblockcount",
+                    Some(rate_limited(&acct)),
+                )))),
             ]))
             .await;
         let replies = batch_replies(&rp);
         assert_eq!(replies[0]["error"]["code"], -32600, "{}", replies[0]);
-        assert!(replies[1].get("result").is_some(), "the call is prepaid: {}", replies[1]);
+        assert!(
+            replies[1].get("result").is_some(),
+            "the call is prepaid: {}",
+            replies[1]
+        );
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 
@@ -1201,31 +1299,51 @@ mod tests {
         let dispatched = Arc::new(AtomicUsize::new(0));
         let svc = TokenRecheck {
             inner: BatchRateFilter {
-                inner: CapabilityFilter { inner: Recorder { dispatched: dispatched.clone() } },
+                inner: CapabilityFilter {
+                    inner: Recorder {
+                        dispatched: dispatched.clone(),
+                    },
+                },
             },
         };
 
         let rp = svc.call(ws_frame("getblockcount", &session)).await;
         assert!(rp.is_success(), "{}", rp.as_json().get());
         let rp = svc.call(ws_frame("sendrawtransaction", &session)).await;
-        assert!(rp.as_json().get().contains("-32004"), "the token's own caps apply: {}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("-32004"),
+            "the token's own caps apply: {}",
+            rp.as_json().get()
+        );
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
 
         // Expired: the reload keeps the token but its `expires` has passed.
         write_ws_authfile(dir.path(), "expires = 1\n");
         store.reload().unwrap();
         let rp = svc.call(ws_frame("getblockcount", &session)).await;
-        assert!(rp.as_json().get().contains("-32006"), "expired: {}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("-32006"),
+            "expired: {}",
+            rp.as_json().get()
+        );
 
         // Valid again, then removed.
         write_ws_authfile(dir.path(), "");
         store.reload().unwrap();
-        assert!(svc.call(ws_frame("getblockcount", &session)).await.is_success());
+        assert!(
+            svc.call(ws_frame("getblockcount", &session))
+                .await
+                .is_success()
+        );
         assert_eq!(dispatched.load(Ordering::SeqCst), 2);
         std::fs::write(&path, "version = 1\n").unwrap();
         store.reload().unwrap();
         let rp = svc.call(ws_frame("getblockcount", &session)).await;
-        assert!(rp.as_json().get().contains("-32006"), "revoked: {}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("-32006"),
+            "revoked: {}",
+            rp.as_json().get()
+        );
 
         // A batch frame: every call refused, the notification dropped.
         let mut note = jsonrpsee::types::Notification::new("getblockcount".into(), None);
@@ -1242,7 +1360,11 @@ mod tests {
         for r in &replies {
             assert_eq!(r["error"]["code"], TOKEN_REVOKED_CODE, "{r}");
         }
-        assert_eq!(dispatched.load(Ordering::SeqCst), 2, "nothing dispatched after revocation");
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            2,
+            "nothing dispatched after revocation"
+        );
     }
 
     /// An empty batch (`[]`) is still answered `-32600` by the layers
@@ -1251,9 +1373,19 @@ mod tests {
     #[tokio::test]
     async fn an_empty_batch_is_still_invalid_behind_the_recheck() {
         let dispatched = Arc::new(AtomicUsize::new(0));
-        let svc = TokenRecheck { inner: BatchRateFilter { inner: Recorder { dispatched: dispatched.clone() } } };
+        let svc = TokenRecheck {
+            inner: BatchRateFilter {
+                inner: Recorder {
+                    dispatched: dispatched.clone(),
+                },
+            },
+        };
         let rp = svc.batch(Batch::from(vec![])).await;
-        assert!(rp.as_json().get().contains("-32600"), "{}", rp.as_json().get());
+        assert!(
+            rp.as_json().get().contains("-32600"),
+            "{}",
+            rp.as_json().get()
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = write_ws_authfile(dir.path(), "");
@@ -1263,7 +1395,9 @@ mod tests {
         store.reload().unwrap();
         let mut note = jsonrpsee::types::Notification::new("getblockcount".into(), None);
         note.extensions.insert(session);
-        let rp = svc.batch(Batch::from(vec![Ok(BatchEntry::Notification(note))])).await;
+        let rp = svc
+            .batch(Batch::from(vec![Ok(BatchEntry::Notification(note))]))
+            .await;
         assert!(rp.is_notification(), "no reply: {}", rp.as_json().get());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
@@ -1273,8 +1407,16 @@ mod tests {
     #[tokio::test]
     async fn calls_without_a_session_pass_the_recheck() {
         let dispatched = Arc::new(AtomicUsize::new(0));
-        let svc = TokenRecheck { inner: Recorder { dispatched: dispatched.clone() } };
-        assert!(svc.call(req_with("getblockcount", Some(Principal::operator()))).await.is_success());
+        let svc = TokenRecheck {
+            inner: Recorder {
+                dispatched: dispatched.clone(),
+            },
+        };
+        assert!(
+            svc.call(req_with("getblockcount", Some(Principal::operator())))
+                .await
+                .is_success()
+        );
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 }

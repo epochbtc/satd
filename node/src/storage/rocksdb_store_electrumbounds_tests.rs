@@ -60,7 +60,9 @@ fn store() -> (RocksDbStore, tempfile::TempDir) {
         funding(SH, 20, 2),
         funding(SH, 20, 3),
     ]);
-    batch.addr_spending_puts.extend([spending(SH, 5, 0), spending(SH, 12, 0)]);
+    batch
+        .addr_spending_puts
+        .extend([spending(SH, 5, 0), spending(SH, 12, 0)]);
     for neighbour in [below, above] {
         for txseq in [1, 7, 15, 30] {
             batch.addr_funding_puts.push(funding(neighbour, txseq, 0));
@@ -98,7 +100,10 @@ fn runs_stop_after_min_txs_and_continue_below() {
     let (store, _dir) = store();
     // Two ordinals; all four rows of ordinal 20 come in one run.
     let first = store.addr_rows_desc(&SH, None, 2);
-    assert_eq!(first.rows, vec![f(20, 3), f(20, 2), f(20, 1), f(20, 0), s(12, 0)]);
+    assert_eq!(
+        first.rows,
+        vec![f(20, 3), f(20, 2), f(20, 1), f(20, 0), s(12, 0)]
+    );
     assert_eq!(first.next_below, Some(12));
 
     let second = store.addr_rows_desc(&SH, first.next_below, 1);
@@ -115,13 +120,22 @@ fn runs_stop_after_min_txs_and_continue_below() {
     assert_eq!(store.addr_rows_desc(&SH, Some(20), 1).rows, vec![s(12, 0)]);
     assert_eq!(store.addr_rows_desc(&SH, Some(19), 1).rows, vec![s(12, 0)]);
     assert_eq!(store.addr_rows_desc(&SH, Some(21), 1).rows.len(), 4);
-    assert_eq!(store.addr_rows_desc(&SH, Some(5), 10), AddrRowsDesc::default());
-    assert_eq!(store.addr_rows_desc(&SH, Some(0), 10), AddrRowsDesc::default());
+    assert_eq!(
+        store.addr_rows_desc(&SH, Some(5), 10),
+        AddrRowsDesc::default()
+    );
+    assert_eq!(
+        store.addr_rows_desc(&SH, Some(0), 10),
+        AddrRowsDesc::default()
+    );
     // Scripthashes with no rows, whose prefixes sort just below and just
     // above `SH`'s: the seek lands on a neighbour's row and must stop there.
     for last in [0x10, 0x12] {
         let mut empty = SH;
         empty[15] = last;
-        assert_eq!(store.addr_rows_desc(&empty, None, 10), AddrRowsDesc::default());
+        assert_eq!(
+            store.addr_rows_desc(&empty, None, 10),
+            AddrRowsDesc::default()
+        );
     }
 }

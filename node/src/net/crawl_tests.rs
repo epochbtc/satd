@@ -11,7 +11,10 @@ fn v4(a: u8, b: u8, c: u8, d: u8) -> PeerAddr {
 fn onion(i: u8) -> PeerAddr {
     let mut key = [0u8; 32];
     key[0] = i;
-    PeerAddr::Onion { host: crate::net::peer::torv3_to_onion_host(&key), port: 8333 }
+    PeerAddr::Onion {
+        host: crate::net::peer::torv3_to_onion_host(&key),
+        port: 8333,
+    }
 }
 
 /// Limits that only the one under test can hit.
@@ -32,7 +35,11 @@ fn one_session_per_target() {
     assert_eq!(s.try_start(&a, 0), Err(Refusal::TargetBusy));
     assert_eq!(s.open(), (1, 0), "the refusal took nothing");
     s.finish(&a);
-    assert_eq!(s.try_start(&a, 0), Ok(()), "free again once the session ends");
+    assert_eq!(
+        s.try_start(&a, 0),
+        Ok(()),
+        "free again once the session ends"
+    );
 }
 
 #[test]
@@ -53,7 +60,11 @@ fn tor_concurrency_is_bounded() {
     assert_eq!(s.try_start(&onion(1), 0), Ok(()));
     assert_eq!(s.try_start(&onion(2), 0), Ok(()));
     assert_eq!(s.try_start(&onion(3), 0), Err(Refusal::Concurrency));
-    assert_eq!(s.try_start(&spread(0), 0), Ok(()), "clearnet has its own limit");
+    assert_eq!(
+        s.try_start(&spread(0), 0),
+        Ok(()),
+        "clearnet has its own limit"
+    );
     assert_eq!(s.open(), (1, 2));
 }
 
@@ -63,14 +74,24 @@ fn two_sessions_per_ipv4_16_and_ipv6_32() {
     assert_eq!(s.try_start(&v4(5, 6, 1, 1), 0), Ok(()));
     assert_eq!(s.try_start(&v4(5, 6, 200, 9), 0), Ok(()));
     assert_eq!(s.try_start(&v4(5, 6, 7, 7), 0), Err(Refusal::Netgroup));
-    assert_eq!(s.try_start(&v4(5, 7, 7, 7), 0), Ok(()), "the next /16 is another group");
+    assert_eq!(
+        s.try_start(&v4(5, 7, 7, 7), 0),
+        Ok(()),
+        "the next /16 is another group"
+    );
     let v6 = |s: &str| PeerAddr::Socket(SocketAddr::new(s.parse().unwrap(), 8333));
     assert_eq!(s.try_start(&v6("2a01:4f8:1::1"), 0), Ok(()));
     assert_eq!(s.try_start(&v6("2a01:4f8:ffff::2"), 0), Ok(()));
-    assert_eq!(s.try_start(&v6("2a01:4f8:1:2::3"), 0), Err(Refusal::Netgroup));
+    assert_eq!(
+        s.try_start(&v6("2a01:4f8:1:2::3"), 0),
+        Err(Refusal::Netgroup)
+    );
     assert_eq!(s.try_start(&v6("2a01:4f9::1"), 0), Ok(()));
     // An IPv4-mapped address is in its IPv4 group.
-    assert_eq!(s.try_start(&v6("::ffff:5.6.9.9"), 0), Err(Refusal::Netgroup));
+    assert_eq!(
+        s.try_start(&v6("::ffff:5.6.9.9"), 0),
+        Err(Refusal::Netgroup)
+    );
     s.finish(&v4(5, 6, 1, 1));
     assert_eq!(s.try_start(&v4(5, 6, 7, 7), 0), Ok(()));
     // Onions have no group.
@@ -83,11 +104,19 @@ fn two_sessions_per_ipv4_16_and_ipv6_32() {
 fn the_rate_allows_its_sessions_a_second() {
     let mut s = Scheduler::new(Limits::new(MAX_CONCURRENCY, MAX_CONCURRENCY, 10), 0);
     for i in 0..10 {
-        assert_eq!(s.try_start(&spread(i), 0), Ok(()), "a second's worth at once");
+        assert_eq!(
+            s.try_start(&spread(i), 0),
+            Ok(()),
+            "a second's worth at once"
+        );
     }
     assert_eq!(s.try_start(&spread(10), 0), Err(Refusal::Rate));
     assert_eq!(s.try_start(&spread(10), 99), Err(Refusal::Rate));
-    assert_eq!(s.try_start(&spread(10), 100), Ok(()), "one more every 100 ms");
+    assert_eq!(
+        s.try_start(&spread(10), 100),
+        Ok(()),
+        "one more every 100 ms"
+    );
     assert_eq!(s.try_start(&spread(11), 150), Err(Refusal::Rate));
     // An idle minute banks no more than a second's worth.
     let mut started = 0;
@@ -104,7 +133,10 @@ fn the_rate_allows_its_sessions_a_second() {
 /// a minute's worth and no more.
 #[test]
 fn the_default_rate_holds_over_a_minute() {
-    let mut s = Scheduler::new(Limits::new(MAX_CONCURRENCY, MAX_CONCURRENCY, DEFAULT_RATE), 0);
+    let mut s = Scheduler::new(
+        Limits::new(MAX_CONCURRENCY, MAX_CONCURRENCY, DEFAULT_RATE),
+        0,
+    );
     let mut started = Vec::new();
     for ms in (0..=60_000).step_by(10) {
         for _ in 0..s.budget(ms) {
@@ -121,9 +153,23 @@ fn the_default_rate_holds_over_a_minute() {
 #[test]
 fn the_ceilings_hold_whatever_is_asked() {
     let asked = Limits::new(10_000, 10_000, 10_000);
-    assert_eq!(asked, Limits { clearnet: MAX_CONCURRENCY, tor: MAX_CONCURRENCY, rate: MAX_RATE });
+    assert_eq!(
+        asked,
+        Limits {
+            clearnet: MAX_CONCURRENCY,
+            tor: MAX_CONCURRENCY,
+            rate: MAX_RATE
+        }
+    );
     // Built by hand past them, the scheduler clamps again.
-    let mut s = Scheduler::new(Limits { clearnet: 10_000, tor: 10_000, rate: 10_000 }, 0);
+    let mut s = Scheduler::new(
+        Limits {
+            clearnet: 10_000,
+            tor: 10_000,
+            rate: 10_000,
+        },
+        0,
+    );
     assert_eq!(s.limits(), asked);
     let mut opened = 0;
     for i in 0..1_000 {
@@ -133,7 +179,11 @@ fn the_ceilings_hold_whatever_is_asked() {
         }
     }
     assert_eq!(opened, MAX_CONCURRENCY);
-    assert_eq!(s.budget(10_000_000), MAX_RATE as usize, "a second's worth at the ceiling rate");
+    assert_eq!(
+        s.budget(10_000_000),
+        MAX_RATE as usize,
+        "a second's worth at the ceiling rate"
+    );
 }
 
 #[test]
@@ -141,18 +191,36 @@ fn session_caps_are_the_sum_of_their_phases() {
     let t = Timings::DEFAULT;
     // Two attempts of a 5 s dial and a 5 s handshake, the 10 s wait, the
     // 1 s close.
-    assert_eq!(t.session_cap(SessionKind::Liveness, false), Duration::from_secs(31));
-    assert_eq!(t.session_cap(SessionKind::V1Recheck, false), Duration::from_secs(21));
-    assert_eq!(t.session_cap(SessionKind::Discovery, false), Duration::from_secs(121));
-    assert_eq!(t.session_cap(SessionKind::Discovery, true), Duration::from_secs(221));
+    assert_eq!(
+        t.session_cap(SessionKind::Liveness, false),
+        Duration::from_secs(31)
+    );
+    assert_eq!(
+        t.session_cap(SessionKind::V1Recheck, false),
+        Duration::from_secs(21)
+    );
+    assert_eq!(
+        t.session_cap(SessionKind::Discovery, false),
+        Duration::from_secs(121)
+    );
+    assert_eq!(
+        t.session_cap(SessionKind::Discovery, true),
+        Duration::from_secs(221)
+    );
 }
 
 #[test]
 fn the_user_agent_declares_a_crawler() {
     let v = env!("CARGO_PKG_VERSION");
     assert_eq!(user_agent(None).unwrap(), format!("/satd:{v}(crawler)/"));
-    assert_eq!(user_agent(Some("census@example")).unwrap(), format!("/satd:{v}(crawler; census@example)/"));
-    assert!(user_agent(Some("a/b")).is_err(), "a comment cannot forge a field");
+    assert_eq!(
+        user_agent(Some("census@example")).unwrap(),
+        format!("/satd:{v}(crawler; census@example)/")
+    );
+    assert!(
+        user_agent(Some("a/b")).is_err(),
+        "a comment cannot forge a field"
+    );
 }
 
 #[test]
@@ -183,7 +251,10 @@ fn branch(from: bitcoin::BlockHash, n: usize, salt: u32) -> Vec<bitcoin::block::
     let mut out: Vec<bitcoin::block::Header> = Vec::with_capacity(n);
     for i in 0..n {
         let prev = out.last().map_or(from, |h| h.block_hash());
-        out.push(header(prev, salt.wrapping_mul(1_000_003).wrapping_add(i as u32)));
+        out.push(header(
+            prev,
+            salt.wrapping_mul(1_000_003).wrapping_add(i as u32),
+        ));
     }
     out
 }
@@ -201,7 +272,11 @@ impl Ours {
         let mut chain = vec![genesis];
         chain.extend(branch(genesis.block_hash(), n, 1));
         let stale = header(chain[1].block_hash(), 99);
-        Ours { chain, stale, asked: Default::default() }
+        Ours {
+            chain,
+            stale,
+            asked: Default::default(),
+        }
     }
 
     fn hash(&self, h: usize) -> bitcoin::BlockHash {
@@ -228,10 +303,19 @@ impl Ours {
     fn check(&self, headers: &[bitcoin::block::Header], peer_height: i32) -> ChainCheck {
         let tip = self.tip();
         self.asked.set(0);
-        let got = chain_check(&self.hash(tip - 1), (tip - 1) as u32, &self.hash(tip), headers, peer_height, |h| {
-            self.lookup(h)
-        });
-        assert!(self.asked.get() <= 2, "asked about {} hashes", self.asked.get());
+        let got = chain_check(
+            &self.hash(tip - 1),
+            (tip - 1) as u32,
+            &self.hash(tip),
+            headers,
+            peer_height,
+            |h| self.lookup(h),
+        );
+        assert!(
+            self.asked.get() <= 2,
+            "asked about {} hashes",
+            self.asked.get()
+        );
         got
     }
 }
@@ -244,7 +328,10 @@ impl Ours {
 fn the_chain_check_tells_on_chain_behind_and_fork_apart() {
     let ours = Ours::new(5);
     let tip = ours.tip();
-    assert_eq!(ours.check(&[ours.chain[tip]], tip as i32), ChainCheck::OnChain);
+    assert_eq!(
+        ours.check(&[ours.chain[tip]], tip as i32),
+        ChainCheck::OnChain
+    );
     // At our locator's block, nothing past it.
     assert_eq!(ours.check(&[], (tip - 1) as i32), ChainCheck::Behind);
     // A sibling of our tip.
@@ -257,9 +344,15 @@ fn the_chain_check_tells_on_chain_behind_and_fork_apart() {
     leaving.extend(branch(leaving[1].block_hash(), 2, 2));
     assert_eq!(ours.check(&leaving, 4), ChainCheck::Fork);
     // From a block we hold off our chain.
-    assert_eq!(ours.check(&branch(ours.stale.block_hash(), 2, 3), 4), ChainCheck::Fork);
+    assert_eq!(
+        ours.check(&branch(ours.stale.block_hash(), 2, 3), 4),
+        ChainCheck::Fork
+    );
     // From a block past our locator on our chain: it has the locator's.
-    assert_eq!(ours.check(&branch(ours.hash(tip), 1, 4), tip as i32 + 1), ChainCheck::OnChain);
+    assert_eq!(
+        ours.check(&branch(ours.hash(tip), 1, 4), tip as i32 + 1),
+        ChainCheck::OnChain
+    );
 }
 
 /// A node whose genesis is not ours (another chain under this network's
@@ -267,7 +360,11 @@ fn the_chain_check_tells_on_chain_behind_and_fork_apart() {
 #[test]
 fn the_chain_check_names_another_chain() {
     let ours = Ours::new(5);
-    let theirs = branch(header(bitcoin::hashes::Hash::all_zeros(), 8).block_hash(), 3, 5);
+    let theirs = branch(
+        header(bitcoin::hashes::Hash::all_zeros(), 8).block_hash(),
+        3,
+        5,
+    );
     assert_eq!(ours.check(&theirs, 3), ChainCheck::OtherChain);
 }
 
@@ -283,7 +380,10 @@ fn a_full_answer_of_our_blocks_is_judged_with_the_stated_height() {
     let shown = &ours.chain[1..=max];
     assert_eq!(ours.check(shown, locator_height), ChainCheck::Fork);
     assert_eq!(ours.check(shown, locator_height - 1), ChainCheck::Behind);
-    assert_eq!(ours.check(&shown[..max - 1], locator_height + 10), ChainCheck::Behind);
+    assert_eq!(
+        ours.check(&shown[..max - 1], locator_height + 10),
+        ChainCheck::Behind
+    );
 }
 
 /// An answer whose headers stop linking is judged by the part that links.

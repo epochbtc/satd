@@ -27,7 +27,6 @@ use bitcoin::hashes::Hash;
 use serde_json::{Value, json};
 
 use crate::chain::state::ChainState;
-use crate::storage::Store;
 use crate::index::address::{
     BackfillCommand, BackfillError, BackfillHandle, cursor::BackfillState, preflight_disk,
     render_status,
@@ -35,6 +34,7 @@ use crate::index::address::{
 #[cfg(feature = "block-filter-index")]
 use crate::index::filter;
 use crate::index::silent_payments;
+use crate::storage::Store;
 
 /// Which Core index flags the node was started with.
 ///
@@ -254,10 +254,7 @@ pub fn get_index_info(
     // The JSON key stays `outpoint_spend` — it is public, and it names
     // the capability rather than the column family behind it.
     let mut outpoint_spend = serde_json::Map::new();
-    outpoint_spend.insert(
-        "complete".into(),
-        json!(chain.store_ref().spent_complete()),
-    );
+    outpoint_spend.insert("complete".into(), json!(chain.store_ref().spent_complete()));
     address.insert("outpoint_spend".into(), Value::Object(outpoint_spend));
 
     let mut top = serde_json::Map::new();
@@ -1090,10 +1087,7 @@ pub fn get_block_filter(
     match chain.get_block_hash_by_height(height) {
         Some(active) if active == block_hash => {}
         _ => {
-            return Err((
-                -5,
-                "filter not found for non-active block".to_string(),
-            ));
+            return Err((-5, "filter not found for non-active block".to_string()));
         }
     }
 
@@ -1114,8 +1108,7 @@ pub fn get_block_filter(
         _ => {
             return Err((
                 -5,
-                "filter not found: concurrent reorg displaced the requested block"
-                    .to_string(),
+                "filter not found: concurrent reorg displaced the requested block".to_string(),
             ));
         }
     }
@@ -1126,8 +1119,7 @@ pub fn get_block_filter(
     // `Display` produces. Returning `hex::encode(header_bytes)`
     // would emit the internal/wire byte order (reversed relative to
     // Core).
-    let header_display =
-        bitcoin::bip158::FilterHeader::from_byte_array(header_bytes).to_string();
+    let header_display = bitcoin::bip158::FilterHeader::from_byte_array(header_bytes).to_string();
 
     Ok(json!({
         "filter": hex::encode(filter_bytes),

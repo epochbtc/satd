@@ -197,7 +197,8 @@ impl TxRequestTracker {
         let mut data = [0u8; 40];
         data[..32].copy_from_slice(hash);
         data[32..].copy_from_slice(&peer.to_le_bytes());
-        let low = bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(self.k0, self.k1, &data) >> 1;
+        let low =
+            bitcoin::hashes::siphash24::Hash::hash_to_u64_with_keys(self.k0, self.k1, &data) >> 1;
         low | (u64::from(preferred) << 63)
     }
 
@@ -258,16 +259,31 @@ impl TxRequestTracker {
             delay += OVERLOADED_PEER_TX_DELAY;
         }
         for parent in parents {
-            self.received_inv(peer, GenTxid::Txid(*parent), info.preferred, now.saturating_add(delay));
+            self.received_inv(
+                peer,
+                GenTxid::Txid(*parent),
+                info.preferred,
+                now.saturating_add(delay),
+            );
         }
         true
     }
 
     /// Core's `ReceivedInv`: a new `Delayed` candidate, unless this peer
     /// already has an announcement for the txhash in any state.
-    pub fn received_inv(&mut self, peer: PeerId, gtxid: GenTxid, preferred: bool, reqtime: u64) -> bool {
+    pub fn received_inv(
+        &mut self,
+        peer: PeerId,
+        gtxid: GenTxid,
+        preferred: bool,
+        reqtime: u64,
+    ) -> bool {
         let hash = gtxid.hash();
-        if self.txs.get(&hash).is_some_and(|anns| anns.iter().any(|a| a.peer == peer)) {
+        if self
+            .txs
+            .get(&hash)
+            .is_some_and(|anns| anns.iter().any(|a| a.peer == peer))
+        {
             return false;
         }
         let seq = self.next_seq;
@@ -289,9 +305,13 @@ impl TxRequestTracker {
     /// Core's `DisconnectedPeer`: forget every announcement of `peer`. A
     /// transaction it was asked for goes to the next candidate.
     pub fn disconnected_peer(&mut self, peer: PeerId) {
-        let Some(pa) = self.peers.remove(&peer) else { return };
+        let Some(pa) = self.peers.remove(&peer) else {
+            return;
+        };
         for hash in pa.all.into_values() {
-            let Some(anns) = self.txs.get_mut(&hash) else { continue };
+            let Some(anns) = self.txs.get_mut(&hash) else {
+                continue;
+            };
             if let Some(i) = anns.iter().position(|a| a.peer == peer) {
                 let a = anns.swap_remove(i);
                 Self::unindex(&mut self.timeline, &mut self.ready, &hash, &a);
@@ -303,7 +323,9 @@ impl TxRequestTracker {
     /// Core's `ForgetTxHash`: drop every announcement of `hash` from every
     /// peer. Called once the transaction is no longer needed.
     pub fn forget_tx_hash(&mut self, hash: &[u8; 32]) {
-        let Some(anns) = self.txs.remove(hash) else { return };
+        let Some(anns) = self.txs.remove(hash) else {
+            return;
+        };
         for a in anns {
             Self::unindex(&mut self.timeline, &mut self.ready, hash, &a);
             if let Some(pa) = self.peers.get_mut(&a.peer) {
@@ -324,13 +346,25 @@ impl TxRequestTracker {
     /// `expired`), then return what to ask `peer` for now, in announcement
     /// order. The caller marks each one it sends with
     /// [`requested_tx`](Self::requested_tx).
-    pub fn get_requestable(&mut self, peer: PeerId, now: u64) -> (Vec<GenTxid>, Vec<(PeerId, GenTxid)>) {
+    pub fn get_requestable(
+        &mut self,
+        peer: PeerId,
+        now: u64,
+    ) -> (Vec<GenTxid>, Vec<(PeerId, GenTxid)>) {
         let expired = self.set_time_point(now);
-        let Some(pa) = self.peers.get(&peer) else { return (Vec::new(), expired) };
+        let Some(pa) = self.peers.get(&peer) else {
+            return (Vec::new(), expired);
+        };
         let selected = pa
             .best
             .values()
-            .filter_map(|hash| self.txs.get(hash)?.iter().find(|a| a.peer == peer).map(|a| a.gtxid))
+            .filter_map(|hash| {
+                self.txs
+                    .get(hash)?
+                    .iter()
+                    .find(|a| a.peer == peer)
+                    .map(|a| a.gtxid)
+            })
             .collect();
         (selected, expired)
     }
@@ -340,8 +374,13 @@ impl TxRequestTracker {
     /// completed, as nothing is waited for on it any more. No effect unless
     /// `peer` has a candidate announcement for it.
     pub fn requested_tx(&mut self, peer: PeerId, hash: &[u8; 32], expiry: u64) {
-        let Some(anns) = self.txs.get_mut(hash) else { return };
-        let Some(i) = anns.iter().position(|a| a.peer == peer && a.state.is_candidate()) else {
+        let Some(anns) = self.txs.get_mut(hash) else {
+            return;
+        };
+        let Some(i) = anns
+            .iter()
+            .position(|a| a.peer == peer && a.state.is_candidate())
+        else {
             return;
         };
         for (j, other) in anns.iter_mut().enumerate() {
@@ -355,7 +394,10 @@ impl TxRequestTracker {
         }
         let a = anns[i].clone();
         Self::unindex(&mut self.timeline, &mut self.ready, hash, &a);
-        let pa = self.peers.get_mut(&peer).expect("an announcement's peer is indexed");
+        let pa = self
+            .peers
+            .get_mut(&peer)
+            .expect("an announcement's peer is indexed");
         pa.best.remove(&a.seq);
         pa.requested += 1;
         anns[i].state = State::Requested;
@@ -369,8 +411,13 @@ impl TxRequestTracker {
     /// the next candidate becomes eligible. Returns whether `hash` had been
     /// requested from `peer` (rather than only announced by it).
     pub fn received_response(&mut self, peer: PeerId, hash: &[u8; 32]) -> bool {
-        let Some(anns) = self.txs.get_mut(hash) else { return false };
-        let Some(i) = anns.iter().position(|a| a.peer == peer && a.state != State::Completed) else {
+        let Some(anns) = self.txs.get_mut(hash) else {
+            return false;
+        };
+        let Some(i) = anns
+            .iter()
+            .position(|a| a.peer == peer && a.state != State::Completed)
+        else {
             return false;
         };
         let a = anns[i].clone();
@@ -393,7 +440,9 @@ impl TxRequestTracker {
 
     /// Candidate announcements of `peer`. Core's `CountCandidates`.
     pub fn count_candidates(&self, peer: PeerId) -> usize {
-        let Some(pa) = self.peers.get(&peer) else { return 0 };
+        let Some(pa) = self.peers.get(&peer) else {
+            return 0;
+        };
         pa.all
             .values()
             .filter(|h| {
@@ -426,7 +475,12 @@ impl TxRequestTracker {
     pub fn candidate_peers(&self, hash: &[u8; 32]) -> Vec<PeerId> {
         self.txs
             .get(hash)
-            .map(|anns| anns.iter().filter(|a| a.state != State::Completed).map(|a| a.peer).collect())
+            .map(|anns| {
+                anns.iter()
+                    .filter(|a| a.state != State::Completed)
+                    .map(|a| a.peer)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -438,8 +492,12 @@ impl TxRequestTracker {
                 break;
             }
             self.timeline.pop_first();
-            let Some(anns) = self.txs.get_mut(&hash) else { continue };
-            let Some(a) = anns.iter_mut().find(|a| a.peer == peer) else { continue };
+            let Some(anns) = self.txs.get_mut(&hash) else {
+                continue;
+            };
+            let Some(a) = anns.iter_mut().find(|a| a.peer == peer) else {
+                continue;
+            };
             match a.state {
                 State::Delayed => {
                     a.state = State::Ready;
@@ -463,8 +521,12 @@ impl TxRequestTracker {
                 break;
             }
             self.ready.pop_last();
-            let Some(anns) = self.txs.get_mut(&hash) else { continue };
-            let Some(a) = anns.iter_mut().find(|a| a.peer == peer) else { continue };
+            let Some(anns) = self.txs.get_mut(&hash) else {
+                continue;
+            };
+            let Some(a) = anns.iter_mut().find(|a| a.peer == peer) else {
+                continue;
+            };
             if a.state == State::Best
                 && let Some(pa) = self.peers.get_mut(&peer)
             {
@@ -500,7 +562,9 @@ impl TxRequestTracker {
     /// the highest-priority ready candidate is `Best`; and a txhash with
     /// only `Completed` announcements is forgotten entirely.
     fn reselect(&mut self, hash: &TxHash) {
-        let Some(anns) = self.txs.get_mut(hash) else { return };
+        let Some(anns) = self.txs.get_mut(hash) else {
+            return;
+        };
         if anns.iter().all(|a| a.state == State::Completed) {
             self.forget_tx_hash(hash);
             return;
@@ -546,11 +610,16 @@ impl TxRequestTracker {
         let mut ready = 0;
         for (hash, anns) in &self.txs {
             assert!(!anns.is_empty());
-            assert!(anns.iter().any(|a| a.state != State::Completed), "only completed remain");
+            assert!(
+                anns.iter().any(|a| a.state != State::Completed),
+                "only completed remain"
+            );
             let requested = anns.iter().filter(|a| a.state == State::Requested).count();
             let best = anns.iter().filter(|a| a.state == State::Best).count();
             assert!(requested + best <= 1, "at most one selected per txhash");
-            let any_ready = anns.iter().any(|a| matches!(a.state, State::Ready | State::Best));
+            let any_ready = anns
+                .iter()
+                .any(|a| matches!(a.state, State::Ready | State::Best));
             if requested == 0 && any_ready {
                 assert_eq!(best, 1, "a ready candidate and no request means one best");
                 let b = anns.iter().find(|a| a.state == State::Best).unwrap();
@@ -607,8 +676,14 @@ mod tests {
         GenTxid::Txid(bitcoin::Txid::from_byte_array([n; 32]))
     }
 
-    const PREF: AnnouncerInfo = AnnouncerInfo { preferred: true, relay_permission: false };
-    const NONPREF: AnnouncerInfo = AnnouncerInfo { preferred: false, relay_permission: false };
+    const PREF: AnnouncerInfo = AnnouncerInfo {
+        preferred: true,
+        relay_permission: false,
+    };
+    const NONPREF: AnnouncerInfo = AnnouncerInfo {
+        preferred: false,
+        relay_permission: false,
+    };
     const T0: u64 = 1_000 * SECOND;
 
     /// Ask every peer what it should be sent at `now`, mark it requested,
@@ -635,10 +710,16 @@ mod tests {
         assert_eq!(first.len(), 1, "two announcers, one request");
         let asked = first[0].0;
         let other = if asked == 1 { 2 } else { 1 };
-        assert!(tick(&mut t, &[1, 2], T0 + GETDATA_TX_INTERVAL - 1).is_empty(), "nothing before expiry");
+        assert!(
+            tick(&mut t, &[1, 2], T0 + GETDATA_TX_INTERVAL - 1).is_empty(),
+            "nothing before expiry"
+        );
         let (_, expired) = t.get_requestable(other, T0 + GETDATA_TX_INTERVAL);
         assert_eq!(expired, vec![(asked, wtxid(1))]);
-        assert_eq!(tick(&mut t, &[1, 2], T0 + GETDATA_TX_INTERVAL), vec![(other, wtxid(1))]);
+        assert_eq!(
+            tick(&mut t, &[1, 2], T0 + GETDATA_TX_INTERVAL),
+            vec![(other, wtxid(1))]
+        );
         // The first peer is never asked again, and once both failed the
         // txhash is forgotten.
         assert!(tick(&mut t, &[1, 2], T0 + 2 * GETDATA_TX_INTERVAL).is_empty());
@@ -669,12 +750,18 @@ mod tests {
         assert!(tick(&mut t, &[1], T0 + NONPREF_PEER_TX_DELAY - 1).is_empty());
         t.add_announcement(2, wtxid(3), PREF, 1, T0 + SECOND);
         assert_eq!(tick(&mut t, &[1, 2], T0 + SECOND), vec![(2, wtxid(3))]);
-        assert!(tick(&mut t, &[1, 2], T0 + NONPREF_PEER_TX_DELAY).is_empty(), "already in flight");
+        assert!(
+            tick(&mut t, &[1, 2], T0 + NONPREF_PEER_TX_DELAY).is_empty(),
+            "already in flight"
+        );
 
         // Alone, the inbound one is asked exactly at its delay.
         let mut t = TxRequestTracker::deterministic();
         t.add_announcement(1, wtxid(3), NONPREF, 1, T0);
-        assert_eq!(tick(&mut t, &[1], T0 + NONPREF_PEER_TX_DELAY), vec![(1, wtxid(3))]);
+        assert_eq!(
+            tick(&mut t, &[1], T0 + NONPREF_PEER_TX_DELAY),
+            vec![(1, wtxid(3))]
+        );
     }
 
     #[test]
@@ -686,7 +773,11 @@ mod tests {
                 t.add_announcement(p, wtxid(4), NONPREF, 1, T0);
             }
             t.add_announcement(5, wtxid(4), PREF, 1, T0);
-            let asked = tick(&mut t, &(5..20).collect::<Vec<_>>(), T0 + NONPREF_PEER_TX_DELAY);
+            let asked = tick(
+                &mut t,
+                &(5..20).collect::<Vec<_>>(),
+                T0 + NONPREF_PEER_TX_DELAY,
+            );
             assert_eq!(asked, vec![(5, wtxid(4))]);
         }
     }
@@ -695,14 +786,31 @@ mod tests {
     fn txid_announcements_wait_only_when_a_wtxid_peer_exists() {
         let mut t = TxRequestTracker::deterministic();
         t.add_announcement(1, txid(5), PREF, 0, T0);
-        assert_eq!(tick(&mut t, &[1], T0), vec![(1, txid(5))], "no wtxid peers: no delay");
+        assert_eq!(
+            tick(&mut t, &[1], T0),
+            vec![(1, txid(5))],
+            "no wtxid peers: no delay"
+        );
         t.add_announcement(1, txid(6), PREF, 1, T0);
         assert!(tick(&mut t, &[1], T0 + TXID_RELAY_DELAY - 1).is_empty());
-        assert_eq!(tick(&mut t, &[1], T0 + TXID_RELAY_DELAY), vec![(1, txid(6))]);
+        assert_eq!(
+            tick(&mut t, &[1], T0 + TXID_RELAY_DELAY),
+            vec![(1, txid(6))]
+        );
         // Delays add up: inbound and by txid.
         t.add_announcement(2, txid(8), NONPREF, 1, T0);
-        assert!(tick(&mut t, &[2], T0 + NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY - 1).is_empty());
-        assert_eq!(tick(&mut t, &[2], T0 + NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY).len(), 1);
+        assert!(
+            tick(
+                &mut t,
+                &[2],
+                T0 + NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY - 1
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            tick(&mut t, &[2], T0 + NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY).len(),
+            1
+        );
     }
 
     #[test]
@@ -711,17 +819,32 @@ mod tests {
         for i in 0..MAX_PEER_TX_REQUEST_IN_FLIGHT as u32 {
             let mut h = [0u8; 32];
             h[..4].copy_from_slice(&i.to_le_bytes());
-            t.add_announcement(1, GenTxid::Wtxid(bitcoin::Wtxid::from_byte_array(h)), PREF, 1, T0);
+            t.add_announcement(
+                1,
+                GenTxid::Wtxid(bitcoin::Wtxid::from_byte_array(h)),
+                PREF,
+                1,
+                T0,
+            );
         }
         assert_eq!(tick(&mut t, &[1], T0).len(), MAX_PEER_TX_REQUEST_IN_FLIGHT);
         assert_eq!(t.count_in_flight(1), MAX_PEER_TX_REQUEST_IN_FLIGHT);
         t.add_announcement(1, wtxid(0xee), PREF, 1, T0);
         assert!(tick(&mut t, &[1], T0 + OVERLOADED_PEER_TX_DELAY - 1).is_empty());
-        assert_eq!(tick(&mut t, &[1], T0 + OVERLOADED_PEER_TX_DELAY), vec![(1, wtxid(0xee))]);
+        assert_eq!(
+            tick(&mut t, &[1], T0 + OVERLOADED_PEER_TX_DELAY),
+            vec![(1, wtxid(0xee))]
+        );
 
-        let relay = AnnouncerInfo { preferred: true, relay_permission: true };
+        let relay = AnnouncerInfo {
+            preferred: true,
+            relay_permission: true,
+        };
         t.add_announcement(1, wtxid(0xef), relay, 1, T0 + OVERLOADED_PEER_TX_DELAY);
-        assert_eq!(tick(&mut t, &[1], T0 + OVERLOADED_PEER_TX_DELAY), vec![(1, wtxid(0xef))]);
+        assert_eq!(
+            tick(&mut t, &[1], T0 + OVERLOADED_PEER_TX_DELAY),
+            vec![(1, wtxid(0xef))]
+        );
     }
 
     #[test]
@@ -735,9 +858,15 @@ mod tests {
         for i in 0..MAX_PEER_TX_ANNOUNCEMENTS as u32 {
             assert!(t.add_announcement(1, g(i), NONPREF, 1, T0));
         }
-        assert!(!t.add_announcement(1, g(u32::MAX), NONPREF, 1, T0), "the 5001st is ignored");
+        assert!(
+            !t.add_announcement(1, g(u32::MAX), NONPREF, 1, T0),
+            "the 5001st is ignored"
+        );
         assert_eq!(t.count(1), MAX_PEER_TX_ANNOUNCEMENTS);
-        let relay = AnnouncerInfo { preferred: false, relay_permission: true };
+        let relay = AnnouncerInfo {
+            preferred: false,
+            relay_permission: true,
+        };
         assert!(t.add_announcement(1, g(u32::MAX), relay, 1, T0));
         // Another peer is unaffected.
         assert!(t.add_announcement(2, g(u32::MAX), NONPREF, 1, T0));
@@ -754,7 +883,10 @@ mod tests {
         t.forget_tx_hash(&wtxid(9).hash());
         t.sanity_check();
         assert_eq!(t.size(), 0);
-        assert_eq!(t.count_in_flight(1) + t.count_in_flight(2) + t.count_in_flight(3), 0);
+        assert_eq!(
+            t.count_in_flight(1) + t.count_in_flight(2) + t.count_in_flight(3),
+            0
+        );
         assert!(tick(&mut t, &[1, 2, 3], T0 + 10 * GETDATA_TX_INTERVAL).is_empty());
     }
 
@@ -806,10 +938,16 @@ mod tests {
     #[test]
     fn orphan_parents_are_announced_by_txid_with_the_txid_delay() {
         let mut t = TxRequestTracker::deterministic();
-        let parents = [bitcoin::Txid::from_byte_array([1; 32]), bitcoin::Txid::from_byte_array([2; 32])];
+        let parents = [
+            bitcoin::Txid::from_byte_array([1; 32]),
+            bitcoin::Txid::from_byte_array([2; 32]),
+        ];
         assert!(t.add_orphan_resolution_candidate(1, &parents, PREF, 1, T0));
         assert!(tick(&mut t, &[1], T0 + TXID_RELAY_DELAY - 1).is_empty());
-        assert_eq!(tick(&mut t, &[1], T0 + TXID_RELAY_DELAY), vec![(1, txid(1)), (1, txid(2))]);
+        assert_eq!(
+            tick(&mut t, &[1], T0 + TXID_RELAY_DELAY),
+            vec![(1, txid(1)), (1, txid(2))]
+        );
         // With no wtxid peers, a preferred peer is asked at once.
         let mut t = TxRequestTracker::deterministic();
         assert!(t.add_orphan_resolution_candidate(1, &parents, PREF, 0, T0));
@@ -829,7 +967,10 @@ mod tests {
             let g = if rng.r#gen() { wtxid(hash) } else { txid(hash) };
             match rng.gen_range(0..9) {
                 0 | 1 => {
-                    let info = AnnouncerInfo { preferred: rng.r#gen(), relay_permission: rng.r#gen() };
+                    let info = AnnouncerInfo {
+                        preferred: rng.r#gen(),
+                        relay_permission: rng.r#gen(),
+                    };
                     t.add_announcement(peer, g, info, rng.gen_range(0..2), now);
                 }
                 2 => {
@@ -845,7 +986,9 @@ mod tests {
                 5 => t.forget_tx_hash(&g.hash()),
                 6 if rng.gen_range(0..10) == 0 => t.disconnected_peer(peer),
                 7 => now = now.saturating_add(rng.gen_range(0..3 * SECOND)),
-                8 if rng.gen_range(0..20) == 0 => now = now.saturating_sub(rng.gen_range(0..5 * SECOND)),
+                8 if rng.gen_range(0..20) == 0 => {
+                    now = now.saturating_sub(rng.gen_range(0..5 * SECOND))
+                }
                 _ => {}
             }
             t.sanity_check();

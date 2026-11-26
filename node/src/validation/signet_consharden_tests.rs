@@ -16,10 +16,11 @@ use super::*;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::script::PushBytes;
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-use bitcoin::{block, BlockHash, CompactTarget, Network, TxMerkleNode};
+use bitcoin::{BlockHash, CompactTarget, Network, TxMerkleNode, block};
 
 /// `OP_RETURN PUSH36[aa21a9ed || 32 zero bytes]`: a BIP 141 commitment.
-const COMMITMENT: &str = "6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000";
+const COMMITMENT: &str =
+    "6a24aa21a9ed0000000000000000000000000000000000000000000000000000000000000000";
 
 fn hex(s: &str) -> Vec<u8> {
     Vec::<u8>::from_hex(s).expect("test hex")
@@ -42,34 +43,104 @@ fn rewrite(script: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
 /// an empty scriptSig and an empty witness stack.
 const CORE_REWRITES: &[(&str, &str, &str, &str)] = &[
     ("section only", "06ecc7daa20000", "04ecc7daa2", "0000"),
-    ("zero-length PUSHDATA1 before", "4c0006ecc7daa20000", "4c04ecc7daa2", "0000"),
-    ("zero-length PUSHDATA1 after", "06ecc7daa200004c00", "04ecc7daa24c", "0000"),
-    ("zero-length PUSHDATA2 before", "4d000006ecc7daa20000", "4d04ecc7daa2", "0000"),
-    ("zero-length PUSHDATA2 after", "06ecc7daa200004d0000", "04ecc7daa24d", "0000"),
-    ("zero-length PUSHDATA4 before", "4e0000000006ecc7daa20000", "4e04ecc7daa2", "0000"),
-    ("zero-length PUSHDATA4 after", "06ecc7daa200004e00000000", "04ecc7daa24e", "0000"),
-    ("PUSHDATA1 with no length byte after", "06ecc7daa200004c", "04ecc7daa2", "0000"),
-    ("PUSHDATA1 data cut short after", "06ecc7daa200004c05aabb", "04ecc7daa2", "0000"),
-    ("direct push cut short after", "06ecc7daa2000005aabb", "04ecc7daa2", "0000"),
-    ("PUSHDATA2 length cut short after", "06ecc7daa200004d01", "04ecc7daa2", "0000"),
-    ("PUSHDATA4 length cut short after", "06ecc7daa200004e0100", "04ecc7daa2", "0000"),
+    (
+        "zero-length PUSHDATA1 before",
+        "4c0006ecc7daa20000",
+        "4c04ecc7daa2",
+        "0000",
+    ),
+    (
+        "zero-length PUSHDATA1 after",
+        "06ecc7daa200004c00",
+        "04ecc7daa24c",
+        "0000",
+    ),
+    (
+        "zero-length PUSHDATA2 before",
+        "4d000006ecc7daa20000",
+        "4d04ecc7daa2",
+        "0000",
+    ),
+    (
+        "zero-length PUSHDATA2 after",
+        "06ecc7daa200004d0000",
+        "04ecc7daa24d",
+        "0000",
+    ),
+    (
+        "zero-length PUSHDATA4 before",
+        "4e0000000006ecc7daa20000",
+        "4e04ecc7daa2",
+        "0000",
+    ),
+    (
+        "zero-length PUSHDATA4 after",
+        "06ecc7daa200004e00000000",
+        "04ecc7daa24e",
+        "0000",
+    ),
+    (
+        "PUSHDATA1 with no length byte after",
+        "06ecc7daa200004c",
+        "04ecc7daa2",
+        "0000",
+    ),
+    (
+        "PUSHDATA1 data cut short after",
+        "06ecc7daa200004c05aabb",
+        "04ecc7daa2",
+        "0000",
+    ),
+    (
+        "direct push cut short after",
+        "06ecc7daa2000005aabb",
+        "04ecc7daa2",
+        "0000",
+    ),
+    (
+        "PUSHDATA2 length cut short after",
+        "06ecc7daa200004d01",
+        "04ecc7daa2",
+        "0000",
+    ),
+    (
+        "PUSHDATA4 length cut short after",
+        "06ecc7daa200004e0100",
+        "04ecc7daa2",
+        "0000",
+    ),
     ("OP_0 before", "0006ecc7daa20000", "0004ecc7daa2", "0000"),
-    ("non-push ops around", "0051ac06ecc7daa20000004f61", "0051ac04ecc7daa2004f61", "0000"),
+    (
+        "non-push ops around",
+        "0051ac06ecc7daa20000004f61",
+        "0051ac04ecc7daa2004f61",
+        "0000",
+    ),
     (
         "long length prefixes are rewritten short",
         "4c01014c06ecc7daa200004d0300aabbcc",
         "010104ecc7daa203aabbcc",
         "0000",
     ),
-    ("a header with no data is not a section", "04ecc7daa206ecc7daa20000", "04ecc7daa204ecc7daa2", "0000"),
-    ("only the first section is cleared", "06ecc7daa2000006ecc7daa20101", "04ecc7daa206ecc7daa20101", "0000"),
+    (
+        "a header with no data is not a section",
+        "04ecc7daa206ecc7daa20000",
+        "04ecc7daa204ecc7daa2",
+        "0000",
+    ),
+    (
+        "only the first section is cleared",
+        "06ecc7daa2000006ecc7daa20101",
+        "04ecc7daa206ecc7daa20101",
+        "0000",
+    ),
 ];
 
 #[test]
 fn the_commitment_rewrite_is_cores_byte_for_byte() {
     for (name, input, core_rewrite, core_solution) in CORE_REWRITES {
-        let (cleared, solution) =
-            rewrite(&commitment_then(input)).unwrap_or_else(|| panic!("{name}: Core finds the section"));
+        let (cleared, solution) = rewrite(&commitment_then(input))
+            .unwrap_or_else(|| panic!("{name}: Core finds the section"));
         assert_eq!(
             bitcoin::hex::DisplayHex::to_lower_hex_string(&cleared[..]),
             format!("{COMMITMENT}{core_rewrite}"),
@@ -94,7 +165,10 @@ fn a_commitment_without_a_section_is_left_alone() {
         ("zero-length PUSHDATA1", "4c00"),
         ("PUSHDATA1 with no length byte", "4c"),
         ("a header with no data", "04ecc7daa2"),
-        ("an unparseable op hides a later header", "4c0a04ecc7daa20000"),
+        (
+            "an unparseable op hides a later header",
+            "4c0a04ecc7daa20000",
+        ),
     ] {
         assert_eq!(rewrite(&commitment_then(input)), None, "{name}");
     }
@@ -132,12 +206,18 @@ fn cores_signet_parse_tests() {
         version: transaction::Version(2),
         lock_time: absolute::LockTime::ZERO,
         input: vec![],
-        output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        }],
     };
     block.txdata = vec![cb.clone(), cb.clone()];
     assert!(!check(&block));
 
-    let section_141: Vec<u8> = [0xaa, 0x21, 0xa9, 0xed].into_iter().chain([0xff; 32]).collect();
+    let section_141: Vec<u8> = [0xaa, 0x21, 0xa9, 0xed]
+        .into_iter()
+        .chain([0xff; 32])
+        .collect();
     let with_sections = |cb: &mut Transaction, block: &mut Block, sections: &[&[u8]]| {
         let mut b = Builder::new().push_opcode(OP_RETURN);
         for s in sections {
@@ -185,7 +265,10 @@ fn block_with_commitment(script: Vec<u8>) -> Block {
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(script) }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(script),
+        }],
     };
     Block {
         header: block::Header {
@@ -205,7 +288,11 @@ fn genesis() -> BlockHash {
 }
 
 /// A P2WPKH challenge and its key.
-fn p2wpkh_challenge() -> (ScriptBuf, bitcoin::secp256k1::SecretKey, bitcoin::CompressedPublicKey) {
+fn p2wpkh_challenge() -> (
+    ScriptBuf,
+    bitcoin::secp256k1::SecretKey,
+    bitcoin::CompressedPublicKey,
+) {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x42u8; 32]).unwrap();
     let pk = bitcoin::CompressedPublicKey(sk.public_key(&secp));
@@ -217,10 +304,17 @@ fn p2wpkh_challenge() -> (ScriptBuf, bitcoin::secp256k1::SecretKey, bitcoin::Com
 /// must hold no signet section, so that the message is built over it as it
 /// stands; the fixed header, prev hash and time are those of every block here.
 fn solution_signing(signed_commitment: &[u8]) -> Vec<u8> {
-    assert_eq!(rewrite(signed_commitment), None, "the signed commitment carries no section");
+    assert_eq!(
+        rewrite(signed_commitment),
+        None,
+        "the signed commitment carries no section"
+    );
     let (challenge, sk, pk) = p2wpkh_challenge();
-    let txs = SignetTxs::create(&block_with_commitment(signed_commitment.to_vec()), &challenge)
-        .expect("signing transactions");
+    let txs = SignetTxs::create(
+        &block_with_commitment(signed_commitment.to_vec()),
+        &challenge,
+    )
+    .expect("signing transactions");
     let sighash = SighashCache::new(&txs.to_sign)
         .p2wpkh_signature_hash(0, &challenge, Amount::ZERO, EcdsaSighashType::All)
         .expect("sighash");
@@ -260,18 +354,30 @@ fn a_zero_length_pushdata_is_signed_as_its_own_opcode() {
         ("", "4d0000", "04ecc7daa24d", "04ecc7daa200"),
         ("", "4e00000000", "04ecc7daa24e", "04ecc7daa200"),
     ] {
-        let signed_over_core = commitment_with_section(before, &solution_signing(&commitment_then(core)), after);
+        let signed_over_core =
+            commitment_with_section(before, &solution_signing(&commitment_then(core)), after);
         assert!(
-            check_signet_block_solution(&block_with_commitment(signed_over_core), challenge.as_bytes(), genesis())
-                .is_ok(),
+            check_signet_block_solution(
+                &block_with_commitment(signed_over_core),
+                challenge.as_bytes(),
+                genesis()
+            )
+            .is_ok(),
             "{before}|section|{after}: a block signed over Core's rewrite {core} must verify"
         );
 
-        let signed_over_op_0 =
-            commitment_with_section(before, &solution_signing(&commitment_then(with_op_0)), after);
+        let signed_over_op_0 = commitment_with_section(
+            before,
+            &solution_signing(&commitment_then(with_op_0)),
+            after,
+        );
         assert!(
             matches!(
-                check_signet_block_solution(&block_with_commitment(signed_over_op_0), challenge.as_bytes(), genesis()),
+                check_signet_block_solution(
+                    &block_with_commitment(signed_over_op_0),
+                    challenge.as_bytes(),
+                    genesis()
+                ),
                 Err(ValidationError::BadSignetSolution)
             ),
             "{before}|section|{after}: a block signed over {with_op_0} is not one Core accepts"
@@ -286,9 +392,15 @@ fn a_zero_length_pushdata_is_signed_as_its_own_opcode() {
 fn a_section_before_an_unparseable_push_is_checked() {
     let (challenge, _, _) = p2wpkh_challenge();
     for after in ["4c", "4c05aabb", "05aabb", "4d01", "4e0100"] {
-        let script = commitment_with_section("", &solution_signing(&commitment_then("04ecc7daa2")), after);
+        let script =
+            commitment_with_section("", &solution_signing(&commitment_then("04ecc7daa2")), after);
         assert!(
-            check_signet_block_solution(&block_with_commitment(script), challenge.as_bytes(), genesis()).is_ok(),
+            check_signet_block_solution(
+                &block_with_commitment(script),
+                challenge.as_bytes(),
+                genesis()
+            )
+            .is_ok(),
             "section then {after}: Core checks the section and accepts the block"
         );
     }
@@ -313,5 +425,7 @@ fn a_bad_section_before_an_unparseable_push_is_refused() {
     ));
     // And with a well-formed solution and the tail, accepted.
     let script = commitment_with_section("", &[0x00, 0x00], "4c");
-    assert!(check_signet_block_solution(&block_with_commitment(script), &op_true, genesis()).is_ok());
+    assert!(
+        check_signet_block_solution(&block_with_commitment(script), &op_true, genesis()).is_ok()
+    );
 }

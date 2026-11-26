@@ -157,10 +157,22 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                Some(Resolved { height: 1, txid: txid(5) }),
-                Some(Resolved { height: 0, txid: txid(1) }),
-                Some(Resolved { height: 1, txid: txid(5) }),
-                Some(Resolved { height: 0, txid: txid(3) }),
+                Some(Resolved {
+                    height: 1,
+                    txid: txid(5)
+                }),
+                Some(Resolved {
+                    height: 0,
+                    txid: txid(1)
+                }),
+                Some(Resolved {
+                    height: 1,
+                    txid: txid(5)
+                }),
+                Some(Resolved {
+                    height: 0,
+                    txid: txid(3)
+                }),
             ]
         );
     }
@@ -252,7 +264,8 @@ mod tests {
         );
         // The key carries the spender, the value the consumed output.
         assert!(
-            rows.iter().all(|(k, prev)| k.height == 1 && prev.txid != k.txid),
+            rows.iter()
+                .all(|(k, prev)| k.height == 1 && prev.txid != k.txid),
             "the key must name the spender and the value the funder"
         );
         let mut sorted = rows.clone();

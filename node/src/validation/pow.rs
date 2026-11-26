@@ -2,7 +2,7 @@ use bitcoin::block::Header;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{BlockHash, Network};
 
-use crate::storage::blockindex::{target_from_compact, compact_from_target, BlockIndexEntry};
+use crate::storage::blockindex::{BlockIndexEntry, compact_from_target, target_from_compact};
 use crate::validation::ValidationError;
 
 /// Mainnet minimum difficulty target.
@@ -43,7 +43,9 @@ static REGTEST_BIP94: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// [`enforces_bip94`] only consults it for [`Network::Regtest`]. Returns
 /// `Err` if it was already set.
 pub fn set_regtest_bip94() -> Result<(), &'static str> {
-    REGTEST_BIP94.set(()).map_err(|_| "regtest BIP 94 already set")
+    REGTEST_BIP94
+        .set(())
+        .map_err(|_| "regtest BIP 94 already set")
 }
 
 /// Whether `network` enforces BIP 94's timewarp guard: testnet4 always,
@@ -94,8 +96,8 @@ pub fn derive_target(bits: CompactTarget, network: Network) -> Option<Target> {
     let size = raw >> 24;
     let word = raw & 0x007f_ffff;
     let negative = word != 0 && raw & 0x0080_0000 != 0;
-    let overflow = word != 0
-        && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
+    let overflow =
+        word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
     if negative || overflow {
         return None;
     }
@@ -115,7 +117,10 @@ pub fn derive_target(bits: CompactTarget, network: Network) -> Option<Target> {
 /// blocks the gap is covered by [`check_difficulty`], which pins `bits` to
 /// the chain's schedule; this is for the places that must judge a header
 /// before, or without, knowing where it sits in the chain.
-pub fn check_proof_of_work_bounded(header: &Header, network: Network) -> Result<(), ValidationError> {
+pub fn check_proof_of_work_bounded(
+    header: &Header,
+    network: Network,
+) -> Result<(), ValidationError> {
     let target = derive_target(header.bits, network).ok_or(ValidationError::BadProofOfWork)?;
     if target.is_met_by(header.block_hash()) {
         Ok(())
@@ -212,24 +217,16 @@ where
     let height = prev.height + 1;
     let bits = match network {
         Network::Regtest => REGTEST_POWLIMIT_BITS,
-        Network::Testnet => calculate_next_bits_testnet(
-            height,
-            header_time,
-            prev,
-            &get_by_hash,
-            false,
-        )?,
+        Network::Testnet => {
+            calculate_next_bits_testnet(height, header_time, prev, &get_by_hash, false)?
+        }
         // Testnet4 uses testnet3's 20-minute min-difficulty rule, with the
         // retarget seeded from the first block of the period (see
         // calculate_next_bits_bip94), so an end-of-period min-difficulty
         // block can't reset the real difficulty.
-        Network::Testnet4 => calculate_next_bits_testnet(
-            height,
-            header_time,
-            prev,
-            &get_by_hash,
-            true,
-        )?,
+        Network::Testnet4 => {
+            calculate_next_bits_testnet(height, header_time, prev, &get_by_hash, true)?
+        }
         Network::Signet => calculate_next_bits(height, prev, &get_by_hash, SIGNET_POWLIMIT_BITS)?,
         // Mainnet
         _ => calculate_next_bits(height, prev, &get_by_hash, MAINNET_POWLIMIT_BITS)?,
@@ -290,7 +287,11 @@ where
     let actual_timespan = prev.header.time.saturating_sub(first_entry.header.time);
     let actual_timespan = actual_timespan.clamp(TARGET_TIMESPAN / 4, TARGET_TIMESPAN * 4);
     // BIP 94: seed from the first block of the period, not `prev`.
-    Ok(retarget(first_entry.header.bits, actual_timespan, MAINNET_POWLIMIT_BITS))
+    Ok(retarget(
+        first_entry.header.bits,
+        actual_timespan,
+        MAINNET_POWLIMIT_BITS,
+    ))
 }
 
 /// Calculate expected difficulty bits for testnet (with special min-difficulty rule).
@@ -328,7 +329,9 @@ where
     // Testnet special rule: if >20 minutes since last block, allow min
     // difficulty. Compared in 64 bits, as Core's `int64_t` block times are,
     // so a parent timestamp near `u32::MAX` cannot wrap the sum.
-    if u64::from(header_time) > u64::from(prev.header.time) + u64::from(TESTNET_ALLOW_MIN_DIFF_AFTER) {
+    if u64::from(header_time)
+        > u64::from(prev.header.time) + u64::from(TESTNET_ALLOW_MIN_DIFF_AFTER)
+    {
         return Ok(TESTNET_POWLIMIT_BITS);
     }
 
@@ -369,7 +372,10 @@ where
 /// timestamps.
 ///
 /// Fails closed (`BadDifficulty`) if a link is missing or inconsistent.
-fn period_first<G>(prev: &BlockIndexEntry, get_by_hash: &G) -> Result<BlockIndexEntry, ValidationError>
+fn period_first<G>(
+    prev: &BlockIndexEntry,
+    get_by_hash: &G,
+) -> Result<BlockIndexEntry, ValidationError>
 where
     G: Fn(&BlockHash) -> Option<BlockIndexEntry>,
 {
@@ -378,7 +384,8 @@ where
         .ok_or(ValidationError::BadDifficulty)?;
     let mut current = prev.clone();
     while current.height > first_height {
-        let parent = get_by_hash(&current.header.prev_blockhash).ok_or(ValidationError::BadDifficulty)?;
+        let parent =
+            get_by_hash(&current.header.prev_blockhash).ok_or(ValidationError::BadDifficulty)?;
         if parent.height + 1 != current.height {
             return Err(ValidationError::BadDifficulty);
         }
@@ -391,7 +398,7 @@ where
 /// new_target = old_target * actual_timespan / TARGET_TIMESPAN
 /// Clamped to not exceed powlimit.
 fn retarget(old_bits: CompactTarget, actual_timespan: u32, powlimit_bits: u32) -> u32 {
-    use crate::storage::blockindex::{mul_u256_u32, div_u256_u32};
+    use crate::storage::blockindex::{div_u256_u32, mul_u256_u32};
 
     let old_target = target_from_compact(old_bits);
 
@@ -413,8 +420,12 @@ fn retarget(old_bits: CompactTarget, actual_timespan: u32, powlimit_bits: u32) -
 /// Compare two big-endian U256 values. Returns 1 if a > b, -1 if a < b, 0 if equal.
 fn compare_targets(a: &[u8; 32], b: &[u8; 32]) -> i32 {
     for i in 0..32 {
-        if a[i] > b[i] { return 1; }
-        if a[i] < b[i] { return -1; }
+        if a[i] > b[i] {
+            return 1;
+        }
+        if a[i] < b[i] {
+            return -1;
+        }
     }
     0
 }
@@ -491,7 +502,10 @@ pub fn check_future_timestamp(header: &Header, now: u64) -> Result<(), Validatio
 /// Core's `fPowAllowMinDifficultyBlocks`: testnet3, testnet4 and regtest,
 /// where a block may fall back to the minimum difficulty.
 pub fn allows_min_difficulty_blocks(network: Network) -> bool {
-    matches!(network, Network::Testnet | Network::Testnet4 | Network::Regtest)
+    matches!(
+        network,
+        Network::Testnet | Network::Testnet4 | Network::Regtest
+    )
 }
 
 /// Core's `consensus.powLimit` as a full 256-bit value, big-endian. On
@@ -516,7 +530,12 @@ fn pow_limit_target(network: Network) -> [u8; 32] {
 /// skip the check. Headers presync runs it on headers it does not store
 /// ([`crate::net::headerssync`]), so a chain cannot pack its work into a few
 /// blocks of very high difficulty.
-pub fn permitted_difficulty_transition(network: Network, height: u32, old_bits: u32, new_bits: u32) -> bool {
+pub fn permitted_difficulty_transition(
+    network: Network,
+    height: u32,
+    old_bits: u32,
+    new_bits: u32,
+) -> bool {
     use crate::storage::blockindex::{div_u256_u32, mul_u256_u32};
     if allows_min_difficulty_blocks(network) {
         return true;
@@ -621,19 +640,30 @@ mod tests {
         // would otherwise allow the value.
         assert!(t(0x0492_3456, Network::Regtest).is_none(), "negative");
         assert!(t(0x0000_0000, Network::Regtest).is_none(), "zero");
-        assert!(t(0x2101_ffff, Network::Regtest).is_none(), "overflow past 256 bits");
-        assert!(t(0x2300_0001, Network::Regtest).is_none(), "overflow by exponent alone");
+        assert!(
+            t(0x2101_ffff, Network::Regtest).is_none(),
+            "overflow past 256 bits"
+        );
+        assert!(
+            t(0x2300_0001, Network::Regtest).is_none(),
+            "overflow by exponent alone"
+        );
         // Each size bound is strict: a 33-byte encoding may carry a 2-byte
         // mantissa (0x100 << 240 = 2^248, inside regtest's limit), as Core's
         // `nWord > 0xff && nSize > 33` allows.
-        assert!(t(0x2100_0100, Network::Regtest).is_some(), "size 33, two-byte word");
+        assert!(
+            t(0x2100_0100, Network::Regtest).is_some(),
+            "size 33, two-byte word"
+        );
         // A zero mantissa with the sign bit set is zero, not negative.
         assert!(t(0x0480_0000, Network::Regtest).is_none());
 
         // The value itself matches the unchecked decode when it is valid.
         assert_eq!(
             t(MAINNET_POWLIMIT_BITS, Network::Bitcoin),
-            Some(Target::from_compact(CompactTarget::from_consensus(MAINNET_POWLIMIT_BITS)))
+            Some(Target::from_compact(CompactTarget::from_consensus(
+                MAINNET_POWLIMIT_BITS
+            )))
         );
     }
     use super::*;
@@ -676,7 +706,10 @@ mod tests {
     fn link_period(
         first: &BlockIndexEntry,
         prev: &BlockIndexEntry,
-    ) -> (BlockIndexEntry, std::collections::HashMap<BlockHash, BlockIndexEntry>) {
+    ) -> (
+        BlockIndexEntry,
+        std::collections::HashMap<BlockHash, BlockIndexEntry>,
+    ) {
         let mut by_hash = std::collections::HashMap::new();
         by_hash.insert(first.header.block_hash(), first.clone());
         let mut parent = first.header.block_hash();
@@ -704,12 +737,18 @@ mod tests {
         let mut new_header = genesis.header;
         new_header.time = prev_header.time - 601; // 601s before parent → violation
         let res = check_difficulty(&new_header, &prev, Network::Testnet4, |_| None);
-        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+        assert!(
+            matches!(res, Err(ValidationError::TimewarpAttack)),
+            "got {res:?}"
+        );
 
         // Exactly 600s before is allowed by the timewarp rule.
         new_header.time = prev_header.time - 600;
         let res = check_difficulty(&new_header, &prev, Network::Testnet4, |_| None);
-        assert!(!matches!(res, Err(ValidationError::TimewarpAttack)), "600s must pass timewarp");
+        assert!(
+            !matches!(res, Err(ValidationError::TimewarpAttack)),
+            "600s must pass timewarp"
+        );
     }
 
     /// Core's `-test=bip94` gives regtest testnet4's timewarp guard and
@@ -726,22 +765,35 @@ mod tests {
         let mut new_header = genesis.header;
         new_header.time = prev_header.time - 601;
         let res = check_difficulty_with(&new_header, &prev, Network::Regtest, true, |_| None);
-        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+        assert!(
+            matches!(res, Err(ValidationError::TimewarpAttack)),
+            "got {res:?}"
+        );
         let res = check_difficulty_with(&new_header, &prev, Network::Regtest, false, |_| None);
-        assert!(res.is_ok(), "regtest without -test=bip94 has no timewarp guard: {res:?}");
+        assert!(
+            res.is_ok(),
+            "regtest without -test=bip94 has no timewarp guard: {res:?}"
+        );
 
         // Only the first block of a period is guarded.
         for mid_height in [144, 2014] {
             let mut mid = prev.clone();
             mid.height = mid_height;
             let res = check_difficulty_with(&new_header, &mid, Network::Regtest, true, |_| None);
-            assert!(res.is_ok(), "height {} is not a period start: {res:?}", mid_height + 1);
+            assert!(
+                res.is_ok(),
+                "height {} is not a period start: {res:?}",
+                mid_height + 1
+            );
         }
         // 2016 = 14 x 144 starts a period on regtest too.
         let mut late = prev.clone();
         late.height = 2015;
         let res = check_difficulty_with(&new_header, &late, Network::Regtest, true, |_| None);
-        assert!(matches!(res, Err(ValidationError::TimewarpAttack)), "got {res:?}");
+        assert!(
+            matches!(res, Err(ValidationError::TimewarpAttack)),
+            "got {res:?}"
+        );
         new_header.time = prev_header.time - 600;
         let res = check_difficulty_with(&new_header, &prev, Network::Regtest, true, |_| None);
         assert!(res.is_ok(), "600s before the parent passes: {res:?}");
@@ -788,8 +840,7 @@ mod tests {
         let get_by_hash = |hsh: &BlockHash| by_hash.get(hsh).cloned();
 
         assert!(
-            check_difficulty(&new_header, &prev, Network::Testnet4, get_by_hash)
-                .is_ok(),
+            check_difficulty(&new_header, &prev, Network::Testnet4, get_by_hash).is_ok(),
             "walk-back must follow parent pointers and survive the height-index gap"
         );
     }
@@ -982,7 +1033,10 @@ mod tests {
 
             // A bound only a few seconds off the target timespan leaves the
             // difficulty where it was, which testnet4 must not accept.
-            for wrong in [period_bits, retarget(seed, TARGET_TIMESPAN + 4, MAINNET_POWLIMIT_BITS)] {
+            for wrong in [
+                period_bits,
+                retarget(seed, TARGET_TIMESPAN + 4, MAINNET_POWLIMIT_BITS),
+            ] {
                 new_header.bits = CompactTarget::from_consensus(wrong);
                 assert!(
                     matches!(
@@ -1022,8 +1076,8 @@ mod tests {
             let get_by_hash = |h: &BlockHash| by_hash.get(h).cloned();
 
             let header_time = prev_header.time + 600;
-            let bits = next_bits(network, &prev, header_time, get_by_hash)
-                .expect("the seed is present");
+            let bits =
+                next_bits(network, &prev, header_time, get_by_hash).expect("the seed is present");
             assert_ne!(
                 bits, prev_header.bits,
                 "{network}: premise — a boundary block does not inherit its parent's bits"
@@ -1166,7 +1220,12 @@ mod tests {
         new_header.bits = CompactTarget::from_consensus(expected_bits);
 
         let (prev, by_hash) = link_period(&first_entry, &prev);
-        assert!(check_difficulty(&new_header, &prev, Network::Bitcoin, |h| by_hash.get(h).cloned()).is_ok());
+        assert!(
+            check_difficulty(&new_header, &prev, Network::Bitcoin, |h| by_hash
+                .get(h)
+                .cloned())
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1213,7 +1272,12 @@ mod tests {
         new_header.bits = CompactTarget::from_consensus(expected_bits);
 
         let (prev, by_hash) = link_period(&first_entry, &prev);
-        assert!(check_difficulty(&new_header, &prev, Network::Bitcoin, |h| by_hash.get(h).cloned()).is_ok());
+        assert!(
+            check_difficulty(&new_header, &prev, Network::Bitcoin, |h| by_hash
+                .get(h)
+                .cloned())
+            .is_ok()
+        );
     }
 
     /// Signet `nBits` follows the retarget schedule, as in Core (#838): the
@@ -1229,7 +1293,8 @@ mod tests {
         let mut prev_header = genesis.header;
         prev_header.time = 1_770_338_984;
         prev_header.bits = CompactTarget::from_consensus(0x1d15_7c9b);
-        let (prev, by_hash) = link_period(&entry(first_header, 288_288), &entry(prev_header, 290_303));
+        let (prev, by_hash) =
+            link_period(&entry(first_header, 288_288), &entry(prev_header, 290_303));
         let by_hash = |h: &BlockHash| by_hash.get(h).cloned();
 
         let mut header = genesis.header;
@@ -1240,7 +1305,10 @@ mod tests {
         for wrong in [0x1d15_7c9b, 0x1a0f_ffff, SIGNET_POWLIMIT_BITS] {
             header.bits = CompactTarget::from_consensus(wrong);
             assert!(
-                matches!(check_difficulty(&header, &prev, Network::Signet, by_hash), Err(ValidationError::BadDifficulty)),
+                matches!(
+                    check_difficulty(&header, &prev, Network::Signet, by_hash),
+                    Err(ValidationError::BadDifficulty)
+                ),
                 "bits {wrong:#x} at a signet retarget"
             );
         }
@@ -1264,7 +1332,10 @@ mod tests {
     fn build_chain(
         count: u32,
         time_at: impl Fn(u32) -> u32,
-    ) -> (Vec<BlockIndexEntry>, std::collections::HashMap<BlockHash, BlockIndexEntry>) {
+    ) -> (
+        Vec<BlockIndexEntry>,
+        std::collections::HashMap<BlockHash, BlockIndexEntry>,
+    ) {
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
         let mut entries: Vec<BlockIndexEntry> = Vec::with_capacity(count as usize);
         for i in 0..count {

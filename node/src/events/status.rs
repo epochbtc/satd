@@ -310,8 +310,10 @@ impl StatusEvent {
     /// agent, a reject reason) should not be able to size either.
     #[must_use]
     pub fn with_detail(mut self, key: &str, value: impl ToString) -> Self {
-        self.details
-            .insert(truncate(key, MAX_DETAIL_LEN), truncate(&value.to_string(), MAX_DETAIL_LEN));
+        self.details.insert(
+            truncate(key, MAX_DETAIL_LEN),
+            truncate(&value.to_string(), MAX_DETAIL_LEN),
+        );
         self
     }
 }

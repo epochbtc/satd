@@ -14,7 +14,10 @@ use bitcoin::{Amount, Sequence, TxIn, Witness};
 const COIN_VALUE: u64 = 100_000;
 
 fn prev(tag: u8) -> OutPoint {
-    OutPoint { txid: Txid::from_byte_array([tag; 32]), vout: 0 }
+    OutPoint {
+        txid: Txid::from_byte_array([tag; 32]),
+        vout: 0,
+    }
 }
 
 fn p2wpkh(tag: u8) -> ScriptBuf {
@@ -49,7 +52,10 @@ fn spend_seq(prevs: &[OutPoint], in_value: u64, fee: u64, tag: u8, sequence: u32
                 witness: Witness::from_slice(&[[tag]]),
             })
             .collect(),
-        output: vec![TxOut { value: Amount::from_sat(in_value - fee), script_pubkey: p2wpkh(tag) }],
+        output: vec![TxOut {
+            value: Amount::from_sat(in_value - fee),
+            script_pubkey: p2wpkh(tag),
+        }],
     }
 }
 
@@ -59,7 +65,10 @@ fn spend(prevs: &[OutPoint], in_value: u64, fee: u64, tag: u8) -> Transaction {
 
 /// Output 0 of `tx`.
 fn out0(tx: &Transaction) -> OutPoint {
-    OutPoint { txid: tx.compute_txid(), vout: 0 }
+    OutPoint {
+        txid: tx.compute_txid(),
+        vout: 0,
+    }
 }
 
 /// A regtest chain holding one coin per tag, and an empty pool with no relay
@@ -67,13 +76,17 @@ fn out0(tx: &Transaction) -> OutPoint {
 fn env(tags: &[u8]) -> (ChainState, Mempool, std::path::PathBuf) {
     let coins: Vec<(OutPoint, Coin)> = tags.iter().map(|t| (prev(*t), coin())).collect();
     let (cs, mp, dir) = make_funded_template_env_with(&coins, Box::new(NoopVerifier));
-    *mp.config.write() =
-        MempoolConfig { max_size_bytes: 1_000_000, min_fee_rate: 0, ..Default::default() };
+    *mp.config.write() = MempoolConfig {
+        max_size_bytes: 1_000_000,
+        min_fee_rate: 0,
+        ..Default::default()
+    };
     (cs, mp, dir)
 }
 
 fn admit(mp: &Mempool, cs: &ChainState, tx: Transaction) -> Txid {
-    mp.accept_transaction(tx, cs, &NoopVerifier, TxSource::Rpc, false).expect("admitted")
+    mp.accept_transaction(tx, cs, &NoopVerifier, TxSource::Rpc, false)
+        .expect("admitted")
 }
 
 fn entry_json(mp: &Mempool, txid: &Txid) -> serde_json::Value {
@@ -92,7 +105,11 @@ fn entry_vsize_rounds_up_as_core_does() {
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 2);
     let child = spend(&[out0(&parent)], COIN_VALUE - 1_000, 1_000, 3);
     let weight = parent.weight().to_wu();
-    assert_ne!(weight % 4, 0, "the fixture must have a weight that is not a multiple of four");
+    assert_ne!(
+        weight % 4,
+        0,
+        "the fixture must have a weight that is not a multiple of four"
+    );
     let p = admit(&mp, &cs, parent);
     let c = admit(&mp, &cs, child.clone());
 
@@ -101,16 +118,28 @@ fn entry_vsize_rounds_up_as_core_does() {
     let child_vsize = child.weight().to_wu().div_ceil(4);
     let pv = entry_json(&mp, &p);
     assert_eq!(pv["vsize"].as_u64(), Some(vsize), "{pv}");
-    assert_eq!(pv["descendantsize"].as_u64(), Some(vsize + child_vsize), "{pv}");
+    assert_eq!(
+        pv["descendantsize"].as_u64(),
+        Some(vsize + child_vsize),
+        "{pv}"
+    );
     let cv = entry_json(&mp, &c);
-    assert_eq!(cv["ancestorsize"].as_u64(), Some(vsize + child_vsize), "{cv}");
+    assert_eq!(
+        cv["ancestorsize"].as_u64(),
+        Some(vsize + child_vsize),
+        "{cv}"
+    );
 
     // `getmempoolinfo.bytes` is the sum of those, and `getmempoolsummary`
     // reports the same rows and total.
     assert_eq!(mp.info().vsize as u64, vsize + child_vsize);
     let summary = mp.summary(10);
     assert_eq!(summary.bytes as u64, vsize + child_vsize);
-    let row = summary.top.iter().find(|r| r.txid == c.to_string()).expect("child row");
+    let row = summary
+        .top
+        .iter()
+        .find(|r| r.txid == c.to_string())
+        .expect("child row");
     assert_eq!(row.vsize as u64, child_vsize);
     assert_eq!(row.ancestorsize as u64, vsize + child_vsize);
     let _ = std::fs::remove_dir_all(&dir);
@@ -140,8 +169,14 @@ fn entry_depends_names_direct_parents_only() {
     let b = admit(&mp, &cs, b);
     let c = admit(&mp, &cs, c);
 
-    assert_eq!(entry_json(&mp, &c)["depends"], serde_json::json!([b.to_string()]));
-    assert_eq!(entry_json(&mp, &b)["depends"], serde_json::json!([a.to_string()]));
+    assert_eq!(
+        entry_json(&mp, &c)["depends"],
+        serde_json::json!([b.to_string()])
+    );
+    assert_eq!(
+        entry_json(&mp, &b)["depends"],
+        serde_json::json!([a.to_string()])
+    );
     assert_eq!(entry_json(&mp, &a)["depends"], serde_json::json!([]));
     // Every ancestor still counts toward the ancestor fields.
     assert_eq!(entry_json(&mp, &c)["ancestorcount"].as_u64(), Some(3));
@@ -179,7 +214,11 @@ fn entry_fee_rollups_use_modified_fees() {
     // Core sums `GetModifiedFee` over the relatives.
     let cv = entry_json(&mp, &c);
     assert_eq!(sats(&cv["fees"]["ancestor"]), 1_000 + 5_000 + 2_000, "{cv}");
-    assert_eq!(cv["ancestorfees"].as_u64(), Some(1_000 + 5_000 + 2_000), "{cv}");
+    assert_eq!(
+        cv["ancestorfees"].as_u64(),
+        Some(1_000 + 5_000 + 2_000),
+        "{cv}"
+    );
     let pv = entry_json(&mp, &p);
     assert_eq!(sats(&pv["fees"]["base"]), 1_000);
     assert_eq!(sats(&pv["fees"]["modified"]), 6_000);
@@ -188,7 +227,11 @@ fn entry_fee_rollups_use_modified_fees() {
 
     // `getmempoolsummary` rows read the same rollup.
     let summary = mp.summary(10);
-    let row = summary.top.iter().find(|r| r.txid == c.to_string()).expect("child row");
+    let row = summary
+        .top
+        .iter()
+        .find(|r| r.txid == c.to_string())
+        .expect("child row");
     assert_eq!(row.ancestorfees, 1_000 + 5_000 + 2_000);
 
     // `total_fee` is Core's `GetTotalFee`: base fees, deltas ignored.
@@ -215,7 +258,11 @@ fn entry_fee_rollups_carry_a_negative_modified_fee() {
     assert_eq!(cv["fees"]["ancestor"].to_string(), "0.00001000", "{cv}");
     assert_eq!(cv["ancestorfees"].as_i64(), Some(1_000), "{cv}");
     let summary = mp.summary(10);
-    let row = summary.top.iter().find(|r| r.txid == c.to_string()).expect("child row");
+    let row = summary
+        .top
+        .iter()
+        .find(|r| r.txid == c.to_string())
+        .expect("child row");
     assert_eq!(row.ancestorfees, 1_000);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -243,7 +290,12 @@ fn entry_reports_the_chunk_it_is_mined_in() {
 
     let chunk = |txid: &Txid| {
         let v = entry_json(&mp, txid);
-        (v["chunkweight"].as_u64().unwrap_or_else(|| panic!("no chunkweight: {v}")), v["fees"]["chunk"].to_string())
+        (
+            v["chunkweight"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no chunkweight: {v}")),
+            v["fees"]["chunk"].to_string(),
+        )
     };
     assert_eq!(chunk(&l), (wl, "0.00001000".to_string()));
     assert_eq!(chunk(&p), (wp + wc, "0.00010100".to_string()));
@@ -260,10 +312,18 @@ fn entry_reports_the_chunk_it_is_mined_in() {
     // linearizes it for all of them, and the rest are answered from the
     // cache with the same values.
     let mut cache = ChunkCache::default();
-    let first = mp.get_entry_verbose_cached(&g, &mut cache).expect("in the pool");
-    assert_eq!(cache.0.len(), 3, "one linearization fills the whole cluster");
+    let first = mp
+        .get_entry_verbose_cached(&g, &mut cache)
+        .expect("in the pool");
+    assert_eq!(
+        cache.0.len(),
+        3,
+        "one linearization fills the whole cluster"
+    );
     for txid in [p, c] {
-        let cached = mp.get_entry_verbose_cached(&txid, &mut cache).expect("in the pool");
+        let cached = mp
+            .get_entry_verbose_cached(&txid, &mut cache)
+            .expect("in the pool");
         assert_eq!(cached, entry_json(&mp, &txid));
     }
     assert_eq!(first, entry_json(&mp, &g));
@@ -278,7 +338,10 @@ fn info_usage_grows_with_the_pool() {
     admit(&mp, &cs, spend(&[prev(1)], COIN_VALUE, 1_000, 3));
     let one = mp.info().usage;
     // An estimate, but never less than the transaction's own bytes.
-    assert!(one > mp.info().bytes, "usage {one} must cover the serialized bytes");
+    assert!(
+        one > mp.info().bytes,
+        "usage {one} must cover the serialized bytes"
+    );
     admit(&mp, &cs, spend(&[prev(2)], COIN_VALUE, 1_000, 4));
     assert!(mp.info().usage > one);
     let _ = std::fs::remove_dir_all(&dir);
@@ -296,7 +359,10 @@ fn block_with(txs: Vec<Transaction>) -> bitcoin::Block {
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: p2wpkh(0x99) }],
+        output: vec![TxOut {
+            value: Amount::from_sat(0),
+            script_pubkey: p2wpkh(0x99),
+        }],
     };
     let mut txdata = vec![coinbase];
     txdata.extend(txs);
@@ -351,7 +417,11 @@ fn block_conflict_takes_the_conflicts_descendants() {
         .recent_events()
         .into_iter()
         .filter_map(|e| match e {
-            MempoolEvent::LeaveEvicted { txid, reason: EvictReason::BlockConflict, .. } => Some(txid),
+            MempoolEvent::LeaveEvicted {
+                txid,
+                reason: EvictReason::BlockConflict,
+                ..
+            } => Some(txid),
             _ => None,
         })
         .collect();
@@ -373,7 +443,8 @@ fn block_clears_the_priority_of_what_it_confirms() {
     let unseen = spend(&[prev(9)], COIN_VALUE, 1_000, 7);
     let unseen_txid = unseen.compute_txid();
     for txid in [confirmed_txid, conflict_txid, kept_txid, unseen_txid] {
-        mp.prioritise_transaction(&txid, 1_000).expect("prioritised");
+        mp.prioritise_transaction(&txid, 1_000)
+            .expect("prioritised");
     }
 
     let rival = spend(&[prev(2)], COIN_VALUE, 2_000, 8);
@@ -382,10 +453,22 @@ fn block_clears_the_priority_of_what_it_confirms() {
     // Core's `removeForBlock` clears each block transaction's delta, and
     // `removeConflicts` the direct conflict's.
     let deltas = mp.get_prioritised_transactions();
-    assert!(!deltas.contains_key(&confirmed_txid), "a confirmed transaction's delta is cleared");
-    assert!(!deltas.contains_key(&unseen_txid), "a confirmed non-resident delta is cleared");
-    assert!(!deltas.contains_key(&conflict_txid), "a block conflict's delta is cleared");
-    assert_eq!(deltas.get(&kept_txid), Some(&(1_000, true, Some(1_000 + 1_000))));
+    assert!(
+        !deltas.contains_key(&confirmed_txid),
+        "a confirmed transaction's delta is cleared"
+    );
+    assert!(
+        !deltas.contains_key(&unseen_txid),
+        "a confirmed non-resident delta is cleared"
+    );
+    assert!(
+        !deltas.contains_key(&conflict_txid),
+        "a block conflict's delta is cleared"
+    );
+    assert_eq!(
+        deltas.get(&kept_txid),
+        Some(&(1_000, true, Some(1_000 + 1_000)))
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -422,7 +505,8 @@ fn prioritising_a_transaction_not_in_the_pool_keeps_the_expiry_floor() {
     assert!(!mp.inner.read().entries.may_hold_older_than(cutoff));
 
     let absent = spend(&[prev(9)], COIN_VALUE, 1_000, 3).compute_txid();
-    mp.prioritise_transaction(&absent, 5_000).expect("stored for later");
+    mp.prioritise_transaction(&absent, 5_000)
+        .expect("stored for later");
     assert!(!mp.inner.read().entries.may_hold_older_than(cutoff));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -432,18 +516,30 @@ fn acting_view_reads_spend_and_creation_together() {
     let (cs, mp, dir) = env(&[1]);
     let parent = spend(&[prev(1)], COIN_VALUE, 1_000, 2);
     let child = spend(&[out0(&parent)], COIN_VALUE - 1_000, 1_000, 3);
-    let child_out = TxOut { value: Amount::from_sat(COIN_VALUE - 2_000), script_pubkey: p2wpkh(3) };
+    let child_out = TxOut {
+        value: Amount::from_sat(COIN_VALUE - 2_000),
+        script_pubkey: p2wpkh(3),
+    };
     admit(&mp, &cs, parent.clone());
     admit(&mp, &cs, child.clone());
 
     assert_eq!(mp.acting_view_of(&out0(&parent)), ActingOutpointView::Spent);
     assert_eq!(
         mp.acting_view_of(&out0(&child)),
-        ActingOutpointView::Created { output: Some(child_out), rests_on: vec![prev(1)] }
+        ActingOutpointView::Created {
+            output: Some(child_out),
+            rests_on: vec![prev(1)]
+        }
     );
     assert_eq!(
-        mp.acting_view_of(&OutPoint { txid: child.compute_txid(), vout: 1 }),
-        ActingOutpointView::Created { output: None, rests_on: vec![prev(1)] }
+        mp.acting_view_of(&OutPoint {
+            txid: child.compute_txid(),
+            vout: 1
+        }),
+        ActingOutpointView::Created {
+            output: None,
+            rests_on: vec![prev(1)]
+        }
     );
     assert_eq!(mp.acting_view_of(&prev(1)), ActingOutpointView::Spent);
     assert_eq!(mp.acting_view_of(&prev(7)), ActingOutpointView::NotInPool);

@@ -1,4 +1,8 @@
-#![allow(clippy::collapsible_if, clippy::needless_return, clippy::manual_range_contains)]
+#![allow(
+    clippy::collapsible_if,
+    clippy::needless_return,
+    clippy::manual_range_contains
+)]
 //! Pure Rust Bitcoin script verification engine.
 //!
 //! Bitcoin Script's interpreter in Rust, built to give the same verdicts as
@@ -189,7 +193,15 @@ pub fn verify_transaction(
     }
     let precomputed = PrecomputedTransactionData::new(tx, prev_outputs).map_err(|e| (0, e))?;
     for (i, prev) in prev_outputs.iter().enumerate() {
-        verify(&prev.script_pubkey, prev.value, tx, i, flag_set, &precomputed).map_err(|e| (i, e))?;
+        verify(
+            &prev.script_pubkey,
+            prev.value,
+            tx,
+            i,
+            flag_set,
+            &precomputed,
+        )
+        .map_err(|e| (i, e))?;
     }
     Ok(())
 }

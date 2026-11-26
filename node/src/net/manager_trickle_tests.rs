@@ -3,8 +3,8 @@
 //! a peer only once announced to it (`p2p_leak_tx.py`,
 //! `p2p_orphan_handling.py` `test_arrival_timing_orphan`).
 
-use super::p1c_tests::{coin_at, pm_with_coins, spend, COIN};
-use super::txrequest_tests::{add_peer_with, MockClock};
+use super::p1c_tests::{COIN, coin_at, pm_with_coins, spend};
+use super::txrequest_tests::{MockClock, add_peer_with};
 use super::*;
 
 const SECOND: u64 = 1_000_000;
@@ -94,11 +94,18 @@ fn a_transaction_in_the_most_recent_block_is_served() {
     let mut rx = handshaken(&pm, 10, Direction::Outbound, |_| {});
     let tx = spend(coin_at(3), COIN, 1_000, 3);
     let tip = pm.chain_state.tip_hash();
-    let mut block = crate::chain::state::tests::build_test_block(tip, 2, crate::time::now_secs() as u32);
+    let mut block =
+        crate::chain::state::tests::build_test_block(tip, 2, crate::time::now_secs() as u32);
     block.txdata.push(tx.clone());
     pm.compact_for(&block, 2, false);
 
-    pm.handle_getdata(10, vec![Inventory::WTx(tx.compute_wtxid()), Inventory::Transaction(tx.compute_txid())]);
+    pm.handle_getdata(
+        10,
+        vec![
+            Inventory::WTx(tx.compute_wtxid()),
+            Inventory::Transaction(tx.compute_txid()),
+        ],
+    );
     for _ in 0..2 {
         match rx.try_recv() {
             Ok(NetworkMessage::Tx(got)) => assert_eq!(got, tx),
@@ -115,12 +122,26 @@ fn a_parent_is_announced_before_its_child() {
     let mut clock = MockClock::install();
     let mut rx = handshaken(&pm, 10, Direction::Outbound, |_| {});
     let parent = spend(coin_at(4), COIN, 1_000, 4);
-    let child = spend(bitcoin::OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 1_000, 50_000, 5);
+    let child = spend(
+        bitcoin::OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        COIN - 1_000,
+        50_000,
+        5,
+    );
     pm.handle_tx(1, parent.clone());
     pm.handle_tx(1, child.clone());
     clock.advance(60 * SECOND);
     pm.send_tx_invs();
-    assert_eq!(invs(&mut rx), vec![Inventory::WTx(parent.compute_wtxid()), Inventory::WTx(child.compute_wtxid())]);
+    assert_eq!(
+        invs(&mut rx),
+        vec![
+            Inventory::WTx(parent.compute_wtxid()),
+            Inventory::WTx(child.compute_wtxid())
+        ]
+    );
 }
 
 /// Core's `broadcast_max`: one flush announces 70 of a short queue; the
@@ -158,7 +179,11 @@ fn a_peer_is_not_announced_what_it_sent_or_announced() {
     clock.advance(60 * SECOND);
     pm.send_tx_invs();
     assert!(invs(&mut sender).is_empty());
-    assert!(invs(&mut announcer).iter().all(|i| *i != Inventory::WTx(tx.compute_wtxid())));
+    assert!(
+        invs(&mut announcer)
+            .iter()
+            .all(|i| *i != Inventory::WTx(tx.compute_wtxid()))
+    );
     assert_eq!(invs(&mut other), vec![Inventory::WTx(tx.compute_wtxid())]);
 }
 
@@ -198,15 +223,28 @@ fn inbound_peers_share_a_timer_and_noban_peers_wait_for_none() {
     assert!(a > now);
     let mut other_listener = info(22, Direction::Inbound);
     other_listener.bind_addr = Some("127.0.0.1:18445".parse().unwrap());
-    assert_ne!(pm.next_inv_send_time(&other_listener, now), a, "another listener has its own");
-    let outbound: Vec<u64> = (0..8).map(|i| pm.next_inv_send_time(&info(30 + i, Direction::Outbound), now)).collect();
-    assert!(outbound.iter().any(|t| *t != outbound[0]), "outbound peers draw their own");
+    assert_ne!(
+        pm.next_inv_send_time(&other_listener, now),
+        a,
+        "another listener has its own"
+    );
+    let outbound: Vec<u64> = (0..8)
+        .map(|i| pm.next_inv_send_time(&info(30 + i, Direction::Outbound), now))
+        .collect();
+    assert!(
+        outbound.iter().any(|t| *t != outbound[0]),
+        "outbound peers draw their own"
+    );
 
     let mut rx = handshaken(&pm, 10, Direction::Inbound, |i| i.permissions.noban = true);
     let tx = spend(coin_at(8), COIN, 1_000, 8);
     pm.handle_tx(1, tx.clone());
     pm.send_tx_invs();
-    assert_eq!(invs(&mut rx), vec![Inventory::WTx(tx.compute_wtxid())], "noban is not kept waiting");
+    assert_eq!(
+        invs(&mut rx),
+        vec![Inventory::WTx(tx.compute_wtxid())],
+        "noban is not kept waiting"
+    );
 }
 
 /// Nothing is queued for a peer before its handshake; after it, the
@@ -219,7 +257,11 @@ fn the_handshake_starts_the_queue_and_getpeerinfo_reports_it() {
     let _rx = add_peer_with(&pm, 10, Direction::Inbound, |_| {});
     let tx = spend(coin_at(9), COIN, 1_000, 9);
     pm.handle_tx(1, tx.clone());
-    assert_eq!(relay_state(&pm, 10), (0, 1), "nothing queued before the handshake");
+    assert_eq!(
+        relay_state(&pm, 10),
+        (0, 1),
+        "nothing queued before the handshake"
+    );
 
     pm.start_tx_relay(10);
     let sequence = pm.mempool.mempool_sequence();
@@ -240,7 +282,9 @@ fn a_mempool_request_is_answered_at_the_next_flush() {
     let mut clock = MockClock::install();
     let tx = spend(coin_at(11), COIN, 1_000, 11);
     pm.handle_tx(1, tx.clone());
-    let mut rx = handshaken(&pm, 10, Direction::Outbound, |i| i.permissions.mempool = true);
+    let mut rx = handshaken(&pm, 10, Direction::Outbound, |i| {
+        i.permissions.mempool = true
+    });
     pm.handle_mempool_request(10);
     assert!(invs(&mut rx).is_empty(), "answered before the flush");
     clock.advance(60 * SECOND);
@@ -259,7 +303,15 @@ fn the_sender_of_an_orphan_is_not_announced_its_parent() {
     let mut orphan_sender = handshaken(&pm, 10, Direction::Outbound, |i| i.wtxid_relay = false);
     let mut other = handshaken(&pm, 11, Direction::Outbound, |_| {});
     let parent = spend(coin_at(13), COIN, 1_000, 13);
-    let child = spend(bitcoin::OutPoint { txid: parent.compute_txid(), vout: 0 }, COIN - 1_000, 1_000, 14);
+    let child = spend(
+        bitcoin::OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        COIN - 1_000,
+        1_000,
+        14,
+    );
     pm.handle_tx(10, child.clone());
     assert!(pm.orphanage.contains(&child.compute_txid()));
     pm.handle_tx(1, parent.clone());
@@ -296,7 +348,9 @@ fn a_rebroadcast_waits_for_the_peer_s_flush() {
     let mut clock = MockClock::install();
     let mut rx = handshaken(&pm, 10, Direction::Outbound, |_| {});
     let tx = spend(coin_at(16), COIN, 1_000, 16);
-    let txid = pm.submit_and_announce(tx.clone(), crate::mempool::pool::TxSource::Rpc, false).unwrap();
+    let txid = pm
+        .submit_and_announce(tx.clone(), crate::mempool::pool::TxSource::Rpc, false)
+        .unwrap();
     pm.rebroadcast_unbroadcast_txs();
     assert!(invs(&mut rx).is_empty(), "announced outside the flush");
     let ask = Inventory::WTx(tx.compute_wtxid());
@@ -330,7 +384,11 @@ fn an_announcement_that_could_not_be_sent_is_kept_for_the_next_flush() {
 
     clock.advance(60 * SECOND);
     pm.send_tx_invs();
-    assert_eq!(relay_state(&pm, 10), (1, before), "kept, and nothing newly servable");
+    assert_eq!(
+        relay_state(&pm, 10),
+        (1, before),
+        "kept, and nothing newly servable"
+    );
     assert!(matches!(rx.try_recv(), Ok(NetworkMessage::Ping(1))));
 
     clock.advance(60 * SECOND);
@@ -347,17 +405,27 @@ fn an_announcement_that_could_not_be_sent_is_kept_for_the_next_flush() {
 fn a_partly_sent_mempool_answer_is_fetchable_where_it_was_sent() {
     let (pm, _dir) = pm_with_coins(&[18]);
     let mut clock = MockClock::install();
-    let mut rx = super::txrequest_tests::add_peer_cap(&pm, 10, Direction::Outbound, 1, |i| i.permissions.mempool = true);
+    let mut rx = super::txrequest_tests::add_peer_cap(&pm, 10, Direction::Outbound, 1, |i| {
+        i.permissions.mempool = true
+    });
     pm.start_tx_relay(10);
     let before = relay_state(&pm, 10).1;
     for nonce in 0..(MAX_INV_PER_MSG as u64 + 1) {
-        pm.mempool.insert_scoped_for_test(1_000 + nonce, 1_000, crate::mempool::pool::QuarantineScope::acting());
+        pm.mempool.insert_scoped_for_test(
+            1_000 + nonce,
+            1_000,
+            crate::mempool::pool::QuarantineScope::acting(),
+        );
     }
     pm.mempool.resequence_for_test();
     pm.handle_mempool_request(10);
     clock.advance(60 * SECOND);
     pm.send_tx_invs();
-    assert_eq!(relay_state(&pm, 10).1, before, "not everything chosen was sent");
+    assert_eq!(
+        relay_state(&pm, 10).1,
+        before,
+        "not everything chosen was sent"
+    );
 
     let sent = match rx.try_recv() {
         Ok(NetworkMessage::Inv(inv)) => inv,
@@ -374,12 +442,29 @@ fn a_partly_sent_mempool_answer_is_fetchable_where_it_was_sent() {
         other => panic!("an announced transaction must be served, got {other:?}"),
     }
     assert!(not_found.is_empty());
-    let all: HashSet<bitcoin::Wtxid> = pm.mempool.relay_ids_above_feerate(0).into_iter().map(|(_, w)| w).collect();
-    let announced: HashSet<bitcoin::Wtxid> =
-        sent.iter().filter_map(|i| if let Inventory::WTx(w) = i { Some(*w) } else { None }).collect();
+    let all: HashSet<bitcoin::Wtxid> = pm
+        .mempool
+        .relay_ids_above_feerate(0)
+        .into_iter()
+        .map(|(_, w)| w)
+        .collect();
+    let announced: HashSet<bitcoin::Wtxid> = sent
+        .iter()
+        .filter_map(|i| {
+            if let Inventory::WTx(w) = i {
+                Some(*w)
+            } else {
+                None
+            }
+        })
+        .collect();
     let unsent = *all.difference(&announced).next().expect("one left out");
     assert!(pm.serve_getdata_entry(10, &sender, Inventory::WTx(unsent), &mut not_found));
-    assert_eq!(not_found, vec![Inventory::WTx(unsent)], "not announced, not served");
+    assert_eq!(
+        not_found,
+        vec![Inventory::WTx(unsent)],
+        "not announced, not served"
+    );
     let _ = rx.try_recv();
 
     // The next flush sends what did not fit, not the whole answer again.
@@ -425,7 +510,10 @@ fn with_no_announce_delay_every_peer_is_announced_at_the_next_flush() {
     let tx = spend(coin_at(21), COIN, 1_000, 21);
     pm.handle_tx(1, tx);
     pm.send_tx_invs();
-    assert!(invs(&mut out).is_empty() && invs(&mut inb).is_empty(), "the timers again");
+    assert!(
+        invs(&mut out).is_empty() && invs(&mut inb).is_empty(),
+        "the timers again"
+    );
 }
 
 /// A queued transaction wakes the flush loop only with
@@ -435,7 +523,12 @@ async fn a_queued_transaction_wakes_the_flush_only_with_no_delay() {
     let (pm, _dir) = pm_with_coins(&[22, 23]);
     let _rx = handshaken(&pm, 10, Direction::Outbound, |_| {});
     async fn woken(pm: &PeerManager) -> bool {
-        tokio::time::timeout(std::time::Duration::from_millis(20), pm.tx_inv_wake.notified()).await.is_ok()
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            pm.tx_inv_wake.notified(),
+        )
+        .await
+        .is_ok()
     }
     pm.handle_tx(1, spend(coin_at(22), COIN, 1_000, 22));
     assert!(!woken(&pm).await, "the timers decide");

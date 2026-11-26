@@ -75,7 +75,8 @@ pub fn any_unspent(
     outs: &[SpTaprootOutput],
     is_unspent: &dyn Fn(&OutPoint) -> bool,
 ) -> bool {
-    outs.iter().any(|o| is_unspent(&OutPoint { txid, vout: o.vout }))
+    outs.iter()
+        .any(|o| is_unspent(&OutPoint { txid, vout: o.vout }))
 }
 
 #[cfg(test)]
@@ -128,14 +129,20 @@ mod tests {
 
     fn sample() -> (StoredBlock, Txid) {
         block_with(vec![
-            TxOut { value: Amount::from_sat(4_000), script_pubkey: p2tr([0x02; 32]) },
+            TxOut {
+                value: Amount::from_sat(4_000),
+                script_pubkey: p2tr([0x02; 32]),
+            },
             // Non-taproot: never enumerated, and must not shift the vout of
             // the taproot output that follows it.
             TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from(vec![0x00, 0x14]),
             },
-            TxOut { value: Amount::from_sat(9_000), script_pubkey: p2tr([0x03; 32]) },
+            TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: p2tr([0x03; 32]),
+            },
         ])
     }
 
@@ -160,7 +167,11 @@ mod tests {
         let spent = OutPoint { txid, vout: 0 };
         let got = taproot_outputs_by_txid(&block, &wanted);
         let outs = got.get(&txid).expect("txid is in the block");
-        assert_eq!(outs.len(), 2, "the full candidate set, spent outputs included");
+        assert_eq!(
+            outs.len(),
+            2,
+            "the full candidate set, spent outputs included"
+        );
         assert!(any_unspent(txid, outs, &|op: &OutPoint| *op != spent));
     }
 
@@ -206,16 +217,28 @@ mod tests {
         let mut data = vec![0x6a, 0x4d, 0xa0, 0x0f];
         data.extend(std::iter::repeat_n(0x5a, 4000));
         let tx = tx_with(vec![
-            TxOut { value: Amount::from_sat(4_000), script_pubkey: p2tr([0x02; 32]) },
-            TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from(data) },
+            TxOut {
+                value: Amount::from_sat(4_000),
+                script_pubkey: p2tr([0x02; 32]),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from(data),
+            },
         ]);
         let txid = tx.compute_txid();
         let block = block_of(vec![tx_with(vec![]), tx]);
         let bytes = bitcoin::consensus::encode::serialize(&block);
-        let (record, filled) = StripRecord::build(&bytes, &block, 4000).unwrap().expect("eligible");
+        let (record, filled) = StripRecord::build(&bytes, &block, 4000)
+            .unwrap()
+            .expect("eligible");
         let stored = StoredBlock::from_bytes(filled, Some(record), &block.block_hash()).unwrap();
         assert!(stored.tx_is_stripped(1), "premise: stripped");
-        assert_ne!(stored.block.txdata[1].compute_txid(), txid, "premise: the filled bytes hash elsewhere");
+        assert_ne!(
+            stored.block.txdata[1].compute_txid(),
+            txid,
+            "premise: the filled bytes hash elsewhere"
+        );
 
         let got = taproot_outputs_by_txid(&stored, &[txid].into_iter().collect());
         let outs = got.get(&txid).expect("joined under the recorded txid");

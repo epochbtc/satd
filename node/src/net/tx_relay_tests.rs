@@ -70,7 +70,11 @@ fn a_flush_takes_the_queue_and_returns_what_it_did_not_send() {
 
     relay.queue(wtxid(4), &[4; 32]);
     relay.finish([wtxid(3)], Some(9));
-    assert_eq!(relay.inv_to_send(), 2, "the unsent one and one queued meanwhile");
+    assert_eq!(
+        relay.inv_to_send(),
+        2,
+        "the unsent one and one queued meanwhile"
+    );
     assert_eq!(relay.last_inv_sequence(), 9);
     relay.unqueue(&wtxid(4));
     assert_eq!(relay.inv_to_send(), 1);

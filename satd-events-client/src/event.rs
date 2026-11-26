@@ -408,7 +408,10 @@ pub struct SpentPrevout {
 impl From<pb::SpentPrevout> for SpentPrevout {
     fn from(s: pb::SpentPrevout) -> Self {
         SpentPrevout {
-            outpoint: Outpoint { txid: s.outpoint_txid, vout: s.outpoint_vout },
+            outpoint: Outpoint {
+                txid: s.outpoint_txid,
+                vout: s.outpoint_vout,
+            },
             script_pubkey: s.script_pubkey,
             amount: s.has_amount.then_some(s.amount),
         }
@@ -1022,7 +1025,11 @@ impl WatchAddRejected {
             scripthashes: r.scripthashes,
             outpoints: r.outpoints.into_iter().map(|o| (o.txid, o.vout)).collect(),
             txids: r.txids,
-            depth_alarms: r.depth_alarms.into_iter().map(|d| (d.txid, d.depth)).collect(),
+            depth_alarms: r
+                .depth_alarms
+                .into_iter()
+                .map(|d| (d.txid, d.depth))
+                .collect(),
             descriptor,
             prefixes: r.prefixes.into_iter().map(|p| (p.prefix, p.bits)).collect(),
             scan_pubkeys: r.scan_pubkeys,
@@ -1124,11 +1131,15 @@ fn rescan_reject_reason(reason: i32) -> RescanRejectReason {
 impl From<pb::NodeEvent> for Event {
     fn from(ev: pb::NodeEvent) -> Self {
         use pb::node_event::Body;
-        let Some(body) = ev.body else { return Event::Unknown };
+        let Some(body) = ev.body else {
+            return Event::Unknown;
+        };
         match body {
             Body::Mempool(m) => mempool_event(m),
             Body::Chain(c) => chain_event(c),
-            Body::Heartbeat(h) => Event::Heartbeat { uptime_ns: h.uptime_ns },
+            Body::Heartbeat(h) => Event::Heartbeat {
+                uptime_ns: h.uptime_ns,
+            },
             Body::Status(s) => Event::Status {
                 kind: StatusKind::from_proto(s.kind),
                 state: StatusState::from_proto(s.state),
@@ -1137,7 +1148,10 @@ impl From<pb::NodeEvent> for Event {
                 details: s.details.into_iter().collect(),
             },
             Body::OutpointSpent(o) => Event::OutpointSpent {
-                outpoint: Outpoint { txid: o.outpoint_txid, vout: o.outpoint_vout },
+                outpoint: Outpoint {
+                    txid: o.outpoint_txid,
+                    vout: o.outpoint_vout,
+                },
                 spending_txid: o.spending_txid,
                 spending_vin: o.spending_vin,
                 confirmed: o.confirmed,
@@ -1170,7 +1184,10 @@ impl From<pb::NodeEvent> for Event {
                 txid: t.txid,
                 replacing_txid: t.replacing_txid,
             },
-            Body::TxidEvicted(t) => Event::TxidEvicted { txid: t.txid, reason: t.reason },
+            Body::TxidEvicted(t) => Event::TxidEvicted {
+                txid: t.txid,
+                reason: t.reason,
+            },
             Body::TxidUnconfirmed(t) => Event::TxidUnconfirmed {
                 txid: t.txid,
                 prev_height: t.prev_height,
@@ -1190,7 +1207,10 @@ impl From<pb::NodeEvent> for Event {
             // surface it as Unknown rather than a structurally-valid-looking 0.
             Body::PrefixMatched(p) => match p.prefix {
                 Some(sp) => Event::PrefixMatched(PrefixMatch {
-                    prefix: ScriptPrefix { prefix: sp.prefix, bits: sp.bits },
+                    prefix: ScriptPrefix {
+                        prefix: sp.prefix,
+                        bits: sp.bits,
+                    },
                     raw_tx: p.raw_tx,
                     raw_tx_stripped: p.raw_tx_stripped,
                     txid: p.txid,
@@ -1361,7 +1381,10 @@ fn mempool_event(m: pb::MempoolEvent) -> Event {
             // NOT `e.reason()` — that accessor collapses an unrecognized value
             // into the zero variant. See `EvictReason::from_proto`.
             let reason = EvictReason::from_proto(e.reason);
-            Event::MempoolLeaveEvicted { txid: e.txid, reason }
+            Event::MempoolLeaveEvicted {
+                txid: e.txid,
+                reason,
+            }
         }
         Some(Body::LeaveReplaced(e)) => Event::MempoolLeaveReplaced {
             txid: e.txid,
@@ -1374,10 +1397,14 @@ fn mempool_event(m: pb::MempoolEvent) -> Event {
 fn chain_event(c: pb::ChainEvent) -> Event {
     use pb::chain_event::Body;
     match c.body {
-        Some(Body::BlockConnected(b)) => Event::BlockConnected { hash: b.hash, height: b.height },
-        Some(Body::BlockDisconnected(b)) => {
-            Event::BlockDisconnected { hash: b.hash, height: b.height }
-        }
+        Some(Body::BlockConnected(b)) => Event::BlockConnected {
+            hash: b.hash,
+            height: b.height,
+        },
+        Some(Body::BlockDisconnected(b)) => Event::BlockDisconnected {
+            hash: b.hash,
+            height: b.height,
+        },
         Some(Body::Reorg(r)) => Event::Reorg {
             from_height: r.from_height,
             old_tip: r.old_tip,
@@ -1455,13 +1482,16 @@ mod tests {
             StatusSeverity::Info,
         ];
         all.sort();
-        assert_eq!(all, vec![
-            StatusSeverity::Unspecified,
-            StatusSeverity::Info,
-            StatusSeverity::Warning,
-            StatusSeverity::Critical,
-            StatusSeverity::Unknown(7),
-        ]);
+        assert_eq!(
+            all,
+            vec![
+                StatusSeverity::Unspecified,
+                StatusSeverity::Info,
+                StatusSeverity::Warning,
+                StatusSeverity::Critical,
+                StatusSeverity::Unknown(7),
+            ]
+        );
     }
 
     #[test]
@@ -1499,17 +1529,23 @@ mod tests {
             StatusSeverity::Info,
         ];
         all.sort();
-        assert_eq!(all, vec![
-            StatusSeverity::Unspecified,
-            StatusSeverity::Info,
-            StatusSeverity::Critical,
-            StatusSeverity::Unknown(i32::MIN),
-            StatusSeverity::Unknown(0),
-            StatusSeverity::Unknown(i32::MAX),
-        ]);
+        assert_eq!(
+            all,
+            vec![
+                StatusSeverity::Unspecified,
+                StatusSeverity::Info,
+                StatusSeverity::Critical,
+                StatusSeverity::Unknown(i32::MIN),
+                StatusSeverity::Unknown(0),
+                StatusSeverity::Unknown(i32::MAX),
+            ]
+        );
         // Every unknown, including the extremes, still outranks Critical.
         for v in [i32::MIN, -1, 0, 1, i32::MAX] {
-            assert!(StatusSeverity::Unknown(v) > StatusSeverity::Critical, "Unknown({v})");
+            assert!(
+                StatusSeverity::Unknown(v) > StatusSeverity::Critical,
+                "Unknown({v})"
+            );
         }
         // Transitivity spot-check across the variant boundary.
         assert!(StatusSeverity::Unspecified < StatusSeverity::Warning);
