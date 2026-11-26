@@ -225,10 +225,15 @@ fn a_chain_with_enough_work_is_stored_after_its_redownload() {
         header_count(&node) == 10_000
     });
     assert_eq!(header_count(&node), 10_000, "the chain was not stored");
-    // Five messages for each pass, and the empty answer to the last
-    // getheaders at most.
+    // A regtest header carries 2 work, so -minimumchainwork=0x3000 (12,288)
+    // is reached at header 6,144, inside the fourth 2,000-header batch, and
+    // presync turns to the redownload right after that batch (headerssync.rs,
+    // `validate_and_store_headers_commitments`). The redownload takes all
+    // five, so 9 getheaders at least; a tenth, the request after the last
+    // batch, is answered only if it arrives before `done()` sees the chain
+    // stored. Without a redownload there would be 5.
     assert!(
-        answered >= 10,
+        answered >= 9,
         "the chain was stored without a redownload ({answered} getheaders)"
     );
 }
