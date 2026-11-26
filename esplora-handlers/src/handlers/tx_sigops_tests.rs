@@ -238,13 +238,13 @@ fn the_tx_json_counts_with_the_prevouts_it_resolved() {
     let json = build_mempool_tx_json(&state, &spend).unwrap();
     assert_eq!(json.fee, Some(4_000), "the prevout was resolved");
     // 1 for the P2WPKH input, 4 for the P2PKH output.
-    assert_eq!(json.sigops, Some(5));
+    assert_eq!(json.sigops, 5);
     assert_eq!(serde_json::to_value(&json).unwrap()["sigops"], serde_json::json!(5));
 
     // The same spend of an output nobody holds: the legacy count, no fee.
     spend.input[0].previous_output.vout = 9;
     let json = build_mempool_tx_json(&state, &spend).unwrap();
-    assert_eq!((json.fee, json.sigops), (None, Some(4)));
+    assert_eq!((json.fee, json.sigops), (None, 4));
 }
 
 /// Through the router, for a confirmed coinbase.
@@ -271,17 +271,17 @@ async fn tx_route_serves_sigops_for_a_coinbase() {
     }
 }
 
-/// A stripped output's script is not there to count, so the field is left
-/// out rather than served short.
+/// A stripped transaction keeps its `sigops`: the zero-filled script counts
+/// nothing, as the pushes it replaced counted nothing.
 #[test]
-fn a_stripped_transaction_has_no_sigops_key() {
+fn a_stripped_transaction_keeps_its_sigops() {
     let (state, _dir) = regtest_state();
     let t = tx(vec![input(ScriptBuf::new(), &[])], vec![p2pkh(), ScriptBuf::new_op_return([])]);
     let stripped = [(1u32, 40u64)];
     let view = TxView { tx: &t, txid: t.compute_txid(), stripped: Some(&stripped) };
     let json = serde_json::to_value(build_tx_json(&state, &view, None).unwrap()).unwrap();
     assert_eq!(json["opreturn_stripped"], true);
-    assert!(json.get("sigops").is_none(), "{json}");
+    assert_eq!(json["sigops"], 4, "{json}");
 
     let json = serde_json::to_value(build_tx_json(&state, &TxView::intact(&t), None).unwrap()).unwrap();
     assert_eq!(json["sigops"], 4, "{json}");

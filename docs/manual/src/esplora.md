@@ -220,8 +220,10 @@ On a node running with `pruneopreturn`
   reads as the bare `OP_RETURN` it keeps: `scriptpubkey` `"6a"`,
   `scriptpubkey_asm` `"OP_RETURN"`, `scriptpubkey_type` `"op_return"`, plus
   `"scriptpubkey_stripped_size"`, the original length. The `txid`, sizes,
-  values and fee are the original's. It has no `sigops`: the stripped
-  scripts are not there to count.
+  values and fee are the original's. `sigops` is counted over the stored
+  scripts. That is the original cost for any standard `OP_RETURN` output,
+  since pushed data never counts; sigop opcodes that a non-standard stripped
+  script held outside its pushes are not counted.
 - **Raw bytes are refused** with 404: `/block/:hash/raw` with
   `block data not available (OP_RETURN data stripped)`, and `/tx/:txid/hex` and
   `/tx/:txid/raw` with `transaction data not available (OP_RETURN data

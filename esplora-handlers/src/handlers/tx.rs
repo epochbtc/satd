@@ -247,10 +247,10 @@ pub struct TxJson {
     /// The transaction's BIP 141 sigop cost, as Bitcoin Core's
     /// `GetTransactionSigOpCost` counts it (see [`sigop_cost`]). Not in
     /// upstream Esplora; rbitcoin's Esplora serves it under this name.
-    /// Left out for an OP_RETURN-stripped transaction, whose stripped
-    /// output scripts are not there to count.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sigops: Option<u64>,
+    /// For an OP_RETURN-stripped transaction it is counted over the
+    /// stored scripts, so it leaves out any sigop opcodes a stripped
+    /// script held outside its pushes (none in a standard one).
+    pub sigops: u64,
     /// satd extension, present (and `true`) only on a transaction whose
     /// OP_RETURN payloads were stripped from this node's block files.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -565,9 +565,10 @@ fn build_tx_json(
         fee,
         status,
         // A stripped output's script is zero-filled past its `OP_RETURN`,
-        // and Core counts the opcodes of an `OP_RETURN` script like any
-        // other, so the count over what is stored could be short.
-        sigops: view.stripped.is_none().then(|| sigop_cost(tx, &spent)),
+        // which counts no sigops. Pushed data never counted, so this is the
+        // original cost unless the script held bare sigop opcodes, which a
+        // standard `OP_RETURN` output cannot.
+        sigops: sigop_cost(tx, &spent),
         opreturn_stripped: view.stripped.is_some(),
     })
 }
