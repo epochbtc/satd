@@ -127,6 +127,7 @@ fn ctx() -> ExportContext<'static> {
         latest_height: 900_002,
         default_port: MAINNET_PORT,
         chain: "main",
+        countries: None,
     }
 }
 

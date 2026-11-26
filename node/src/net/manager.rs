@@ -1441,6 +1441,8 @@ pub struct PeerManager {
     alt_slots: altslot_conn::AltSlots,
     /// `-asmap`, for the survey's autonomous systems.
     asmap: std::sync::OnceLock<Arc<crate::net::asmap::AsMap>>,
+    /// `-countryfile`, for the crawl's per-country totals.
+    country_map: std::sync::OnceLock<Arc<crate::net::country::CountryMap>>,
     /// The flags each departed peer carried as it left, for tests.
     #[cfg(test)]
     retired_flags: parking_lot::Mutex<Vec<(PeerId, crate::net::flags::FlagSet)>>,
@@ -2045,6 +2047,7 @@ impl PeerManager {
             flag_policy_evict: AtomicBool::new(false),
             alt_slots: Default::default(),
             asmap: Default::default(),
+            country_map: Default::default(),
             #[cfg(test)]
             retired_flags: Default::default(),
             sweep_not_found: RwLock::new(HashMap::new()),

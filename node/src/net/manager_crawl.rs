@@ -472,11 +472,29 @@ impl PeerManager {
         }
     }
 
-    /// A fresh aggregate of the book, kept for reuse.
+    /// A fresh aggregate of the book, kept for reuse. With `-countryfile`,
+    /// its per-country totals over the reachable set, folded under
+    /// `-crawlexportmink`.
     fn crawl_aggregate_now(&self, run: &CrawlRun) -> crawlreport::Aggregate {
-        let agg = crawlreport::aggregate(&run.book.lock(), crate::time::now_secs());
+        let now = crate::time::now_secs();
+        let book = run.book.lock();
+        let mut agg = crawlreport::aggregate(&book, now);
+        agg.countries = self.country_map.get().map(|map| {
+            crate::net::country::totals(
+                book.snapshot(now).map(|(peer, _)| peer),
+                map,
+                run.config.export_min_k,
+            )
+        });
+        drop(book);
         *run.aggregate.lock() = Some((Instant::now(), agg.clone()));
         agg
+    }
+
+    /// `-countryfile`'s map, for the crawl's per-country totals. Call once,
+    /// at startup; a second map is ignored.
+    pub fn set_country_map(&self, map: Arc<crate::net::country::CountryMap>) {
+        let _ = self.country_map.set(map);
     }
 
     /// `getcrawlinfo`: the crawl's state, its limits, its book's size, its
@@ -562,12 +580,16 @@ impl PeerManager {
     }
 
     /// What an export states besides the book, as of `now`.
-    fn crawl_export_context(&self, now: u64) -> crawlsnapshot::ExportContext<'static> {
+    fn crawl_export_context(&self, run: &CrawlRun, now: u64) -> crawlsnapshot::ExportContext<'_> {
         crawlsnapshot::ExportContext {
             now,
             latest_height: self.chain_state.tip_height(),
             default_port: crate::net::peer::default_p2p_port(self.chain_state.network),
             chain: self.chain_state.network.to_core_arg(),
+            countries: self.country_map.get().map(|map| crawlsnapshot::Countries {
+                map,
+                min_k: run.config.export_min_k,
+            }),
         }
     }
 
@@ -586,7 +608,7 @@ impl PeerManager {
         }
         // The reachable set's lines are built under the book's lock: a
         // copy of the whole book would cost more.
-        let ctx = self.crawl_export_context(now);
+        let ctx = self.crawl_export_context(run, now);
         let lines = crawlsnapshot::snapshot_lines(&run.book.lock(), &ctx);
         match store.write(now, &lines) {
             Ok(w) => {
@@ -624,7 +646,7 @@ impl PeerManager {
                 min_k: run.config.export_min_k,
             }
         };
-        let ctx = self.crawl_export_context(crate::time::now_secs());
+        let ctx = self.crawl_export_context(run, crate::time::now_secs());
         Ok(crawlsnapshot::export_json(&run.book.lock(), &ctx, &mode))
     }
 

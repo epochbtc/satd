@@ -919,3 +919,135 @@ fn a_closed_early_address_is_retried_until_it_settles() {
     assert_eq!(core, 1, "{info}");
     c.stop();
 }
+
+/// The committed country file the node tests write and check
+/// (`node::net::country`): documentation ranges only, so a loopback peer
+/// has no country in it.
+fn country_fixture() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/country-test.mmdb")
+}
+
+/// With `-countryfile`, `getcrawlinfo` counts the reachable nodes per
+/// country: the scripted loopback peer is in no country of the file, so it
+/// is `unknown`, and the totals add up to the reachable count. Without the
+/// option, `countries` is null (checked on the same node after a restart),
+/// and a relative path is read from the data directory.
+#[test]
+fn getcrawlinfo_counts_countries_with_a_country_file() {
+    let (l, port) = bind();
+    let _accepts = scripted(l, core(vec![]));
+    let seed = format!("--crawlseed=127.0.0.1:{port}");
+    let country = format!("--countryfile={}", country_fixture().display());
+    let mut node = TestNode::start(&[
+        "--maxconnections=0",
+        "--crawl=1",
+        &seed,
+        &country,
+        "--loglevel=debug",
+    ]);
+    node.rpc_ok("generatetoaddress", vec![json!(1), json!(ADDR)]);
+    // The discovery session waits out its getaddr and probes.
+    wait_for("the seed's session", 300, || {
+        sessions_done(&node, port) >= 1
+    });
+    wait_for("the aggregate", 10, || {
+        node.rpc_ok("getcrawlinfo", vec![])["reachable"]["total"] == 1
+    });
+    let info = node.rpc_ok("getcrawlinfo", vec![]);
+    assert_eq!(
+        info["countries"],
+        json!({
+            "unknown": {"count": 1, "share": 1.0},
+            "other": {"count": 0, "share": 0.0},
+            "onion": {"count": 0, "share": 0.0},
+        }),
+        "{info}"
+    );
+    let raw = node.rpc_ok("dumpcrawlsnapshot", vec![json!(true)]);
+    assert_eq!(
+        raw["satd"]["countries"],
+        json!({"unknown": 1, "other": 0, "onion": 0}),
+        "{raw}"
+    );
+    node.stop();
+
+    std::fs::copy(country_fixture(), node.datadir.join("country.mmdb")).unwrap();
+    node.restart_preserving_datadir(&[
+        "--maxconnections=0",
+        "--crawl=1",
+        &seed,
+        "--countryfile=country.mmdb",
+    ]);
+    assert!(
+        node.rpc_ok("getcrawlinfo", vec![])["countries"].is_object(),
+        "read from the data directory"
+    );
+    node.stop();
+
+    node.restart_preserving_datadir(&["--maxconnections=0", "--crawl=1", &seed]);
+    let info = node.rpc_ok("getcrawlinfo", vec![]);
+    assert!(info["countries"].is_null(), "{info}");
+    node.stop();
+}
+
+/// A country file that is not a MaxMind DB fails startup, naming the file,
+/// as a bad asmap does, before the node finishes loading; a missing one
+/// fails it too. A node still running after the timeout is killed and
+/// fails the test.
+#[test]
+fn a_bad_country_file_fails_startup() {
+    use std::process::{Command, Stdio};
+    let dir = common::fresh_test_datadir("satd-bad-countryfile");
+    std::fs::write(dir.join("country.mmdb"), b"not a MaxMind DB").unwrap();
+    let out_path = dir.join("startup.log");
+    let run = |file: &str| {
+        // Its log and its errors in one file: the log goes to stdout.
+        let out = std::fs::File::create(&out_path).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_satd"))
+            .arg("--regtest")
+            .arg(format!("--datadir={}", dir.display()))
+            .arg(format!("--rpcport={}", find_available_port()))
+            .arg(format!("--port={}", find_available_port()))
+            .arg(format!("--countryfile={file}"))
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(Stdio::from(out))
+            .spawn()
+            .expect("spawn satd");
+        let deadline = Instant::now() + test_timeout(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        (status, std::fs::read_to_string(&out_path).unwrap())
+    };
+    let (bad, bad_err) = run("country.mmdb");
+    let (missing, missing_err) = run("missing.mmdb");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        bad.is_some_and(|s| !s.success()),
+        "a bad file must fail startup: {bad:?} {bad_err}"
+    );
+    assert!(
+        bad_err.contains("Error loading the country file") && bad_err.contains("country.mmdb"),
+        "{bad_err}"
+    );
+    assert!(
+        !bad_err.contains("Done loading"),
+        "it fails before the node has loaded: {bad_err}"
+    );
+    assert!(
+        missing.is_some_and(|s| !s.success()),
+        "a missing file must fail startup: {missing:?}"
+    );
+    assert!(
+        missing_err.contains("country file not found"),
+        "{missing_err}"
+    );
+}

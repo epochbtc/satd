@@ -201,7 +201,8 @@ restart-only).
 | `-crawluacomment` | none | A comment for the crawler's user agent: `/satd:<version>(crawler; <comment>)/`. Use one that tells other operators who runs the crawl. |
 | `-crawlprobes` | on | Send the four [survey probes](peer-behavior.md#probes) on each discovery session. |
 | `-crawlexportkeyfile` | `crawlexport.key` | The key a keyed `dumpcrawlsnapshot` computes node IDs under: a 32-byte file, relative paths under the network's data directory. See [Snapshots and export](#snapshots-and-export). |
-| `-crawlexportmink` | 10 | In a keyed export, an autonomous system with fewer nodes than this is `"other"`; 1 to 100000. |
+| `-crawlexportmink` | 10 | In a keyed export, an autonomous system with fewer nodes than this is `"other"`; 1 to 100000. With `-countryfile`, a country with fewer nodes than this is folded into `other` in the country totals, keyed export or not. |
+| `-countryfile` | none | A MaxMind DB (`.mmdb`) country file, for per-country totals in `getcrawlinfo` and the export's summary; relative paths are under the data directory. See [Country totals](#country-totals--countryfile). |
 
 The limits hold whatever the options say: no option lifts concurrency past
 256 or the rate past 100 a second. On top of them, the crawl never opens
@@ -347,6 +348,49 @@ where clearnet IP addresses of home nodes are.
   handshake.
 - **Disk and memory.** Bounded as above.
 
+## Country totals (`-countryfile`)
+
+With `-countryfile=<file>`, the crawl counts its reachable nodes per
+country: in `getcrawlinfo` (`countries`), in the summary of
+`dumpcrawlsnapshot` (`satd.countries`) and in the
+`satd_crawl_country{country}` metric. The file is in the MaxMind DB
+(`.mmdb`) format. Two free ones carry what it needs:
+
+- DB-IP's **IP to Country Lite**, under the Creative Commons Attribution
+  4.0 licence: published counts made with it must credit DB-IP.
+- MaxMind's **GeoLite2 Country**, after creating a free account; its
+  licence requires replacing the file with a newer release within 30 days
+  of one being published.
+
+A city file in the same format works too. satd reads only
+`country.iso_code` from a record: never a city, a region or coordinates.
+
+The file is resolved against the data directory as `-asmap` is, read once
+at startup into memory, and fatal to startup when it is missing or does
+not parse. Update it by replacing the file and restarting. Without
+`-countryfile` nothing is looked up, and `countries` is `null` (not an
+empty object, which would read as no nodes); the metric is not exported.
+
+The totals' keys:
+
+| Key | What |
+|---|---|
+| `DE`, `US`, ... | An ISO 3166-1 alpha-2 code, uppercase: the IPv4 and IPv6 nodes the file places there, when there are at least `-crawlexportmink` (10) of them. |
+| `other` | Every country with fewer nodes than `-crawlexportmink`, added together. |
+| `unknown` | IPv4 and IPv6 nodes the file has no country for. |
+| `onion` | Onion nodes: an onion address says nothing about where its node is, so none is given a country. |
+
+`other`, `unknown` and `onion` are always present, zero or not; they are
+never folded. Each reachable node is counted once, so the totals add up
+to `reachable.total`. The fold is the same in `getcrawlinfo`, the metrics
+and both forms of the export.
+
+**No country is given per node**, anywhere: not in `getcrawlnodes`, not in
+a node of the export (Bitnodes' country field stays null) and not in the
+hourly snapshots. Next to a node's autonomous system, user agent and
+services, a country can single out a node in a small one. Nothing finer
+than a country is read at all.
+
 ## `getcrawlinfo`
 
 `getcrawlinfo` returns the crawl's state and its aggregate. Counts only.
@@ -379,6 +423,11 @@ where clearnet IP addresses of home nodes are.
   "closed_early": {"count": 100, "share": 0.0048},
   "mismatches": 12,
   "retries": {"pending": 60, "exhausted": 14},
+  "countries": {"DE": {"count": 4100, "share": 0.1952},
+                "US": {"count": 3900, "share": 0.1857}, "...": "...",
+                "other": {"count": 310, "share": 0.0148},
+                "unknown": {"count": 20, "share": 0.001},
+                "onion": {"count": 5900, "share": 0.281}},
   "sessions": {"reached": 50213, "unreached": 140022,
                "in_flight": {"clearnet": 31, "tor": 8}},
   "totals": {"totalbytessent": 81234567, "totalbytesrecv": 912345678}
@@ -402,6 +451,7 @@ where clearnet IP addresses of home nodes are.
 | `closed_early` | The reachable addresses whose peer closed the last session before its handshake settled: no fingerprint, in no family. Each reachable address is counted once among `families`, `claimed`, `fake` and `closed_early`. |
 | `mismatches` | Reachable addresses whose user agent names one family and handshake another. |
 | `retries` | Addresses in the book, reachable or not, whose last observation is closed early: with a retry scheduled (`pending`), and with none left after ten (`exhausted`). |
+| `countries` | With `-countryfile`, the reachable addresses per country, each with its share of `reachable.total`: ISO codes, `other` (countries under `-crawlexportmink`), `unknown` and `onion`. See [Country totals](#country-totals--countryfile). `null` without a country file. |
 | `sessions` | Sessions since start that completed a handshake (`reached`) or did not (`unreached`), and those open now. |
 | `totals` | The crawl's own bytes, as `getnettotals` names them; not counted there. |
 
@@ -493,7 +543,10 @@ snapshot, so tools that read those read this:
   },
   "satd": {"export": "keyed", "chain": "main", "liveness": 7200,
            "learned_not_dialled": {"i2p": 200, "cjdns": 34},
-           "node_id": "hmac-sha256-128", "asn_min_count": 10}
+           "node_id": "hmac-sha256-128", "asn_min_count": 10,
+           "countries": {"DE": 4100, "US": 3900, "...": "...", "other": 310,
+                         "unknown": 20, "onion": 5900},
+           "country_min_count": 10}
 }
 ```
 
@@ -503,7 +556,7 @@ snapshot, so tools that read those read this:
 | `total_nodes` | Nodes in `nodes`. |
 | `latest_height` | This node's tip height. |
 | `nodes` | One entry per reachable node: keyed by node ID (or onion), or with `raw=true` by address. |
-| `satd` | `export` (`keyed` or `raw`), `chain`, `liveness` (the window, seconds), `learned_not_dialled` (I2P and CJDNS addresses learned: the crawl never dials them, so they are counts only); keyed, `node_id` (how IDs are made) and `asn_min_count`. |
+| `satd` | `export` (`keyed` or `raw`), `chain`, `liveness` (the window, seconds), `learned_not_dialled` (I2P and CJDNS addresses learned: the crawl never dials them, so they are counts only); keyed, `node_id` (how IDs are made) and `asn_min_count`; `countries`, the nodes per country under `-countryfile` (null without one; folded below `-crawlexportmink` in both forms, as in `getcrawlinfo`), and with a country file `country_min_count`. |
 
 Each node is Bitnodes' thirteen fields, then a `satd` object:
 
@@ -515,7 +568,7 @@ Each node is Bitnodes' thirteen fields, then a `satd` object:
 | 3 | services | from its `version` |
 | 4 | height | its `start_height` |
 | 5 | hostname | null: no reverse lookup |
-| 6–10 | city, country, latitude, longitude, timezone | null: no geolocation |
+| 6–10 | city, country, latitude, longitude, timezone | null: no geolocation per node, `-countryfile` or not |
 | 11 | ASN | `AS<n>` from `-asmap`; null without one |
 | 12 | organization | null |
 | 13 | `satd` | `network` (`ipv4`, `ipv6`, `onion`), `port` (`default` or `other`), `transport` (as in `getcrawlinfo`), `v2_advertised`, `family` (null when claimed, fake or closed early), `fingerprint` (as `getcrawlnodes` gives it: `core/high`, `core/claimed`, `fake/core`, `closed-early`, ...), `confidence` (`high`, `low` or `claimed`; null when unknown, a mismatch, fake or closed early), `claimed` (the family the user agent names, if any), `mismatch`, `chain_check`, `last_seen` (its last completed handshake) |
@@ -574,6 +627,9 @@ is missing or not 32 bytes, it returns an error.
   names.
 - `satd_crawl_closed_early_retries`: the closed-early addresses in the
   book with a retry scheduled.
+- `satd_crawl_country{country}`: with `-countryfile` only, the reachable
+  addresses per country, under the keys and fold of
+  [Country totals](#country-totals--countryfile).
 - `satd_crawl_sessions_total{result}` (`reached`, `unreached`) and
   `satd_crawl_sessions_in_flight{network}` (`clearnet`, `tor`).
 - `satd_crawl_bytes_sent_total` and `satd_crawl_bytes_recv_total`: the

@@ -1303,6 +1303,24 @@ fn render_crawl(out: &mut String, m: Option<&crate::net::manager::CrawlMetrics>)
         &[],
         a.mismatches as u64,
     );
+    // Only with -countryfile: no series at all without one, rather than
+    // series that would read as no nodes anywhere.
+    if let Some(countries) = &a.countries {
+        metric_header(
+            out,
+            "satd_crawl_country",
+            "Reachable addresses by country under -countryfile: an ISO 3166-1 alpha-2 code, other (every country with fewer than -crawlexportmink), unknown (an IP the file has no country for) or onion.",
+            "gauge",
+        );
+        for (country, n) in countries {
+            metric_sample(
+                out,
+                "satd_crawl_country",
+                &[("country", country.as_str())],
+                *n as u64,
+            );
+        }
+    }
     metric_header(
         out,
         "satd_crawl_sessions_total",
@@ -2466,6 +2484,33 @@ mod tests {
         }
         assert!(!out.contains("satd_crawl_claimed{family=\"unknown\"}"));
         assert!(!out.contains("satd_crawl_fake{family=\"unknown\"}"));
+    }
+
+    /// `satd_crawl_country` carries the aggregate's folded totals, and is
+    /// absent without `-countryfile`.
+    #[test]
+    fn the_crawl_country_series_only_with_a_country_file() {
+        let mut m = crate::net::manager::CrawlMetrics::default();
+        let mut out = String::new();
+        render_crawl(&mut out, Some(&m));
+        assert!(!out.contains("satd_crawl_country"), "{out}");
+        m.aggregate.countries = Some(
+            [("DE", 12), ("other", 3), ("unknown", 1), ("onion", 4)]
+                .into_iter()
+                .map(|(k, n)| (k.to_string(), n))
+                .collect(),
+        );
+        let mut out = String::new();
+        render_crawl(&mut out, Some(&m));
+        for line in [
+            "# TYPE satd_crawl_country gauge",
+            "satd_crawl_country{country=\"DE\"} 12",
+            "satd_crawl_country{country=\"other\"} 3",
+            "satd_crawl_country{country=\"unknown\"} 1",
+            "satd_crawl_country{country=\"onion\"} 4",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
+        }
     }
 
     /// The survey's and the connected peers' metrics keep a claimed

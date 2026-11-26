@@ -10,6 +10,7 @@ pub mod bg_catchup;
 pub mod block_source;
 pub mod compact;
 pub mod connection;
+pub mod country;
 pub mod crawl;
 pub mod crawlbook;
 pub mod crawlreport;

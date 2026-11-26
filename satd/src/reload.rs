@@ -796,6 +796,7 @@ fn field_specs() -> Vec<FieldSpec> {
         }),
         restart!("whitebind", whitebind),
         restart!("asmap", asmap),
+        restart!("countryfile", countryfile),
         restart!("port", port),
         // The user agent rides in the version message, which is sent once per
         // connection at handshake time. A live change would apply only to
