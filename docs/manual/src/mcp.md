@@ -50,8 +50,8 @@ MCP uses the [unified auth system](authentication.md):
 - **Loopback default.** With `--mcpauth` off, the server performs no
   per-request auth check. This mode is valid only for a loopback bind.
 - **Bearer.** `--mcpauth` (which requires `--authfile`) demands
-  `Authorization: Bearer <token>` resolving to a principal that holds the
-  `mcp:*` capability. Otherwise the server returns `401` with
+  `Authorization: Bearer <token>` resolving to a principal that holds
+  `mcp:*` or `mcp:read`. Otherwise the server returns `401` with
   `WWW-Authenticate: Bearer`. The token's rate limit applies; a throttled
   request gets `429` with `Retry-After`.
 - **Remote exposure is gated.** A non-loopback `--mcpbind` requires
@@ -68,10 +68,25 @@ MCP uses the [unified auth system](authentication.md):
   is refused.** The option is additive — loopback stays allowed, and no value
   empties the list.
 
-A single capability, `mcp:*`, gates all of MCP. There is no read-only versus
-mutating split, so any token with `mcp:*` can call every tool.
+Two capabilities gate MCP:
 
-## Posture: MCP is not read-only
+- **`mcp:*`** grants every tool.
+- **`mcp:read`** grants the read-only profile: the tools that answer
+  questions about the chain, the mempool and fees. It is meant for a token
+  you hand to someone else, up to the public. It leaves out every tool that
+  acts (`sign_transaction`, `send_transaction`, `generate_blocks`,
+  `manage_peer`), that shows other people's addresses (`get_peer_info`,
+  `get_ban_list`), or that shows your machine or setup (`get_config`,
+  `get_policy_info`, which names the ruleset's file, `get_system_info` and
+  `get_metrics_snapshot`). `psbt_workflow` and `create_transaction` stay in:
+  satd holds no keys, so neither signs anything.
+
+A tool an `mcp:read` token may not use is invisible to it: `tools/list`
+leaves it out, and calling it gets the same `tool not found` error as a name
+no tool has. `mcp:*` implies `mcp:read`. Without `--mcpauth` the loopback
+client gets every tool.
+
+## Posture: `mcp:*` is not read-only
 
 MCP exposes state-changing tools: `send_transaction` broadcasts to the
 network, `generate_blocks` mines and connects blocks on regtest, and
@@ -79,7 +94,8 @@ network, `generate_blocks` mines and connects blocks on regtest, and
 construction and signing tools also mutate what the client can do with funds.
 
 Treat an `mcp:*` token as a privileged credential. Keep the listener
-loopback-bound unless both auth and TLS are in front of it.
+loopback-bound unless both auth and TLS are in front of it, and give anyone
+who only needs to ask questions an `mcp:read` token instead.
 
 ## Connecting a client
 
@@ -103,8 +119,8 @@ satd --datadir=/path/to/node --mcp --mcpport=18888
 
 The server is then reachable at `http://127.0.0.1:18888/`.
 
-For remote use, add TLS and auth, and issue a token that holds the `mcp:*`
-capability:
+For remote use, add TLS and auth, and issue a token that holds `mcp:read`
+(or `mcp:*` for a client you trust with every tool):
 
 ```sh
 satd --datadir=/path/to/node --mcp --mcpport=18888 \

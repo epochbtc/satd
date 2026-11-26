@@ -21,12 +21,14 @@ hyper = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
+http = "1"
 tokio-util = "0.7"
 satd-auth = { path = "../satd-auth" }
 tls-config = { path = "../tls-config" }
 
 [dev-dependencies]
 tempfile = "3"
+reqwest = { workspace = true }
 # The vendored BIP 375 vectors, so the PSBT tool's tests use the BIP's own
 # bytes rather than a hand-rolled approximation of them.
 satd-psbt = { path = "../satd-psbt", features = ["test-vectors"] }

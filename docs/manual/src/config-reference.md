@@ -555,7 +555,7 @@ the taxonomy and the details each event carries.
 | `mcpmtls` | false | restart | satd | Require mutual TLS on the MCP listener (requires `mcpcert`/`mcpkey` + `mcpmtlsclientca`). |
 | `mcpmtlsclientca` | none | restart | satd | PEM CA bundle that client certs must chain to when `mcpmtls`. |
 | `mcpmtlsclientallow` | any | restart | satd | Allowlist of accepted client-cert CN / DNS-SAN values. |
-| `mcpauth` | false | restart | satd | Require bearer tokens (`mcp:*`) on the MCP HTTP server (requires `authfile`). |
+| `mcpauth` | false | restart | satd | Require bearer tokens (`mcp:*`, or `mcp:read` for the read-only tools) on the MCP HTTP server (requires `authfile`). |
 | `mcpallowremote` | false | restart | satd | Permit a non-loopback MCP HTTP bind (requires `mcpauth` + TLS). |
 | `mcpallowedhost` | loopback only | restart | satd | Extra `Host` values the MCP listener accepts, as `host` or `host:port` (repeatable, comma-separated). Loopback names are always accepted. Required to reach MCP by hostname. |
 
