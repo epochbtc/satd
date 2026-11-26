@@ -115,12 +115,36 @@ pub enum Socks5Failure {
     /// (command or address type not supported, an unassigned reply code,
     /// a malformed reply). Nothing is known of the target.
     Proxy(String),
-    /// The proxy took the CONNECT and the target failed it: one of the
-    /// reply codes 0x01 to 0x06 (general failure, not allowed by ruleset,
-    /// network unreachable, host unreachable, refused, TTL expired), or no
-    /// reply before the exchange budget ran out, or the proxy closing the
-    /// connection instead of replying.
+    /// The proxy took the CONNECT and got no answer from the target: reply
+    /// 0x01 (general failure), 0x03 (network unreachable), 0x04 (host
+    /// unreachable) or 0x06 (TTL expired), no reply by the deadline, or the
+    /// proxy closing the connection instead of replying. The target's, but
+    /// also what a proxy whose own uplink is down gives for every target.
     Target(String),
+    /// The target answered, with a refusal: reply 0x02 (not allowed by
+    /// ruleset) or 0x05 (connection refused). The target's, and proof that
+    /// the proxy reaches the network.
+    Refused(String),
+}
+
+/// Send the CONNECT request by `deadline`. A failure here is the proxy's:
+/// the target was never asked.
+async fn send_request<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    request: &[u8],
+    deadline: tokio::time::Instant,
+    proxy_addr: SocketAddr,
+) -> Result<(), Socks5Failure> {
+    use tokio::io::AsyncWriteExt as _;
+    match tokio::time::timeout_at(deadline, w.write_all(request)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(Socks5Failure::Proxy(format!(
+            "proxy {proxy_addr}: request not sent: {e}"
+        ))),
+        Err(_) => Err(Socks5Failure::Proxy(format!(
+            "proxy {proxy_addr}: request not sent in time"
+        ))),
+    }
 }
 
 /// Connect to `target` through a no-authentication SOCKS5 proxy at
@@ -133,7 +157,8 @@ pub enum Socks5Failure {
 /// not say whether a timeout or an EOF came during the greeting (the proxy)
 /// or while the proxy dialled the target. 0x01, general failure, is the
 /// target's: a proxy that answered the greeting is up, and a code given per
-/// CONNECT held against the proxy would redial that target for ever.
+/// CONNECT held against the proxy would redial that target for ever. Every
+/// stage is bounded by `deadline`, the request's write included.
 pub async fn connect_socks5_staged(
     proxy_addr: SocketAddr,
     target: SocketAddr,
@@ -178,9 +203,7 @@ pub async fn connect_socks5_staged(
         }
     }
     request.extend_from_slice(&target.port().to_be_bytes());
-    if let Err(e) = sock.write_all(&request).await {
-        return Err(proxy_err(&format!("request not sent: {e}")));
-    }
+    send_request(&mut sock, &request, deadline, proxy_addr).await?;
     // The reply's head: version, reply code, reserved, address type.
     let mut head = [0u8; 4];
     match tokio::time::timeout_at(deadline, sock.read_exact(&mut head)).await {
@@ -212,10 +235,12 @@ pub async fn connect_socks5_staged(
         code => return Err(proxy_err(&format!("unassigned reply code {code:#04x}"))),
     };
     if let Some(reason) = reason {
-        return Err(Socks5Failure::Target(format!(
-            "{target}: {reason} (SOCKS5 reply {:#04x})",
-            head[1]
-        )));
+        let why = format!("{target}: {reason} (SOCKS5 reply {:#04x})", head[1]);
+        return Err(if matches!(head[1], 0x02 | 0x05) {
+            Socks5Failure::Refused(why)
+        } else {
+            Socks5Failure::Target(why)
+        });
     }
     // The bound address, which nothing here needs.
     let rest = match head[3] {
@@ -613,9 +638,13 @@ mod tests {
     /// A staged dial tells the proxy's failures from the target's: a
     /// proxy nothing listens on, one that never greets, or one that refuses
     /// the greeting fails as the proxy; a CONNECT the proxy cannot serve
-    /// (0x07, 0x08, an unassigned code) too. Reply codes 0x01 to 0x06, no
-    /// reply in time, and a close instead of a reply are the target's.
-    /// Perturbation: map 0x05 to `Proxy` and the refused case fails here.
+    /// (0x07, 0x08, an unassigned code) too, and a request the proxy does
+    /// not take by the deadline. Replies 0x01, 0x03, 0x04 and 0x06, no reply
+    /// in time, and a close instead of a reply are the target's, no answer;
+    /// 0x02 and 0x05 the target's, a refusal.
+    /// Perturbation: map 0x05 to `Proxy` and the refused case fails here;
+    /// leave the request's write unbounded and the blocked write outlives
+    /// the test's own bound.
     #[tokio::test]
     async fn a_staged_dial_tells_the_proxy_from_the_target() {
         let (ok, task) = staged_proxy(Staged::Reply(0x00)).await;
@@ -645,11 +674,36 @@ mod tests {
             let got = staged(p, "203.0.113.7:8333").await;
             assert!(matches!(got, Err(Socks5Failure::Proxy(_))), "{code:#04x}: {got:?}");
         }
-        for code in 0x01u8..=0x06 {
+        for code in [0x01u8, 0x03, 0x04, 0x06] {
             let (p, _t) = staged_proxy(Staged::Reply(code)).await;
             let got = staged(p, "203.0.113.7:8333").await;
             assert!(matches!(got, Err(Socks5Failure::Target(_))), "{code:#04x}: {got:?}");
         }
+        for code in [0x02u8, 0x05] {
+            let (p, _t) = staged_proxy(Staged::Reply(code)).await;
+            let got = staged(p, "203.0.113.7:8333").await;
+            assert!(matches!(got, Err(Socks5Failure::Refused(_))), "{code:#04x}: {got:?}");
+        }
+        // The request's write is bounded and the proxy's. A 10-byte write to
+        // a loopback socket never blocks (the kernel buffers it), so the
+        // stage is driven over a one-byte in-memory pipe: unread, the write
+        // blocks past the deadline; with the far end gone, it fails.
+        let any: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let request = [0x05u8, 0x01, 0x00, 0x01, 203, 0, 113, 7, 0x20, 0x8d];
+        let (mut near, _far) = tokio::io::duplex(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let got = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_request(&mut near, &request, deadline, any),
+        )
+        .await
+        .expect("the request's write is bounded by the deadline");
+        assert!(matches!(&got, Err(Socks5Failure::Proxy(e)) if e.contains("in time")), "{got:?}");
+        let (mut near, far) = tokio::io::duplex(1);
+        drop(far);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let got = send_request(&mut near, &request, deadline, any).await;
+        assert!(matches!(&got, Err(Socks5Failure::Proxy(e)) if e.contains("not sent")), "{got:?}");
         for how in [Staged::SilentConnect, Staged::CloseOnConnect] {
             let (p, _t) = staged_proxy(how).await;
             let started = std::time::Instant::now();

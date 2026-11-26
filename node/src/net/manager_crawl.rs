@@ -94,7 +94,11 @@
 //! for [`PROXY_PAUSE`], and `getcrawlinfo` counts the failure; the log
 //! says once when the proxy fails and once when it answers again. A
 //! failure the proxy reports for the target (a SOCKS5 reply 0x01 to 0x06,
-//! or no reply in time) is the target's, as a failed direct dial is.
+//! or no reply in time) is the target's, as a failed direct dial is, with
+//! one backstop: [`PROXY_SILENT_STREAK`] dials in a row with no answer from
+//! any target (no success, no refusal) put the proxy down too, and while
+//! it is down such a dial is the proxy's. A success or a refusal (0x02,
+//! 0x05) ends the outage.
 //!
 //! # Failure
 //!
@@ -143,10 +147,13 @@ pub(super) struct CrawlRun {
     pub(super) proxy_failures: AtomicU64,
     /// `-crawlproxy` failed its last dial: the log has said so, and says
     /// so again only after the proxy answers once more.
-    proxy_down: AtomicBool,
+    pub(super) proxy_down: AtomicBool,
     /// No proxied dial starts before this, on the crawl's clock
     /// ([`CrawlRun::now_ms`]): set by a proxy failure.
     pub(super) proxy_paused_until_ms: AtomicU64,
+    /// Proxied dials in a row whose target gave no answer
+    /// ([`PROXY_SILENT_STREAK`]).
+    pub(super) proxy_silent_streak: std::sync::atomic::AtomicU32,
     /// The aggregate the metrics and the status page read, and when it was
     /// taken: they are polled often, and a walk of a full book is not free.
     pub(super) aggregate: parking_lot::Mutex<Option<(Instant, crawlreport::Aggregate)>>,
@@ -194,9 +201,31 @@ impl CrawlRun {
         }
     }
 
-    /// `-crawlproxy` answered a dial's CONNECT, for the target or against
-    /// it: the proxy is up.
+    /// A proxied dial got no answer from its target (reply 0x01, 0x03,
+    /// 0x04, 0x06, no reply, or a close instead of one). Whether it is
+    /// taken as the proxy's failure: while the proxy is down, or when it
+    /// makes [`PROXY_SILENT_STREAK`] such dials in a row with no success
+    /// and no refusal, which puts the proxy down.
+    fn proxy_silent(&self, error: &str) -> bool {
+        if self.proxy_down.load(Ordering::Relaxed) {
+            self.proxy_failed(error);
+            return true;
+        }
+        let streak = self.proxy_silent_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak < PROXY_SILENT_STREAK {
+            return false;
+        }
+        self.proxy_silent_streak.store(0, Ordering::Relaxed);
+        self.proxy_failed(&format!(
+            "{PROXY_SILENT_STREAK} dials in a row without an answer from any target; the last: {error}"
+        ));
+        true
+    }
+
+    /// `-crawlproxy` connected a dial or relayed a target's refusal: the
+    /// proxy is up and reaches the network.
     fn proxy_answered(&self) {
+        self.proxy_silent_streak.store(0, Ordering::Relaxed);
         if self.proxy_down.swap(false, Ordering::Relaxed) {
             tracing::info!("The crawl proxy (-crawlproxy) answers again: clearnet crawl dials resume");
         }
@@ -206,6 +235,25 @@ impl CrawlRun {
 /// How long proxied dials wait after `-crawlproxy` fails one, so a proxy
 /// that is down is tried every few seconds, not at the crawl's rate.
 pub(super) const PROXY_PAUSE: Duration = Duration::from_secs(5);
+
+/// Proxied dials in a row that got no answer from their target (reply
+/// 0x01, 0x03, 0x04 or 0x06, no reply, a close instead of one), with no
+/// success and no refusal between them, after which the proxy is taken as
+/// down: a SOCKS server that greets but whose own uplink is down answers
+/// every CONNECT that way, and charging each to its target would decay the
+/// clearnet book while `proxy.failures` stays 0.
+///
+/// Why 200: on a working uplink a crawl dial reaches a handshake a few per
+/// cent of the time, and a large share of the rest are refusals (a closed
+/// port answers with a reset, which a SOCKS server reports as 0x05), each
+/// of which breaks the streak. Even counting successes alone at 3 %, 200
+/// silent dials in a row happen with probability 0.97^200, about 0.2 %, per
+/// window; with refusals as well it is vanishingly small. The bound it
+/// leaves: at most `PROXY_SILENT_STREAK - 1` silent failures of an outage
+/// begun this way are recorded against their targets before it is seen.
+/// The estimate of the failure mix is a reasoned one, not one measured on
+/// a crawl.
+pub(super) const PROXY_SILENT_STREAK: u32 = 200;
 
 /// How long the metrics and the status page reuse an aggregate before they
 /// take a new one.
@@ -400,6 +448,7 @@ impl PeerManager {
             proxy_failures: AtomicU64::new(0),
             proxy_down: AtomicBool::new(false),
             proxy_paused_until_ms: AtomicU64::new(0),
+            proxy_silent_streak: std::sync::atomic::AtomicU32::new(0),
             aggregate: parking_lot::Mutex::new(None),
             snapshots,
             #[cfg(test)]
@@ -1086,9 +1135,17 @@ impl PeerManager {
                             run.proxy_answered();
                             Ok(stream)
                         }
-                        Err(proxy::Socks5Failure::Target(e)) => {
+                        // The target answered: the proxy reaches the network.
+                        Err(proxy::Socks5Failure::Refused(e)) => {
                             run.proxy_answered();
                             Err(DialFailure::Target(e))
+                        }
+                        Err(proxy::Socks5Failure::Target(e)) => {
+                            if run.proxy_silent(&e) {
+                                Err(DialFailure::Proxy(e))
+                            } else {
+                                Err(DialFailure::Target(e))
+                            }
                         }
                         Err(proxy::Socks5Failure::Proxy(e)) => {
                             run.proxy_failed(&e);

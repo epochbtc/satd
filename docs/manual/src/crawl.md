@@ -282,13 +282,27 @@ the node's own onion connections use.
 
 `-crawlproxy=<ip>:<port>` sends every IPv4 and IPv6 crawl dial through a
 SOCKS5 proxy, so the crawl's source address is the proxy host's and the
-node stays where it is. The proxy must be one that is not a Tor exit: an
-SSH dynamic forward to a host you rent for the purpose is the simplest.
+node stays where it is. The proxy must be one that is not a Tor exit:
+`-crawlproxy` at the address of `-proxy` or `-onion` is refused at
+startup (compared as addresses, so `[::ffff:127.0.0.1]:9050` matches
+`127.0.0.1:9050`; a `-proxy` given as a host name is not resolved for the
+check).
+
+The best setup is a SOCKS5 server on the far host, bound to its
+loopback, reached through an SSH tunnel:
 
 ```sh
-# On the node's host: a SOCKS5 proxy on loopback, its exits on the other host
-ssh -N -D 127.0.0.1:1081 user@crawl-host.example
+# On the far host: a SOCKS5 server on its loopback only (microsocks, say)
+microsocks -i 127.0.0.1 -p 1080
+# On the node's host: forward a local port to it
+ssh -N -L 127.0.0.1:1081:127.0.0.1:1080 user@crawl-host.example
 ```
+
+An SSH dynamic forward (`ssh -N -D 127.0.0.1:1081 user@crawl-host.example`)
+works too, but OpenSSH answers every CONNECT with success before the far
+side has connected. A dead target then looks like a connection that
+closed at once, which the crawl's v2-to-v1 redial rule retries over v1,
+and refused and unreachable targets cannot be told apart.
 
 ```ini
 crawl=1
@@ -311,6 +325,13 @@ crawlproxy=127.0.0.1:1081
   due, proxied dials pause for 5 seconds after each failure, and the crawl
   resumes once the proxy answers. The log says so once when the proxy
   fails and once when it answers again.
+- **A proxy that greets but reaches nothing** (its host's own uplink
+  down) answers every CONNECT with no reply, 0x01, 0x03, 0x04 or 0x06.
+  After 200 such dials in a row, with no success and no refusal (0x02,
+  0x05) between them, the crawl takes the proxy as down, as above; while
+  it is down such a dial is the proxy's, and a success or a refusal ends
+  the outage. At most 199 dials of such an outage are recorded against
+  their targets before it is seen.
 - **Proxy or target.** A failure to reach the proxy, a failed SOCKS5
   greeting, or a CONNECT the proxy cannot serve (reply 0x07 command not
   supported, 0x08 address type not supported, or an unassigned code) is
@@ -318,9 +339,8 @@ crawlproxy=127.0.0.1:1081
   failure, 0x02 not allowed by ruleset, 0x03 network unreachable, 0x04
   host unreachable, 0x05 refused, 0x06 TTL expired), no reply in time, or
   the proxy closing instead of replying, is the target's, as a failed
-  direct dial is. An SSH dynamic forward accepts every CONNECT at once and
-  closes the channel when the far side cannot connect, so a target down
-  behind it reads as a target that closed. A proxy host without IPv6
+  direct dial is (see the SSH dynamic forward note above). A request the
+  proxy does not take in time is the proxy's. A proxy host without IPv6
   answers IPv6 CONNECTs with 0x08 or 0x04: add `-crawlnet=ipv4`.
 - `-crawlbind` does not apply to proxied dials, and a proxied session's
   `version` names the dummy address as the receiver, as an onion dial's

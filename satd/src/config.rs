@@ -4433,6 +4433,7 @@ impl Config {
         let alt_slots =
             resolve_alt_slots(&cli.alt_slot_args, &file_get, &file_get_all, maxconnections)?;
         let crawl = resolve_crawl(&cli.crawl_args, &file_get, &file_get_all, network)?;
+        check_crawlproxy_not_tor(crawl.proxy, proxy.as_deref(), onion.as_deref())?;
 
         Ok(Config {
             network,
@@ -9094,6 +9095,34 @@ fn resolve_crawl(
     })
 }
 
+/// `-crawlproxy` must not be the node's Tor proxy (`-proxy` or `-onion`):
+/// the clearnet crawl would leave through Tor exits, which the crawl never
+/// does. Compared as socket addresses, the IP canonical (`[::ffff:a.b.c.d]`
+/// is `a.b.c.d`), so another spelling of one address is caught. A `-proxy`
+/// or `-onion` given as a host name and port is not resolved for this, so
+/// it is not compared.
+fn check_crawlproxy_not_tor(
+    crawlproxy: Option<std::net::SocketAddr>,
+    proxy: Option<&str>,
+    onion: Option<&str>,
+) -> Result<(), String> {
+    let Some(crawl) = crawlproxy else {
+        return Ok(());
+    };
+    let canonical = |sa: std::net::SocketAddr| (sa.ip().to_canonical(), sa.port());
+    for (flag, value) in [("-proxy", proxy), ("-onion", onion)] {
+        let Some(sa) = value.and_then(|v| v.trim().parse::<std::net::SocketAddr>().ok()) else {
+            continue;
+        };
+        if canonical(sa) == canonical(crawl) {
+            return Err(format!(
+                "-crawlproxy must not be the Tor proxy ({flag}): the clearnet crawl would go through Tor exits"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// The crawl's settings as the peer manager takes them. Every value was
     /// checked when the config was read. `datadir`, the network's data
@@ -13518,6 +13547,23 @@ blockmintxfee=0.00001
         );
         std::fs::write(dir.path().join("bitcoin.conf"), "crawlproxy=nope\n").unwrap();
         assert!(load(&[]).is_err(), "a bad value in the file is refused too");
+        std::fs::write(dir.path().join("bitcoin.conf"), "").unwrap();
+
+        // Never the Tor proxy: -proxy or -onion at the same address, in
+        // another spelling too. A name is not resolved, so not compared.
+        for tor in [
+            "-proxy=127.0.0.1:9050",
+            "-onion=127.0.0.1:9050",
+            "-proxy=[::ffff:127.0.0.1]:9050",
+        ] {
+            let err = load(&[tor, "-crawlproxy=127.0.0.1:9050"]).expect_err(tor);
+            assert!(err.contains("-crawlproxy must not be the Tor proxy"), "{tor}: {err}");
+        }
+        let err = load(&["-proxy=127.0.0.1:9050", "-crawlproxy=[::ffff:127.0.0.1]:9050"])
+            .expect_err("the crawl proxy spelled another way");
+        assert!(err.contains("Tor exits"), "{err}");
+        assert!(load(&["-proxy=127.0.0.1:9050", "-crawlproxy=127.0.0.1:1081"]).is_ok());
+        assert!(load(&["-proxy=localhost:9050", "-crawlproxy=127.0.0.1:9050"]).is_ok());
     }
 
     /// The crawl's export options: `crawlexportkeyfile` relative to the
