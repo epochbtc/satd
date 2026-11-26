@@ -1296,7 +1296,7 @@ pub struct Config {
     /// DNS-SAN, case-insensitive). Empty means "any CA-signed cert"; non-empty
     /// narrows further.
     pub mcp_mtls_client_allow: Vec<String>,
-    /// Require bearer tokens (`mcp:*`) on the MCP HTTP server. Requires
+    /// Require bearer tokens (`mcp:*` or `mcp:read`) on the MCP HTTP server. Requires
     /// `authfile`. Default false (loopback-trust). Also the precondition for a
     /// non-loopback MCP bind.
     pub mcp_auth: bool,
@@ -7098,14 +7098,14 @@ pub struct CliArgs {
     )]
     pub mcpmtlsclientallow: Vec<String>,
 
-    /// Require bearer tokens (mcp:*) on the MCP HTTP server.
+    /// Require bearer tokens (mcp:* or mcp:read) on the MCP HTTP server.
     #[arg(
         long,
         value_name = "BOOL",
         value_parser = parse_bool_arg,
         num_args = 0..=1,
         default_missing_value = "1",
-        help = "Require Authorization: Bearer tokens (mcp:*) on the MCP HTTP server (default: false). Requires --authfile."
+        help = "Require Authorization: Bearer tokens (mcp:* or mcp:read) on the MCP HTTP server (default: false). Requires --authfile."
     )]
     pub mcpauth: Option<bool>,
 

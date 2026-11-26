@@ -117,7 +117,8 @@ read-only nor a submit-only token holds.
 | Esplora read | `esplora:read` | The Esplora REST + SSE surface. Reads only: `POST /tx` additionally needs `rpc:submit`. |
 | Stream subscribe | `stream:subscribe` | Open a streaming subscription (events gRPC, `streamws`). |
 | Stream watch | `stream:watch` | Register outpoint/script/descriptor/txid watches, bounded by the token's watch quota. |
-| MCP | `mcp:*` | The MCP server. One capability; there is no per-tool split. |
+| MCP | `mcp:*` | Every MCP tool. Implies `mcp:read`. |
+| MCP read-only | `mcp:read` | The MCP tools that answer questions about the chain, mempool and fees: none that signs, broadcasts, mines, manages peers, shows peer addresses, file paths, host resources or configuration, or costs the node far more than the request. Withheld tools are invisible to the token. See [MCP](mcp.md#authentication) for the list. Give a public `mcp:read` token a `rate_limit`. |
 | Test clock | `test:clock` | `setmocktime`, which moves the node clock (regtest only). **Not** implied by `rpc:write`: it reaches the future-block check, mempool expiry and block-template timestamps, so it must be granted deliberately. |
 | Test net | `test:net` | `addconnection`, which opens an outbound connection of a chosen type (regtest only). **Not** implied by `rpc:write`: it dials an address the caller chooses and picks the connection's type, which decides whether that peer is asked for transactions and whether it takes part in address relay — reshaping the peer set, not writing to the node. Also `sendmsgtopeer`, which writes arbitrary bytes onto a peer connection, and `addpeeraddress`, which writes an address of the caller's choosing into the address book the node dials from. Grant it deliberately. |
 
@@ -152,6 +153,13 @@ expires = 2026-12-31T00:00:00Z             # unquoted RFC 3339 datetime, or unix
 id = "agent"
 hash = "sha256:<64-hex>"
 capabilities = ["mcp:*"]
+
+# A public agent: read-only MCP tools, rate-capped.
+[[token]]
+id = "public-agent"
+hash = "sha256:<64-hex>"
+capabilities = ["mcp:read"]
+rate_limit = "5/s"
 ```
 
 Rules:
@@ -231,7 +239,7 @@ an authfile.
 | Esplora REST / SSE | `-esploraauthbearer` | `esplora:read` (+ `rpc:submit` for `POST /tx`) | `-esploraauth` Basic, loopback-unauth default |
 | events gRPC | `-eventsgrpcauth` | `stream:subscribe` / `stream:watch` | loopback-trust |
 | streaming WS/SSE (`streamws`) | `-streamwsauth` | `stream:subscribe` / `stream:watch` | loopback-trust |
-| MCP (HTTP) | `-mcpauth` | `mcp:*` | loopback-trust |
+| MCP (HTTP) | `-mcpauth` | `mcp:*` or `mcp:read` | loopback-trust |
 
 The read-only JSON-RPC listener (`-rpcreadonlybind`) does not honor bearer
 tokens. Client-certificate (mTLS) principals for the Electrum surface are

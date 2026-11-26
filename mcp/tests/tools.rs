@@ -949,7 +949,7 @@ mod tool_router {
         let (ctx, _dir) = make_test_ctx();
         // Leak the TempDir so it lives long enough (tests are short-lived)
         std::mem::forget(_dir);
-        satd_mcp::SatdMcpServer::new(Arc::new(ctx))
+        satd_mcp::SatdMcpServer::new(Arc::new(ctx), false)
     }
 
     #[test]

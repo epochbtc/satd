@@ -1,7 +1,9 @@
 pub mod context;
+pub mod profile;
 pub mod tools;
 
 pub use context::McpContext;
+pub use profile::McpProfile;
 
 use context::McpContext as Ctx;
 use rmcp::handler::server::tool::ToolRouter;
@@ -17,6 +19,11 @@ use std::sync::Arc;
 pub struct SatdMcpServer {
     ctx: Arc<Ctx>,
     tool_router: ToolRouter<Self>,
+    /// Bearer tokens are required (`-mcpauth`): every request must arrive
+    /// tagged with the [`McpProfile`] its token was granted, and one that
+    /// is not is refused every tool. Without `-mcpauth` an untagged request
+    /// is the loopback operator and gets [`McpProfile::Full`].
+    auth_required: bool,
 }
 
 // --- Parameter structs for tools that take arguments ---
@@ -579,21 +586,138 @@ impl ServerHandler for SatdMcpServer {
                  constructing transactions (including PSBTs), and managing the node.",
             )
     }
+
+    /// The tools this request's token may see. A tool its profile leaves
+    /// out is not listed.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let profile = self.profile_of(&context);
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| profile.is_some_and(|p| p.allows(&t.name)))
+            .collect();
+        // Cache hints as the generated handler gives them, but scoped to the
+        // session: two tokens on one server see different lists.
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Private),
+        })
+    }
+
+    /// Call a tool the request's token may use. Any other name is answered
+    /// as the router answers a name no tool has, so a token cannot tell a
+    /// withheld tool from a missing one.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let allowed = self
+            .profile_of(&context)
+            .is_some_and(|p| p.allows(&request.name));
+        if !allowed {
+            return Err(rmcp::ErrorData::invalid_params("tool not found", None));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
 }
 
 impl SatdMcpServer {
-    /// Create a new MCP server with the given context.
-    pub fn new(ctx: Arc<Ctx>) -> Self {
+    /// Create a new MCP server with the given context. `auth_required` is
+    /// `-mcpauth`: see the field of that name.
+    pub fn new(ctx: Arc<Ctx>, auth_required: bool) -> Self {
         Self {
             ctx,
             tool_router: Self::tool_router(),
+            auth_required,
         }
+    }
+
+    /// The profile the request's token was granted, read from the tag the
+    /// HTTP layer puts on the request ([`serve_http`]). `None` refuses
+    /// every tool.
+    fn profile_of(
+        &self,
+        context: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Option<McpProfile> {
+        let tagged = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<McpProfile>())
+            .copied();
+        McpProfile::resolve(tagged, self.auth_required)
     }
 
     /// List all registered tools (for testing / introspection).
     pub fn list_tools_from_router(&self) -> Vec<rmcp::model::Tool> {
         self.tool_router.list_all()
     }
+}
+
+/// A fresh regtest context for unit tests, and the directory it keeps its
+/// block files in (dropped with it).
+#[cfg(test)]
+pub(crate) fn test_ctx() -> (Arc<Ctx>, tempfile::TempDir) {
+    use bitcoin::Network;
+    let dir = tempfile::TempDir::new().unwrap();
+    let flat_files =
+        node::storage::flatfile::FlatFileManager::new(&dir.path().join("blocks")).unwrap();
+    let chain_state = Arc::new(
+        node::chain::state::ChainState::new(
+            Box::new(node::storage::db::InMemoryStore::new()),
+            flat_files,
+            Network::Regtest,
+            Box::new(node::validation::script::NoopVerifier),
+            node::chain::state::AssumeValid::Disabled,
+            450,
+            4,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let mempool = Arc::new(node::mempool::pool::Mempool::new(1_000_000, 0));
+    let fee_estimator = Arc::new(node::mempool::fee::FeeEstimator::new());
+    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let peer_manager = node::net::manager::PeerManager::new(
+        chain_state.clone(),
+        mempool.clone(),
+        fee_estimator.clone(),
+        Network::Regtest,
+        shutdown_rx,
+    );
+    let ctx = Ctx {
+        chain_state,
+        mempool,
+        peer_manager,
+        fee_estimator,
+        start_time: std::time::Instant::now(),
+        network: Network::Regtest,
+        effective_config: serde_json::json!({"network": "regtest"}),
+        mempool_history: None,
+        addr_enabled: false,
+        sp_enabled: false,
+        filter_enabled: false,
+        addr_subs: None,
+        health: None,
+        webhooks: None,
+        shutdown: None,
+    };
+    (Arc::new(ctx), dir)
 }
 
 // --- Public API ---
@@ -607,13 +731,14 @@ fn mcp_now_unix() -> i64 {
 }
 
 enum McpOutcome {
-    Authorized,
+    Authorized(McpProfile),
     Unauthorized,
     RateLimited { retry_after_secs: u32 },
 }
 
 /// Evaluate an MCP request: require an `Authorization: Bearer <token>` resolving
-/// to a principal that holds `mcp:*`, then charge its rate limit.
+/// to a principal that holds `mcp:*` or `mcp:read`, then charge its rate
+/// limit. The profile it was granted rides on the request to the tools.
 fn mcp_evaluate(headers: &hyper::HeaderMap, store: &satd_auth::TokenStore) -> McpOutcome {
     let Some(hdr) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return McpOutcome::Unauthorized;
@@ -623,14 +748,16 @@ fn mcp_evaluate(headers: &hyper::HeaderMap, store: &satd_auth::TokenStore) -> Mc
         Some(satd_auth::Credential::Bearer { token }) => store.resolve(token, mcp_now_unix()),
         _ => None,
     };
-    match principal {
-        Some(p) if p.has(satd_auth::Capability::McpAll) => match p.check_rate() {
-            satd_auth::RateDecision::Allow => McpOutcome::Authorized,
-            satd_auth::RateDecision::Throttle { retry_after_secs } => {
-                McpOutcome::RateLimited { retry_after_secs }
-            }
-        },
-        _ => McpOutcome::Unauthorized,
+    let Some((principal, profile)) =
+        principal.and_then(|p| McpProfile::of(&p).map(|profile| (p, profile)))
+    else {
+        return McpOutcome::Unauthorized;
+    };
+    match principal.check_rate() {
+        satd_auth::RateDecision::Allow => McpOutcome::Authorized(profile),
+        satd_auth::RateDecision::Throttle { retry_after_secs } => {
+            McpOutcome::RateLimited { retry_after_secs }
+        }
     }
 }
 
@@ -761,7 +888,9 @@ fn allowed_hosts(extra: &[String]) -> Vec<String> {
 ///
 /// When `auth` is `Some` (operator set `-mcpauth`, which requires `authfile`),
 /// every request must present an `Authorization: Bearer <token>` resolving to a
-/// principal with the `mcp:*` capability; otherwise it is answered with 401.
+/// principal with `mcp:*` or `mcp:read`; otherwise it is answered with 401.
+/// An `mcp:read` token sees and calls only the read-only tools
+/// ([`profile`]).
 /// `auth = None` is the loopback-trust default. The caller is responsible for
 /// refusing a non-loopback bind unless auth is enabled.
 ///
@@ -799,9 +928,10 @@ pub async fn serve_http(
     }
 
     let session_manager = std::sync::Arc::new(LocalSessionManager::default());
+    let auth_required = auth.is_some();
 
     let mcp_service = StreamableHttpService::new(
-        move || Ok(SatdMcpServer::new(ctx.clone())),
+        move || Ok(SatdMcpServer::new(ctx.clone(), auth_required)),
         session_manager,
         config,
     );
@@ -875,13 +1005,20 @@ pub async fn serve_http(
                                 stream,
                                 Some(node::http_serve::WRITE_STALL_TIMEOUT),
                             );
-                            let svc = hyper::service::service_fn(move |req| {
+                            let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                                 let svc = svc.clone();
                                 let conn_auth = conn_auth.clone();
                                 async move {
+                                    // A tag a client put on the request could
+                                    // not get here (extensions are not on the
+                                    // wire), but clear it so only the one
+                                    // below can exist.
+                                    req.extensions_mut().remove::<McpProfile>();
                                     if let Some(store) = &conn_auth {
                                         match mcp_evaluate(req.headers(), store) {
-                                            McpOutcome::Authorized => {}
+                                            McpOutcome::Authorized(profile) => {
+                                                req.extensions_mut().insert(profile);
+                                            }
                                             McpOutcome::Unauthorized => {
                                                 return Ok::<_, std::convert::Infallible>(
                                                     mcp_status_response(

@@ -36,8 +36,17 @@ pub enum Capability {
     StreamSubscribe,
     /// Register outpoint/script/descriptor watches (gated by `watch_quota`).
     StreamWatch,
-    /// MCP tool access (serialized as the wildcard `mcp:*`).
+    /// MCP tool access, every tool (serialized as the wildcard `mcp:*`).
+    ///
+    /// Implies [`Capability::McpRead`].
     McpAll,
+    /// MCP tool access limited to the read-only profile (`mcp:read`): the
+    /// tools that answer questions about the chain, mempool and fees, and
+    /// none that sign, broadcast, mine, manage peers or reveal peer
+    /// addresses, file paths, host resources or configuration. The list
+    /// lives with the tools (`satd_mcp::profile`). Meant for a token handed
+    /// to the public. Implied by [`Capability::McpAll`].
+    McpRead,
     /// Move the node clock via `setmocktime` (regtest only).
     ///
     /// Deliberately *not* implied by [`Capability::RpcWrite`]: shifting the
@@ -60,7 +69,7 @@ pub enum Capability {
 
 /// Every capability, in bit order. The single source of truth used to derive
 /// [`CapabilitySet::ALL`] and to render a set for logging.
-pub(crate) const ALL_CAPS: [Capability; 9] = [
+pub(crate) const ALL_CAPS: [Capability; 10] = [
     Capability::RpcRead,
     Capability::RpcWrite,
     Capability::RpcSubmit,
@@ -70,6 +79,7 @@ pub(crate) const ALL_CAPS: [Capability; 9] = [
     Capability::McpAll,
     Capability::TestClock,
     Capability::TestNet,
+    Capability::McpRead,
 ];
 
 impl Capability {
@@ -83,6 +93,7 @@ impl Capability {
             Capability::StreamSubscribe => "stream:subscribe",
             Capability::StreamWatch => "stream:watch",
             Capability::McpAll => "mcp:*",
+            Capability::McpRead => "mcp:read",
             Capability::TestClock => "test:clock",
             Capability::TestNet => "test:net",
         }
@@ -133,7 +144,8 @@ impl CapabilitySet {
                 | Capability::StreamWatch.bit()
                 | Capability::McpAll.bit()
                 | Capability::TestClock.bit()
-                | Capability::TestNet.bit(),
+                | Capability::TestNet.bit()
+                | Capability::McpRead.bit(),
         )
     };
 
@@ -150,14 +162,20 @@ impl CapabilitySet {
     /// Does the set grant `c`?
     ///
     /// This is the single check every surface reaches through
-    /// `Principal::has`, so the one implication in the vocabulary lives here:
-    /// [`Capability::RpcWrite`] grants [`Capability::RpcSubmit`]. A set that
-    /// holds only `rpc:submit` does **not** satisfy `rpc:write`.
+    /// `Principal::has`, so the implications in the vocabulary live here:
+    /// [`Capability::RpcWrite`] grants [`Capability::RpcSubmit`], and
+    /// [`Capability::McpAll`] grants [`Capability::McpRead`]. Neither holds
+    /// the other way: a set with only `rpc:submit` does **not** satisfy
+    /// `rpc:write`, and one with only `mcp:read` does not satisfy `mcp:*`.
     pub const fn contains(self, c: Capability) -> bool {
         if self.0 & c.bit() != 0 {
             return true;
         }
-        matches!(c, Capability::RpcSubmit) && self.0 & Capability::RpcWrite.bit() != 0
+        match c {
+            Capability::RpcSubmit => self.0 & Capability::RpcWrite.bit() != 0,
+            Capability::McpRead => self.0 & Capability::McpAll.bit() != 0,
+            _ => false,
+        }
     }
 
     /// Is the set empty?
@@ -257,6 +275,29 @@ mod tests {
         assert_eq!(format!("{submit_only:?}"), r#"["rpc:submit"]"#);
         assert!(CapabilitySet::EMPTY.is_empty());
         assert!(!CapabilitySet::EMPTY.contains(Capability::RpcSubmit));
+    }
+
+    #[test]
+    fn mcp_all_implies_mcp_read_but_not_the_converse() {
+        assert_eq!(Capability::parse("mcp:read"), Some(Capability::McpRead));
+        // A token minted with the wildcard keeps every tool, the read-only
+        // ones included.
+        let all = CapabilitySet::from_strs(["mcp:*"]).unwrap();
+        assert!(all.contains(Capability::McpAll));
+        assert!(all.contains(Capability::McpRead));
+        // A read-only token is not the wildcard.
+        let read = CapabilitySet::from_strs(["mcp:read"]).unwrap();
+        assert!(read.contains(Capability::McpRead));
+        assert!(!read.contains(Capability::McpAll));
+        // Neither grants anything outside MCP.
+        for c in [
+            Capability::RpcRead,
+            Capability::RpcWrite,
+            Capability::RpcSubmit,
+        ] {
+            assert!(!all.contains(c) && !read.contains(c), "{}", c.as_str());
+        }
+        assert_eq!(format!("{read:?}"), r#"["mcp:read"]"#);
     }
 
     #[test]

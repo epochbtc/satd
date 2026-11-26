@@ -21,6 +21,7 @@ It includes every fix shipped in 0.7.1:
 - Consensus: P2SH, WITNESS and TAPROOT are on for every block except Core's three exception blocks, as in Core, instead of from activation heights; main-chain verdicts are unchanged (#1244, #724).
 - Consensus: the Rust engine reports a tapscript push past the script's end as `BAD_OPCODE`, as Core does; verdicts are unchanged.
 - Consensus: transactions are decoded as Core decodes them: `version | 00 00 | lock_time` is a transaction with no inputs, refused as `bad-txns-vin-empty` where satd refused the bytes, and a witness flag with no inputs is a decode failure; verdicts are unchanged (#1242). Such a transaction is written, measured and hashed as Core does (`createrawtransaction` with no inputs returns Core's bytes), `submitpackage` refuses it as `conflict-in-package`, and the RPCs that take a transaction give Core's decode-failure messages.
+- MCP: new `mcp:read` capability, a read-only tool profile for tokens handed to others; withheld tools are invisible to the token. `mcp:*` is unchanged and implies it.
 - Dependencies: `rmcp` 3.9.0 (RUSTSEC-2026-0457, -0462; client features satd does not build); MCP requests are capped at 4 MiB.
 - Dependencies: `url` 2.5.9 (RUSTSEC-2026-0592) and `cookie` 0.18.3 (RUSTSEC-2026-0594, test-only); neither affects satd.
 - RPC: any request `Content-Type` is read as JSON, as in Core (#824).
