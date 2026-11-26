@@ -2095,3 +2095,149 @@ async fn a_settled_address_keeps_its_fingerprint_when_a_later_session_closes_ear
         serde_json::json!({ "pending": 0, "exhausted": 0 })
     );
 }
+
+// ---- Per-country totals (-countryfile) ----
+
+/// A manager whose crawl reached, under the test country file: two nodes
+/// in `DE`, one in `JP`, one IP the file has no country for and an onion.
+/// The export minimum is 2, so `JP` is `other`. Its snapshots and export
+/// key are under the returned directory.
+fn crawl_with_countries(map: bool) -> (Arc<PeerManager>, tempfile::TempDir, Vec<PeerAddr>) {
+    let (pm, dir) = mk_pm_with(None);
+    if map {
+        let m = crate::net::country::CountryMap::from_bytes(crate::net::country::testing::mmdb(
+            crate::net::country::testing::FIXTURE,
+        ))
+        .unwrap();
+        pm.set_country_map(Arc::new(m));
+    }
+    let run = enable(
+        &pm,
+        CrawlConfig {
+            export_min_k: 2,
+            ..with_files(dir.path())
+        },
+    );
+    let now = crate::time::now_secs();
+    let peers = vec![
+        PeerAddr::Socket(SocketAddr::from(([192, 0, 2, 1], 8333))),
+        PeerAddr::Socket(SocketAddr::from(([192, 0, 2, 2], 8333))),
+        PeerAddr::Socket(SocketAddr::from(([192, 0, 2, 130], 8333))),
+        PeerAddr::Socket(SocketAddr::from(([203, 0, 113, 200], 8333))),
+        PeerAddr::Onion {
+            host: ONION.to_string(),
+            port: 8333,
+        },
+    ];
+    for peer in &peers {
+        assert!(run.book.lock().seed(peer.clone(), 0, now), "{peer}");
+        let ok = SessionResult {
+            v2: Attempt::Failed,
+            v1: Attempt::Ok,
+            observation: None,
+        };
+        run.book
+            .lock()
+            .record_result(peer, None, SessionKind::Liveness, ok, now);
+    }
+    (pm, dir, peers)
+}
+
+/// With `-countryfile`, `getcrawlinfo` and the snapshot summary, keyed and
+/// raw, give the reachable nodes per country under the one fold: `JP`,
+/// below the minimum of 2, is `other`; the IP the file has no country for
+/// is `unknown`; the onion is `onion`; every node is counted once.
+#[test]
+fn country_totals_in_getcrawlinfo_and_the_snapshot_summary() {
+    let (pm, _dir, peers) = crawl_with_countries(true);
+    let info = pm.get_crawl_info();
+    let c = &info["countries"];
+    assert_eq!(c["DE"]["count"], 2, "{c}");
+    assert_eq!(c["other"]["count"], 1, "JP folded: {c}");
+    assert!(c.get("JP").is_none(), "{c}");
+    assert_eq!(c["unknown"]["count"], 1, "{c}");
+    assert_eq!(c["onion"]["count"], 1, "{c}");
+    assert_eq!(c["DE"]["share"], 0.4, "{c}");
+    assert_eq!(c.as_object().unwrap().len(), 4, "{c}");
+    let total: u64 = c
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, peers.len() as u64);
+    let want = serde_json::json!({ "DE": 2, "other": 1, "unknown": 1, "onion": 1 });
+    for raw in [false, true] {
+        let snap = pm.dump_crawl_snapshot(raw).unwrap();
+        assert_eq!(snap["satd"]["countries"], want, "raw={raw}: {snap}");
+        assert_eq!(snap["satd"]["country_min_count"], 2);
+    }
+    let metrics = pm.crawl_metrics().unwrap();
+    assert_eq!(
+        metrics.aggregate.countries.as_ref().unwrap()["other"],
+        1,
+        "the metrics read the same fold"
+    );
+}
+
+/// Without `-countryfile` the country totals are null, not an empty
+/// object that would read as no nodes: in `getcrawlinfo` with the crawl on
+/// and off, and in both exports.
+#[test]
+fn without_a_country_file_the_country_totals_are_null() {
+    let (off, _d) = mk_pm_with(None);
+    assert!(off.get_crawl_info()["countries"].is_null());
+    let (pm, _dir, _peers) = crawl_with_countries(false);
+    let info = pm.get_crawl_info();
+    assert!(info["countries"].is_null(), "{info}");
+    assert_eq!(info["reachable"]["total"], 5, "the nodes are there: {info}");
+    for raw in [false, true] {
+        let snap = pm.dump_crawl_snapshot(raw).unwrap();
+        assert!(snap["satd"]["countries"].is_null(), "{snap}");
+        assert!(snap["satd"].get("country_min_count").is_none(), "{snap}");
+    }
+    assert!(pm.crawl_metrics().unwrap().aggregate.countries.is_none());
+}
+
+/// No per-node row carries a country, with a country file that names one
+/// for most nodes: not `getcrawlnodes` (verbose or not), not a node of
+/// the keyed or the raw export (Bitnodes' country field, index 7, stays
+/// null, and the `satd` object has none), not an hourly snapshot line.
+#[test]
+fn no_per_node_row_carries_a_country() {
+    let (pm, dir, _peers) = crawl_with_countries(true);
+    let check = |what: &str, row: &serde_json::Value| {
+        let text = row.to_string();
+        for needle in ["\"DE\"", "\"JP\"", "country", "countries"] {
+            assert!(!text.contains(needle), "{what} has {needle}: {text}");
+        }
+    };
+    for verbose in [false, true] {
+        let rows = pm.get_crawl_nodes(verbose);
+        assert_eq!(rows.as_array().unwrap().len(), 5);
+        for row in rows.as_array().unwrap() {
+            check("a getcrawlnodes row", row);
+        }
+    }
+    for raw in [false, true] {
+        let snap = pm.dump_crawl_snapshot(raw).unwrap();
+        let nodes = snap["nodes"].as_object().unwrap();
+        assert_eq!(nodes.len(), 5);
+        for node in nodes.values() {
+            assert!(node[7].is_null(), "Bitnodes' country: {node}");
+            check("an export node", node);
+        }
+        assert_eq!(snap["satd"]["countries"]["DE"], 2, "the totals are there");
+    }
+    assert!(pm.crawl_snapshot_tick(crate::time::now_secs()));
+    let snaps = dir.path().join(crate::net::crawlsnapshot::SNAPSHOT_DIR);
+    let t = crate::net::crawlsnapshot::list_snapshots(&snaps).unwrap()[0];
+    let gz = std::fs::read(snaps.join(crate::net::crawlsnapshot::snapshot_file_name(t))).unwrap();
+    let lines = String::from_utf8(crate::net::crawlsnapshot::gunzip(&gz).unwrap()).unwrap();
+    assert_eq!(lines.lines().count(), 5);
+    for line in lines.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(v["node"][7].is_null(), "{line}");
+        check("an hourly line", &v);
+    }
+}

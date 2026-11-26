@@ -135,6 +135,12 @@ pub struct Aggregate {
     /// Addresses in the book whose last observation is closed early and
     /// that have no retry left.
     pub retries_exhausted: usize,
+    /// Reachable addresses per country under `-countryfile`
+    /// ([`crate::net::country::totals`]): ISO codes, `unknown`, `onion`,
+    /// and `other` for every country under `-crawlexportmink`. `None`
+    /// without a country file: [`aggregate`] leaves it so, and the crawl
+    /// fills it in when it has a file.
+    pub countries: Option<std::collections::BTreeMap<String, usize>>,
 }
 
 impl Aggregate {
@@ -225,7 +231,9 @@ pub fn aggregate(book: &CrawlBook, now: u64) -> Aggregate {
 /// `unknown`: no row matched and the user agent names no family),
 /// `claimed` (no row matched; the user agent names the family), `fake`
 /// (per claimed family) and `closed_early`, so a claim never adds to a
-/// family's observed count.
+/// family's observed count. `countries` is null without `-countryfile`,
+/// never an empty object that would read as no nodes; with one, a count
+/// and share per key of [`Aggregate::countries`].
 pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value {
     let total = agg.reachable_total();
     let share = |n: usize| {
@@ -279,6 +287,16 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
         }
         serde_json::Value::Object(out)
     };
+    let countries = agg.countries.as_ref().map(|m| {
+        m.iter()
+            .map(|(k, c)| {
+                (
+                    k.clone(),
+                    serde_json::json!({ "count": c, "share": share(*c) }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+    });
     serde_json::json!({
         "book": {
             "entries": agg.entries,
@@ -294,6 +312,7 @@ pub fn aggregate_json(agg: &Aggregate, max_entries: usize) -> serde_json::Value 
         "closed_early": { "count": agg.closed_early, "share": share(agg.closed_early) },
         "mismatches": agg.mismatches,
         "retries": { "pending": agg.retries_pending, "exhausted": agg.retries_exhausted },
+        "countries": countries,
     })
 }
 

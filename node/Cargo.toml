@@ -49,6 +49,10 @@ data-encoding = "2"
 # DEFLATE for the crawl's gzip snapshots (`net/crawlsnapshot.rs` writes the
 # gzip framing). Already in the graph, through `backtrace`.
 miniz_oxide = "0.8"
+# MaxMind DB (`.mmdb`) reader for `-countryfile` (`net/country.rs`): DB-IP
+# IP to Country Lite or MaxMind GeoLite2 Country. Only `country.iso_code` is
+# read. ISC. No default features (no mmap): the file is read into memory.
+maxminddb = { version = "0.33", default-features = false }
 bip324 = "0.10"
 tls-config = { path = "../tls-config" }
 # Names the server-side TLS stream type for the Stratum listener. Already in

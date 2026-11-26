@@ -41,6 +41,13 @@
 //!
 //! **Raw** (`raw=true`), nodes are keyed by address and the ASN is exact.
 //!
+//! With `-countryfile`, the `satd` object carries `countries`, the
+//! reachable nodes per country ([`crate::net::country::totals`]), every
+//! country under `-crawlexportmink` nodes folded into `other` in either
+//! mode, and `country_min_count`; without one `countries` is null. No node
+//! carries a country: Bitnodes' country field is null in every export and
+//! every hourly line.
+//!
 //! The key is `crawlexport.key` in the network's data directory, created
 //! (mode 0600) by the first keyed export, or the file `-crawlexportkeyfile`
 //! names, which satd never creates. satd never rotates it: replacing the file
@@ -234,6 +241,17 @@ pub struct ExportContext<'a> {
     pub default_port: u16,
     /// The chain, as `-chain` names it.
     pub chain: &'a str,
+    /// `-countryfile`'s map and the fold's minimum, for the summary's
+    /// per-country totals; `None` without a country file.
+    pub countries: Option<Countries<'a>>,
+}
+
+/// The per-country totals' inputs: the map, and the count below which a
+/// country is `other` (`-crawlexportmink`).
+#[derive(Debug, Clone, Copy)]
+pub struct Countries<'a> {
+    pub map: &'a crate::net::country::CountryMap,
+    pub min_k: u32,
 }
 
 /// The port as an export gives it.
@@ -359,6 +377,19 @@ pub fn export_json(book: &CrawlBook, ctx: &ExportContext<'_>, mode: &Mode) -> se
     if let Mode::Keyed { min_k, .. } = mode {
         satd["node_id"] = serde_json::json!(format!("hmac-sha256-{}", NODE_ID_BYTES * 8));
         satd["asn_min_count"] = serde_json::json!(min_k);
+    }
+    // Totals only, in either mode, folded in either: no node is given a
+    // country (Bitnodes' country field stays null).
+    satd["countries"] = match ctx.countries {
+        Some(c) => serde_json::json!(crate::net::country::totals(
+            reachable.iter().map(|(peer, _)| *peer),
+            c.map,
+            c.min_k,
+        )),
+        None => serde_json::Value::Null,
+    };
+    if let Some(c) = ctx.countries {
+        satd["country_min_count"] = serde_json::json!(c.min_k);
     }
     serde_json::json!({
         "timestamp": ctx.now,

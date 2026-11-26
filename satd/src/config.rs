@@ -648,6 +648,10 @@ pub struct Config {
     /// Path to a Bitcoin Core `-asmap` file. When set, the addrman
     /// buckets by ASN instead of `/16` for eclipse resistance.
     pub asmap: Option<PathBuf>,
+    /// `-countryfile`: a MaxMind DB (`.mmdb`) country file for the crawl's
+    /// per-country totals; resolved against the datadir like `-asmap`.
+    /// `None` (the default) gives no country anywhere. satd-only.
+    pub countryfile: Option<PathBuf>,
     pub assumevalid: Option<String>,
     pub assumevalidage: u64,
     /// Stop running once the active-chain tip reaches this height
@@ -2753,6 +2757,29 @@ impl Config {
             }
         };
 
+        // -countryfile: the country file, resolved against datadir as
+        // -asmap is; read and parsed at startup.
+        let countryfile: Option<PathBuf> = {
+            let raw = cli.countryfile.clone().or_else(|| file_get("countryfile"));
+            match raw {
+                Some(p) if p.trim().is_empty() => {
+                    return Err("-countryfile: an empty path".to_string());
+                }
+                Some(p) => {
+                    let path = if Path::new(&p).is_absolute() {
+                        PathBuf::from(&p)
+                    } else {
+                        base_datadir.join(&p)
+                    };
+                    if !path.exists() {
+                        return Err(format!("country file not found: {}", path.display()));
+                    }
+                    Some(path)
+                }
+                None => None,
+            }
+        };
+
         let port = cli
             .port
             .or_else(|| file_get("port").and_then(|v| v.parse().ok()))
@@ -4457,6 +4484,7 @@ impl Config {
             whitelist_force_relay,
             whitebind,
             asmap,
+            countryfile,
             port,
             connect,
             automatic_outbound,
@@ -5357,6 +5385,8 @@ impl Config {
             "export_key_file": self.crawlexportkeyfile.is_some(),
             "export_min_k": self.crawlexportmink,
         });
+        out["p2p"]["countryfile"] =
+            serde_json::json!(self.countryfile.as_ref().map(|p| p.display().to_string()));
         out["p2p"]["max_outbound_full_relay"] = serde_json::json!(self.maxoutboundfullrelay);
         out["p2p"]["peer_flag_policy"] = serde_json::json!(self.peerflagpolicy);
         out["p2p"]["alt_slots"] = serde_json::json!({
@@ -5931,6 +5961,16 @@ pub struct CliArgs {
         help = "asmap file for ASN-based peer bucketing"
     )]
     pub asmap: Option<String>,
+
+    /// A MaxMind DB (`.mmdb`) country file (DB-IP IP to Country Lite or
+    /// MaxMind GeoLite2 Country) for the crawl's per-country totals.
+    /// Relative paths resolve against `--datadir`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "MaxMind DB (.mmdb) country file for the crawl's per-country node totals (getcrawlinfo, dumpcrawlsnapshot); relative paths are under the data directory (default: none, no country totals)"
+    )]
+    pub countryfile: Option<String>,
 
     #[arg(
         long,
@@ -10366,6 +10406,7 @@ pub fn normalize_args(args: Vec<String>) -> Vec<String> {
         "whitelist",
         "whitebind",
         "asmap",
+        "countryfile",
         "bantime",
         "rebroadcastinterval",
         "broadcastconfirmpeers",
@@ -11033,6 +11074,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "whitelist",
     "whitebind",
     "asmap",
+    "countryfile",
     "port",
     "bind",
     "connect",
@@ -15177,6 +15219,7 @@ testactivationheight=bip34@2
             whitelist: vec![],
             whitebind: vec![],
             asmap: None,
+            countryfile: None,
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -15504,6 +15547,7 @@ testactivationheight=bip34@2
             whitelist: vec![],
             whitebind: vec![],
             asmap: None,
+            countryfile: None,
             assumevalid: None,
             assumevalidage: None,
             stopatheight: None,
@@ -18531,6 +18575,68 @@ mcpallowedhost=node.local
     fn asmap_now_recognised() {
         assert_eq!(classify_unsupported_key("asmap"), None);
         assert!(is_known_config_key("asmap"));
+    }
+
+    // ---- countryfile ----
+
+    /// `-countryfile` is resolved against the data directory (the base one,
+    /// as `-asmap` is), from the command line or `bitcoin.conf`; an absolute
+    /// path is kept; a missing file or an empty path fails the config; unset
+    /// it is none. The file's contents are read at startup, not here.
+    #[test]
+    fn countryfile_resolves_relative_to_datadir_and_requires_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("country.mmdb"), b"not read here").unwrap();
+        let load = |extra: &[&str]| {
+            let mut args = vec![
+                "satd",
+                "--regtest",
+                "--datadir",
+                dir.path().to_str().unwrap(),
+            ];
+            args.extend_from_slice(extra);
+            Config::from_cli(
+                parse_cli(normalize_args(args.iter().map(|a| a.to_string()).collect())).unwrap(),
+            )
+        };
+        assert_eq!(load(&[]).unwrap().countryfile, None, "off by default");
+        let want = Some(dir.path().join("country.mmdb"));
+        assert_eq!(
+            load(&["--countryfile", "country.mmdb"])
+                .unwrap()
+                .countryfile,
+            want
+        );
+        assert_eq!(
+            load(&["-countryfile=country.mmdb"]).unwrap().countryfile,
+            want
+        );
+        let abs = dir.path().join("country.mmdb");
+        assert_eq!(
+            load(&[&format!("-countryfile={}", abs.display())])
+                .unwrap()
+                .countryfile,
+            Some(abs)
+        );
+        assert!(
+            load(&["-countryfile=nope.mmdb"])
+                .unwrap_err()
+                .contains("country file not found")
+        );
+        assert!(load(&["-countryfile="]).unwrap_err().contains("empty path"));
+        std::fs::write(
+            dir.path().join("bitcoin.conf"),
+            "countryfile=country.mmdb\n",
+        )
+        .unwrap();
+        let c = load(&[]).unwrap();
+        assert_eq!(c.countryfile, want, "from bitcoin.conf");
+        assert_eq!(
+            c.effective_view()["p2p"]["countryfile"],
+            serde_json::json!(dir.path().join("country.mmdb").display().to_string())
+        );
+        assert_eq!(classify_unsupported_key("countryfile"), None);
+        assert!(is_known_config_key("countryfile"));
     }
 
     // ---- maxuploadtarget ----

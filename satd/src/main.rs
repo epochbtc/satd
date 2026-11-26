@@ -3046,6 +3046,28 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
         }
     }
 
+    // -countryfile: read the country file into memory once. A file that
+    // does not parse as a MaxMind DB is fatal, as a bad asmap is (the config
+    // layer already verified the path exists).
+    if let Some(ref country_path) = config.countryfile {
+        match node::net::country::CountryMap::load(country_path) {
+            Ok(map) => {
+                tracing::info!(
+                    path = %country_path.display(),
+                    database_type = map.database_type(),
+                    build_epoch = map.build_epoch(),
+                    "Loaded the country file for the crawl's per-country totals"
+                );
+                peer_manager.set_country_map(std::sync::Arc::new(map));
+            }
+            Err(e) => {
+                eprintln!("Error loading the country file: {e}");
+                auth.cleanup();
+                node::shutdown::exit_now(1);
+            }
+        }
+    }
+
     // Load the persistent address book (peers.dat), which the automatic
     // dials draw from, so we don't have to re-bootstrap from DNS seeds on
     // every restart.
