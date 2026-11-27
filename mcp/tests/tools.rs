@@ -968,13 +968,14 @@ mod tool_router {
         // 27 original + 8 ergonomics-backfill (#68) + 4 policy observability
         // (PR 7c: get_policy_info / get_quarantine_info / list_quarantine /
         // get_quarantine_entry) + get_opreturn_prune_info = 40, + the two
-        // NAP tools (get_nap_report, list_nap_aggregate) = 42
+        // NAP tools (get_nap_report, list_nap_aggregate) = 42, + the crawl,
+        // survey and behaviour tools = 45
         let server = make_server();
         let tools = server.list_tools_from_router();
         assert_eq!(
             tools.len(),
-            42,
-            "Expected 42 tools, got {}. Tools: {:?}",
+            45,
+            "Expected 45 tools, got {}. Tools: {:?}",
             tools.len(),
             tools.iter().map(|t| &*t.name).collect::<Vec<_>>()
         );
@@ -1021,6 +1022,9 @@ mod tool_router {
             "get_quarantine_entry",
             "get_nap_report",
             "list_nap_aggregate",
+            "get_crawl_info",
+            "get_peer_survey",
+            "get_peer_behavior",
         ];
 
         for name in &expected {
@@ -1288,5 +1292,55 @@ mod nap {
             Some(0),
         ));
         assert!(ok["error"].is_null(), "{ok}");
+    }
+}
+
+// ============================================================
+// Network survey, crawl and peer behaviour
+// ============================================================
+
+mod network_survey {
+    use super::*;
+    use satd_mcp::tools::network;
+
+    fn parse(out: &str) -> serde_json::Value {
+        serde_json::from_str(out).unwrap()
+    }
+
+    #[test]
+    fn crawl_info_with_the_crawl_off_says_so() {
+        let (ctx, _dir) = make_test_ctx();
+        let info = parse(&network::get_crawl_info(&ctx));
+        assert_eq!(info["enabled"], false, "{info}");
+        assert_eq!(info["state"], "off", "{info}");
+    }
+
+    #[test]
+    fn the_survey_tool_returns_the_aggregate_without_rows() {
+        let (ctx, _dir) = make_test_ctx();
+        let survey = parse(&network::get_peer_survey(&ctx));
+        // The verbose answer is the aggregate's keys plus per-address
+        // records; the tool never asks for it.
+        let verbose = ctx.peer_manager.get_peer_survey(true);
+        let rows_key = verbose
+            .as_object()
+            .unwrap()
+            .keys()
+            .find(|k| survey.get(k.as_str()).is_none())
+            .cloned();
+        assert!(
+            rows_key.is_some(),
+            "verbose and aggregate answers are the same shape: {verbose}"
+        );
+        assert_eq!(survey, ctx.peer_manager.get_peer_survey(false));
+    }
+
+    #[test]
+    fn peer_behavior_lists_no_peers_and_refuses_an_unknown_id() {
+        let (ctx, _dir) = make_test_ctx();
+        let all = parse(&network::get_peer_behavior(&ctx, None));
+        assert_eq!(all["peers"], serde_json::json!([]), "{all}");
+        let one = parse(&network::get_peer_behavior(&ctx, Some(7)));
+        assert_eq!(one["error"], "peer_id 7 not found", "{one}");
     }
 }

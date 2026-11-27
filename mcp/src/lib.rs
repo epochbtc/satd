@@ -246,6 +246,14 @@ struct ListNapAggregateParams {
     limit: Option<u32>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GetPeerBehaviorParams {
+    #[schemars(
+        description = "One peer's id (from get_peer_info); every connected peer if omitted"
+    )]
+    peer_id: Option<u64>,
+}
+
 // --- Tool router: register all tools ---
 
 #[tool_router]
@@ -584,6 +592,29 @@ impl SatdMcpServer {
     )]
     fn get_readiness(&self) -> String {
         tools::ergonomics::get_readiness(&self.ctx)
+    }
+
+    // === Network survey and crawl ===
+
+    #[tool(
+        description = "What the network looks like, from the node's crawl (-crawl): its state and limits, and the reachable nodes it found counted by software family, network, protocol (v2 transport), AS and country. Counts only, no addresses. Off unless the node runs -crawl."
+    )]
+    fn get_crawl_info(&self) -> String {
+        tools::network::get_crawl_info(&self.ctx)
+    }
+
+    #[tool(
+        description = "The node's passive network survey (-peersurvey): the addresses it surveyed counted by software family, claimed and fake families, nodes that closed early, v2 transport and top AS. Aggregate only, no addresses. Off unless the node runs -peersurvey."
+    )]
+    fn get_peer_survey(&self) -> String {
+        tools::network::get_peer_survey(&self.ctx)
+    }
+
+    #[tool(
+        description = "Each connected peer's behaviour record: connection type, session length, user agent, software fingerprint, misbehaviour flags with their evidence, and traffic counters. No addresses. Param: peer_id for one peer."
+    )]
+    fn get_peer_behavior(&self, Parameters(p): Parameters<GetPeerBehaviorParams>) -> String {
+        tools::network::get_peer_behavior(&self.ctx, p.peer_id)
     }
 
     // === NAP (node attestation protocol) ===

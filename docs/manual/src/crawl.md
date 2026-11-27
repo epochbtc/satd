@@ -539,6 +539,7 @@ than a country is read at all.
 | `totals` | The crawl's own bytes, as `getnettotals` names them; not counted there. |
 
 It is a read: allowed on the read-only listener and to an `rpc:read` token.
+Over MCP it is `get_crawl_info`, in the read-only `mcp:read` profile.
 [sat-tui](tui.md#network-crawl--crawl-detail)'s Chain view draws it as
 the Network crawl row.
 
