@@ -57,17 +57,9 @@ pub fn list_aggregate(p: &crate::nap::pull::Puller, chain: &ChainState) -> Value
     let attestations: Vec<Value> = counting
         .iter()
         .map(|h| {
-            let att = &h.attestation;
-            json!({
-                "id": att.id().to_string(),
-                "outpoint": att.outpoint().to_string(),
-                "key": att.key(),
-                "value": att.value(),
-                "anchor_height": att.anchor_height(),
-                "anchor_hash": att.anchor_hash().to_string(),
-                "amount": format_amount(h.status.as_ref().map_or(0, |a| a.to_sat()), unit),
-                "source": h.source,
-            })
+            let mut row = held_json(h, unit);
+            row["source"] = json!(h.source);
+            row
         })
         .collect();
     let mut out = json!({
@@ -86,6 +78,54 @@ pub fn list_aggregate(p: &crate::nap::pull::Puller, chain: &ChainState) -> Value
         "key_limit": stats.key_limit,
         "full": stats.full,
         "attestations": attestations,
+    });
+    annotate_units(&mut out, unit);
+    out
+}
+
+/// An attestation that counts, as `listnapaggregate` lists it, less the
+/// peer it came from.
+fn held_json(h: &crate::nap::aggregate::Held, unit: crate::rpc::amounts::AmountUnit) -> Value {
+    let att = &h.attestation;
+    json!({
+        "id": att.id().to_string(),
+        "outpoint": att.outpoint().to_string(),
+        "key": att.key(),
+        "value": att.value(),
+        "anchor_height": att.anchor_height(),
+        "anchor_hash": att.anchor_hash().to_string(),
+        "amount": format_amount(h.status.as_ref().map_or(0, |a| a.to_sat()), unit),
+    })
+}
+
+/// One page of the attestations that count, for MCP's `list_nap_aggregate`:
+/// at most `limit` after the `(outpoint, key)` pair `after`, in
+/// `listnapaggregate`'s order and shape, without `source`. That is the
+/// address of the peer each was collected from, which a page meant for any
+/// caller does not hand out. `next` is the pair to pass as `after` for the
+/// following page, or null after the last. `height` is the tip's, as
+/// `listnapaggregate` reports it.
+pub fn aggregate_page(
+    p: &crate::nap::pull::Puller,
+    height: u32,
+    after: Option<&(OutPoint, String)>,
+    limit: usize,
+) -> Value {
+    let unit = default_unit();
+    let aggregate = p.collector().aggregate();
+    let page = aggregate.counting_page(after, limit);
+    let next = match page.last() {
+        Some(h) if page.len() == limit => json!({
+            "outpoint": h.attestation.outpoint().to_string(),
+            "key": h.attestation.key(),
+        }),
+        _ => Value::Null,
+    };
+    let mut out = json!({
+        "height": height,
+        "held": aggregate.len(),
+        "attestations": page.iter().map(|h| held_json(h, unit)).collect::<Vec<_>>(),
+        "next": next,
     });
     annotate_units(&mut out, unit);
     out

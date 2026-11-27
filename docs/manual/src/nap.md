@@ -533,6 +533,11 @@ it, and `exportnapsnapshot` writes a file. Both need `rpc:write` and are
 refused on the read-only listener, as `scantxoutset` and `dumptxoutset`
 are. See [Authentication & Authorization](authentication.md).
 
+Over MCP, `get_nap_report` and `list_nap_aggregate` are in the read-only
+`mcp:read` profile. `list_nap_aggregate` returns a page at a time and leaves
+out each attestation's `source`, the address of the peer it came from. See
+[MCP Server](mcp.md#node-attestations-nap).
+
 | Error | Meaning |
 |---|---|
 | `-26` | The attestation is not valid, or is superseded, or the outpoint has 32 keys (`key-limit`), or the store is at `napmaxattestations` (`store-full`). The message names the rule. |

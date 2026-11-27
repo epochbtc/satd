@@ -43,4 +43,8 @@ pub struct McpContext {
     /// shutdown begins rather than connecting blocks past the chainstate
     /// flush. `None` in tests.
     pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The NAP aggregator (`-napaggregator=1`), for `get_nap_report` and
+    /// `list_nap_aggregate`. `None` when it is off; both tools then answer
+    /// an error.
+    pub nap_aggregator: Option<Arc<node::nap::pull::Puller>>,
 }

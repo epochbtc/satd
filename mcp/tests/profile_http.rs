@@ -68,6 +68,7 @@ fn make_ctx(dir: &std::path::Path) -> McpContext {
         health: None,
         webhooks: None,
         shutdown: None,
+        nap_aggregator: None,
     }
 }
 
@@ -270,6 +271,12 @@ async fn a_read_token_calls_a_read_tool() {
         v["error"].is_null() && v["result"]["isError"] != json!(true),
         "{v}"
     );
+    // A NAP tool is a read tool: it answers, here that the aggregator is
+    // off, rather than "tool not found".
+    let v = read.call("list_nap_aggregate", json!({})).await;
+    assert!(v["error"].is_null(), "{v}");
+    let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("aggregator is disabled"), "{v}");
 }
 
 #[tokio::test]

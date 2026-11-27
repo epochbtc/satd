@@ -232,6 +232,20 @@ struct GetReorgHistoryParams {
     since_secs: Option<u64>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ListNapAggregateParams {
+    #[schemars(
+        description = "Start after this outpoint (\"txid:vout\"): the previous page's next.outpoint. Pass with after_key, or neither for the first page"
+    )]
+    after_outpoint: Option<String>,
+    #[schemars(
+        description = "Start after this key at after_outpoint: the previous page's next.key"
+    )]
+    after_key: Option<String>,
+    #[schemars(description = "Attestations per page (default: 100, max: 1000)")]
+    limit: Option<u32>,
+}
+
 // --- Tool router: register all tools ---
 
 #[tool_router]
@@ -571,6 +585,27 @@ impl SatdMcpServer {
     fn get_readiness(&self) -> String {
         tools::ergonomics::get_readiness(&self.ctx)
     }
+
+    // === NAP (node attestation protocol) ===
+
+    #[tool(
+        description = "What coin holders say: the NAP aggregator's report at the tip. For each key, every value attested with the coin weight behind it, its share of the attesting weight and of the coin supply, how concentrated that weight is in the largest coins, and how old the coins are. Needs -napaggregator=1."
+    )]
+    async fn get_nap_report(&self) -> String {
+        tools::nap::get_nap_report(&self.ctx).await
+    }
+
+    #[tool(
+        description = "List the NAP attestations that count at the tip, one per (outpoint, key), ordered by outpoint and key, a page at a time: outpoint, key, value, anchor and the coin's amount. Pass the previous page's next as after_outpoint and after_key to continue; next is null on the last page. Needs -napaggregator=1."
+    )]
+    fn list_nap_aggregate(&self, Parameters(p): Parameters<ListNapAggregateParams>) -> String {
+        tools::nap::list_nap_aggregate(
+            &self.ctx,
+            p.after_outpoint.as_deref(),
+            p.after_key.as_deref(),
+            p.limit,
+        )
+    }
 }
 
 // --- ServerHandler implementation ---
@@ -716,6 +751,7 @@ pub(crate) fn test_ctx() -> (Arc<Ctx>, tempfile::TempDir) {
         health: None,
         webhooks: None,
         shutdown: None,
+        nap_aggregator: None,
     };
     (Arc::new(ctx), dir)
 }

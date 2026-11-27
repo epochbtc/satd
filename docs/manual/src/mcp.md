@@ -72,7 +72,7 @@ Two capabilities gate MCP:
 
 - **`mcp:*`** grants every tool.
 - **`mcp:read`** grants the read-only profile: the tools that answer
-  questions about the chain, the mempool and fees. It is meant for a token
+  questions about the chain, the mempool, fees and node attestations. It is meant for a token
   you hand to someone else, up to the public. It leaves out every tool that
   acts (`sign_transaction`, `send_transaction`, `generate_blocks`,
   `manage_peer`), that shows other people's addresses (`get_peer_info`,
@@ -252,3 +252,9 @@ The server registers the following tools. Each returns a text result.
 - `get_utxo`: single UTXO by `txid`/`vout` (null if spent).
 - `get_utxo_set_stats`: total UTXOs, total value, best block.
 - `validate_address`: parse and classify an address (P2PKH/P2SH/P2WPKH/P2WSH/P2TR); returns script hex and witness info.
+
+### Node attestations (NAP)
+Both need the aggregator (`-napaggregator=1`) and answer an error without
+it. See [Node attestations](nap.md#aggregating).
+- `get_nap_report`: `getnapreport`: for each key, every value attested, the coin weight behind it, its share of the attesting weight and of the supply, its concentration and the coins' age, at the tip. Computed once per tip and set.
+- `list_nap_aggregate`: the attestations that count, in `listnapaggregate`'s order and shape, a page at a time. Params: `limit` (default 100, max 1000), and `after_outpoint` with `after_key` from the previous page's `next` (null on the last page). Unlike `listnapaggregate`, a row has no `source`: that is the address of the peer it was collected from.

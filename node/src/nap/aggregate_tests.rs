@@ -947,3 +947,92 @@ fn the_change_count_moves_with_what_the_set_holds() {
     assert_eq!(c.aggregate().on_tip(&chain), 1);
     assert!(c.aggregate().changes() > added, "an attestation dropped");
 }
+
+/// Three coins with two keys each: six `(outpoint, key)` pairs, all counting.
+fn six_counting(chain: &Chain, s: &Signer) -> (tempfile::TempDir, Collector) {
+    let (d, c) = open(chain);
+    let page = (1..=3)
+        .flat_map(|n| ["a", "b"].map(|k| attest(chain, s, outpoint(n), k, "yes", ANCHOR)))
+        .collect();
+    assert_eq!(take(&c, chain, "203.0.113.5:8333", page).added, 6);
+    (d, c)
+}
+
+#[test]
+fn counting_pages_walk_the_set_in_order_from_the_cursor() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 3);
+    let (_d, c) = six_counting(&chain, &s);
+    let pair = |h: &Held| (h.attestation.outpoint(), h.attestation.key().to_owned());
+    let whole: Vec<_> = c.aggregate().counting().iter().map(pair).collect();
+    assert_eq!(whole.len(), 6);
+
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = c.aggregate().counting_page(after.as_ref(), 4);
+        assert!(page.len() <= 4);
+        let Some(last) = page.last() else { break };
+        after = Some(pair(last));
+        paged.extend(page.iter().map(pair));
+    }
+    assert_eq!(paged, whole, "the pages, joined, are counting()");
+    assert!(
+        c.aggregate().counting_page(Some(&whole[5]), 4).is_empty(),
+        "nothing follows the last pair"
+    );
+    assert_eq!(
+        c.aggregate()
+            .counting_page(Some(&whole[1]), 1)
+            .iter()
+            .map(pair)
+            .collect::<Vec<_>>(),
+        vec![whole[2].clone()],
+        "the cursor is exclusive"
+    );
+}
+
+#[test]
+fn a_counting_page_skips_pairs_with_nothing_counting() {
+    let s = p2wpkh();
+    let mut chain = chain_with(&s, 3);
+    let (_d, c) = six_counting(&chain, &s);
+    // Coin 2 is spent: both of its keys drop out of what counts.
+    chain.coins.remove(&outpoint(2));
+    c.aggregate().on_tip(&chain);
+    let page = c.aggregate().counting_page(None, 10);
+    assert_eq!(page.len(), 4);
+    assert!(page.iter().all(|h| h.attestation.outpoint() != outpoint(2)));
+}
+
+#[test]
+fn the_mcp_page_leaves_out_the_peer_each_attestation_came_from() {
+    let s = p2wpkh();
+    let chain = chain_with(&s, 3);
+    let (_d, c) = six_counting(&chain, &s);
+    let puller = super::pull::Puller::new(std::sync::Arc::new(c));
+    let first = crate::rpc::nap::aggregate_page(&puller, TIP, None, 4);
+    assert_eq!(first["held"], 6);
+    assert_eq!(first["height"], TIP);
+    let rows = first["attestations"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    for row in rows {
+        assert!(row.get("source").is_none(), "a row names its source: {row}");
+        assert!(row["outpoint"].is_string() && row["key"].is_string());
+    }
+    assert!(
+        !first.to_string().contains("203.0.113.5"),
+        "the page carries the peer's address: {first}"
+    );
+    // `next` resumes after the fourth row, and the last page has none.
+    let next = &first["next"];
+    assert_eq!(next["outpoint"], rows[3]["outpoint"]);
+    assert_eq!(next["key"], rows[3]["key"]);
+    let after = (
+        next["outpoint"].as_str().unwrap().parse().unwrap(),
+        next["key"].as_str().unwrap().to_owned(),
+    );
+    let second = crate::rpc::nap::aggregate_page(&puller, TIP, Some(&after), 4);
+    assert_eq!(second["attestations"].as_array().unwrap().len(), 2);
+    assert!(second["next"].is_null());
+}

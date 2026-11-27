@@ -64,6 +64,7 @@ fn make_test_ctx() -> (McpContext, tempfile::TempDir) {
         health: None,
         webhooks: None,
         shutdown: None,
+        nap_aggregator: None,
     };
     (ctx, dir)
 }
@@ -848,6 +849,7 @@ mod mining {
             health: None,
             webhooks: None,
             shutdown: None,
+            nap_aggregator: None,
         };
 
         let result = mine::generate_blocks(&ctx, 1, REGTEST_ADDR);
@@ -965,13 +967,14 @@ mod tool_router {
     fn test_tool_router_lists_expected_tools() {
         // 27 original + 8 ergonomics-backfill (#68) + 4 policy observability
         // (PR 7c: get_policy_info / get_quarantine_info / list_quarantine /
-        // get_quarantine_entry) + get_opreturn_prune_info = 40
+        // get_quarantine_entry) + get_opreturn_prune_info = 40, + the two
+        // NAP tools (get_nap_report, list_nap_aggregate) = 42
         let server = make_server();
         let tools = server.list_tools_from_router();
         assert_eq!(
             tools.len(),
-            40,
-            "Expected 40 tools, got {}. Tools: {:?}",
+            42,
+            "Expected 42 tools, got {}. Tools: {:?}",
             tools.len(),
             tools.iter().map(|t| &*t.name).collect::<Vec<_>>()
         );
@@ -1016,6 +1019,8 @@ mod tool_router {
             "get_quarantine_info",
             "list_quarantine",
             "get_quarantine_entry",
+            "get_nap_report",
+            "list_nap_aggregate",
         ];
 
         for name in &expected {
@@ -1212,5 +1217,76 @@ mod ergonomics {
         let json: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(json["count"].is_number());
         assert!(json["events"].is_array());
+    }
+}
+
+// ============================================================
+// NAP Tools
+// ============================================================
+
+mod nap {
+    use super::*;
+    use satd_mcp::tools::nap;
+
+    fn parse(out: &str) -> serde_json::Value {
+        serde_json::from_str(out).unwrap()
+    }
+
+    /// `ctx` with an empty aggregator, its set in `dir`.
+    fn with_aggregator(mut ctx: McpContext, dir: &std::path::Path) -> McpContext {
+        let path = dir.join("nap").join("aggregate").join("aggregate.dat");
+        let aggregate = node::nap::aggregate::Aggregate::open(path, &*ctx.chain_state).unwrap();
+        let collector = Arc::new(node::nap::collect::Collector::new(aggregate));
+        ctx.nap_aggregator = Some(Arc::new(node::nap::pull::Puller::new(collector)));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn both_tools_say_the_aggregator_is_off_without_it() {
+        let (ctx, _dir) = make_test_ctx();
+        let report = parse(&nap::get_nap_report(&ctx).await);
+        assert_eq!(report["error"], "the NAP aggregator is disabled");
+        let page = parse(&nap::list_nap_aggregate(&ctx, None, None, None));
+        assert_eq!(page["error"], "the NAP aggregator is disabled");
+    }
+
+    #[tokio::test]
+    async fn an_empty_aggregate_reports_and_lists_nothing() {
+        let (ctx, dir) = make_test_ctx_with_blocks(3);
+        let ctx = with_aggregator(ctx, dir.path());
+        let report = parse(&nap::get_nap_report(&ctx).await);
+        assert!(report["error"].is_null(), "{report}");
+        assert_eq!(report["height"], 3, "{report}");
+        let page = parse(&nap::list_nap_aggregate(&ctx, None, None, Some(10)));
+        assert_eq!(page["height"], 3);
+        assert_eq!(page["held"], 0);
+        assert_eq!(page["attestations"], serde_json::json!([]));
+        assert!(page["next"].is_null());
+    }
+
+    #[test]
+    fn a_cursor_needs_both_halves_and_a_real_outpoint() {
+        let (ctx, dir) = make_test_ctx();
+        let ctx = with_aggregator(ctx, dir.path());
+        let half = parse(&nap::list_nap_aggregate(&ctx, None, Some("k"), None));
+        assert!(
+            half["error"].as_str().unwrap().contains("go together"),
+            "{half}"
+        );
+        let bad = parse(&nap::list_nap_aggregate(
+            &ctx,
+            Some("nope"),
+            Some("k"),
+            None,
+        ));
+        assert!(bad["error"].is_string(), "{bad}");
+        let txid = "00".repeat(32);
+        let ok = parse(&nap::list_nap_aggregate(
+            &ctx,
+            Some(&format!("{txid}:0")),
+            Some("k"),
+            Some(0),
+        ));
+        assert!(ok["error"].is_null(), "{ok}");
     }
 }
