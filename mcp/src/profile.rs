@@ -9,7 +9,8 @@
 //!   (`sign_transaction`, `send_transaction`, `generate_blocks`,
 //!   `manage_peer`);
 //! - reveals other people's addresses: `get_peer_info`, `get_ban_list`;
-//! - reveals the operator's machine or setup: `get_config`,
+//! - reveals the operator's machine or setup: `get_peer_behavior` (a row
+//!   per connected peer), `get_config`,
 //!   `get_policy_info` (the ruleset's file path), `get_system_info` (memory
 //!   use), `get_metrics_snapshot` (the full metrics dump);
 //! - costs the node far more than the request costs the caller:
@@ -75,6 +76,11 @@ pub const READ_TOOLS: &[&str] = &[
     // is computed once per tip and set.
     "get_nap_report",
     "list_nap_aggregate",
+    // The crawl's and the survey's aggregates: counts per family, network
+    // and AS, never a node's address. The survey tool has no per-address
+    // mode.
+    "get_crawl_info",
+    "get_peer_survey",
 ];
 
 /// The tools only an `mcp:*` token may use.
@@ -91,6 +97,10 @@ pub const FULL_ONLY_TOOLS: &[&str] = &[
     "get_metrics_snapshot",
     "get_utxo_set_stats",
     "get_block_template",
+    // No address, but a row per connected peer: who the node talks to and
+    // how they behave, and an alt-slot peer's rule from the operator's
+    // `-altslots` (user, 2026-11-26).
+    "get_peer_behavior",
 ];
 
 impl McpProfile {

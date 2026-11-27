@@ -78,3 +78,29 @@ pub fn get_ban_list(ctx: &McpContext) -> String {
     });
     serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
 }
+
+/// The network crawl (`-crawl`): its state, limits and the aggregate of the
+/// reachable nodes it found, counts only (`getcrawlinfo`).
+pub fn get_crawl_info(ctx: &McpContext) -> String {
+    serde_json::to_string_pretty(&ctx.peer_manager.get_crawl_info())
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+/// The network survey (`-peersurvey`): the aggregate only, as
+/// `getpeersurvey` answers without `verbose`. The per-address rows are not
+/// offered here.
+pub fn get_peer_survey(ctx: &McpContext) -> String {
+    serde_json::to_string_pretty(&ctx.peer_manager.get_peer_survey(false))
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Each connected peer's behaviour record, fingerprint and flags, or one
+/// peer's by id (`getpeerbehavior`). No address.
+pub fn get_peer_behavior(ctx: &McpContext, peer_id: Option<u64>) -> String {
+    match ctx.peer_manager.get_peer_behavior(peer_id) {
+        Some(rows) => serde_json::to_string_pretty(&json!({ "peers": rows }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        None => json!({ "error": format!("peer_id {} not found", peer_id.unwrap_or_default()) })
+            .to_string(),
+    }
+}

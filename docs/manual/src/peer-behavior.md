@@ -128,7 +128,8 @@ sat-cli getpeerbehavior 7
 | `counters` | The raw record: `inv_tx_in`, `getdata_tx_in`, `getdata_latency` (count, `p10_ms`, `median_ms`, and the histogram), `inv_tx_announced_to`, `headers_req`, `blocks_req`, `getaddr_in`, `addr_in`, `addr_out`, `addr_rate_limited`, `notfound_after_inv`, `height_claim_gap`, `stalls`, and the `version` fields. |
 
 It is a read: allowed on the read-only listener, and for a bearer token it
-needs `rpc:read`.
+needs `rpc:read`. Over MCP it is `get_peer_behavior`, which needs `mcp:*`:
+the read-only `mcp:read` profile leaves it out.
 
 ## In sat-tui
 
@@ -367,6 +368,9 @@ Each record is counted once among `families`, `claimed`, `fake` and
 | `enabled`, `probes`, `interval` | The survey's settings. With the survey off, `enabled` is false and every count is zero. |
 | `connections` | Survey connections since start: `completed`, and `failed` at the dial or the handshake; `last`, the most recent to end, with its `time` (Unix seconds) and `result` (`completed` or `failed`), null until one ends. |
 | `alt_slots` | The [alt-slots](#alt-slots): `configured`, `matched`, `fallback` and `empty`. Reported with the survey off too. |
+
+Over MCP, `get_peer_survey` returns this aggregate, in the read-only
+`mcp:read` profile. MCP has no per-address form.
 
 `getpeersurvey true` adds `peers`, one row per address, most recently seen
 first: `addr`, `network`, `fingerprint` (as in `getpeerbehavior`, for

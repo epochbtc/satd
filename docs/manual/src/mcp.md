@@ -72,11 +72,13 @@ Two capabilities gate MCP:
 
 - **`mcp:*`** grants every tool.
 - **`mcp:read`** grants the read-only profile: the tools that answer
-  questions about the chain, the mempool, fees and node attestations. It is meant for a token
+  questions about the chain, the mempool, fees, node attestations and the
+  network's makeup. It is meant for a token
   you hand to someone else, up to the public. It leaves out every tool that
   acts (`sign_transaction`, `send_transaction`, `generate_blocks`,
   `manage_peer`), that shows other people's addresses (`get_peer_info`,
-  `get_ban_list`), or that shows your machine or setup (`get_config`,
+  `get_ban_list`), or that shows your machine or setup (`get_peer_behavior`,
+  a row per connected peer, `get_config`,
   `get_policy_info`, which names the ruleset's file, `get_system_info` and
   `get_metrics_snapshot`), or that costs the node far more than the request
   costs the caller (`get_utxo_set_stats`, which flushes the coin cache to
@@ -232,6 +234,9 @@ The server registers the following tools. Each returns a text result.
 - `get_peer_info`: connected peers. Param: `summary` (default true).
 - `manage_peer`: mutating; `add` / `disconnect` / `ban` / `unban`. Params: `action`, `address`.
 - `get_ban_list`: banned peers with timestamps and reasons.
+- `get_peer_behavior`: each connected peer's behaviour record, fingerprint and flags (`getpeerbehavior`); no addresses. Param: `peer_id` for one peer. Not in `mcp:read`.
+- `get_crawl_info`: the network crawl's state and its counts of reachable nodes by family, network, v2, AS and country (`getcrawlinfo`). Counts only. See [Network crawl](crawl.md).
+- `get_peer_survey`: the passive survey's aggregate (`getpeersurvey` without `verbose`). The per-address rows are not offered over MCP. See [Peer behaviour](peer-behavior.md).
 
 ### Transaction construction (mutating)
 - `create_transaction`: build an unsigned raw tx. Params: `inputs`, `outputs`, `locktime`.

@@ -343,5 +343,6 @@ withheld_tests! {
     read_token_cannot_call_get_system_info => "get_system_info",
     read_token_cannot_call_get_metrics_snapshot => "get_metrics_snapshot",
     read_token_cannot_call_get_utxo_set_stats => "get_utxo_set_stats",
+    read_token_cannot_call_get_peer_behavior => "get_peer_behavior",
     read_token_cannot_call_get_block_template => "get_block_template",
 }
