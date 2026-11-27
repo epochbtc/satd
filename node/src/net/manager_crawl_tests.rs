@@ -14,6 +14,7 @@ use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
 fn quick() -> Timings {
     Timings {
         connect: Duration::from_secs(2),
+        proxy_greeting: Duration::from_secs(2),
         tor_connect: Duration::from_secs(2),
         handshake: Duration::from_secs(2),
         tor_handshake: Duration::from_secs(2),
@@ -664,7 +665,7 @@ async fn a_discovery_session_ends_by_its_bound() {
     .expect("the session ended");
     let t = quick();
     assert!(
-        started.elapsed() <= t.session_cap(SessionKind::Discovery, false),
+        started.elapsed() <= t.session_cap(SessionKind::Discovery, false, false),
         "{:?}",
         started.elapsed()
     );

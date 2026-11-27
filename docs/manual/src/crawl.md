@@ -344,7 +344,11 @@ crawlproxy=127.0.0.1:1081
   host unreachable, 0x05 refused, 0x06 TTL expired), no reply in time, or
   the proxy closing instead of replying, is the target's, as a failed
   direct dial is (see the SSH dynamic forward note above). A request the
-  proxy does not take in time is the proxy's. A proxy host without IPv6
+  proxy does not take in time is the proxy's. The proxy's TCP accept and
+  greeting reply have 15 seconds of their own; the target's 5-second
+  connect budget starts only once the proxy has greeted, so a proxy host
+  slow to answer under load neither shortens the target's dial nor, short
+  of 15 seconds, counts as a failed proxy. A proxy host without IPv6
   answers IPv6 CONNECTs with 0x08 or 0x04: add `-crawlnet=ipv4`.
 - `-crawlbind` does not apply to proxied dials, and a proxied session's
   `version` names the dummy address as the receiver, as an onion dial's

@@ -151,38 +151,39 @@ async fn send_request<W: tokio::io::AsyncWrite + Unpin>(
 
 /// Connect to `target` through a no-authentication SOCKS5 proxy at
 /// `proxy_addr`, telling a failure of the proxy from a failure of the
-/// target ([`Socks5Failure`]). The TCP connect to the proxy is bounded by
-/// `proxy_connect`, and the whole dial, greeting and CONNECT reply
-/// included, by `deadline`.
+/// target ([`Socks5Failure`]). The TCP connect to the proxy and its
+/// greeting reply are bounded by `greeting`; the CONNECT (the request's
+/// write and the reply) by `connect`, from the greeting reply on, so a
+/// proxy slow to greet leaves the target its whole budget.
 ///
 /// Written out rather than through `tokio_socks`, whose single error does
 /// not say whether a timeout or an EOF came during the greeting (the proxy)
 /// or while the proxy dialled the target. 0x01, general failure, is the
 /// target's: a proxy that answered the greeting is up, and a code given per
 /// CONNECT held against the proxy would redial that target for ever. Every
-/// stage is bounded by `deadline`, the request's write included.
+/// stage is bounded, the request's write included.
 pub async fn connect_socks5_staged(
     proxy_addr: SocketAddr,
     target: SocketAddr,
-    proxy_connect: Duration,
-    deadline: tokio::time::Instant,
+    greeting: Duration,
+    connect: Duration,
 ) -> Result<TcpStream, Socks5Failure> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let proxy_err = |what: &str| Socks5Failure::Proxy(format!("proxy {proxy_addr}: {what}"));
-    let connect_by = deadline.min(tokio::time::Instant::now() + proxy_connect);
-    let mut sock = match tokio::time::timeout_at(connect_by, TcpStream::connect(proxy_addr)).await {
+    let greeted_by = tokio::time::Instant::now() + greeting;
+    let mut sock = match tokio::time::timeout_at(greeted_by, TcpStream::connect(proxy_addr)).await {
         Err(_) => return Err(proxy_err("did not accept in time")),
         Ok(Err(e)) => return Err(proxy_err(&format!("unreachable: {e}"))),
         Ok(Ok(s)) => s,
     };
     // Greeting: version 5, one method, no authentication.
-    let greeting = async {
+    let hello = async {
         sock.write_all(&[0x05, 0x01, 0x00]).await?;
         let mut choice = [0u8; 2];
         sock.read_exact(&mut choice).await?;
         Ok::<_, std::io::Error>(choice)
     };
-    match tokio::time::timeout_at(deadline, greeting).await {
+    match tokio::time::timeout_at(greeted_by, hello).await {
         Err(_) => return Err(proxy_err("no greeting reply in time")),
         Ok(Err(e)) => return Err(proxy_err(&format!("greeting failed: {e}"))),
         Ok(Ok([0x05, 0x00])) => {}
@@ -193,6 +194,7 @@ pub async fn connect_socks5_staged(
             )));
         }
     }
+    let deadline = tokio::time::Instant::now() + connect;
     let mut request = vec![0x05, 0x01, 0x00];
     match target.ip().to_canonical() {
         std::net::IpAddr::V4(v4) => {
@@ -589,6 +591,9 @@ mod tests {
         SilentConnect,
         /// Answer the greeting, then close on the CONNECT.
         CloseOnConnect,
+        /// Answer the greeting after this many milliseconds, then the
+        /// CONNECT with success at once.
+        SlowGreeting(u64),
     }
 
     /// A one-connection proxy behaving as `how`; the request's address
@@ -611,6 +616,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 return None;
             }
+            if let Staged::SlowGreeting(ms) = how {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
             sock.write_all(&[0x05, 0x00]).await.ok()?;
             let mut req = [0u8; 4];
             sock.read_exact(&mut req).await.ok()?;
@@ -618,6 +626,12 @@ mod tests {
             let mut rest = vec![0u8; len + 2];
             sock.read_exact(&mut rest).await.ok()?;
             match how {
+                Staged::SlowGreeting(_) => {
+                    let _ = sock
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
                 Staged::Reply(code) => {
                     let _ = sock
                         .write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -632,15 +646,28 @@ mod tests {
         (addr, task)
     }
 
+    /// A staged dial with a 2 s greeting budget and an 800 ms CONNECT.
     async fn staged(proxy: SocketAddr, target: &str) -> Result<TcpStream, Socks5Failure> {
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
         connect_socks5_staged(
             proxy,
             target.parse().unwrap(),
             Duration::from_secs(2),
-            deadline,
+            Duration::from_millis(800),
         )
         .await
+    }
+
+    /// A proxy slow to greet, within its greeting budget, leaves the
+    /// target its whole CONNECT budget: a greeting 1.2 s late, past the
+    /// 800 ms CONNECT budget, still dials. Perturbation: start the CONNECT
+    /// budget before the greeting and the greeting times out as the
+    /// proxy's failure.
+    #[tokio::test]
+    async fn a_slow_greeting_leaves_the_target_its_budget() {
+        let (p, task) = staged_proxy(Staged::SlowGreeting(1_200)).await;
+        let got = staged(p, "203.0.113.7:8333").await;
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(task.await.unwrap(), Some(0x01));
     }
 
     /// A staged dial tells the proxy's failures from the target's: a
