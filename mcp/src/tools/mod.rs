@@ -5,6 +5,7 @@ pub mod ergonomics;
 pub mod fees;
 pub mod mempool;
 pub mod mining;
+pub mod nap;
 pub mod network;
 pub mod node_status;
 pub mod policy;

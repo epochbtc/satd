@@ -415,6 +415,23 @@ impl Aggregate {
             .collect()
     }
 
+    /// One page of [`Self::counting`]: the attestations that count, for the
+    /// `(outpoint, key)` pairs after `after` (exclusive; `None` starts at the
+    /// first), at most `limit`, in the same order. It starts at `after`
+    /// rather than walking the set from the front, and clones only what it
+    /// returns.
+    pub fn counting_page(&self, after: Option<&(OutPoint, String)>, limit: usize) -> Vec<Held> {
+        use std::ops::Bound;
+        let lower = after.map_or(Bound::Unbounded, |k| Bound::Excluded(k.clone()));
+        self.state
+            .lock()
+            .entries
+            .range((lower, Bound::Unbounded))
+            .filter_map(|(_, gens)| gens.iter().find(|h| h.status.is_ok()).cloned())
+            .take(limit)
+            .collect()
+    }
+
     /// Every attestation held, ordered by outpoint and key, newest first
     /// within each.
     pub fn all(&self) -> Vec<Held> {

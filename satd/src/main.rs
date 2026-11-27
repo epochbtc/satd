@@ -4019,7 +4019,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             })
         },
         nap,
-        nap_aggregator,
+        nap_aggregator.clone(),
     )
     .await
     {
@@ -4221,6 +4221,7 @@ async fn run() -> Option<std::sync::Weak<node::storage::coin_cache::CoinCache>> 
             health: health_state.clone(),
             webhooks: Some(webhook_metrics.clone()),
             shutdown: Some(shutdown_rx.clone()),
+            nap_aggregator: nap_aggregator.clone(),
         });
 
         // `--mcp` only enables the feature; `--mcpport` provides the transport.

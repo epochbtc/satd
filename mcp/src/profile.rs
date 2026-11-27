@@ -70,6 +70,11 @@ pub const READ_TOOLS: &[&str] = &[
     "get_reorg_history",
     "get_health",
     "get_readiness",
+    // What coin holders have attested, as the aggregator holds it. The
+    // page leaves out the peer each attestation came from; the report
+    // is computed once per tip and set.
+    "get_nap_report",
+    "list_nap_aggregate",
 ];
 
 /// The tools only an `mcp:*` token may use.
