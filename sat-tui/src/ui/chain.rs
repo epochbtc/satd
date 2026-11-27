@@ -470,19 +470,25 @@ fn draw_extra_rows(f: &mut Frame, area: Rect, state: &AppState) {
 }
 
 /// A bar per family, `pct` giving each count's share: two-cell indent,
-/// label, bar, share; `width` cells inside the panel's border. A bar's
-/// observed records are full blocks, its claimed ones (the user agent's
-/// word alone) the dark shade after them, in the family's colour; the
-/// share is of both.
+/// label, count, bar, share; `width` cells inside the panel's border. The
+/// count (observed and claimed records together) is right-aligned in a
+/// column as wide as the largest. A bar's observed records are full
+/// blocks, its claimed ones (the user agent's word alone) the dark shade
+/// after them, in the family's colour; the share is of both.
 fn family_bar_lines(
     bars: Vec<crate::survey::FamilyBar>,
     pct: impl Fn(u64) -> f64,
     width: u16,
 ) -> Vec<Line<'static>> {
     const LABEL: usize = 14;
-    // Two-cell indent, label, space, bar, space, `100.0%`.
+    let count_width = bars
+        .iter()
+        .map(|b| format_num(b.total()).chars().count())
+        .max()
+        .unwrap_or(1);
+    // Two-cell indent, label, space, count, space, bar, space, `100.0%`.
     let bar_width = (width as usize)
-        .saturating_sub(2 + LABEL + 1 + 1 + 6)
+        .saturating_sub(2 + LABEL + 1 + count_width + 1 + 1 + 6)
         .clamp(4, 30);
     let cells = |n: u64| (pct(n) / 100.0 * bar_width as f64).round() as usize;
     bars.into_iter()
@@ -492,10 +498,17 @@ fn family_bar_lines(
             // A family with any record shows at least one cell, and each
             // part with any record one of its own where there is room.
             let filled = cells(total).clamp(usize::from(total > 0), bar_width);
-            let observed = cells(bar.observed).clamp(usize::from(bar.observed > 0), filled);
+            let mut observed = cells(bar.observed).clamp(usize::from(bar.observed > 0), filled);
             let mut claimed = filled - observed;
-            if bar.claimed > 0 && claimed == 0 && filled < bar_width {
-                claimed = 1;
+            // Claimed records show a cell: a free one, or, on a full bar,
+            // one of the observed part's while it keeps one of its own.
+            if bar.claimed > 0 && claimed == 0 {
+                if filled < bar_width {
+                    claimed = 1;
+                } else if observed > 1 {
+                    observed -= 1;
+                    claimed = 1;
+                }
             }
             let empty = bar_width - observed - claimed;
             let color = match bar.name.as_str() {
@@ -507,6 +520,10 @@ fn family_bar_lines(
                 Span::styled(
                     format!("  {:<width$} ", truncate(&bar.name, LABEL), width = LABEL),
                     Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{:>count_width$} ", format_num(total)),
+                    Style::default().fg(Color::Gray),
                 ),
                 Span::styled("\u{2588}".repeat(observed), Style::default().fg(color)),
                 Span::styled("\u{2593}".repeat(claimed), Style::default().fg(color)),
@@ -964,6 +981,7 @@ mod tests {
             "{left:?}"
         );
         assert!(left[1].contains('\u{2593}'), "the claimed part: {left:?}");
+        assert!(left[1].starts_with("  core           1,121 "), "{left:?}");
         assert!(
             left[2].starts_with("  btcd ") && left[2].contains('\u{2593}'),
             "{left:?}"
@@ -1157,6 +1175,19 @@ mod tests {
         assert!(left[10].starts_with("  other "), "{left:?}");
         assert_eq!(left.last().map(String::as_str), Some("  non-Core 1.4 %"));
         assert_eq!(left.len(), 12);
+        // Each family's count next to its name, observed and claimed
+        // together, right-aligned to the widest: core 20,000 + 350, btcd
+        // 150 + 10, rbitcoin 40.
+        assert!(left[2].starts_with("  core           20,350 "), "{left:?}");
+        assert!(left[3].starts_with("  btcd              160 "), "{left:?}");
+        assert!(
+            left.iter()
+                .any(|l| l.starts_with("  rbitcoin           40 ")),
+            "{left:?}"
+        );
+        for l in &left {
+            assert!(l.chars().count() <= 38, "fits the panel: {l:?}");
+        }
 
         let right: Vec<String> = crawl_right_lines(c).iter().map(line_text).collect();
         assert_eq!(

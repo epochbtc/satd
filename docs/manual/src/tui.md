@@ -508,8 +508,9 @@ Network survey:
 
 - `1,204 addrs, last 30 d`: the addresses the survey reached that the
   node still keeps (it drops a record not seen for 30 days).
-- One bar per family, the 8 largest, then "other", each with its share
-  of the addresses. A bar is the family's observed addresses (full
+- One bar per family, the 8 largest, then "other", each with its count
+  (observed and claimed together) after the name and its share of the
+  addresses. A bar is the family's observed addresses (full
   blocks) followed by its claimed ones (dark shade): those no handshake
   row matched whose user agent names the family. `unknown` is a handshake
   that matched no family under a user agent that names none. Fake and
@@ -580,8 +581,8 @@ Network crawl:
 - `21,000 reachable`: the addresses with a completed handshake inside
   the liveness window (`-crawlliveness`), the crawl's count of the
   reachable network.
-- One bar per family, the 8 largest, then "other", each with its share
-  of the reachable addresses, and the **non-Core** share, counted as in
+- One bar per family, the 8 largest, then "other", each with its count
+  after the name and its share of the reachable addresses, and the **non-Core** share, counted as in
   the survey row. As in the survey row, a bar is the family's observed
   addresses in full blocks, then in the dark shade those no handshake
   row matched whose user agent names the family (`claimed` in
