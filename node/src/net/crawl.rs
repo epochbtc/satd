@@ -78,8 +78,14 @@ pub const MIN_MAX_AGE_SECS: u64 = 60 * 60;
 /// The bounds of one session's phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timings {
-    /// Reaching a clearnet target.
+    /// Reaching a clearnet target: directly, or through `-crawlproxy`
+    /// from the proxy's greeting reply on (its CONNECT).
     pub connect: Duration,
+    /// Reaching `-crawlproxy` itself: its TCP accept and its greeting
+    /// reply, before [`Self::connect`] starts. Apart from the target's
+    /// budget so that a proxy host slow to answer under load neither
+    /// eats into the target's dial nor reads as a failed proxy.
+    pub proxy_greeting: Duration,
     /// Reaching an onion through the proxy.
     pub tor_connect: Duration,
     /// From the connection to the peer's `verack`, the v2 key exchange
@@ -102,6 +108,7 @@ pub struct Timings {
 impl Timings {
     pub const DEFAULT: Timings = Timings {
         connect: Duration::from_secs(5),
+        proxy_greeting: Duration::from_secs(15),
         tor_connect: Duration::from_secs(30),
         handshake: Duration::from_secs(5),
         tor_handshake: Duration::from_secs(30),
@@ -116,10 +123,13 @@ impl Timings {
     /// session still open then is closed. Each transport attempt is a dial
     /// and a handshake (two for a v2 attempt that falls back to v1), then
     /// the passive wait, then for a discovery session its `getaddr` and
-    /// probes, then the close.
-    pub fn session_cap(&self, kind: SessionKind, tor: bool) -> Duration {
+    /// probes, then the close. A clearnet dial through `-crawlproxy`
+    /// (`proxied`) has the proxy's greeting first.
+    pub fn session_cap(&self, kind: SessionKind, tor: bool, proxied: bool) -> Duration {
         let (connect, handshake) = if tor {
             (self.tor_connect, self.tor_handshake)
+        } else if proxied {
+            (self.proxy_greeting + self.connect, self.handshake)
         } else {
             (self.connect, self.handshake)
         };

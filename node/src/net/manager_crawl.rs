@@ -972,7 +972,10 @@ impl PeerManager {
         if run.panic_in_session.swap(false, Ordering::Relaxed) {
             panic!("a crawl session panicked, as the test asked");
         }
-        let cap = run.config.timings.session_cap(kind, addr.is_onion());
+        let cap = run
+            .config
+            .timings
+            .session_cap(kind, addr.is_onion(), run.config.proxy.is_some());
         let out = match tokio::time::timeout(cap, self.crawl_session(&addr, kind)).await {
             Ok(out) => out,
             Err(_) => {
@@ -1124,13 +1127,13 @@ impl PeerManager {
                     // -crawlbind does not apply: the source is the proxy's
                     // host. No fallback: a proxy failure is never dialled
                     // direct.
-                    let deadline = tokio::time::Instant::now() + connect;
-                    let proxy_connect = self.socks_dial_timeouts().proxy_connect;
+                    // The proxy's accept and greeting have a budget of
+                    // their own; `connect` starts after them.
                     return match proxy::connect_socks5_staged(
                         proxy_addr,
                         sa,
-                        proxy_connect,
-                        deadline,
+                        run.config.timings.proxy_greeting,
+                        connect,
                     )
                     .await
                     {

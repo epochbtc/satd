@@ -192,20 +192,26 @@ fn session_caps_are_the_sum_of_their_phases() {
     // Two attempts of a 5 s dial and a 5 s handshake, the 10 s wait, the
     // 1 s close.
     assert_eq!(
-        t.session_cap(SessionKind::Liveness, false),
+        t.session_cap(SessionKind::Liveness, false, false),
         Duration::from_secs(31)
     );
     assert_eq!(
-        t.session_cap(SessionKind::V1Recheck, false),
+        t.session_cap(SessionKind::V1Recheck, false, false),
         Duration::from_secs(21)
     );
     assert_eq!(
-        t.session_cap(SessionKind::Discovery, false),
+        t.session_cap(SessionKind::Discovery, false, false),
         Duration::from_secs(121)
     );
     assert_eq!(
-        t.session_cap(SessionKind::Discovery, true),
+        t.session_cap(SessionKind::Discovery, true, false),
         Duration::from_secs(221)
+    );
+    // Through -crawlproxy each attempt has the proxy's 15 s greeting
+    // before its dial.
+    assert_eq!(
+        t.session_cap(SessionKind::Liveness, false, true),
+        Duration::from_secs(61)
     );
 }
 
